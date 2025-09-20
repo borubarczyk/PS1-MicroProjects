@@ -40,4 +40,4 @@ W razie pytań lub sugestii, zapraszam do kontaktu poprzez Issues na GitHub.
 
 ---
 
-**Autor:** Bartosz Boruń-Barczyk  
+**Autor:** Boris
