@@ -26,6 +26,7 @@ $textBox.ReadOnly = $true
 $textBox.ScrollBars = "Vertical"
 
 # Przycisk Zablokuj konto
+# To-Do - Dodaj potwierdzenie przed zablokowaniem konta oraz zmień tekst przycisku na "Odblokuj konto" jeśli konto jest zablokowane
 $lockButton = New-Object System.Windows.Forms.Button
 $lockButton.Location = New-Object System.Drawing.Point(10,250)
 $lockButton.Size = New-Object System.Drawing.Size(100,30)
@@ -37,13 +38,19 @@ $resetButton.Location = New-Object System.Drawing.Point(120,250)
 $resetButton.Size = New-Object System.Drawing.Size(100,30)
 $resetButton.Text = "Reset hasła"
 
-# Pobieranie użytkowników przy starcie
-$users = Get-ADUser -Filter * -Properties Enabled,LastLogonDate,PasswordLastSet,PasswordExpired
-foreach ($user in $users) {
-    if ($user.SamAccountName) {
-        $comboBox.Items.Add($user.SamAccountName) | Out-Null
-        $comboBox.AutoCompleteCustomSource.Add($user.SamAccountName)
+# Pobieranie użytkowników
+# To-Do - Dodaj obsługę błędów na wypadek braku uprawnień lub problemów z połączeniem oraz pobieraj dane użytkownika tylko na podstawie wybranego konta
+try {
+    $users = Get-ADUser -Filter * -Properties Enabled,LastLogonDate,PasswordLastSet,PasswordExpired
+    foreach ($user in $users) {
+        if ($user.SamAccountName) {
+            $comboBox.Items.Add($user.SamAccountName) | Out-Null
+            $comboBox.AutoCompleteCustomSource.Add($user.SamAccountName)
+        }
     }
+}
+catch {
+    [System.Windows.Forms.MessageBox]::Show("Błąd podczas pobierania użytkowników: $($_.Exception.Message)", "Błąd")
 }
 
 # Funkcja pokazująca informacje o użytkowniku
