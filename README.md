@@ -30,8 +30,15 @@ Przykład listy (uzupełnij według zawartości katalogu):
 
 | Nazwa skryptu | Opis |
 | --- | --- |
-| Skrypt1.ps1 | Automatyzuje zadanie X |
-| Skrypt2.ps1 | Narzędzie do Y |
+| AD User Manager.ps1 |   |
+| AD-BulkAccountStatusChecker.ps1 |   |
+| AD-BulkAddUsersToGroups.ps1 |   |
+| AD-BulkGroupCreator.ps1 |   |
+| AD-BulkUserCreator.ps1 |   |
+| AD-BulkUserCreator.ps1.bak |   |
+| AD-MoveDisabledUsersGUI.ps1 | Przenoszenie zablokowanych użytkowników AD do wybranego OU – interfejs graficzny.  |
+| AD-NTFS-BulkGroupPermissions.ps1 |   |
+| AD-RemoveDisabledUsersFromGroups.ps1 |   |
 | ... | ... |
 
 ## Kontakt
