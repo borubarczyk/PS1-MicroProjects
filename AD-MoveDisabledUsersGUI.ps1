@@ -721,7 +721,7 @@ i przeniesienie z opcją „WhatIf”.
 Uruchamia narzędzie GUI.
 
 .NOTES
-Autor: (uzupełnij)
+Autor: (BK)
 Wersja: 1.0
 Historia: Dodano wybór dowolnego docelowego OU, przyciski zaznacz/odznacz wszystkie,
 diagnozę błędów wyboru OU, poprawiono rozmiary i marginesy UI.
