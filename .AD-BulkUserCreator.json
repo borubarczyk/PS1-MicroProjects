@@ -1,0 +1,42 @@
+{
+  "EmailDomain": "home.local",
+  "LoginFormat": "inazwisko",
+  "DisplayNameFormat": "{Imie} {Nazwisko} ({Rola})",
+  "LoginFormatByTab": {
+    "Student": "i.nazwisko",
+    "Uczen": "inazwisko",
+    "Pracownik": "i.nazwisko",
+    "Inne": "i.nazwisko",
+    "Wykladowca": "i.nazwisko"
+  },
+  "DisplayNameFormatByTab": {
+    "Student": "{Imie} {Nazwisko} ({Rola})",
+    "Uczen": "{Imie} {Nazwisko} ({Rola})",
+    "Pracownik": "{Imie} {Nazwisko}",
+    "Inne": "{Imie} {Nazwisko} ({Rola})",
+    "Wykladowca": "{Imie} {Nazwisko} ({Rola})"
+  },
+  "Domain_Defaults": {
+    "Student": "home.local",
+    "Pracownik": "firma.local",
+    "Uczen": "home.local",
+    "Wykladowca": "wykladowcy.firma.local",
+    "Inne": "inne.firma.local"
+  },
+  "OU_Defaults": {
+    "Student": "OU=STUDNET,OU=TESTOWE,OU=HOME,DC=home,DC=local",
+    "Pracownik": "OU=PRACOWNICY,OU=TESTOWE,OU=HOME,DC=home,DC=local",
+    "Uczen": "OU=UCZEN,OU=TESTOWE,OU=HOME,DC=home,DC=local",
+    "Wykladowca": "OU=WYKLADOWCA,OU=TESTOWE,OU=HOME,DC=home,DC=local",
+    "Inne": "OU=INNE,OU=TESTOWE,OU=HOME,DC=home,DC=local"
+  },
+  "Cities": [
+    "Warszawa",
+    "Olsztyn",
+    "Katowice",
+    "Poznań",
+    "Szczecin",
+    "Człuchów",
+    "Lublin"
+  ]
+}
