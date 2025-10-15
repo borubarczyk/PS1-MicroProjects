@@ -143,6 +143,14 @@ $btnClear.Width = 130
 $btnClear.Anchor = 'Bottom,Left'
 $bottomPanel.Controls.Add($btnClear)
 
+# Dodatkowy przycisk: Wyczyść wszystko (input + tabela)
+$btnClearAll = New-Object System.Windows.Forms.Button
+$btnClearAll.Text = "Wyczysc wszystko"
+$btnClearAll.Location = '310,145'
+$btnClearAll.Width = 140
+$btnClearAll.Anchor = 'Bottom,Left'
+$bottomPanel.Controls.Add($btnClearAll)
+
 # Prawa strona: kontrolki nad gridem
 $topPanel = New-Object System.Windows.Forms.Panel
 $topPanel.Dock = 'Fill'
@@ -151,9 +159,17 @@ $topPanel.Height = 40
 $chkDryRun = New-Object System.Windows.Forms.CheckBox
 $chkDryRun.Text = "Tryb testowy (bez zmian w AD)"
 $chkDryRun.AutoSize = $true
-$chkDryRun.Checked = $true
+$chkDryRun.Checked = $false
 $chkDryRun.Location = '10,10'
 $topPanel.Controls.Add($chkDryRun)
+
+# Opcja: nadpisuj DisplayName przy zamianie
+$chkUpdateDN = New-Object System.Windows.Forms.CheckBox
+$chkUpdateDN.Text = "Nadpisz DisplayName"
+$chkUpdateDN.AutoSize = $true
+$chkUpdateDN.Checked = $false
+$chkUpdateDN.Location = '180,10'
+$topPanel.Controls.Add($chkUpdateDN)
 
 $btnSelectAll = New-Object System.Windows.Forms.Button
 $btnSelectAll.Text = "Zaznacz wszystko"
@@ -209,13 +225,23 @@ $reposition = {
     if ($w -le 0) { return }
     $x = $w - $pad
 
+    # Ustaw checkbox "Nadpisz DisplayName" tuz za "Tryb testowy"
+    try {
+        $newChkUpdateLeft = $chkDryRun.Left + ($chkDryRun.PreferredSize.Width) + $pad
+        $chkUpdateDN.Location = New-Object System.Drawing.Point($newChkUpdateLeft, 7)
+    } catch {}
+
     $btnExport.Location = New-Object System.Drawing.Point(($x - $btnExport.Width), 7)
     $x -= ($btnExport.Width + $pad)
     $btnSwap.Location   = New-Object System.Drawing.Point(($x - $btnSwap.Width), 7)
     $x -= ($btnSwap.Width + $pad)
     $btnUnselectAll.Location = New-Object System.Drawing.Point(($x - $btnUnselectAll.Width), 7)
     $x -= ($btnUnselectAll.Width + $pad)
-    $leftStart = [Math]::Max($chkDryRun.Right + $pad, $x - $btnSelectAll.Width)
+    # Rezerwuj miejsce na checkboxy po lewej, liczac wg PreferredSize
+    $chkDryRunRight  = $chkDryRun.Left  + $chkDryRun.PreferredSize.Width
+    $chkUpdateRight  = $chkUpdateDN.Left + $chkUpdateDN.PreferredSize.Width
+    $leftAreaRight = [Math]::Max($chkDryRunRight, $chkUpdateRight)
+    $leftStart = [Math]::Max($leftAreaRight + $pad, $x - $btnSelectAll.Width)
     $btnSelectAll.Location = New-Object System.Drawing.Point($leftStart, 7)
 }
 
@@ -284,9 +310,14 @@ $grid.add_DataBindingComplete({
 # --- ZDARZENIA ---
 $btnClear.Add_Click({
     $txtLoginy.Clear()
+    $lblStatus.Text = "Wyczyszczono pole loginy."
+})
+
+$btnClearAll.Add_Click({
+    $txtLoginy.Clear()
     $table.Clear()
     $binding.ResetBindings($true)
-    $lblStatus.Text = "Wyczyszczono."
+    $lblStatus.Text = "Wyczyszczono wszystko."
 })
 
 $btnCheck.Add_Click({
@@ -319,6 +350,7 @@ $btnUnselectAll.Add_Click({
 
 $btnSwap.Add_Click({
     $doit = -not $chkDryRun.Checked
+    $updateDN = $chkUpdateDN.Checked
     $count = 0
     $errors = 0
     $form.UseWaitCursor = $true
@@ -332,11 +364,16 @@ $btnSwap.Add_Click({
                 $sn     = $row.Cells[$grid.Columns['Nazwisko'].Index].Value
                 try {
                     if ($doit) {
-                        Set-ADUser -Identity $login -GivenName $sn -Surname $given -ErrorAction Stop
+                        if ($updateDN) {
+                            Set-ADUser -Identity $login -GivenName $sn -Surname $given -DisplayName ("{0} {1}" -f $sn, $given) -ErrorAction Stop
+                        } else {
+                            Set-ADUser -Identity $login -GivenName $sn -Surname $given -ErrorAction Stop
+                        }
                     }
                     # odśwież wiersz (lokalnie zamieniamy widok niezależnie od dry-run)
                     $row.Cells[$grid.Columns['Imię'].Index].Value = $sn
                     $row.Cells[$grid.Columns['Nazwisko'].Index].Value = $given
+                    if ($updateDN) { $row.Cells[$grid.Columns['Wyswietlana'].Index].Value = ("{0} {1}" -f $sn, $given) }
                     $row.Cells[0].Value = $false
                     $count++
                 }
