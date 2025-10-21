@@ -198,9 +198,9 @@ function Render-Results {
     }
 
     $filter = $filterCombo.SelectedItem
-     = ( -eq 'Wszystkie')
-     = ( -eq 'Tylko wlaczone' -or  -eq 'Tylko włączone')
-     = ( -eq 'Tylko wylaczone' -or  -eq 'Tylko wyłączone')
+    $filterAll = ($filter -eq 'Wszystkie')
+    $filterEnabled = ($filter -eq 'Tylko wlaczone' -or  $filter -eq 'Tylko włączone')
+    $filterDisabled = ($filter -eq 'Tylko wylaczone' -or  $filter -eq 'Tylko wyłączone')
     $L = [char]0x0141  # Ł
     $Aog = [char]0x0104 # Ą
 
