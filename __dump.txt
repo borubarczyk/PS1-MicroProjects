@@ -206,62 +206,13 @@ foreach ($t in $tabNames) {
 $script:IsInitializing = $true
 
 #region Logging
-$Script:LogFilePath = $null
-$Script:LogFileDisabled = $false
-try {
-  $logCandidates = @()
-  if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $logCandidates += $PSScriptRoot }
-  if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) { $logCandidates += (Split-Path -Path $PSCommandPath -Parent) }
-  if ($MyInvocation -and $MyInvocation.MyCommand -and $MyInvocation.MyCommand.Path) {
-    $logCandidates += (Split-Path -Path $MyInvocation.MyCommand.Path -Parent)
-  }
-  try {
-    $pwdCandidate = (Get-Location).ProviderPath
-    if (-not [string]::IsNullOrWhiteSpace($pwdCandidate)) { $logCandidates += $pwdCandidate }
-  }
-  catch {}
-  foreach ($candidate in $logCandidates) {
-    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-    try {
-      if (Test-Path -LiteralPath $candidate) {
-        $Script:LogFilePath = Join-Path -Path $candidate -ChildPath 'AD-BulkUserCreator.log'
-        break
-      }
-    }
-    catch {}
-  }
-  if (-not $Script:LogFilePath) { $Script:LogFileDisabled = $true }
-}
-catch {
-  $Script:LogFilePath = $null
-  $Script:LogFileDisabled = $true
-}
-
-function Write-LogFile {
-  param(
-    [string]$Text,
-    [ValidateSet('Info', 'Warning', 'Error', 'Success')][string]$Type = 'Info',
-    [datetime]$Timestamp = (Get-Date)
-  )
-
-  if ($Script:LogFileDisabled -or -not $Script:LogFilePath) { return }
-  $level = $Type.ToUpperInvariant()
-  $entry = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f $Timestamp, $level, $Text
-  try {
-    Add-Content -LiteralPath $Script:LogFilePath -Value $entry -Encoding UTF8 -ErrorAction Stop
-  }
-  catch {
-    $Script:LogFileDisabled = $true
-  }
-}
-
 function Write-ToTextBox {
   param(
     [string]$Text,
     [ValidateSet('Info', 'Warning', 'Error', 'Success')][string]$Type = 'Info'
   )
 
-  $timestamp = Get-Date
+  $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
   switch ($Type) {
     'Info' { $color = [Drawing.Color]::FromArgb(0, 120, 215); $prefix = '[INFO]' }
     'Warning' { $color = [Drawing.Color]::FromArgb(199, 125, 0); $prefix = '[WARNING]' }
@@ -270,24 +221,13 @@ function Write-ToTextBox {
     default { $color = $tb_logg_box.ForeColor; $prefix = '[INFO]' }
   }
 
-  $entry = '{0:yyyy-MM-dd HH:mm:ss} {1} {2}' -f $timestamp, $prefix, $Text
-  if ($tb_logg_box) {
-    $tb_logg_box.SelectionStart = $tb_logg_box.TextLength
-    $tb_logg_box.SelectionLength = 0
-    $tb_logg_box.SelectionColor = $color
-    $tb_logg_box.AppendText($entry + [Environment]::NewLine)
-    $tb_logg_box.ScrollToCaret()
-    $tb_logg_box.SelectionColor = $tb_logg_box.ForeColor
-  }
-
-  Write-LogFile -Text $Text -Type $Type -Timestamp $timestamp
-}
-
-$Script:DuplicateDebug = $true
-function Write-DuplicateDebug {
-  param([string]$Text)
-  if (-not $Script:DuplicateDebug) { return }
-  Write-ToTextBox ("[DEBUG] {0}" -f $Text) 'Info'
+  $entry = '{0} {1} {2}' -f $timestamp, $prefix, $Text
+  $tb_logg_box.SelectionStart = $tb_logg_box.TextLength
+  $tb_logg_box.SelectionLength = 0
+  $tb_logg_box.SelectionColor = $color
+  $tb_logg_box.AppendText($entry + [Environment]::NewLine)
+  $tb_logg_box.ScrollToCaret()
+  $tb_logg_box.SelectionColor = $tb_logg_box.ForeColor
 }
 
 #region Configuration
@@ -411,6 +351,7 @@ function Get-ABCSettings {
             $script:Domain_Defaults[$k] = [string]$data.Domain_Defaults.$k
           }
         }
+        
       }
       if ($data.PSObject.Properties.Name -contains 'OU_Defaults' -and $data.OU_Defaults) {
         $script:OU_Defaults = @{}
@@ -419,6 +360,7 @@ function Get-ABCSettings {
             $script:OU_Defaults[$k] = [string]$data.OU_Defaults.$k
           }
         }
+        
       }
       if ($data.PSObject.Properties.Name -contains 'Cities' -and $data.Cities) {
         $script:Cities = @($data.Cities)
@@ -591,17 +533,17 @@ function Get-UniqueLogin {
 # handles multi-part and hyphenated names like "Anna-Maria").
 #region Names & Validation
 ## Column name constants (single source of truth)
-$ColLp = 'Lp'
-$ColImie = 'Imię'
-$ColNazwisko = 'Nazwisko'
-$ColNrAlbumu = 'NrAlbumu'
+$ColLp               = 'Lp'
+$ColImie             = 'Imię'
+$ColNazwisko         = 'Nazwisko'
+$ColNrAlbumu         = 'NrAlbumu'
 $ColNazwaWyswietlana = 'NazwaWyswietlana'
-$ColLogin = 'Login'
-$ColMiasto = 'Miasto'
-$ColEmail = 'Email'
-$ColHaslo = 'Haslo'
+$ColLogin            = 'Login'
+$ColMiasto           = 'Miasto'
+$ColEmail            = 'Email'
+$ColHaslo            = 'Haslo'
 
-function Convert-ToPolishProperName {
+ function Convert-ToPolishProperName {
   param([string]$Text)
 
   if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
@@ -659,9 +601,9 @@ function Invoke-RowNameValidation {
       $imi = [string]$r.Cells['Imię'].Value
       $naz = [string]$r.Cells[$ColNazwisko].Value
       $resI = Test-NameValid -Text $imi -Field 'Imię'
-      $okI = [bool]$resI[0]
+      $okI  = [bool]$resI[0]
       $resN = Test-NameValid -Text $naz -Field 'Nazwisko'
-      $okN = [bool]$resN[0]
+      $okN  = [bool]$resN[0]
       $login = [string]$r.Cells[$ColLogin].Value
       $tooLong = $false
       try {
@@ -669,8 +611,7 @@ function Invoke-RowNameValidation {
           $max = if ($Script:MaxLoginLength) { [int]$Script:MaxLoginLength } else { 20 }
           if ($login.Length -gt $max) { $tooLong = $true }
         }
-      }
-      catch {}
+      } catch {}
       if (-not $okI -or -not $okN -or $tooLong) {
         $r.DefaultCellStyle.BackColor = $colorInvalid
         [void]$bad.Add($i)
@@ -708,8 +649,7 @@ function Get-BadRowList {
     try {
       $lpv = $Grid.Rows[$idx].Cells[$ColLp].Value
       if ($null -ne $lpv -and $lpv.ToString().Trim() -ne '') { [void]$list.Add($lpv) } else { [void]$list.Add($idx) }
-    }
-    catch { [void]$list.Add($idx) }
+    } catch { [void]$list.Add($idx) }
   }
   return (($list | Sort-Object) -join ', ')
 }
@@ -721,7 +661,7 @@ function Show-InvalidDataDialog {
   try {
     $details = New-Object System.Collections.Generic.List[string]
     $max = if ($Script:MaxLoginLength) { [int]$Script:MaxLoginLength } else { 20 }
-    foreach ($i in $Rows) {
+    foreach($i in $Rows){
       if ($i -isnot [int]) { continue }
       $r = $Grid.Rows[$i]; if (-not $r -or $r.IsNewRow) { continue }
       $reasons = @()
@@ -739,15 +679,13 @@ function Show-InvalidDataDialog {
       try {
         $lpv2 = $r.Cells[$ColLp].Value
         if ($null -ne $lpv2 -and $lpv2.ToString().Trim() -ne '') { $dispRow = $lpv2 }
-      }
-      catch {}
+      } catch {}
       if ($reasons.Count -gt 0) { [void]$details.Add(("Wiersz {0}: {1}" -f $dispRow, ($reasons -join '; '))) }
     }
     if ($details.Count -gt 0) {
       [System.Windows.Forms.MessageBox]::Show(($details -join [Environment]::NewLine), 'Błędne dane', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
     }
-  }
-  catch {}
+  } catch {}
 }
 #endregion Names & Validation
 
@@ -773,44 +711,6 @@ function Test-ADPreCreateConflicts {
     catch {}
   }
   return [pscustomobject]$res
-}
-
-function Add-DuplicateAlertEntry {
-  param(
-    [System.Collections.Generic.List[string]]$List,
-    [string]$DisplayLabel,
-    [string]$Login,
-    [string[]]$Reasons
-  )
-
-  if (-not $List -or [string]::IsNullOrWhiteSpace($Login)) { return }
-  $label = if ([string]::IsNullOrWhiteSpace($DisplayLabel)) { $Login } else { $DisplayLabel }
-  $reasonText = if ($Reasons) {
-    $clean = $Reasons | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    if ($clean -and $clean.Count -gt 0) { ($clean | Select-Object -Unique) -join ', ' } else { $null }
-  }
-  else { $null }
-  if ([string]::IsNullOrWhiteSpace($reasonText)) { $reasonText = 'nieznany konflikt' }
-  $null = $List.Add(("{0} (login: {1}) - konflikt: {2}" -f $label, $Login, $reasonText))
-}
-
-function Get-DuplicateReasonsFromError {
-  param(
-    $ErrorRecord,
-    [string]$FriendlyHint
-  )
-
-  $reasons = New-Object System.Collections.Generic.List[string]
-  if (-not [string]::IsNullOrWhiteSpace($FriendlyHint) -and ($FriendlyHint -match '(?i)istnieje|exists|duplicate|in use|zaj[ęe]ty')) {
-    $null = $reasons.Add($FriendlyHint)
-  }
-  $raw = $null
-  try { $raw = [string]$ErrorRecord.Exception.Message } catch { $raw = [string]$ErrorRecord }
-  if (-not [string]::IsNullOrWhiteSpace($raw) -and ($raw -match '(?i)already|exists|duplicate|in use|istnieje|zaj[ęe]ty|kolizja')) {
-    $null = $reasons.Add($raw)
-  }
-  if ($reasons.Count -eq 0) { return $null }
-  return ($reasons | Select-Object -Unique)
 }
 
 # Mapowanie bledow AD na przyjazne komunikaty PL
@@ -842,7 +742,7 @@ function Get-RandChar([Parameter(Mandatory)][string]$Pool) {
   $Pool[$idx]
 }
 function Test-Sequential([char]$Prev, [char]$Curr) { if (-not $Prev) { return $false }; return ([math]::Abs([int][char]$Prev - [int][char]$Curr) -eq 1) }
-function New-RandomPassword([ValidateRange(8, 128)][int]$Length = 8) {
+function New-RandomPassword([ValidateRange(8, 128)][int]$Length = 12) {
   $chars = @{Digits = '123456789'; Lower = 'abcdefghjkmnpqrstuvwxyz'; Upper = 'ABCDEFGHJKMNPQRSTUVWXYZ'; Symbols = '#$%&?@' }
   $sb = New-Object System.Text.StringBuilder
   [void]$sb.Append((Get-RandChar -Pool ($chars.Lower + $chars.Upper)))
@@ -1052,7 +952,7 @@ function Invoke-ActiveTabCheck {
         $row = $grid.Rows[$r]; if ($row.IsNewRow) { continue }
         $imiS = [string]$row.Cells['Imię'].Value
         $nazS = [string]$row.Cells['Nazwisko'].Value
-        $album = [string]$row.Cells[$ColNrAlbumu].Value
+        $album = [string]$row.Cells['NrAlbumu'].Value
         if ([string]::IsNullOrWhiteSpace($album)) { Write-ToTextBox "Wiersz ${r}: brak NrAlbumu" 'Warning'; continue }
         $sam = $album.Trim()
         # Jesli dane w wierszu sa niepoprawne, nie koloruj na zielono/czerwono (zostanie nadpisane przez walidacje na pomaranczowo)
@@ -1065,8 +965,7 @@ function Invoke-ActiveTabCheck {
             $max = if ($Script:MaxLoginLength) { [int]$Script:MaxLoginLength } else { 20 }
             if ($sam.Length -gt $max) { $isInvalid = $true }
           }
-        }
-        catch {}
+        } catch {}
         try {
           $user = Get-ADUser -LDAPFilter "(sAMAccountName=$sam)" -Properties sAMAccountName -ErrorAction Stop
           if (-not $isInvalid) {
@@ -1166,8 +1065,7 @@ function Invoke-ActiveTabCheck {
         if (-not [bool]$ri[0] -or -not [bool]$rn[0]) { $skipColor = $true }
         $max3 = if ($Script:MaxLoginLength) { [int]$Script:MaxLoginLength } else { 20 }
         if ($login3.Length -gt $max3) { $skipColor = $true }
-      }
-      catch {}
+      } catch {}
       if ($skipColor) { continue }
       try {
         $u = Get-ADUser -LDAPFilter "(sAMAccountName=$login3)" -Properties sAMAccountName -ErrorAction Stop
@@ -1536,9 +1434,9 @@ foreach ($name in $tabNames) {
   $grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.SystemColors]::ControlLightLight
 
   switch ($name) {
-    'Uczen'   { $columns = @($ColLp, $ColImie, $ColNazwisko, $ColNazwaWyswietlana, $ColLogin, $ColMiasto, $ColEmail, $ColHaslo) }
-    'Student' { $columns = @($ColLp, $ColImie, $ColNazwisko, $ColNrAlbumu, $ColNazwaWyswietlana, $ColLogin, $ColMiasto, $ColEmail, $ColHaslo) }
-    default   { $columns = @($ColLp, $ColImie, $ColNazwisko, $ColNazwaWyswietlana, $ColLogin, $ColMiasto, $ColEmail, $ColHaslo) }
+    'Uczen' { $columns = @('Lp', 'Imię', 'Nazwisko', 'NazwaWyswietlana', 'Login', 'Miasto', 'Email', 'Haslo') }
+    'Student' { $columns = @('Lp', 'Imię', 'Nazwisko', 'NrAlbumu', 'NazwaWyswietlana', 'Login', 'Miasto', 'Email', 'Haslo') }
+    default { $columns = @('Lp', 'Imię', 'Nazwisko', 'NazwaWyswietlana', 'Login', 'Miasto', 'Email', 'Haslo') }
   }
   foreach ($col in $columns) { [void]$grid.Columns.Add($col, $col) }
   try { $grid.Columns['Lp'].ReadOnly = $true } catch {}
@@ -1572,6 +1470,15 @@ foreach ($name in $tabNames) {
   $buttonsRight.Padding = [System.Windows.Forms.Padding]::new(0)
   $buttonsRow.Controls.Add($buttonsLeft, 0, 0)
   $buttonsRow.Controls.Add($buttonsRight, 1, 0)
+  # Dolny wiersz przycisków (pod spodem)
+  $buttonsBottom = New-Object System.Windows.Forms.FlowLayoutPanel
+  $buttonsBottom.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+  $buttonsBottom.AutoSize = $true
+  $buttonsBottom.AutoSizeMode = 'GrowAndShrink'
+  $buttonsBottom.WrapContents = $false
+  $buttonsBottom.Dock = 'Fill'
+  $buttonsBottom.Margin = [System.Windows.Forms.Padding]::new(0, 4, 0, 0)
+  $buttonsBottom.Padding = [System.Windows.Forms.Padding]::new(0)
 
   $pasteBtn = New-Object System.Windows.Forms.Button
   $pasteBtn.Text = 'Wklej'
@@ -1588,7 +1495,6 @@ foreach ($name in $tabNames) {
 
         $linesText = $clip -split "`r?
 "
-        $addedRows = 0
         $targetGrid.SuspendLayout()
         foreach ($line in $linesText) {
           if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -1598,10 +1504,9 @@ foreach ($name in $tabNames) {
           if ($vals.Count -gt $exp) { Write-ToTextBox "Zbyt wiele kolumn dla $selectedTab" 'Warning'; continue }
           $ri = $targetGrid.Rows.Add()
           $row = $targetGrid.Rows[$ri]
-          $addedRows++
           if ($vals.Count -ge 1) { $row.Cells['Imię'].Value = ([string]$vals[0]).Trim() }
           if ($vals.Count -ge 2) { $row.Cells['Nazwisko'].Value = ([string]$vals[1]).Trim() }
-          if ($selectedTab -eq 'Student' -and $vals.Count -ge 3) { $row.Cells[$ColNrAlbumu].Value = ([string]$vals[2]).Trim() }
+          if ($selectedTab -eq 'Student' -and $vals.Count -ge 3) { $row.Cells['NrAlbumu'].Value = ([string]$vals[2]).Trim() }
         }
 
         $domain = if ($cbDomain.SelectedItem) { [string]$cbDomain.SelectedItem } else { $Domain_Defaults[$selectedTab] }
@@ -1614,7 +1519,7 @@ foreach ($name in $tabNames) {
           $fmt = $LoginFormat_ByTab[$selectedTab]
           $login = Get-Login $imi $naz $fmt
           if ($selectedTab -eq 'Student') {
-            $album = [string]$rRow.Cells[$ColNrAlbumu].Value
+            $album = [string]$rRow.Cells['NrAlbumu'].Value
             if (-not [string]::IsNullOrWhiteSpace($album)) {
               $albumClean = $album.Trim()
               $rRow.Cells['Login'].Value = $albumClean
@@ -1632,11 +1537,11 @@ foreach ($name in $tabNames) {
             $rRow.Cells['Email'].Value = "$login@$domain"
             $rRow.Cells['NazwaWyswietlana'].Value = "$imi $naz ($selectedTab)"
           }
-          if (-not $rRow.Cells[$ColMiasto].Value) { $rRow.Cells[$ColMiasto].Value = $cbMiasto.SelectedItem }
+          if (-not $rRow.Cells['Miasto'].Value) { $rRow.Cells['Miasto'].Value = $cbMiasto.SelectedItem }
           if (-not $rRow.Cells['Haslo'].Value) { $rRow.Cells['Haslo'].Value = New-RandomPassword }
         }
 
-        Write-ToTextBox ("Wklejono dane dla zakladki {0} [{1} pozycji]" -f $selectedTab, $addedRows) 'Info'
+        Write-ToTextBox "Wklejono dane dla zakladki $selectedTab." 'Info'
         # Po wklejeniu automatycznie uruchom sprawdzanie (jak klikniecie "Sprawdz")
       }
       catch {
@@ -1679,7 +1584,7 @@ foreach ($name in $tabNames) {
           $naz = [string]$row.Cells['Nazwisko'].Value
 
           if ($selectedTab -eq 'Student') {
-            $album = ([string]$row.Cells[$ColNrAlbumu].Value).Trim()
+            $album = ([string]$row.Cells['NrAlbumu'].Value).Trim()
             if (-not [string]::IsNullOrWhiteSpace($album)) {
               $row.Cells['Login'].Value = $album
               $row.Cells['Email'].Value = ("{0}@{1}" -f $album, $domain)
@@ -1694,7 +1599,7 @@ foreach ($name in $tabNames) {
             if (-not $row.Cells['NazwaWyswietlana'].Value) { $row.Cells['NazwaWyswietlana'].Value = "$imi $naz ($selectedTab)" }
           }
 
-          if (-not $row.Cells[$ColMiasto].Value) { $row.Cells[$ColMiasto].Value = $cbMiasto.SelectedItem }
+          if (-not $row.Cells['Miasto'].Value) { $row.Cells['Miasto'].Value = $cbMiasto.SelectedItem }
           if (-not $row.Cells['Haslo'].Value) { $row.Cells['Haslo'].Value = New-RandomPassword }
         }
         Write-ToTextBox "Odświeżono dane dla zakładki $selectedTab." 'Info'
@@ -1780,7 +1685,7 @@ foreach ($name in $tabNames) {
           $domainForAccount = if ($cbDomain.SelectedItem) { [string]$cbDomain.SelectedItem } else { $Domain_Defaults[$selectedTab] }
           $email = [string]$row.Cells[$ColEmail].Value
           if ([string]::IsNullOrWhiteSpace($email)) {
-          $loginForEmail = if ($selectedTab -eq 'Student' -and $row.Cells[$ColNrAlbumu].Value) { ([string]$row.Cells[$ColNrAlbumu].Value).Trim() } else { $login }
+            $loginForEmail = if ($selectedTab -eq 'Student' -and $row.Cells['NrAlbumu'].Value) { ([string]$row.Cells['NrAlbumu'].Value).Trim() } else { $login }
             if ([string]::IsNullOrWhiteSpace($loginForEmail)) { continue }
             $email = ("{0}@{1}" -f $loginForEmail, $domainForAccount)
           }
@@ -1801,7 +1706,7 @@ foreach ($name in $tabNames) {
         Write-ToTextBox "Blad podczas kopiowania danych do schowka: $_" 'Error'
       }
     })
-  $buttonsLeft.Controls.Add($btnCopyTab) | Out-Null
+  $buttonsBottom.Controls.Add($btnCopyTab) | Out-Null
 
   # Eksport do CSV – przeniesiony do wiersza z Wklej/Usun/WhatIf
   $btnExportTab = New-Object System.Windows.Forms.Button
@@ -1844,7 +1749,7 @@ foreach ($name in $tabNames) {
         Write-ToTextBox "Blad eksportu CSV: $_" 'Error'
       }
     })
-  $buttonsLeft.Controls.Add($btnExportTab) | Out-Null
+  $buttonsBottom.Controls.Add($btnExportTab) | Out-Null
 
   # Wyczyść zakladkę – przeniesiony do wiersza z Wklej/Usun/WhatIf
   $btnClearTab = New-Object System.Windows.Forms.Button
@@ -1857,11 +1762,11 @@ foreach ($name in $tabNames) {
       $grids[$selectedTab].Rows.Clear()
       Write-ToTextBox "Wyczyszczono dane z zakladki $selectedTab." 'Info'
     })
-  $buttonsLeft.Controls.Add($btnClearTab) | Out-Null
+  $buttonsBottom.Controls.Add($btnClearTab) | Out-Null
 
   $btnCreate = New-Object System.Windows.Forms.Button
   $btnCreate.Text = 'Utwórz'
-  & $styleButton $btnCreate -Primary
+& $styleButton $btnCreate -Primary
   $btnCreate.Add_Click({
       try {
         $selectedTab = $tabs.SelectedTab.Text
@@ -1869,20 +1774,15 @@ foreach ($name in $tabNames) {
         if (-not $grid) { Write-ToTextBox "Brak gridu dla zakładki $selectedTab" 'Warning'; return }
 
         $createdCount = 0
-        $duplicateAlerts = $null
-        if (@('Student', 'Pracownik') -contains $selectedTab) {
-          $duplicateAlerts = New-Object System.Collections.Generic.List[string]
-        }
 
         foreach ($row in $grid.Rows) {
           if ($row.IsNewRow) { continue }
           $imi = [string]$row.Cells['Imię'].Value
           $naz = [string]$row.Cells['Nazwisko'].Value
           $login = [string]$row.Cells['Login'].Value
-          $isStrictDuplicateTab = @('Student', 'Pracownik') -contains $selectedTab
           # DisplayName: Student ma sztywno "Imie Nazwisko (NrAlbumu)", bez roli i bez edycji formatu
           if ($selectedTab -eq 'Student') {
-            $albumForDn = ([string]$row.Cells[$ColNrAlbumu].Value).Trim()
+            $albumForDn = ([string]$row.Cells['NrAlbumu'].Value).Trim()
             if (-not [string]::IsNullOrWhiteSpace($albumForDn)) { $dn = "$imi $naz ($albumForDn)" } else { $dn = "$imi $naz" }
           }
           else {
@@ -1908,19 +1808,17 @@ foreach ($name in $tabNames) {
             }
           }
           $domainForAccount = if ($cbDomain.SelectedItem) { [string]$cbDomain.SelectedItem } else { $Domain_Defaults[$selectedTab] }
-          $email = if ($selectedTab -eq 'Student' -and $row.Cells[$ColNrAlbumu].Value) {
-            "{0}@{1}" -f ([string]$row.Cells[$ColNrAlbumu].Value), $domainForAccount
+          $email = if ($selectedTab -eq 'Student' -and $row.Cells['NrAlbumu'].Value) {
+            "{0}@{1}" -f ([string]$row.Cells['NrAlbumu'].Value), $domainForAccount
           }
           else {
             "{0}@{1}" -f $login, $domainForAccount
           }
           if ([string]::IsNullOrWhiteSpace($login)) { Write-ToTextBox "Pomijam wiersz bez loginu" 'Warning'; continue }
-          # dopilnuj unikalnosci jeszcze raz (poza Student/Pracownik - tam chcemy zglosic duplikaty)
-          if (-not $isStrictDuplicateTab) {
-            $loginU = Get-UniqueLogin -BaseLogin $login -Rola $selectedTab
-            if ($loginU -ne $login) { $row.Cells['Login'].Value = $loginU; $login = $loginU }
-          }
 
+          # dopilnuj unikalności jeszcze raz
+          $loginU = Get-UniqueLogin -BaseLogin $login -Rola $selectedTab
+          if ($loginU -ne $login) { $row.Cells['Login'].Value = $loginU; $login = $loginU }
 
           $PlainPassword = [string]$row.Cells['Haslo'].Value
           if ([string]::IsNullOrWhiteSpace($PlainPassword)) { $PlainPassword = New-RandomPassword; $row.Cells['Haslo'].Value = $PlainPassword }
@@ -1929,17 +1827,8 @@ foreach ($name in $tabNames) {
             $targetPath = if (-not [string]::IsNullOrWhiteSpace($tbOU_Edit.Text)) { $tbOU_Edit.Text } else { $OU_Defaults[$selectedTab] }
             # Pre-check typowych konfliktów przed New-ADUser
             $conf = Test-ADPreCreateConflicts -Sam $login -CN $cn -Path $targetPath
-            $conflictReasons = @()
-            if ($conf.LoginExists) { Write-ToTextBox "Login juz istnieje w AD: $login - zmien login (wiersz: $($row.Index))" 'Error'; $conflictReasons += 'login' }
-            if ($conf.NameExists) { Write-ToTextBox "Nazwa (CN/Name) w OU juz istnieje: '$cn' - zmien format nazwy lub wybierz inne OU (wiersz: $($row.Index))" 'Error'; $conflictReasons += 'nazwa' }
-            if ($conflictReasons.Count -gt 0) {
-              if ($duplicateAlerts) {
-                $displayLabel = if (-not [string]::IsNullOrWhiteSpace($cn)) { $cn } else { "$imi $naz" }
-                Add-DuplicateAlertEntry -List $duplicateAlerts -DisplayLabel $displayLabel -Login $login -Reasons $conflictReasons
-                Write-DuplicateDebug ("Pre-check duplicate captured for {0} (login: {1}) reasons: {2}" -f $displayLabel, $login, ($conflictReasons -join ', '))
-              }
-              continue
-            }
+            if ($conf.LoginExists) { Write-ToTextBox "Login już istnieje w AD: $login — zmień login (wiersz: $($row.Index))" 'Error'; continue }
+            if ($conf.NameExists) { Write-ToTextBox "Nazwa (CN/Name) w OU już istnieje: '$cn' — zmień format nazwy lub wybierz inne OU (wiersz: $($row.Index))" 'Error'; continue }
             $params = @{
               Name              = $cn
               GivenName         = $imi
@@ -1961,55 +1850,27 @@ foreach ($name in $tabNames) {
                 Write-ToTextBox "Utworzono konto: $login ($dn)" 'Success'
               }
               catch {
-                $errRecord = $_
-                $hint = Get-FriendlyADError -ErrorRecord $errRecord
-                Write-ToTextBox ("Blad tworzenia konta {0}: {1}" -f $login, $hint) 'Error'
-                if ($duplicateAlerts -and $isStrictDuplicateTab) {
-                  $dupReasons = Get-DuplicateReasonsFromError -ErrorRecord $errRecord -FriendlyHint $hint
-                  if ($dupReasons) {
-                    $displayLabel = if (-not [string]::IsNullOrWhiteSpace($cn)) { $cn } else { "$imi $naz" }
-                    Add-DuplicateAlertEntry -List $duplicateAlerts -DisplayLabel $displayLabel -Login $login -Reasons $dupReasons
-                    Write-DuplicateDebug ("AD error duplicate captured for {0} (login: {1}) reasons: {2}" -f $displayLabel, $login, ($dupReasons -join ', '))
-                  }
-                }
+                $hint = Get-FriendlyADError -ErrorRecord $_
+                Write-ToTextBox ("Błąd tworzenia konta {0}: {1}" -f $login, $hint) 'Error'
                 continue
               }
             }
           }
           catch {
-            Write-ToTextBox "Blad tworzenia konta $($login): $_" 'Error'
-            if ($duplicateAlerts -and $isStrictDuplicateTab) {
-              $dupReasonsOuter = Get-DuplicateReasonsFromError -ErrorRecord $_ -FriendlyHint $null
-              if ($dupReasonsOuter) {
-                $displayLabelOuter = if (-not [string]::IsNullOrWhiteSpace($cn)) { $cn } else { "$imi $naz" }
-                Add-DuplicateAlertEntry -List $duplicateAlerts -DisplayLabel $displayLabelOuter -Login $login -Reasons $dupReasonsOuter
-                Write-DuplicateDebug ("Outer error duplicate captured for {0} (login: {1}) reasons: {2}" -f $displayLabelOuter, $login, ($dupReasonsOuter -join ', '))
-              }
-            }
+            Write-ToTextBox "Błąd tworzenia konta $($login): $_" 'Error'
           }
         }
-        if ($duplicateAlerts -and $duplicateAlerts.Count -gt 0) {
-          Write-DuplicateDebug ("duplicateAlerts entries: {0}" -f $duplicateAlerts.Count)
-          $body = "Nastepujace konta juz istnieja w AD:`r`n - " + ($duplicateAlerts -join "`r`n - ")
-          try {
-            [System.Windows.Forms.MessageBox]::Show($body, 'Konta juz istnieja', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-          }
-          catch {}
+      # Uruchom synchronizacje AAD Connect (Delta) po utworzeniu kont
+      $whatIfActive = ($WhatIf_ByTab.ContainsKey($selectedTab) -and $WhatIf_ByTab[$selectedTab].Checked)
+      if (-not $whatIfActive -and $createdCount -gt 0) {
+        try {
+          Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
+          Write-ToTextBox 'Wystartowano synchronizacje AAD Connect (Delta).' 'Info'
         }
-        else {
-          Write-DuplicateDebug 'duplicateAlerts empty — dialog skipped'
+        catch {
+          Write-ToTextBox 'Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.' 'Warning'
         }
-        # Uruchom synchronizacje AAD Connect (Delta) po utworzeniu kont
-        $whatIfActive = ($WhatIf_ByTab.ContainsKey($selectedTab) -and $WhatIf_ByTab[$selectedTab].Checked)
-        if (-not $whatIfActive -and $createdCount -gt 0) {
-          try {
-            Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
-            Write-ToTextBox 'Wystartowano synchronizacje AAD Connect (Delta).' 'Info'
-          }
-          catch {
-            Write-ToTextBox 'Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.' 'Warning'
-          }
-        }
+      }
       }
       catch {
         Write-ToTextBox "Błąd procesu tworzenia kont: $_" 'Error'
@@ -2018,11 +1879,6 @@ foreach ($name in $tabNames) {
   # Prawa grupa (wyrównana do prawej kolumny)
   # Prawa grupa (wyrównana do prawej kolumny)
   try { Set-ButtonStockIcon -Button $btnCreate -Siid 96 -Small } catch {}
-  try {
-    $btnCreate.Margin = [System.Windows.Forms.Padding]::new(0, 0, 8, 0)
-    if ($checkBtn -and $checkBtn.Height -gt 0) { $btnCreate.Height = $checkBtn.Height }
-  }
-  catch {}
   $buttonsRight.Controls.Add($btnCreate) | Out-Null
 
   try { Set-ButtonStockIcon -Button $checkBtn -Siid 22 -Small } catch {}
@@ -2033,6 +1889,7 @@ foreach ($name in $tabNames) {
   
   $tabLayout.Controls.Add($grid, 0, 0)
   $tabLayout.Controls.Add($buttonsRow, 0, 1)
+  $tabLayout.Controls.Add($buttonsBottom, 0, 2)
   $tab.Controls.Add($tabLayout)
 
   $grids[$name] = $grid
@@ -2120,7 +1977,7 @@ $btnCopyTsv.Add_Click({
         $domainForAccount = if ($cbDomain.SelectedItem) { [string]$cbDomain.SelectedItem } else { $Domain_Defaults[$selectedTab] }
         $email = [string]$row.Cells[$ColEmail].Value
         if ([string]::IsNullOrWhiteSpace($email)) {
-          $loginForEmail = if ($selectedTab -eq 'Student' -and $row.Cells[$ColNrAlbumu].Value) { ([string]$row.Cells[$ColNrAlbumu].Value).Trim() } else { $login }
+          $loginForEmail = if ($selectedTab -eq 'Student' -and $row.Cells['NrAlbumu'].Value) { ([string]$row.Cells['NrAlbumu'].Value).Trim() } else { $login }
           if ([string]::IsNullOrWhiteSpace($loginForEmail)) { continue }
           $email = ("{0}@{1}" -f $loginForEmail, $domainForAccount)
         }
@@ -2165,33 +2022,7 @@ try { Set-ButtonStockIcon -Button $btnZamknij -Siid 80 -Small } catch {}
 $btnZamknij.Margin = [System.Windows.Forms.Padding]::new(8, 0, 0, 0)
 $btnZamknij.Add_Click({ $form.Close() })
 
-$btnPomoc.Add_Click({
-    $msg = @"
-OPIS
-- Narzedzie do masowego tworzenia kont AD z wklejanych danych (TAB).
-- Normalizuje imiona/nazwiska, generuje loginy/e‑maile, wybor Domena/UPN i OU.
-- Sprawdza kolizje (login/CN), koloruje wiersze, podpowiada unikalne loginy.
-- Po utworzeniu kont uruchamia synchronizacje: Start-ADSyncSyncCycle -PolicyType Delta.
-
-WKLEJANIE (TAB)
-- Uczen/Pracownik/Wykladowca/Inne: Imie[TAB]Nazwisko
-- Student: Imie[TAB]Nazwisko[TAB]NrAlbumu
-
-PRZYCISKI (w zakladce)
-- Wklej: wkleja dane z schowka.
-- Usun: usuwa zaznaczony wiersz. WhatIf: tryb podgladu.
-- Sprawdz: waliduje dane i kolizje AD. Odswiez: przelicza loginy/e‑maile.
-- Utworz: tworzy konta w OU i startuje Delta sync do M365.
-- Kopiuj: kopiuje TSV: Email, Nazwa wyswietlana, Haslo.
-- Eksport CSV: zapisuje biezaca zakladke do CSV.
-- Wyczysc: czysci wszystkie wiersze.
-
-WYMAGANIA
-- RSAT ActiveDirectory, uprawnienia do OU, sesja desktop Windows.
-"@
-    [Windows.Forms.MessageBox]::Show($msg, 'Pomoc – Kreator Kont AD') | Out-Null
-  })
-
+\$btnPomoc\.Add_Click\(\{\n\ \ \ \ \$msg\ =\ @"\ \nOPIS\n-\ Narzędzie\ do\ masowego\ tworzenia\ kont\ AD\ z\ danymi\ wklejanymi\ do\ siatki\.\n-\ Normalizuje\ imiona/nazwiska,\ generuje\ loginy/e‑maile,\ pozwala\ wybrać\ domenę\ \(Domena/UPN\)\ i\ OU\.\n-\ Sprawdza\ kolizje\ w\ AD\ \(login/CN\),\ koloruje\ wiersze,\ podpowiada\ unikalne\ loginy\.\n-\ Po\ utworzeniu\ kont\ uruchamia\ synchronizację:\ Start-ADSyncSyncCycle\ -PolicyType\ Delta\.\n\nWKLEJANIE\ DANYCH\ \(TAB\)\n-\ Uczeń/Pracownik/Wykładowca/Inne:\ \ Imię\[TAB]Nazwisko\n-\ Student:\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ Imię\[TAB]Nazwisko\[TAB]NrAlbumu\n\nPRZYCISKI\ \(per\ zakładka\)\n-\ Wklej:\ Wkleja\ dane\ z\ TAB\ ze\ schowka\.\n-\ Usuń:\ Usuwa\ zaznaczony\ wiersz\.\ \ WhatIf:\ tryb\ podglądu\ \(bez\ tworzenia\)\.\n-\ Sprawdź:\ Waliduje\ dane\ i\ kolizje\ AD\.\ \ Odśwież:\ przelicza\ loginy/e‑maile\.\n-\ Utwórz:\ Tworzy\ użytkowników\ w\ OU\ i\ startuje\ Delta\ sync\ do\ M365\.\n-\ Kopiuj:\ Kopiuje\ TSV:\ Email,\ Nazwa\ wyświetlana,\ Hasło\.\n-\ Eksport\ CSV:\ Zapisuje\ bieżącą\ zakładkę\ do\ pliku\ CSV\.\n-\ Wyczyść:\ Czyści\ wszystkie\ wiersze\ z\ aktywnej\ zakładki\.\n\nWYMAGANIA\n-\ RSAT:\ ActiveDirectory,\ uprawnienia\ do\ OU,\ sesja\ desktop\ Windows\.\n"@\n\ \ \ \ \[Windows\.Forms\.MessageBox]::Show\(\$msg,\ 'Pomoc\ –\ Kreator\ Kont\ AD'\)\ \|\ Out-Null\n\ \ }\)
 
 $null = $null # przeniesiono przyciski Export/Kopiuj/Wyczysc do wiersza zakladki
 $actionPanel.Controls.Add($btnTopMost) | Out-Null
@@ -2262,3 +2093,11 @@ $form.Add_Shown({
 
 Get-ABCSettings
 [void]$form.ShowDialog()
+
+
+
+
+
+
+
+

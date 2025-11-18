@@ -214,17 +214,22 @@ function Render-Results {
         }
 
         if ($show) {
+            $name = $r.Name
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = "-" }
+
             if ($r.Enabled -eq $null) {
                 $blad = "B" + $L + $Aog + "D"
-                Write-Line ("Konto: {0} | {1} | {2}: {3}" -f $r.Login, ($r.Name ?? "-"), $blad, ($r.Error ?? "Nie znaleziono")) ([System.Drawing.Color]::Black)
+                $errText = $r.Error
+                if ([string]::IsNullOrWhiteSpace($errText)) { $errText = "Nie znaleziono" }
+                Write-Line ("Konto: {0} | {1} | {2}: {3}" -f $r.Login, $name, $blad, $errText) ([System.Drawing.Color]::Black)
             }
             elseif ($r.Enabled) {
                 $wlaczone = "W" + $L + $Aog + "CZONE"
-                Write-Line ("Konto: {0} | {1} | Status: {2}" -f $r.Login, ($r.Name ?? "-"), $wlaczone) ([System.Drawing.Color]::Green)
+                Write-Line ("Konto: {0} | {1} | Status: {2}" -f $r.Login, $name, $wlaczone) ([System.Drawing.Color]::Green)
             }
             else {
                 $wylaczone = "WY" + $L + $Aog + "CZONE"
-                Write-Line ("Konto: {0} | {1} | Status: {2}" -f $r.Login, ($r.Name ?? "-"), $wylaczone) ([System.Drawing.Color]::Red)
+                Write-Line ("Konto: {0} | {1} | Status: {2}" -f $r.Login, $name, $wylaczone) ([System.Drawing.Color]::Red)
             }
         }
     }
