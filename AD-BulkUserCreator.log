@@ -550,3 +550,529 @@
 2025-11-18 10:35:50 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
 2025-11-18 10:35:50 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
 2025-11-18 10:35:50 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:48:57 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:49:01 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-11-18 10:49:01 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:51:02 [SUCCESS] Utworzono konto: anowak (Adam Nowak (Uczen))
+2025-11-18 10:51:02 [SUCCESS] Utworzono konto: ekowalska (Ewa Kowalska (Uczen))
+2025-11-18 10:51:02 [SUCCESS] Utworzono konto: pzielinski (Piotr Zieliński (Uczen))
+2025-11-18 10:51:02 [SUCCESS] Utworzono konto: awisniewska (Anna Wiśniewska (Uczen))
+2025-11-18 10:51:02 [SUCCESS] Utworzono konto: kwojcik (Kamil Wójcik (Uczen))
+2025-11-18 10:51:03 [SUCCESS] Utworzono konto: mlewandowska (Marta Lewandowska (Uczen))
+2025-11-18 10:51:03 [SUCCESS] Utworzono konto: tkaminski (Tomasz Kamiński (Uczen))
+2025-11-18 10:51:03 [SUCCESS] Utworzono konto: jmazur (Julia Mazur (Uczen))
+2025-11-18 10:51:03 [SUCCESS] Utworzono konto: mkrawczyk (Mateusz Krawczyk (Uczen))
+2025-11-18 10:51:03 [SUCCESS] Utworzono konto: kdudek (Karolina Dudek (Uczen))
+2025-11-18 10:51:03 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-11-18 10:51:03 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-11-18 10:51:06 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: anowak -> anowak1 (wiersz 0)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska1 (wiersz 1)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski1 (wiersz 2)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska1 (wiersz 3)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik1 (wiersz 4)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska1 (wiersz 5)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski1 (wiersz 6)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: jmazur -> jmazur1 (wiersz 7)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk1 (wiersz 8)
+2025-11-18 10:51:06 [INFO] Zmieniono login na unikalny: kdudek -> kdudek1 (wiersz 9)
+2025-11-18 10:51:09 [INFO] Odświeżono dane dla zakładki Uczen.
+2025-11-18 10:51:14 [INFO] Wyczyszczono dane z zakladki Uczen.
+2025-11-18 10:51:20 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-11-18 10:51:20 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: anowak -> anowak1 (wiersz 0)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska1 (wiersz 1)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski1 (wiersz 2)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska1 (wiersz 3)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik1 (wiersz 4)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska1 (wiersz 5)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski1 (wiersz 6)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: jmazur -> jmazur1 (wiersz 7)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk1 (wiersz 8)
+2025-11-18 10:51:20 [INFO] Zmieniono login na unikalny: kdudek -> kdudek1 (wiersz 9)
+2025-11-18 10:51:39 [SUCCESS] Utworzono konto: anowak1 (Adam Nowak (Uczen))
+2025-11-18 10:51:39 [SUCCESS] Utworzono konto: ekowalska1 (Ewa Kowalska (Uczen))
+2025-11-18 10:51:39 [SUCCESS] Utworzono konto: pzielinski1 (Piotr Zieliński (Uczen))
+2025-11-18 10:51:39 [SUCCESS] Utworzono konto: awisniewska1 (Anna Wiśniewska (Uczen))
+2025-11-18 10:51:39 [SUCCESS] Utworzono konto: kwojcik1 (Kamil Wójcik (Uczen))
+2025-11-18 10:51:40 [SUCCESS] Utworzono konto: mlewandowska1 (Marta Lewandowska (Uczen))
+2025-11-18 10:51:40 [SUCCESS] Utworzono konto: tkaminski1 (Tomasz Kamiński (Uczen))
+2025-11-18 10:51:40 [SUCCESS] Utworzono konto: jmazur1 (Julia Mazur (Uczen))
+2025-11-18 10:51:40 [SUCCESS] Utworzono konto: mkrawczyk1 (Mateusz Krawczyk (Uczen))
+2025-11-18 10:51:40 [SUCCESS] Utworzono konto: kdudek1 (Karolina Dudek (Uczen))
+2025-11-18 10:51:40 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-11-18 10:51:40 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-11-18 10:51:55 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: anowak1 -> anowak11 (wiersz 0)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: ekowalska1 -> ekowalska11 (wiersz 1)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: pzielinski1 -> pzielinski11 (wiersz 2)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: awisniewska1 -> awisniewska11 (wiersz 3)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: kwojcik1 -> kwojcik11 (wiersz 4)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: mlewandowska1 -> mlewandowska11 (wiersz 5)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: tkaminski1 -> tkaminski11 (wiersz 6)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: jmazur1 -> jmazur11 (wiersz 7)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: mkrawczyk1 -> mkrawczyk11 (wiersz 8)
+2025-11-18 10:51:55 [INFO] Zmieniono login na unikalny: kdudek1 -> kdudek11 (wiersz 9)
+2025-11-18 10:51:58 [INFO] Odświeżono dane dla zakładki Uczen.
+2025-11-18 10:52:00 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: anowak -> anowak2 (wiersz 0)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska2 (wiersz 1)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski2 (wiersz 2)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska2 (wiersz 3)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik2 (wiersz 4)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska2 (wiersz 5)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski2 (wiersz 6)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: jmazur -> jmazur2 (wiersz 7)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk2 (wiersz 8)
+2025-11-18 10:52:00 [INFO] Zmieniono login na unikalny: kdudek -> kdudek2 (wiersz 9)
+2025-11-18 10:52:03 [INFO] Odświeżono dane dla zakładki Uczen.
+2025-11-18 10:52:04 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: anowak -> anowak2 (wiersz 0)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska2 (wiersz 1)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski2 (wiersz 2)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska2 (wiersz 3)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik2 (wiersz 4)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska2 (wiersz 5)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski2 (wiersz 6)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: jmazur -> jmazur2 (wiersz 7)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk2 (wiersz 8)
+2025-11-18 10:52:04 [INFO] Zmieniono login na unikalny: kdudek -> kdudek2 (wiersz 9)
+2025-11-18 10:52:05 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:52:06 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:52:07 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:52:07 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:52:15 [INFO] Wyczyszczono dane z zakladki Uczen.
+2025-11-18 10:52:17 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-11-18 10:52:17 [INFO] Sprawdzanie zakończone.
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: anowak -> anowak2 (wiersz 0)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska2 (wiersz 1)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski2 (wiersz 2)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska2 (wiersz 3)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik2 (wiersz 4)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska2 (wiersz 5)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski2 (wiersz 6)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: jmazur -> jmazur2 (wiersz 7)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk2 (wiersz 8)
+2025-11-18 10:52:17 [INFO] Zmieniono login na unikalny: kdudek -> kdudek2 (wiersz 9)
+2025-11-18 10:52:50 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:52:50 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:52:51 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:52:51 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:52:51 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:52:51 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:52:52 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-18 10:52:54 [SUCCESS] Utworzono konto: anowak2 (Adam Nowak (UCZEŃ))
+2025-11-18 10:52:54 [SUCCESS] Utworzono konto: ekowalska2 (Ewa Kowalska (UCZEŃ))
+2025-11-18 10:52:54 [SUCCESS] Utworzono konto: pzielinski2 (Piotr Zieliński (UCZEŃ))
+2025-11-18 10:52:55 [SUCCESS] Utworzono konto: awisniewska2 (Anna Wiśniewska (UCZEŃ))
+2025-11-18 10:52:55 [SUCCESS] Utworzono konto: kwojcik2 (Kamil Wójcik (UCZEŃ))
+2025-11-18 10:52:55 [SUCCESS] Utworzono konto: mlewandowska2 (Marta Lewandowska (UCZEŃ))
+2025-11-18 10:52:55 [SUCCESS] Utworzono konto: tkaminski2 (Tomasz Kamiński (UCZEŃ))
+2025-11-18 10:52:55 [SUCCESS] Utworzono konto: jmazur2 (Julia Mazur (UCZEŃ))
+2025-11-18 10:52:55 [SUCCESS] Utworzono konto: mkrawczyk2 (Mateusz Krawczyk (UCZEŃ))
+2025-11-18 10:52:55 [SUCCESS] Utworzono konto: kdudek2 (Karolina Dudek (UCZEŃ))
+2025-11-18 10:52:55 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-11-18 10:52:56 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-11-18 10:53:55 [INFO] Wyczyszczono dane z zakladki Uczen.
+2025-11-20 22:01:57 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-11-20 22:02:22 [INFO] Odświeżono dane dla zakładki Wykladowca.
+2025-11-20 22:02:28 [SUCCESS] Utworzono konto: a.kowalski (Adam Kowalski (Wykladowca))
+2025-11-20 22:02:28 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-11-20 22:02:28 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-12-28 21:25:28 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-12-28 21:32:59 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:32:59 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:32:59 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:33:03 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:33:03 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:33:03 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:33:04 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:33:04 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:33:04 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:33:04 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:33:04 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:33:04 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:33:04 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:33:04 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:33:16 [INFO] Wyczyszczono dane z zakladki Student.
+2025-12-28 21:33:17 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:33:17 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:33:18 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100001 - zmien login (wiersz: 0)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Adam Nowak (100001)' - zmien format nazwy lub wybierz inne OU (wiersz: 0)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100002 - zmien login (wiersz: 1)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Ewa Kowalska (100002)' - zmien format nazwy lub wybierz inne OU (wiersz: 1)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100003 - zmien login (wiersz: 2)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Piotr Zieliński (100003)' - zmien format nazwy lub wybierz inne OU (wiersz: 2)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100004 - zmien login (wiersz: 3)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Anna Wiśniewska (100004)' - zmien format nazwy lub wybierz inne OU (wiersz: 3)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100005 - zmien login (wiersz: 4)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Kamil Wójcik (100005)' - zmien format nazwy lub wybierz inne OU (wiersz: 4)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100006 - zmien login (wiersz: 5)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Marta Lewandowska (100006)' - zmien format nazwy lub wybierz inne OU (wiersz: 5)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100007 - zmien login (wiersz: 6)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Tomasz Kamiński (100007)' - zmien format nazwy lub wybierz inne OU (wiersz: 6)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100008 - zmien login (wiersz: 7)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Julia Mazur (100008)' - zmien format nazwy lub wybierz inne OU (wiersz: 7)
+2025-12-28 21:33:20 [ERROR] Login juz istnieje w AD: 100009 - zmien login (wiersz: 8)
+2025-12-28 21:33:20 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Mateusz Krawczyk (100009)' - zmien format nazwy lub wybierz inne OU (wiersz: 8)
+2025-12-28 21:33:21 [ERROR] Login juz istnieje w AD: 100010 - zmien login (wiersz: 9)
+2025-12-28 21:33:21 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Karolina Dudek (100010)' - zmien format nazwy lub wybierz inne OU (wiersz: 9)
+2025-12-28 21:33:21 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 21:33:29 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:33:29 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:33:29 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:33:29 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:33:29 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:33:30 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:33:30 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:33:30 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:33:30 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:33:30 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:33:30 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:33:36 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:33:37 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:33:37 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:33:46 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 21:33:46 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:33:54 [SUCCESS] Utworzono konto: anowak (Adam Nowak (UCZEŃ))
+2025-12-28 21:33:54 [SUCCESS] Utworzono konto: ekowalska (Ewa Kowalska (UCZEŃ))
+2025-12-28 21:33:54 [SUCCESS] Utworzono konto: pzielinski (Piotr Zieliński (UCZEŃ))
+2025-12-28 21:33:54 [SUCCESS] Utworzono konto: awisniewska (Anna Wiśniewska (UCZEŃ))
+2025-12-28 21:33:54 [SUCCESS] Utworzono konto: kwojcik (Kamil Wójcik (UCZEŃ))
+2025-12-28 21:33:55 [SUCCESS] Utworzono konto: mlewandowska (Marta Lewandowska (UCZEŃ))
+2025-12-28 21:33:55 [SUCCESS] Utworzono konto: tkaminski (Tomasz Kamiński (UCZEŃ))
+2025-12-28 21:33:55 [SUCCESS] Utworzono konto: jmazur (Julia Mazur (UCZEŃ))
+2025-12-28 21:33:55 [SUCCESS] Utworzono konto: mkrawczyk (Mateusz Krawczyk (UCZEŃ))
+2025-12-28 21:33:55 [SUCCESS] Utworzono konto: kdudek (Karolina Dudek (UCZEŃ))
+2025-12-28 21:33:55 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 21:33:55 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-12-28 21:36:16 [INFO] Wyczyszczono dane z zakladki Uczen.
+2025-12-28 21:36:44 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 21:36:44 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:36:46 [SUCCESS] Utworzono konto: anowak (Adam Nowak (UCZEŃ))
+2025-12-28 21:36:46 [SUCCESS] Utworzono konto: ekowalska (Ewa Kowalska (UCZEŃ))
+2025-12-28 21:36:46 [SUCCESS] Utworzono konto: pzielinski (Piotr Zieliński (UCZEŃ))
+2025-12-28 21:36:47 [SUCCESS] Utworzono konto: awisniewska (Anna Wiśniewska (UCZEŃ))
+2025-12-28 21:36:47 [SUCCESS] Utworzono konto: kwojcik (Kamil Wójcik (UCZEŃ))
+2025-12-28 21:36:47 [SUCCESS] Utworzono konto: mlewandowska (Marta Lewandowska (UCZEŃ))
+2025-12-28 21:36:47 [SUCCESS] Utworzono konto: tkaminski (Tomasz Kamiński (UCZEŃ))
+2025-12-28 21:36:47 [SUCCESS] Utworzono konto: jmazur (Julia Mazur (UCZEŃ))
+2025-12-28 21:36:47 [SUCCESS] Utworzono konto: mkrawczyk (Mateusz Krawczyk (UCZEŃ))
+2025-12-28 21:36:47 [SUCCESS] Utworzono konto: kdudek (Karolina Dudek (UCZEŃ))
+2025-12-28 21:36:48 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 21:36:48 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-12-28 21:38:01 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: anowak -> anowak1 (wiersz 0)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska1 (wiersz 1)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski1 (wiersz 2)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska1 (wiersz 3)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik1 (wiersz 4)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska1 (wiersz 5)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski1 (wiersz 6)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: jmazur -> jmazur1 (wiersz 7)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk1 (wiersz 8)
+2025-12-28 21:38:01 [INFO] Zmieniono login na unikalny: kdudek -> kdudek1 (wiersz 9)
+2025-12-28 21:38:04 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:06 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:07 [INFO] Wyczyszczono dane z zakladki Uczen.
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:38:12 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:38:12 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:22 [INFO] Wyczyszczono dane z zakladki Student.
+2025-12-28 21:38:25 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 21:38:25 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:38:25 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:38:25 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:38:25 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:38:25 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:38:25 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:38:26 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:38:26 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:38:26 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:38:26 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:38:26 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:38:29 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:38:29 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:36 [ERROR] Login juz istnieje w AD: 100001 - zmien login (wiersz: 0)
+2025-12-28 21:38:36 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Adam Nowak (100001)' - zmien format nazwy lub wybierz inne OU (wiersz: 0)
+2025-12-28 21:38:36 [ERROR] Login juz istnieje w AD: 100002 - zmien login (wiersz: 1)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Ewa Kowalska (100002)' - zmien format nazwy lub wybierz inne OU (wiersz: 1)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100003 - zmien login (wiersz: 2)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Piotr Zieliński (100003)' - zmien format nazwy lub wybierz inne OU (wiersz: 2)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100004 - zmien login (wiersz: 3)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Anna Wiśniewska (100004)' - zmien format nazwy lub wybierz inne OU (wiersz: 3)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100005 - zmien login (wiersz: 4)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Kamil Wójcik (100005)' - zmien format nazwy lub wybierz inne OU (wiersz: 4)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100006 - zmien login (wiersz: 5)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Marta Lewandowska (100006)' - zmien format nazwy lub wybierz inne OU (wiersz: 5)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100007 - zmien login (wiersz: 6)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Tomasz Kamiński (100007)' - zmien format nazwy lub wybierz inne OU (wiersz: 6)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100008 - zmien login (wiersz: 7)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Julia Mazur (100008)' - zmien format nazwy lub wybierz inne OU (wiersz: 7)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100009 - zmien login (wiersz: 8)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Mateusz Krawczyk (100009)' - zmien format nazwy lub wybierz inne OU (wiersz: 8)
+2025-12-28 21:38:37 [ERROR] Login juz istnieje w AD: 100010 - zmien login (wiersz: 9)
+2025-12-28 21:38:37 [ERROR] Nazwa (CN/Name) w OU juz istnieje: 'Karolina Dudek (100010)' - zmien format nazwy lub wybierz inne OU (wiersz: 9)
+2025-12-28 21:38:37 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:38:41 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:38:41 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:43 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 10)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 11)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 12)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 13)
+2025-12-28 21:38:43 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 14)
+2025-12-28 21:38:44 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 15)
+2025-12-28 21:38:44 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 16)
+2025-12-28 21:38:44 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 17)
+2025-12-28 21:38:44 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 18)
+2025-12-28 21:38:44 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 19)
+2025-12-28 21:38:44 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:45 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 10)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 11)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 12)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 13)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 14)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 15)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 16)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 17)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 18)
+2025-12-28 21:38:46 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 19)
+2025-12-28 21:38:46 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:38:57 [INFO] Wyczyszczono dane z zakladki Student.
+2025-12-28 21:39:00 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:39:03 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:39:03 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:39:03 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [WARNING] Zbyt wiele kolumn dla Pracownik
+2025-12-28 21:39:10 [INFO] Wklejono dane dla zakladki Pracownik [0 pozycji]
+2025-12-28 21:39:10 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:52:57 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-12-28 21:53:55 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 21:53:56 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:53:58 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:10 [INFO] Wyczyszczono dane z zakladki Uczen.
+2025-12-28 21:54:11 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 21:54:11 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:15 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:16 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:16 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:16 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:18 [INFO] Wklejono dane dla zakladki Pracownik [10 pozycji]
+2025-12-28 21:54:18 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:26 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:54:26 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:54:26 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [WARNING] Pomijam wiersz bez loginu
+2025-12-28 21:54:30 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 21:54:35 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:54:38 [INFO] Zapisano ustawienia do E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-12-28 21:54:41 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:59:22 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-12-28 21:59:37 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 21:59:37 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 21:59:37 [INFO] Sprawdzanie zakończone.
+2025-12-28 21:59:42 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 21:59:42 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:11:26 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-12-28 22:11:32 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100001 (wiersz 0)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100002 (wiersz 1)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100003 (wiersz 2)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100004 (wiersz 3)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100005 (wiersz 4)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100006 (wiersz 5)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100007 (wiersz 6)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100008 (wiersz 7)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100009 (wiersz 8)
+2025-12-28 22:11:32 [INFO] Konto studenta juz istnieje w AD: 100010 (wiersz 9)
+2025-12-28 22:11:32 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:11:51 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 22:11:51 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:11:54 [SUCCESS] Utworzono konto: anowak (Nowak (UCZEŃ))
+2025-12-28 22:11:54 [SUCCESS] Utworzono konto: ekowalska (Kowalska (UCZEŃ))
+2025-12-28 22:11:54 [SUCCESS] Utworzono konto: pzielinski (Zieliński (UCZEŃ))
+2025-12-28 22:11:54 [SUCCESS] Utworzono konto: awisniewska (Wiśniewska (UCZEŃ))
+2025-12-28 22:11:55 [SUCCESS] Utworzono konto: kwojcik (Wójcik (UCZEŃ))
+2025-12-28 22:11:55 [SUCCESS] Utworzono konto: mlewandowska (Lewandowska (UCZEŃ))
+2025-12-28 22:11:55 [SUCCESS] Utworzono konto: tkaminski (Kamiński (UCZEŃ))
+2025-12-28 22:11:55 [SUCCESS] Utworzono konto: jmazur (Mazur (UCZEŃ))
+2025-12-28 22:11:55 [SUCCESS] Utworzono konto: mkrawczyk (Krawczyk (UCZEŃ))
+2025-12-28 22:11:55 [SUCCESS] Utworzono konto: kdudek (Dudek (UCZEŃ))
+2025-12-28 22:11:56 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 22:11:56 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-12-28 22:12:42 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:12:42 [INFO] Zmieniono login na unikalny: anowak -> anowak1 (wiersz 0)
+2025-12-28 22:12:42 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska1 (wiersz 1)
+2025-12-28 22:12:42 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski1 (wiersz 2)
+2025-12-28 22:12:42 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska1 (wiersz 3)
+2025-12-28 22:12:43 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik1 (wiersz 4)
+2025-12-28 22:12:43 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska1 (wiersz 5)
+2025-12-28 22:12:43 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski1 (wiersz 6)
+2025-12-28 22:12:43 [INFO] Zmieniono login na unikalny: jmazur -> jmazur1 (wiersz 7)
+2025-12-28 22:12:43 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk1 (wiersz 8)
+2025-12-28 22:12:43 [INFO] Zmieniono login na unikalny: kdudek -> kdudek1 (wiersz 9)
+2025-12-28 22:12:44 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:12:45 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:15:18 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-12-28 22:15:28 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 22:15:28 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:15:28 [INFO] Zmieniono login na unikalny: anowak -> anowak1 (wiersz 0)
+2025-12-28 22:15:28 [INFO] Zmieniono login na unikalny: ekowalska -> ekowalska1 (wiersz 1)
+2025-12-28 22:15:28 [INFO] Zmieniono login na unikalny: pzielinski -> pzielinski1 (wiersz 2)
+2025-12-28 22:15:28 [INFO] Zmieniono login na unikalny: awisniewska -> awisniewska1 (wiersz 3)
+2025-12-28 22:15:29 [INFO] Zmieniono login na unikalny: kwojcik -> kwojcik1 (wiersz 4)
+2025-12-28 22:15:29 [INFO] Zmieniono login na unikalny: mlewandowska -> mlewandowska1 (wiersz 5)
+2025-12-28 22:15:29 [INFO] Zmieniono login na unikalny: tkaminski -> tkaminski1 (wiersz 6)
+2025-12-28 22:15:29 [INFO] Zmieniono login na unikalny: jmazur -> jmazur1 (wiersz 7)
+2025-12-28 22:15:29 [INFO] Zmieniono login na unikalny: mkrawczyk -> mkrawczyk1 (wiersz 8)
+2025-12-28 22:15:29 [INFO] Zmieniono login na unikalny: kdudek -> kdudek1 (wiersz 9)
+2025-12-28 22:15:31 [SUCCESS] Utworzono konto: anowak1 (Adam Nowak (UCZEŃ))
+2025-12-28 22:15:31 [SUCCESS] Utworzono konto: ekowalska1 (Ewa Kowalska (UCZEŃ))
+2025-12-28 22:15:31 [SUCCESS] Utworzono konto: pzielinski1 (Piotr Zieliński (UCZEŃ))
+2025-12-28 22:15:31 [SUCCESS] Utworzono konto: awisniewska1 (Anna Wiśniewska (UCZEŃ))
+2025-12-28 22:15:31 [SUCCESS] Utworzono konto: kwojcik1 (Kamil Wójcik (UCZEŃ))
+2025-12-28 22:15:32 [SUCCESS] Utworzono konto: mlewandowska1 (Marta Lewandowska (UCZEŃ))
+2025-12-28 22:15:32 [SUCCESS] Utworzono konto: tkaminski1 (Tomasz Kamiński (UCZEŃ))
+2025-12-28 22:15:32 [SUCCESS] Utworzono konto: jmazur1 (Julia Mazur (UCZEŃ))
+2025-12-28 22:15:32 [SUCCESS] Utworzono konto: mkrawczyk1 (Mateusz Krawczyk (UCZEŃ))
+2025-12-28 22:15:32 [SUCCESS] Utworzono konto: kdudek1 (Karolina Dudek (UCZEŃ))
+2025-12-28 22:15:32 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 22:15:32 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.
+2025-12-28 22:16:35 [INFO] Wczytano ustawienia z E:\NextCloud\Borys\IT\Codowanie\Powershell\PS1-MicroProjects\.AD-BulkUserCreator.json
+2025-12-28 22:16:40 [WARNING] Schowek jest pusty.
+2025-12-28 22:16:40 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:16:45 [INFO] Wklejono dane dla zakladki Uczen [10 pozycji]
+2025-12-28 22:16:45 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:17:41 [INFO] Wklejono dane dla zakladki Student [10 pozycji]
+2025-12-28 22:17:41 [INFO] Sprawdzanie zakończone.
+2025-12-28 22:17:48 [SUCCESS] Utworzono konto: 100001 (Adam Nowak (100001))
+2025-12-28 22:17:48 [SUCCESS] Utworzono konto: 100002 (Ewa Kowalska (100002))
+2025-12-28 22:17:48 [SUCCESS] Utworzono konto: 100003 (Piotr Zieliński (100003))
+2025-12-28 22:17:48 [SUCCESS] Utworzono konto: 100004 (Anna Wiśniewska (100004))
+2025-12-28 22:17:48 [SUCCESS] Utworzono konto: 100005 (Kamil Wójcik (100005))
+2025-12-28 22:17:48 [SUCCESS] Utworzono konto: 100006 (Marta Lewandowska (100006))
+2025-12-28 22:17:49 [SUCCESS] Utworzono konto: 100007 (Tomasz Kamiński (100007))
+2025-12-28 22:17:49 [SUCCESS] Utworzono konto: 100008 (Julia Mazur (100008))
+2025-12-28 22:17:49 [SUCCESS] Utworzono konto: 100009 (Mateusz Krawczyk (100009))
+2025-12-28 22:17:49 [SUCCESS] Utworzono konto: 100010 (Karolina Dudek (100010))
+2025-12-28 22:17:49 [INFO] [DEBUG] duplicateAlerts empty — dialog skipped
+2025-12-28 22:17:49 [WARNING] Nie udalo sie uruchomic Start-ADSyncSyncCycle -PolicyType Delta.

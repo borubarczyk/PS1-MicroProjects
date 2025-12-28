@@ -39,9 +39,10 @@ friendly error hints for typical AD creation problems.
     $msg = @" 
 OPIS
 - Narzedzie do masowego tworzenia kont AD z wklejanych danych (TAB).
-- Normalizuje imiona/nazwiska, generuje loginy/e‑maile, wybor Domena/UPN i OU.
+- Normalizuje imiona/nazwiska, generuje loginy/e-maile, wybor Domena/UPN i OU.
 - Sprawdza kolizje (login/CN), koloruje wiersze, podpowiada unikalne loginy.
 - Po utworzeniu kont uruchamia synchronizacje: Start-ADSyncSyncCycle -PolicyType Delta.
+- Nazwa uzytkownika (Name) oraz DisplayName w AD sa identyczne i wynikaja z formatu ustawionego per zakladka; dostepne tokeny: {Imie}, {Nazwisko}, {Rola}, {Login}/{SamAccountName}, {Album}.
 
 WKLEJANIE (TAB)
 - Uczen/Pracownik/Wykladowca/Inne: Imie[TAB]Nazwisko
@@ -356,6 +357,156 @@ function Get-Login {
     'imie.nazwisko' { return '{0}.{1}' -f $i, $n }
     'nazwisko.imie' { return '{0}.{1}' -f $n, $i }
     default { return '{0}.{1}' -f $firstLetter, $n }
+  }
+}
+
+function Get-DisplayNameForRole {
+  <#
+    .SYNOPSIS
+    Zwraca nazwe wyswietlana dla danego wiersza/tabeli na podstawie konfiguracji.
+
+    .NOTES
+    Obslugiwane tokeny w formacie: {Imie}, {Nazwisko}, {Rola}, {Login} / {SamAccountName}, {Album}.
+    Zakladka Student ignoruje format i zawsze zwraca "Imie Nazwisko (NrAlbumu)".
+  #>
+  param(
+    [string]$TabName,
+    [string]$Imie,
+    [string]$Nazwisko,
+    [string]$Login,
+    [string]$StudentAlbum
+  )
+
+  $tabSafe = if ($TabName) { $TabName } else { '' }
+  $imiSafe = if ($Imie) { $Imie.Trim() } else { '' }
+  $nazSafe = if ($Nazwisko) { $Nazwisko.Trim() } else { '' }
+  $loginSafe = if ($Login) { $Login.Trim() } else { '' }
+  $albumSafe = if ($StudentAlbum) { $StudentAlbum.Trim() } else { '' }
+
+  if ($tabSafe -eq 'Student') {
+    if (-not [string]::IsNullOrWhiteSpace($albumSafe)) {
+      return ("{0} {1} ({2})" -f $imiSafe, $nazSafe, $albumSafe).Trim()
+    }
+    return ("{0} {1}" -f $imiSafe, $nazSafe).Trim()
+  }
+
+  $fmt = if ($DisplayNameFormat_ByTab.ContainsKey($tabSafe)) {
+    [string]$DisplayNameFormat_ByTab[$tabSafe]
+  }
+  elseif ($Script:Settings.DisplayNameFormat) {
+    [string]$Script:Settings.DisplayNameFormat
+  }
+  else {
+    '{Imie} {Nazwisko} ({Rola})'
+  }
+  if ([string]::IsNullOrWhiteSpace($fmt)) { $fmt = '{Imie} {Nazwisko} ({Rola})' }
+
+  $replacements = @{
+    '{Imie}'           = $imiSafe
+    '{Nazwisko}'       = $nazSafe
+    '{Rola}'           = $tabSafe
+    '{Login}'          = $loginSafe
+    '{SamAccountName}' = $loginSafe
+    '{Album}'          = $albumSafe
+  }
+
+  $result = $fmt
+  foreach ($key in $replacements.Keys) {
+    $val = if ($null -ne $replacements[$key]) { $replacements[$key] } else { '' }
+    $result = $result.Replace($key, $val)
+  }
+  return $result.Trim()
+}
+
+function Update-GridDisplayNamesForTab {
+  param(
+    [string]$TabName,
+    [System.Windows.Forms.DataGridView]$Grid
+  )
+
+  if (-not $Grid -or [string]::IsNullOrWhiteSpace($TabName)) { return }
+  for ($i = 0; $i -lt $Grid.Rows.Count; $i++) {
+    $row = $Grid.Rows[$i]
+    if (-not $row -or $row.IsNewRow) { continue }
+    try {
+      $imi = [string]$row.Cells[$ColImie].Value
+      $naz = [string]$row.Cells[$ColNazwisko].Value
+      $loginVal = [string]$row.Cells[$ColLogin].Value
+      $albumVal = if ($TabName -eq 'Student') { [string]$row.Cells[$ColNrAlbumu].Value } else { '' }
+      $display = Get-DisplayNameForRole -TabName $TabName -Imie $imi -Nazwisko $naz -Login $loginVal -StudentAlbum $albumVal
+      if ($row.Cells -and $row.Cells[$ColNazwaWyswietlana]) {
+        $row.Cells[$ColNazwaWyswietlana].Value = $display
+      }
+    }
+    catch {}
+  }
+}
+
+function Update-RowComputedFields {
+  param(
+    [string]$TabName,
+    [System.Windows.Forms.DataGridViewRow]$Row,
+    [string]$Domain,
+    [string]$LoginFormat,
+    [switch]$Force
+  )
+
+  if (-not $Row -or $Row.IsNewRow) { return }
+
+  $imi = [string]$Row.Cells[$ColImie].Value
+  $naz = [string]$Row.Cells[$ColNazwisko].Value
+  $studentAlbumValue = ''
+  $hasNameData = -not [string]::IsNullOrWhiteSpace($imi) -and -not [string]::IsNullOrWhiteSpace($naz)
+
+  if ($TabName -eq 'Student') {
+    $albumRaw = [string]$Row.Cells[$ColNrAlbumu].Value
+    if (-not [string]::IsNullOrWhiteSpace($albumRaw)) {
+      $albumClean = $albumRaw.Trim()
+      $studentAlbumValue = $albumClean
+      if ($Force -or ([string]::IsNullOrWhiteSpace([string]$Row.Cells[$ColLogin].Value)) -or ($Row.Cells[$ColLogin].Value -ne $albumClean)) {
+        $Row.Cells[$ColLogin].Value = $albumClean
+        if (-not [string]::IsNullOrWhiteSpace($Domain)) {
+          $Row.Cells[$ColEmail].Value = ("{0}@{1}" -f $albumClean, $Domain)
+        }
+      }
+    }
+    elseif ($Force -and $hasNameData) {
+      $loginStudent = Get-Login $imi $naz $LoginFormat
+      if (-not [string]::IsNullOrWhiteSpace($loginStudent)) {
+        $Row.Cells[$ColLogin].Value = $loginStudent
+        if (-not [string]::IsNullOrWhiteSpace($Domain)) {
+          $Row.Cells[$ColEmail].Value = "$loginStudent@$Domain"
+        }
+      }
+    }
+  }
+  else {
+    $loginCellValue = [string]$Row.Cells[$ColLogin].Value
+    if (($Force -or [string]::IsNullOrWhiteSpace($loginCellValue)) -and $hasNameData) {
+      $loginGeneral = Get-Login $imi $naz $LoginFormat
+      if (-not [string]::IsNullOrWhiteSpace($loginGeneral)) {
+        $Row.Cells[$ColLogin].Value = $loginGeneral
+        if (-not [string]::IsNullOrWhiteSpace($Domain)) {
+          $Row.Cells[$ColEmail].Value = "$loginGeneral@$Domain"
+        }
+      }
+    }
+  }
+
+  $loginForDisplay = [string]$Row.Cells[$ColLogin].Value
+  $displayComputed = Get-DisplayNameForRole -TabName $TabName -Imie $imi -Nazwisko $naz -Login $loginForDisplay -StudentAlbum $studentAlbumValue
+  if ($Row.Cells[$ColNazwaWyswietlana]) {
+    $currentDisplay = [string]$Row.Cells[$ColNazwaWyswietlana].Value
+    if ($Force -or [string]::IsNullOrWhiteSpace($currentDisplay)) {
+      $Row.Cells[$ColNazwaWyswietlana].Value = $displayComputed
+    }
+  }
+
+  if ($cbMiasto -and $cbMiasto.SelectedItem) {
+    if (-not $Row.Cells[$ColMiasto].Value) { $Row.Cells[$ColMiasto].Value = $cbMiasto.SelectedItem }
+  }
+  if (-not $Row.Cells[$ColHaslo].Value) {
+    $Row.Cells[$ColHaslo].Value = New-RandomPassword
   }
 }
 # === SETTINGS ===
@@ -1045,6 +1196,14 @@ function Invoke-ActiveTabCheck {
       }
     }
 
+    $derivedDomain = if ($cbDomain.SelectedItem) { [string]$cbDomain.SelectedItem } else { $Domain_Defaults[$selectedTab] }
+    $derivedFormat = $LoginFormat_ByTab[$selectedTab]
+    for ($rDerived = 0; $rDerived -lt $grid.Rows.Count; $rDerived++) {
+      $rowDerived = $grid.Rows[$rDerived]
+      if (-not $rowDerived -or $rowDerived.IsNewRow) { continue }
+      try { Update-RowComputedFields -TabName $selectedTab -Row $rowDerived -Domain $derivedDomain -LoginFormat $derivedFormat } catch {}
+    }
+
     # Student: nie sprawdzamy unikalnosci ani nie modyfikujemy loginow.
     # Tylko informujemy przy sprawdzaniu, ze konto juz istnieje (jesli jest w AD).
     if ($selectedTab -eq 'Student') {
@@ -1080,12 +1239,7 @@ function Invoke-ActiveTabCheck {
           }
           # Aktualizuj nazwę wyświetlaną wg znormalizowanych Imię/Nazwisko
           if ($row.Cells['NazwaWyswietlana']) {
-            if (-not [string]::IsNullOrWhiteSpace($sam)) {
-              $row.Cells['NazwaWyswietlana'].Value = ("{0} {1} ({2})" -f $imiS, $nazS, $sam)
-            }
-            else {
-              $row.Cells['NazwaWyswietlana'].Value = ("{0} {1}" -f $imiS, $nazS)
-            }
+            $row.Cells['NazwaWyswietlana'].Value = Get-DisplayNameForRole -TabName 'Student' -Imie $imiS -Nazwisko $nazS -Login $sam -StudentAlbum $sam
           }
         }
         catch {
@@ -1177,6 +1331,7 @@ function Invoke-ActiveTabCheck {
         # Brak koloru, jesli AD niedostepne
       }
     }
+    try { Update-GridDisplayNamesForTab -TabName $selectedTab -Grid $grid } catch {}
   }
   catch {
     Write-ToTextBox "Blad sprawdzania: $_" 'Error'
@@ -1415,10 +1570,16 @@ $configPanel.Controls.Add($tbDN, 1, 5)
 $configPanel.SetColumnSpan($tbDN, 2)
 $tbDN.Add_TextChanged({
     if ($script:IsInitializing) { return }
-    if ($tabs.SelectedTab) {
-      $DisplayNameFormat_ByTab[$tabs.SelectedTab.Text] = [string]$tbDN.Text
-      try { Set-ABCSettings } catch {}
+    if (-not $tabs.SelectedTab) { return }
+    $tabName = [string]$tabs.SelectedTab.Text
+    $DisplayNameFormat_ByTab[$tabName] = [string]$tbDN.Text
+    try { Set-ABCSettings } catch {}
+    try {
+      if ($grids.ContainsKey($tabName)) {
+        Update-GridDisplayNamesForTab -TabName $tabName -Grid $grids[$tabName]
+      }
     }
+    catch {}
   })
 # Info label dla zakladki Student (format loginu zablokowany)
 $lblStudentFmtInfo = New-Object System.Windows.Forms.Label
@@ -1462,6 +1623,7 @@ $cbDomain.Add_SelectedIndexChanged({
 
 $tabs.Add_SelectedIndexChanged({
     $script:IsInitializing = $true
+    $tabName = $null
     if ($tabs.SelectedTab -and $tabs.SelectedTab.Text) {
       $tabName = $tabs.SelectedTab.Text
       if ($Domain_Defaults.ContainsKey($tabName)) {
@@ -1499,6 +1661,9 @@ $tabs.Add_SelectedIndexChanged({
       }
     }
     $script:IsInitializing = $false
+    if ($tabName -and $grids.ContainsKey($tabName)) {
+      try { Update-GridDisplayNamesForTab -TabName $tabName -Grid $grids[$tabName] } catch {}
+    }
   })
 $grids = @{}
 foreach ($name in $tabNames) {
@@ -1605,37 +1770,12 @@ foreach ($name in $tabNames) {
         }
 
         $domain = if ($cbDomain.SelectedItem) { [string]$cbDomain.SelectedItem } else { $Domain_Defaults[$selectedTab] }
+        $fmt = $LoginFormat_ByTab[$selectedTab]
         for ($r = 0; $r -lt $targetGrid.Rows.Count; $r++) {
           $rRow = $targetGrid.Rows[$r]
           if ($rRow.IsNewRow) { continue }
-          $imi = [string]$rRow.Cells['Imię'].Value
-          $naz = [string]$rRow.Cells['Nazwisko'].Value
-          if ([string]::IsNullOrWhiteSpace($imi) -or [string]::IsNullOrWhiteSpace($naz)) { continue }
-          $fmt = $LoginFormat_ByTab[$selectedTab]
-          $login = Get-Login $imi $naz $fmt
-          if ($selectedTab -eq 'Student') {
-            $album = [string]$rRow.Cells[$ColNrAlbumu].Value
-            if (-not [string]::IsNullOrWhiteSpace($album)) {
-              $albumClean = $album.Trim()
-              $rRow.Cells['Login'].Value = $albumClean
-              $rRow.Cells['Email'].Value = ("{0}@{1}" -f $albumClean, $domain)
-              $rRow.Cells['NazwaWyswietlana'].Value = "$imi $naz ($albumClean)"
-            }
-            else {
-              $rRow.Cells['Login'].Value = $login
-              $rRow.Cells['Email'].Value = "$login@$domain"
-              $rRow.Cells['NazwaWyswietlana'].Value = "$imi $naz"
-            }
-          }
-          else {
-            $rRow.Cells['Login'].Value = $login
-            $rRow.Cells['Email'].Value = "$login@$domain"
-            $rRow.Cells['NazwaWyswietlana'].Value = "$imi $naz ($selectedTab)"
-          }
-          if (-not $rRow.Cells[$ColMiasto].Value) { $rRow.Cells[$ColMiasto].Value = $cbMiasto.SelectedItem }
-          if (-not $rRow.Cells['Haslo'].Value) { $rRow.Cells['Haslo'].Value = New-RandomPassword }
+          Update-RowComputedFields -TabName $selectedTab -Row $rRow -Domain $domain -LoginFormat $fmt -Force
         }
-
         Write-ToTextBox ("Wklejono dane dla zakladki {0} [{1} pozycji]" -f $selectedTab, $addedRows) 'Info'
         # Po wklejeniu automatycznie uruchom sprawdzanie (jak klikniecie "Sprawdz")
       }
@@ -1675,27 +1815,7 @@ foreach ($name in $tabNames) {
 
         for ($r = 0; $r -lt $grid.Rows.Count; $r++) {
           $row = $grid.Rows[$r]; if ($row.IsNewRow) { continue }
-          $imi = [string]$row.Cells['Imię'].Value
-          $naz = [string]$row.Cells['Nazwisko'].Value
-
-          if ($selectedTab -eq 'Student') {
-            $album = ([string]$row.Cells[$ColNrAlbumu].Value).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($album)) {
-              $row.Cells['Login'].Value = $album
-              $row.Cells['Email'].Value = ("{0}@{1}" -f $album, $domain)
-              $row.Cells['NazwaWyswietlana'].Value = "$imi $naz ($album)"
-            }
-          }
-          else {
-            if ([string]::IsNullOrWhiteSpace($imi) -or [string]::IsNullOrWhiteSpace($naz)) { continue }
-            $login = Get-Login $imi $naz $fmt
-            $row.Cells['Login'].Value = $login
-            $row.Cells['Email'].Value = "$login@$domain"
-            if (-not $row.Cells['NazwaWyswietlana'].Value) { $row.Cells['NazwaWyswietlana'].Value = "$imi $naz ($selectedTab)" }
-          }
-
-          if (-not $row.Cells[$ColMiasto].Value) { $row.Cells[$ColMiasto].Value = $cbMiasto.SelectedItem }
-          if (-not $row.Cells['Haslo'].Value) { $row.Cells['Haslo'].Value = New-RandomPassword }
+          Update-RowComputedFields -TabName $selectedTab -Row $row -Domain $domain -LoginFormat $fmt -Force
         }
         Write-ToTextBox "Odświeżono dane dla zakładki $selectedTab." 'Info'
       }
@@ -1876,51 +1996,30 @@ foreach ($name in $tabNames) {
 
         foreach ($row in $grid.Rows) {
           if ($row.IsNewRow) { continue }
-          $imi = [string]$row.Cells['Imię'].Value
-          $naz = [string]$row.Cells['Nazwisko'].Value
-          $login = [string]$row.Cells['Login'].Value
+          $imi = [string]$row.Cells[$ColImie].Value
+          $naz = [string]$row.Cells[$ColNazwisko].Value
+          $login = [string]$row.Cells[$ColLogin].Value
           $isStrictDuplicateTab = @('Student', 'Pracownik') -contains $selectedTab
-          # DisplayName: Student ma sztywno "Imie Nazwisko (NrAlbumu)", bez roli i bez edycji formatu
-          if ($selectedTab -eq 'Student') {
-            $albumForDn = ([string]$row.Cells[$ColNrAlbumu].Value).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($albumForDn)) { $dn = "$imi $naz ($albumForDn)" } else { $dn = "$imi $naz" }
-          }
-          else {
-            $dnFmt = if ($DisplayNameFormat_ByTab.ContainsKey($selectedTab)) { [string]$DisplayNameFormat_ByTab[$selectedTab] } else { [string]$Script:Settings.DisplayNameFormat }
-            $dn = $dnFmt.Replace('{Imie}', $imi).Replace('{Nazwisko}', $naz).Replace('{Rola}', $selectedTab)
-          }
-          # CN/Name: dla Student nie dopisujemy nr albumu drugi raz
-          # (CN = DisplayName, czyli "Imie Nazwisko (NrAlbumu)").
-          # Dla pozostalych ról utrzymujemy dotychczasowe reguly unikalnosci.
-          if ($selectedTab -eq 'Student') {
-            $cn = $dn
-          }
-          else {
-            # CN/Name in AD must be unique in the container; keep DisplayName readable,
-            # but make Name unique by appending trailing digits from login if present,
-            # otherwise append the login itself.
-            $cn = $dn
-            if ($login -match '\d+$') {
-              $cn = "$dn $($Matches[0])"
-            }
-            else {
-              $cn = "$dn ($login)"
-            }
-          }
           $domainForAccount = if ($cbDomain.SelectedItem) { [string]$cbDomain.SelectedItem } else { $Domain_Defaults[$selectedTab] }
-          $email = if ($selectedTab -eq 'Student' -and $row.Cells[$ColNrAlbumu].Value) {
-            "{0}@{1}" -f ([string]$row.Cells[$ColNrAlbumu].Value), $domainForAccount
-          }
-          else {
-            "{0}@{1}" -f $login, $domainForAccount
-          }
+
           if ([string]::IsNullOrWhiteSpace($login)) { Write-ToTextBox "Pomijam wiersz bez loginu" 'Warning'; continue }
-          # dopilnuj unikalnosci jeszcze raz (poza Student/Pracownik - tam chcemy zglosic duplikaty)
           if (-not $isStrictDuplicateTab) {
             $loginU = Get-UniqueLogin -BaseLogin $login -Rola $selectedTab
             if ($loginU -ne $login) { $row.Cells['Login'].Value = $loginU; $login = $loginU }
           }
 
+          $studentAlbumForDisplay = if ($selectedTab -eq 'Student') { ([string]$row.Cells[$ColNrAlbumu].Value).Trim() } else { '' }
+          $email = if ($selectedTab -eq 'Student' -and -not [string]::IsNullOrWhiteSpace($studentAlbumForDisplay)) {
+            "{0}@{1}" -f $studentAlbumForDisplay, $domainForAccount
+          }
+          else {
+            "{0}@{1}" -f $login, $domainForAccount
+          }
+
+          $dn = Get-DisplayNameForRole -TabName $selectedTab -Imie $imi -Nazwisko $naz -Login $login -StudentAlbum $studentAlbumForDisplay
+          if ($row.Cells[$ColNazwaWyswietlana]) { $row.Cells[$ColNazwaWyswietlana].Value = $dn }
+
+          $cn = $dn
 
           $PlainPassword = [string]$row.Cells['Haslo'].Value
           if ([string]::IsNullOrWhiteSpace($PlainPassword)) { $PlainPassword = New-RandomPassword; $row.Cells['Haslo'].Value = $PlainPassword }
@@ -2169,9 +2268,10 @@ $btnPomoc.Add_Click({
     $msg = @"
 OPIS
 - Narzedzie do masowego tworzenia kont AD z wklejanych danych (TAB).
-- Normalizuje imiona/nazwiska, generuje loginy/e‑maile, wybor Domena/UPN i OU.
+- Normalizuje imiona/nazwiska, generuje loginy/e-maile, wybor Domena/UPN i OU.
 - Sprawdza kolizje (login/CN), koloruje wiersze, podpowiada unikalne loginy.
 - Po utworzeniu kont uruchamia synchronizacje: Start-ADSyncSyncCycle -PolicyType Delta.
+- Nazwa uzytkownika (Name) oraz DisplayName w AD sa identyczne i wynikaja z formatu ustawionego per zakladka; dostepne tokeny: {Imie}, {Nazwisko}, {Rola}, {Login}/{SamAccountName}, {Album}.
 
 WKLEJANIE (TAB)
 - Uczen/Pracownik/Wykladowca/Inne: Imie[TAB]Nazwisko
