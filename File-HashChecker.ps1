@@ -1,3 +1,20 @@
+<#
+.SYNOPSIS
+Interaktywne narzędzie GUI do liczenia hashy (MD5/SHA1/SHA256) dla wielu plików i folderów.
+
+.DESCRIPTION
+Tworzy aplikację Windows Forms pozwalającą wskazać pliki lub katalogi (również metodą drag & drop),
+oblicza ich wartości skrótów wybranym algorytmem, prezentuje wyniki i zapamiętuje historię sesji.
+Zawiera pasek postępu i komunikaty dla błędnych ścieżek, dzięki czemu na bieżąco widać status pracy.
+
+.EXAMPLE
+PS> .\File-HashChecker.ps1
+Uruchamia okno „Sprawdzanie hashy plików” w którym można wskazać elementy do przeliczenia.
+
+.NOTES
+Obsługuje zaznaczenie wielu pozycji w oknie dialogowym i automatyczne rozwijanie folderów do plików.
+#>
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 

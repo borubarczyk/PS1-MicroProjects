@@ -44,7 +44,9 @@ Zbior mikroprojektow PowerShell wspomagajacych codzienna administracje Active Di
 | `AD-RDP-LoginEvents.ps1` | Skrypt CLI analizujacy zdarzenia 4624/4634 (RemoteInteractive) z ostatnich N dni, paruje logowania z wylogowaniami i buduje raport czasu trwania sesji RDP. |
 | `AD-RemoveDisabledUsersFromGroups.ps1` | Narzedzie tekstowe (z opcjonalnym Out-GridView) usuwajace wylaczone konta z niekrytycznych grup AD z kopia zapasowa czlonkostw w CSV. |
 | `AD-SwapLogin.ps1` | GUI przyspieszajace naprawianie kont z zamienionym imieniem/nazwiskiem; pozwala hurtowo zaktualizowac pola GivenName/Surname/DisplayName i dziala w trybie testowym. |
+| `AD-UpdateUserTitleDepartment.ps1` | Kreator WinForms do hurtowej aktualizacji Title/Department (oraz dodatkowych atrybutow) z CSV: mapowanie kolumn, walidacja kont, podsumowanie zmian oraz plik rollback do cofniecia operacji. |
 | `AD-User-Manager.ps1` | Lekki manager uzytkownikow: wyszukuje po SamAccountName, wyswietla najwazniejsze atrybuty, pozwala blokowac/odblokowac konto i resetowac haslo. |
+| `File-HashChecker.ps1` | Prosta aplikacja WinForms liczaca hashe MD5/SHA1/SHA256 dla wskazanych plikow lub folderow (rekurencyjnie) z paskiem postepu i zakladka historii wynikow. |
 | `Get-PremissionReport.ps1` | Generator raportu ACL (CSV) dla folderow i plikow wraz z wersja "clean" bez wbudowanych kont; wczytuje katalog przez okno wyboru. |
 | `PC-CheckHashFoldersIntegrity.ps1` | WinForms do indeksowania katalogow (hash SHA256) oraz porownywania aktualnej struktury z referencja, co ulatwia wykrycie zmian i sabotażu. |
 | `PC-Folder-TreeView.ps1` | Wizualizuje drzewo folderu w ASCII, wspiera ukryte pliki oraz eksport do TXT. |
