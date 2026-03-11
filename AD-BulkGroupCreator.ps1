@@ -24,8 +24,6 @@ function Select-OU {
 function Normalize-Sam([string]$name) {
     if ([string]::IsNullOrWhiteSpace($name)) { return "" }
     $sam = ($name -replace '[\\/:"\*\?\<\>\|;=,\+\@\[\]\(\)\{\}]','')
-    $sam = $sam -replace '\s+','_'
-    if ($sam.Length -gt 20) { $sam = $sam.Substring(0,20) }
     return $sam
 }
 
@@ -33,18 +31,18 @@ function New-GroupsUI([string]$OuDn) {
     $form                = New-Object Windows.Forms.Form
     $form.Text           = "Batch: nowe grupy w OU = $OuDn"
     $form.StartPosition  = 'CenterScreen'
-    $form.Size           = [Drawing.Size]::new(900, 520)
+    $form.Size           = [Drawing.Size]::new(1200, 820)
     $form.TopMost        = $true
     $font                = New-Object Drawing.Font('Segoe UI',10)
 
     $lbl = New-Object Windows.Forms.Label
-    $lbl.Text = "Podaj grupy poniżej (możesz wkleić z Excela: Nazwa [TAB] Opis [TAB] Scope [TAB] Kategoria)"
+    $lbl.Text = "Podaj grupy poniżej (możesz wkleić z Excela: Nazwa [TAB] Opis [TAB] Scope [TAB] Kategoria [TAB] Email)"
     $lbl.AutoSize = $true; $lbl.Font=$font; $lbl.Location='10,10'
     $form.Controls.Add($lbl)
 
     $grid = New-Object Windows.Forms.DataGridView
     $grid.Location = '10,40'
-    $grid.Size     = [Drawing.Size]::new(860,380)
+    $grid.Size     = [Drawing.Size]::new(1160,680)
     $grid.Font     = $font
     $grid.AllowUserToAddRows = $true
     $grid.AllowUserToResizeRows = $false
@@ -70,12 +68,15 @@ function New-GroupsUI([string]$OuDn) {
     $colCat.HeaderText='Kategoria'; $colCat.Name='Category'
     $colCat.Items.AddRange(@('Security','Distribution')); $colCat.FillWeight=90
 
+    $colMail = New-Object Windows.Forms.DataGridViewTextBoxColumn
+    $colMail.HeaderText='Email (mail)'; $colMail.Name='Email'; $colMail.FillWeight=160
+
     $colRes = New-Object Windows.Forms.DataGridViewTextBoxColumn
     $colRes.HeaderText='Status'; $colRes.Name='Result'; $colRes.ReadOnly=$true; $colRes.FillWeight=120
 
     $grid.Columns.AddRange(
     [System.Windows.Forms.DataGridViewColumn[]]@(
-        $colName,$colSam,$colDesc,$colScope,$colCat,$colRes
+        $colName,$colSam,$colDesc,$colScope,$colCat,$colMail,$colRes
     )
 )
     $form.Controls.Add($grid)
@@ -91,22 +92,71 @@ function New-GroupsUI([string]$OuDn) {
         }
     })
 
-    # Przyciski
+    # Przyciski / akcje masowe
+    $setColumnForAll = {
+        param([string]$columnName,$value)
+        if ([string]::IsNullOrWhiteSpace($columnName)) { return }
+        for ($i=0; $i -lt $grid.Rows.Count; $i++) {
+            $row = $grid.Rows[$i]
+            if ($row.IsNewRow) { continue }
+            $row.Cells[$columnName].Value = $value
+        }
+    }
+
     $btnPaste = New-Object Windows.Forms.Button
     $btnPaste.Text='Wklej ze schowka'; $btnPaste.Font=$font
-    $btnPaste.Location='10,430'; $btnPaste.Size=[Drawing.Size]::new(150,35)
+    $btnPaste.Location='10,730'; $btnPaste.Size=[Drawing.Size]::new(150,35)
 
     $btnAdd = New-Object Windows.Forms.Button
     $btnAdd.Text='Dodaj 10 wierszy'; $btnAdd.Font=$font
-    $btnAdd.Location='170,430'; $btnAdd.Size=[Drawing.Size]::new(150,35)
+    $btnAdd.Location='170,730'; $btnAdd.Size=[Drawing.Size]::new(150,35)
+
+    $btnScopeAll = New-Object Windows.Forms.Button
+    $btnScopeAll.Text='Scope: ustaw'; $btnScopeAll.Font=$font
+    $btnScopeAll.Location='330,730'; $btnScopeAll.Size=[Drawing.Size]::new(150,35)
+
+    $btnCategoryAll = New-Object Windows.Forms.Button
+    $btnCategoryAll.Text='Typ: ustaw'; $btnCategoryAll.Font=$font
+    $btnCategoryAll.Location='490,730'; $btnCategoryAll.Size=[Drawing.Size]::new(150,35)
 
     $btnCreate = New-Object Windows.Forms.Button
     $btnCreate.Text='Utwórz wszystkie'; $btnCreate.Font=$font
-    $btnCreate.Location='700,430'; $btnCreate.Size=[Drawing.Size]::new(170,35)
+    $btnCreate.Location='1020,730'; $btnCreate.Size=[Drawing.Size]::new(170,35)
 
-    $form.Controls.AddRange(@($btnPaste,$btnAdd,$btnCreate))
+    $scopeMenu = New-Object Windows.Forms.ContextMenuStrip
+    foreach ($scopeOption in @('Global','DomainLocal','Universal')) {
+        $item = $scopeMenu.Items.Add($scopeOption)
+        $item.Tag = $scopeOption
+        $item.add_Click({
+            param($sender,$args)
+            if ($sender.Tag) {
+                & $setColumnForAll 'Scope' $sender.Tag
+            }
+        })
+    }
 
-    # Wklej: zakładamy TSV (Excel), kolumny: Name [tab] Desc [tab] Scope [tab] Category
+    $categoryMenu = New-Object Windows.Forms.ContextMenuStrip
+    foreach ($catOption in @('Security','Distribution')) {
+        $item = $categoryMenu.Items.Add($catOption)
+        $item.Tag = $catOption
+        $item.add_Click({
+            param($sender,$args)
+            if ($sender.Tag) {
+                & $setColumnForAll 'Category' $sender.Tag
+            }
+        })
+    }
+
+    $btnScopeAll.Add_Click({
+        $scopeMenu.Show($btnScopeAll,[Drawing.Point]::new(0,$btnScopeAll.Height))
+    })
+    $btnCategoryAll.Add_Click({
+        $categoryMenu.Show($btnCategoryAll,[Drawing.Point]::new(0,$btnCategoryAll.Height))
+    })
+
+    $form.Controls.AddRange(@($btnPaste,$btnAdd,$btnScopeAll,$btnCategoryAll,$btnCreate))
+
+    # Wklej: zakładamy TSV (Excel), kolumny: Name [tab] Desc [tab] Scope [tab] Category [tab] Email
     $btnPaste.Add_Click({
         try {
             $txt = [Windows.Forms.Clipboard]::GetText()
@@ -120,6 +170,7 @@ function New-GroupsUI([string]$OuDn) {
                 $desc  = if ($parts.Count -ge 2) { $parts[1] } else { "" }
                 $scope = if ($parts.Count -ge 3 -and @('Global','DomainLocal','Universal') -contains $parts[2]) { $parts[2] } else { 'Global' }
                 $cat   = if ($parts.Count -ge 4 -and @('Security','Distribution') -contains $parts[3]) { $parts[3] } else { 'Security' }
+                $email = if ($parts.Count -ge 5) { $parts[4].Trim() } else { "" }
 
                 $idx = $grid.Rows.Add()
                 $grid.Rows[$idx].Cells['Name'].Value = $name
@@ -127,6 +178,7 @@ function New-GroupsUI([string]$OuDn) {
                 $grid.Rows[$idx].Cells['Desc'].Value = $desc
                 $grid.Rows[$idx].Cells['Scope'].Value= $scope
                 $grid.Rows[$idx].Cells['Category'].Value = $cat
+                $grid.Rows[$idx].Cells['Email'].Value = $email
             }
         } catch {
             [Windows.Forms.MessageBox]::Show($_.Exception.Message,"Błąd wklejania") | Out-Null
@@ -144,28 +196,43 @@ function New-GroupsUI([string]$OuDn) {
                 $row = $grid.Rows[$i]
                 if ($row.IsNewRow) { continue }
 
-                $name = "$($row.Cells['Name'].Value)".Trim()
-                $sam  = "$($row.Cells['sAM'].Value)".Trim()
-                $desc = "$($row.Cells['Desc'].Value)".Trim()
-                $scp  = "$($row.Cells['Scope'].Value)"
-                $cat  = "$($row.Cells['Category'].Value)"
+                $name  = "$($row.Cells['Name'].Value)".Trim()
+                $sam   = "$($row.Cells['sAM'].Value)".Trim()
+                $desc  = "$($row.Cells['Desc'].Value)".Trim()
+                $scp   = "$($row.Cells['Scope'].Value)"
+                $cat   = "$($row.Cells['Category'].Value)"
+                $email = "$($row.Cells['Email'].Value)".Trim()
 
                 if ([string]::IsNullOrWhiteSpace($name)) { $row.Cells['Result'].Value = "Pominięto: brak Nazwy"; continue }
-                if ([string]::IsNullOrWhiteSpace($sam))  { $sam = Normalize-Sam $name }
+                if ($cat -eq 'Distribution' -and [string]::IsNullOrWhiteSpace($email)) {
+                    $row.Cells['Result'].Value = "Błąd: dystrybucyjna wymaga email"
+                    continue
+                }
 
                 try {
-                    if (Get-ADGroup -LDAPFilter "(sAMAccountName=$sam)" -ErrorAction SilentlyContinue) {
+                    if (-not [string]::IsNullOrWhiteSpace($sam) -and
+                        Get-ADGroup -LDAPFilter "(sAMAccountName=$sam)" -ErrorAction SilentlyContinue) {
                         $row.Cells['Result'].Value = "Istnieje (sAM=$sam)"
                         continue
                     }
 
-                    New-ADGroup -Name $name `
-                        -SamAccountName $sam `
-                        -GroupScope $scp `
-                        -GroupCategory $cat `
-                        -Path $OuDn `
-                        -Description $desc `
-                        -ErrorAction Stop
+                    $groupParams = @{
+                        Name = $name
+                        GroupScope = $scp
+                        GroupCategory = $cat
+                        Path = $OuDn
+                        Description = $desc
+                        ErrorAction = 'Stop'
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($sam)) {
+                        $groupParams['SamAccountName'] = $sam
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($email)) {
+                        $groupParams['OtherAttributes'] = @{ mail = $email }
+                    }
+
+                    New-ADGroup @groupParams
 
                     $row.Cells['Result'].Value = "OK"
                 }

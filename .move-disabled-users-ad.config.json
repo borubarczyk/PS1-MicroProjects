@@ -1,0 +1,6 @@
+{
+  "BaseOU": "OU=Użytkownicy,OU=USERS,OU=HOME,DC=home,DC=local",
+  "TargetOU": "OU=Użytkownicy,OU=USERS,OU=HOME,DC=home,DC=local",
+  "LastUsed": "2026-03-11T12:54:56.4368206+01:00",
+  "Version": "1.0"
+}
