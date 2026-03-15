@@ -2358,11 +2358,11 @@ Register-ModuleTab -Name 'Certyfikaty (LM)' -Builder {
                 $store = $cmbStore.Text
                 $thumb = $grid.SelectedRows[0].Cells['Thumbprint'].Value
                 $dlg = New-Object System.Windows.Forms.SaveFileDialog
-                $dlg.Filter = 'CER (*.cer)|*.cer'; $dlg.FileName = "$selectedHost-$thumb.cer"
+                $dlg.Filter = 'CER (*.cer)|*.cer'; $dlg.FileName = "$selectedHost-$($thumb).cer"
                 if ($dlg.ShowDialog() -ne 'OK') { return }
                 Write-Log "[$selectedHost] eksportuję $thumb z LocalMachine\\$store do $($dlg.FileName) ..."
                 # zapis na hoście i pobranie pliku
-                $remoteTmp = "C:\Windows\Temp\DomainOps\$thumb.cer"
+                $remoteTmp = "C:\Windows\Temp\DomainOps\$($thumb).cer"
                 $sb = {
                     param($store, $thumb, $outFile)
                     if (-not (Test-Path (Split-Path -Path $outFile -Parent))) { New-Item -ItemType Directory -Force -Path (Split-Path -Path $outFile -Parent) | Out-Null }
