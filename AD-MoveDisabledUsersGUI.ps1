@@ -2,18 +2,6 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ===================== LISTY OCHRONNE =====================
-$script:ExceptionUsers = @(
-    'Guest','krbtgt','Gość','Admin2','Konto domyślne','any connect'
-)
-
-$script:ProtectedGroups = @(
-    'Domain Users','Administrators','Domain Admins','Enterprise Admins',
-    'Schema Admins','Protected Users','DnsAdmins','Backup Operators',
-    'Account Operators','Server Operators','Print Operators',
-    'Read-only Domain Controllers'
-)
-
 # ===================== PICKER OU =====================
 function Show-OUChooser {
     param(
@@ -193,6 +181,17 @@ function Show-OUChooser {
 
 # ===================== GŁÓWNE OKNO =====================
 function Show-MoveDisabledUsersGUI {
+    # ===================== LISTY OCHRONNE (DOMYŚLNE) =====================
+    $script:ExceptionUsers = @(
+        'Guest','krbtgt','Gość','Admin2','Konto domyślne','any connect'
+    )
+    $script:ProtectedGroups = @(
+        'Domain Users','Administrators','Domain Admins','Enterprise Admins',
+        'Schema Admins','Protected Users','DnsAdmins','Backup Operators',
+        'Account Operators','Server Operators','Print Operators',
+        'Read-only Domain Controllers'
+    )
+
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
         [System.Windows.Forms.MessageBox]::Show("Brak modułu ActiveDirectory. Zainstaluj RSAT / AD PowerShell Tools.","Błąd",'OK','Error') | Out-Null
         return
@@ -207,6 +206,72 @@ function Show-MoveDisabledUsersGUI {
     $form.MinimumSize  = New-Object System.Drawing.Size(1000,760)
     $form.Size         = New-Object System.Drawing.Size(1150,820)
 
+    # ===================== ZARZĄDZANIE KONFIGURACJĄ =====================
+    function Get-ConfigPath {
+        try {
+            $scriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
+            $scriptDir  = Split-Path -Parent $scriptPath
+            return (Join-Path $scriptDir '.move-disabled-users-ad.config.json')
+        } catch { return (Join-Path (Get-Location).Path '.move-disabled-users-ad.config.json') }
+    }
+
+    function Load-Config {
+        $path = Get-ConfigPath
+        if (Test-Path -LiteralPath $path) {
+            try {
+                $config = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+                if ($config.ExceptionUsers) { $script:ExceptionUsers = @($config.ExceptionUsers) }
+                if ($config.ProtectedGroups) { $script:ProtectedGroups = @($config.ProtectedGroups) }
+                return $config
+            } catch {
+                # Błąd odczytu lub parsowania, użyj domyślnych
+            }
+        }
+        return $null
+    }
+
+    function Save-Config {
+        param(
+            [string]$BaseOU,
+            [string]$TargetOU
+        )
+        $obj = [PSCustomObject]@{
+            BaseOU = $BaseOU
+            TargetOU = $TargetOU
+            ExceptionUsers = $script:ExceptionUsers
+            ProtectedGroups = $script:ProtectedGroups
+            LastUsed = (Get-Date).ToString('o')
+            Version = '2.0'
+        }
+        $json = $obj | ConvertTo-Json -Depth 3
+        try {
+            Set-Content -Path (Get-ConfigPath) -Value $json -Encoding UTF8 -Force
+            return $true
+        } catch {
+            return $false
+        }
+    }
+    
+    # Inicjalizacja konfiguracji na starcie
+    $cfg = Load-Config
+
+    # ===================== GŁÓWNY LAYOUT (TABCONTROL) =====================
+    $tabControl = New-Object System.Windows.Forms.TabControl
+    $tabControl.Dock = 'Fill'
+    
+    $tabOperations = New-Object System.Windows.Forms.TabPage
+    $tabOperations.Text = "Operacje"
+    $tabOperations.Padding = '8,8,8,8'
+
+    $tabSettings = New-Object System.Windows.Forms.TabPage
+    $tabSettings.Text = "Ustawienia"
+    $tabSettings.Padding = '8,8,8,8'
+
+    $tabControl.Controls.Add($tabOperations)
+    $tabControl.Controls.Add($tabSettings)
+    $form.Controls.Add($tabControl)
+
+    # ===================== ZAKŁADKA "OPERACJE" =====================
     $root = New-Object System.Windows.Forms.TableLayoutPanel
     $root.Dock = 'Fill'
     $root.ColumnCount = 1
@@ -217,6 +282,7 @@ function Show-MoveDisabledUsersGUI {
     [void]$root.RowStyles.Add( (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)) )
     [void]$root.RowStyles.Add( (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)) )
     [void]$root.RowStyles.Add( (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent,40)) )
+    $tabOperations.Controls.Add($root)
 
     # ---- BAZA (wiersz 0) ----
     $pBase = New-Object System.Windows.Forms.TableLayoutPanel
@@ -225,250 +291,88 @@ function Show-MoveDisabledUsersGUI {
     $pBase.ColumnStyles.Add( (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,100)) )
     $pBase.ColumnStyles.Add( (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)) )
 
-    $lblBase = New-Object System.Windows.Forms.Label
-    $lblBase.Text = "Bazowe OU (drzewo NIEAKTYWNI):"
-    $lblBase.AutoSize = $true
+    $lblBase = New-Object System.Windows.Forms.Label; $lblBase.Text = "Bazowe OU (drzewo NIEAKTYWNI):"; $lblBase.AutoSize = $true
+    $tbBase = New-Object System.Windows.Forms.TextBox; $tbBase.ReadOnly = $true; $tbBase.Dock = 'Fill'; $tbBase.Margin = '0,0,8,0'
+    $btnPickBase = New-Object System.Windows.Forms.Button; $btnPickBase.Text = "Wybierz bazowe…"; $btnPickBase.AutoSize = $false; $btnPickBase.Width = 140; $btnPickBase.Height = 32
 
-    $tbBase = New-Object System.Windows.Forms.TextBox
-    $tbBase.ReadOnly = $true
-    $tbBase.Dock = 'Fill'
-    $tbBase.Margin = '0,0,8,0'
+    $pBase.Controls.Add($lblBase,0,0); $pBase.Controls.Add($tbBase,1,0); $pBase.Controls.Add($btnPickBase,2,0)
 
-    $btnPickBase = New-Object System.Windows.Forms.Button
-    $btnPickBase.Text = "Wybierz bazowe…"
-    $btnPickBase.AutoSize = $false
-    $btnPickBase.Width  = 140
-    $btnPickBase.Height = 32
-
-    $pBase.Controls.Add($lblBase,0,0)
-    $pBase.Controls.Add($tbBase,1,0)
-    $pBase.Controls.Add($btnPickBase,2,0)
-
-    $lblStatus = New-Object System.Windows.Forms.Label
-    $lblStatus.Text = "Status: brak bazowego OU"
-    $lblStatus.AutoSize = $true
-    $lblStatus.Padding = '0,4,0,8'
-
-    $pBaseWrap = New-Object System.Windows.Forms.FlowLayoutPanel
-    $pBaseWrap.Dock='Fill'; $pBaseWrap.AutoSize=$false; $pBaseWrap.FlowDirection='TopDown'
-    $pBaseWrap.WrapContents = $false
-    $pBaseWrap.Controls.Add($pBase) | Out-Null
-    $pBaseWrap.Controls.Add($lblStatus) | Out-Null
+    $lblStatus = New-Object System.Windows.Forms.Label; $lblStatus.Text = "Status: brak bazowego OU"; $lblStatus.AutoSize = $true; $lblStatus.Padding = '0,4,0,8'
+    $pBaseWrap = New-Object System.Windows.Forms.FlowLayoutPanel; $pBaseWrap.Dock='Fill'; $pBaseWrap.AutoSize=$false; $pBaseWrap.FlowDirection='TopDown'; $pBaseWrap.WrapContents = $false
+    $pBaseWrap.Controls.Add($pBase); $pBaseWrap.Controls.Add($lblStatus)
 
     # ---- SKAN (wiersz 1) ----
-    $btnScan = New-Object System.Windows.Forms.Button
-    $btnScan.Text = "Skanuj zablokowanych (spoza bazowego OU)"
-    $btnScan.AutoSize = $false
-    $btnScan.Width  = 360
-    $btnScan.Height = 32
-    $btnScan.Margin = '8,4,0,8'
-    $btnScan.Enabled  = $false
+    $btnScan = New-Object System.Windows.Forms.Button; $btnScan.Text = "Skanuj zablokowanych (spoza bazowego OU)"; $btnScan.AutoSize = $false; $btnScan.Width = 360; $btnScan.Height = 32; $btnScan.Margin = '8,4,0,8'; $btnScan.Enabled = $false
 
     # ---- GRID (wiersz 2) ----
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Dock = 'Fill'
-    $grid.ReadOnly = $false
-    $grid.AllowUserToAddRows = $false
-    $grid.SelectionMode = 'FullRowSelect'
-    $grid.MultiSelect = $true
-    $grid.AutoGenerateColumns = $false
-    $grid.RowHeadersVisible = $false
-    $grid.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-    $grid.AutoSizeColumnsMode = 'AllCells'
-
-    $colCheck = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
-    $colCheck.HeaderText = "Wybierz"
-    $colCheck.Width = 70
-    $grid.Columns.Add($colCheck) | Out-Null
-
-    $colName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colName.HeaderText = "Name"
-    $colName.DataPropertyName = "Name"
-    $colName.AutoSizeMode = 'Fill'
-    $grid.Columns.Add($colName) | Out-Null
-
-    $colSam = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colSam.HeaderText = "SamAccountName"
-    $colSam.DataPropertyName = "SamAccountName"
-    $colSam.Width = 180
-    $grid.Columns.Add($colSam) | Out-Null
-
-    $colDn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colDn.HeaderText = "DistinguishedName"
-    $colDn.DataPropertyName = "DistinguishedName"
-    $colDn.AutoSizeMode = 'Fill'
-    $grid.Columns.Add($colDn) | Out-Null
+    $grid = New-Object System.Windows.Forms.DataGridView; $grid.Dock = 'Fill'; $grid.ReadOnly = $false; $grid.AllowUserToAddRows = $false; $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $true; $grid.AutoGenerateColumns = $false; $grid.RowHeadersVisible = $false; $grid.Font = New-Object System.Drawing.Font("Segoe UI", 10); $grid.AutoSizeColumnsMode = 'AllCells'
+    $colCheck = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn; $colCheck.HeaderText = "Wybierz"; $colCheck.Width = 70; $grid.Columns.Add($colCheck)
+    $colName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colName.HeaderText = "Name"; $colName.DataPropertyName = "Name"; $colName.AutoSizeMode = 'Fill'; $grid.Columns.Add($colName)
+    $colSam = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colSam.HeaderText = "SamAccountName"; $colSam.DataPropertyName = "SamAccountName"; $colSam.Width = 180; $grid.Columns.Add($colSam)
+    $colDn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colDn.HeaderText = "DistinguishedName"; $colDn.DataPropertyName = "DistinguishedName"; $colDn.AutoSizeMode = 'Fill'; $grid.Columns.Add($colDn)
 
     # ---- TARGET (wiersz 3) ----
-    $pTarget = New-Object System.Windows.Forms.TableLayoutPanel
-    $pTarget.Dock='Top'; $pTarget.ColumnCount=3; $pTarget.AutoSize=$true
+    $pTarget = New-Object System.Windows.Forms.TableLayoutPanel; $pTarget.Dock='Top'; $pTarget.ColumnCount=3; $pTarget.AutoSize=$true
     $pTarget.ColumnStyles.Add( (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)) )
     $pTarget.ColumnStyles.Add( (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,100)) )
     $pTarget.ColumnStyles.Add( (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)) )
-
-    $lblTarget = New-Object System.Windows.Forms.Label
-    $lblTarget.Text = "Docelowe OU:"
-    $lblTarget.AutoSize = $true
-
-    $tbTarget = New-Object System.Windows.Forms.TextBox
-    $tbTarget.ReadOnly = $true
-    $tbTarget.Dock = 'Fill'
-
-    $btnPickTarget = New-Object System.Windows.Forms.Button
-    $btnPickTarget.Text= "Wybierz docelowe…"
-    $btnPickTarget.AutoSize = $false
-    $btnPickTarget.Width  = 140
-    $btnPickTarget.Height = 32
-    $btnPickTarget.Enabled = $false
-
-    $pTarget.Controls.Add($lblTarget,0,0)
-    $pTarget.Controls.Add($tbTarget,1,0)
-    $pTarget.Controls.Add($btnPickTarget,2,0)
+    $lblTarget = New-Object System.Windows.Forms.Label; $lblTarget.Text = "Docelowe OU:"; $lblTarget.AutoSize = $true
+    $tbTarget = New-Object System.Windows.Forms.TextBox; $tbTarget.ReadOnly = $true; $tbTarget.Dock = 'Fill'
+    $btnPickTarget = New-Object System.Windows.Forms.Button; $btnPickTarget.Text= "Wybierz docelowe…"; $btnPickTarget.AutoSize = $false; $btnPickTarget.Width = 140; $btnPickTarget.Height = 32; $btnPickTarget.Enabled = $false
+    $pTarget.Controls.Add($lblTarget,0,0); $pTarget.Controls.Add($tbTarget,1,0); $pTarget.Controls.Add($btnPickTarget,2,0)
 
     # ---- AKCJE (wiersz 4) ----
-    $pActions = New-Object System.Windows.Forms.FlowLayoutPanel
-    $pActions.Dock='Top'
-    $pActions.AutoSize = $true
-    $pActions.WrapContents = $false
-    
-    $btnSelectAll = New-Object System.Windows.Forms.Button
-    $btnSelectAll.Text = "Zaznacz wszystkie"
-    $btnSelectAll.AutoSize = $false
-    $btnSelectAll.Width = 150
-    $btnSelectAll.Height = 32
-
-    $btnClearAll = New-Object System.Windows.Forms.Button
-    $btnClearAll.Text = "Odznacz wszystkie"
-    $btnClearAll.AutoSize = $false
-    $btnClearAll.Width = 150
-    $btnClearAll.Height = 32
-    $btnClearAll.Margin = '6,0,0,0'
-
-    $chkWhatIf = New-Object System.Windows.Forms.CheckBox
-    $chkWhatIf.Text = "WhatIf (bez zmian)"
-    $chkWhatIf.AutoSize = $true
-    $chkWhatIf.Checked  = $true   
-
-    $btnMove = New-Object System.Windows.Forms.Button
-    $btnMove.Text = "Tylko przenieś"
-    $btnMove.AutoSize = $false
-    $btnMove.Width  = 180
-    $btnMove.Height = 32
-    $btnMove.Margin = '12,0,0,0'
-    $btnMove.BackColor = [System.Drawing.Color]::LightYellow
-
-    $btnMoveAndClean = New-Object System.Windows.Forms.Button
-    $btnMoveAndClean.Text = "Przenieś i usuń z grup"
-    $btnMoveAndClean.AutoSize = $false
-    $btnMoveAndClean.Width  = 200
-    $btnMoveAndClean.Height = 32
-    $btnMoveAndClean.Margin = '6,0,0,0'
-    $btnMoveAndClean.BackColor = [System.Drawing.Color]::LightGreen
-    $btnMoveAndClean.Font = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
-
-    $pActions.Controls.Add($btnSelectAll) | Out-Null
-    $pActions.Controls.Add($btnClearAll) | Out-Null
-    $pActions.Controls.Add($chkWhatIf)   | Out-Null
-    $pActions.Controls.Add($btnMove)     | Out-Null
-    $pActions.Controls.Add($btnMoveAndClean) | Out-Null
-
+    $pActions = New-Object System.Windows.Forms.FlowLayoutPanel; $pActions.Dock='Top'; $pActions.AutoSize = $true; $pActions.WrapContents = $false
+    $btnSelectAll = New-Object System.Windows.Forms.Button; $btnSelectAll.Text = "Zaznacz wszystkie"; $btnSelectAll.AutoSize = $false; $btnSelectAll.Width = 150; $btnSelectAll.Height = 32
+    $btnClearAll = New-Object System.Windows.Forms.Button; $btnClearAll.Text = "Odznacz wszystkie"; $btnClearAll.AutoSize = $false; $btnClearAll.Width = 150; $btnClearAll.Height = 32; $btnClearAll.Margin = '6,0,0,0'
+    $chkWhatIf = New-Object System.Windows.Forms.CheckBox; $chkWhatIf.Text = "WhatIf (bez zmian)"; $chkWhatIf.AutoSize = $true; $chkWhatIf.Checked = $true
+    $btnMove = New-Object System.Windows.Forms.Button; $btnMove.Text = "Tylko przenieś"; $btnMove.AutoSize = $false; $btnMove.Width = 180; $btnMove.Height = 32; $btnMove.Margin = '12,0,0,0'; $btnMove.BackColor = [System.Drawing.Color]::LightYellow
+    $btnMoveAndClean = New-Object System.Windows.Forms.Button; $btnMoveAndClean.Text = "Przenieś i usuń z grup"; $btnMoveAndClean.AutoSize = $false; $btnMoveAndClean.Width = 200; $btnMoveAndClean.Height = 32; $btnMoveAndClean.Margin = '6,0,0,0'; $btnMoveAndClean.BackColor = [System.Drawing.Color]::LightGreen; $btnMoveAndClean.Font = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
+    $pActions.Controls.Add($btnSelectAll); $pActions.Controls.Add($btnClearAll); $pActions.Controls.Add($chkWhatIf); $pActions.Controls.Add($btnMove); $pActions.Controls.Add($btnMoveAndClean)
     $btnSelectAll.Add_Click({ foreach ($r in $grid.Rows) { try { $r.Cells[0].Value = $true } catch {} } })
     $btnClearAll.Add_Click({ foreach ($r in $grid.Rows) { try { $r.Cells[0].Value = $false } catch {} } })
 
     # ---- LOG (wiersz 5) ----
-    $tbLog = New-Object System.Windows.Forms.TextBox
-    $tbLog.Multiline = $true
-    $tbLog.ScrollBars = 'Both'
-    $tbLog.ReadOnly = $true
-    $tbLog.Dock = 'Fill'
-    $tbLog.Font = New-Object System.Drawing.Font("Consolas",10)
+    $tbLog = New-Object System.Windows.Forms.TextBox; $tbLog.Multiline = $true; $tbLog.ScrollBars = 'Both'; $tbLog.ReadOnly = $true; $tbLog.Dock = 'Fill'; $tbLog.Font = New-Object System.Drawing.Font("Consolas",10)
 
-    $root.Controls.Add($pBaseWrap,0,0)
-    $root.Controls.Add($btnScan,  0,1)
-    $root.Controls.Add($grid,     0,2)
-    $root.Controls.Add($pTarget,  0,3)
-    $root.Controls.Add($pActions, 0,4)
-    $root.Controls.Add($tbLog,    0,5)
-    $form.Controls.Add($root)
+    $root.Controls.Add($pBaseWrap,0,0); $root.Controls.Add($btnScan,0,1); $root.Controls.Add($grid,0,2); $root.Controls.Add($pTarget,0,3); $root.Controls.Add($pActions,0,4); $root.Controls.Add($tbLog,0,5)
 
-    # ===== Config Helpers =====
-    function Get-ConfigPath {
-        try {
-            $scriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
-            $scriptDir  = Split-Path -Parent $scriptPath
-            return (Join-Path $scriptDir '.move-disabled-users-ad.config.json')
-        } catch { return (Join-Path (Get-Location).Path '.move-disabled-users-ad.config.json') }
-    }
+    # ===================== ZAKŁADKA "USTAWIENIA" =====================
+    $settingsRoot = New-Object System.Windows.Forms.TableLayoutPanel
+    $settingsRoot.Dock = 'Fill'; $settingsRoot.ColumnCount = 2; $settingsRoot.RowCount = 3
+    [void]$settingsRoot.ColumnStyles.Add( (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)) )
+    [void]$settingsRoot.ColumnStyles.Add( (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)) )
+    [void]$settingsRoot.RowStyles.Add( (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)) )
+    [void]$settingsRoot.RowStyles.Add( (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)) )
+    [void]$settingsRoot.RowStyles.Add( (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)) )
+    $tabSettings.Controls.Add($settingsRoot)
 
-    function Get-AppDataConfigPath {
-        try {
-            $dir = Join-Path $env:LOCALAPPDATA 'MoveDisabledUsersAD'
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            return (Join-Path $dir 'config.json')
-        } catch { return (Join-Path (Get-Location).Path 'config.json') }
-    }
+    $lblExceptionUsers = New-Object System.Windows.Forms.Label; $lblExceptionUsers.Text = "Wyjątki użytkowników (jeden na linię):"; $lblExceptionUsers.Dock = 'Top'
+    $tbExceptionUsers = New-Object System.Windows.Forms.TextBox; $tbExceptionUsers.Multiline = $true; $tbExceptionUsers.ScrollBars = 'Both'; $tbExceptionUsers.Dock = 'Fill'; $tbExceptionUsers.Font = New-Object System.Drawing.Font("Consolas",10)
+    $tbExceptionUsers.Text = $script:ExceptionUsers -join [Environment]::NewLine
+    
+    $lblProtectedGroups = New-Object System.Windows.Forms.Label; $lblProtectedGroups.Text = "Grupy chronione (jedna na linię):"; $lblProtectedGroups.Dock = 'Top'
+    $tbProtectedGroups = New-Object System.Windows.Forms.TextBox; $tbProtectedGroups.Multiline = $true; $tbProtectedGroups.ScrollBars = 'Both'; $tbProtectedGroups.Dock = 'Fill'; $tbProtectedGroups.Font = New-Object System.Drawing.Font("Consolas",10)
+    $tbProtectedGroups.Text = $script:ProtectedGroups -join [Environment]::NewLine
 
-    function Get-TempConfigPath {
-        try {
-            $dir = Join-Path $env:TEMP 'MoveDisabledUsersAD'
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            return (Join-Path $dir 'config.json')
-        } catch { return (Join-Path (Get-Location).Path 'config.tmp.json') }
-    }
+    $btnSaveSettings = New-Object System.Windows.Forms.Button; $btnSaveSettings.Text = "Zapisz ustawienia"; $btnSaveSettings.Width = 150; $btnSaveSettings.Height = 32; $btnSaveSettings.Anchor = 'Right'
+    $pSave = New-Object System.Windows.Forms.FlowLayoutPanel; $pSave.Dock='Fill'; $pSave.FlowDirection='RightToLeft'; $pSave.Controls.Add($btnSaveSettings)
 
-    function Load-Config {
-        $primary  = Get-ConfigPath
-        $fallback = Get-AppDataConfigPath
-        $tempPath = Get-TempConfigPath
-        foreach ($path in @($primary,$fallback,$tempPath)) {
-            if (-not (Test-Path -LiteralPath $path)) { continue }
-            try {
-                $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
-                if ([string]::IsNullOrWhiteSpace($raw)) { continue }
-                return ($raw | ConvertFrom-Json -ErrorAction Stop)
-            } catch { continue }
+    $settingsRoot.Controls.Add($lblExceptionUsers, 0, 0); $settingsRoot.Controls.Add($lblProtectedGroups, 1, 0)
+    $settingsRoot.Controls.Add($tbExceptionUsers, 0, 1);  $settingsRoot.Controls.Add($tbProtectedGroups, 1, 1)
+    $settingsRoot.SetColumnSpan($pSave, 2); $settingsRoot.Controls.Add($pSave, 0, 2)
+
+    $btnSaveSettings.Add_Click({
+        $script:ExceptionUsers = $tbExceptionUsers.Text.Split([Environment]::NewLine, [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() }
+        $script:ProtectedGroups = $tbProtectedGroups.Text.Split([Environment]::NewLine, [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() }
+        if (Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text) {
+            [System.Windows.Forms.MessageBox]::Show("Ustawienia zapisane pomyślnie.", "Sukces", "OK", "Information") | Out-Null
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Nie udało się zapisać ustawień.", "Błąd", "OK", "Error") | Out-Null
         }
-        return $null
-    }
+    })
 
-    function Save-Config([string]$BaseOU,[string]$TargetOU){
-        $obj = [PSCustomObject]@{ BaseOU = $BaseOU; TargetOU = $TargetOU; LastUsed = (Get-Date).ToString('o'); Version = '1.0' }
-        $json = $obj | ConvertTo-Json -Depth 3
-        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-
-        function Write-Robust([string]$path){
-            $dir = Split-Path -Parent $path
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            $maxAttempts = 5; $attempt = 0
-            while ($attempt -lt $maxAttempts) {
-                $attempt++
-                $tmp = Join-Path $dir ('.' + [IO.Path]::GetFileName($path) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
-                try {
-                    [System.IO.File]::WriteAllText($tmp,$json,$utf8NoBom)
-                    if (Test-Path -LiteralPath $path) {
-                        try { (Get-Item -LiteralPath $path -Force).Attributes = 'Normal' } catch {}
-                        try { [System.IO.File]::Replace($tmp, $path, $null, $true) } 
-                        catch {
-                            try { [System.IO.File]::Copy($tmp,$path,$true) } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-                        }
-                    } else {
-                        try { Move-Item -LiteralPath $tmp -Destination $path -Force } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-                    }
-                    try { (Get-Item -LiteralPath $path).Attributes = ((Get-Item -LiteralPath $path).Attributes -bor [System.IO.FileAttributes]::Hidden) } catch {}
-                    return $true
-                } catch {
-                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-                    if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds (200 * $attempt) } else { return $false }
-                }
-            }
-            return $false
-        }
-
-        if (Write-Robust (Get-ConfigPath)) { return }
-        if (Write-Robust (Get-AppDataConfigPath)) { return }
-        if (Write-Robust (Get-TempConfigPath)) { return }
-    }
-
+    # ===== Logika =====
     function Get-DisabledUsersOutsideOU([string]$BaseOU){
         Get-ADUser -Filter 'Enabled -eq $false' -Properties DistinguishedName,SamAccountName,Name |
             Where-Object { $_.DistinguishedName -notlike "*$BaseOU*" } |
@@ -476,8 +380,6 @@ function Show-MoveDisabledUsersGUI {
             Sort-Object Name
     }
 
-    # Inicjalizacja konfiguracji
-    $cfg = Load-Config
     if ($cfg -and $cfg.BaseOU) {
         $tbBase.Text = [string]$cfg.BaseOU
         $lblStatus.Text = "Bazowe OU: $($tbBase.Text)"
@@ -499,7 +401,6 @@ function Show-MoveDisabledUsersGUI {
         } catch {}
     }
 
-    # Handlery wyborów OU
     $btnPickBase.Add_Click({
         $sel = Show-OUChooser -Title "Wybierz BAZOWE OU (np. NIEAKTYWNI)" -PreselectByName "NIEAKTYWNI"
         if ($sel) {
@@ -520,7 +421,6 @@ function Show-MoveDisabledUsersGUI {
         }
     })
 
-    # Skanowanie
     $btnScan.Add_Click({
         $grid.Rows.Clear()
         $tbLog.AppendText("Skanowanie…`r`n")
@@ -543,7 +443,6 @@ function Show-MoveDisabledUsersGUI {
         }
     })
 
-    # Centralna funkcja wykonawcza
     function Execute-Process([bool]$CleanGroups) {
         $base   = $tbBase.Text
         $target = $tbTarget.Text
@@ -557,8 +456,7 @@ function Show-MoveDisabledUsersGUI {
             }
         }
         if (-not $selected) {
-            [System.Windows.Forms.MessageBox]::Show("Nie zaznaczono żadnych użytkowników.","Uwaga",'OK','Information') | Out-Null
-            return
+            [System.Windows.Forms.MessageBox]::Show("Nie zaznaczono żadnych użytkowników.","Uwaga",'OK','Information') | Out-Null; return
         }
 
         $whatIf = $chkWhatIf.Checked

@@ -1,4 +1,4 @@
-# Import wymaganych modułów
+﻿# Import wymaganych modułów
 Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.Application]::EnableVisualStyles()
 Import-Module ActiveDirectory
@@ -18,10 +18,9 @@ $comboBox.AutoCompleteMode = "SuggestAppend"
 $comboBox.AutoCompleteSource = "CustomSource"
 
 # Pole tekstowe z informacjami
-$textBox = New-Object System.Windows.Forms.TextBox
+$textBox = New-Object System.Windows.Forms.RichTextBox
 $textBox.Location = New-Object System.Drawing.Point(10,40)
 $textBox.Size = New-Object System.Drawing.Size(560,200)
-$textBox.Multiline = $true
 $textBox.ReadOnly = $true
 $textBox.ScrollBars = "Vertical"
 
@@ -63,25 +62,73 @@ function Show-UserInfo {
             $maxPasswordAge = (Get-ADDefaultDomainPasswordPolicy).MaxPasswordAge.Days
             $passwordExpires = if ($user.PasswordLastSet) { $user.PasswordLastSet.AddDays($maxPasswordAge) } else { "Nigdy nie ustawiono" }
             
-            $info = "Nazwa użytkownika: $($user.SamAccountName)`r`n"
-            $info += "Nazwa wyświetlana: $($user.DisplayName)`r`n"
-            $info += "Konto utworzone: $($user.Created)`r`n"
-            $info += "Konto aktywne: $($user.Enabled)`r`n"
-            $info += "Ostatnie logowanie: $($user.LastLogonDate)`r`n"
-            $info += "Hasło ostatnio ustawione: $($user.PasswordLastSet)`r`n"
-            $info += "Hasło ważne do: $passwordExpires`r`n"
-            $info += "Hasło wygasłe: $($user.PasswordExpired)"
-            $textBox.Text = $info
-            # Dodatkowe informacje o stanie lockout i probach logowania
-            $textBox.AppendText("`r`nZablokowany (lockout): $($user.LockedOut)`r`n")
-            $textBox.AppendText("Ost. bledna proba: $($user.LastBadPasswordAttempt)`r`n")
-            $textBox.AppendText("Liczba blednych prob: $($user.badPwdCount)")
+            $textBox.Clear()
+
+            $textBox.AppendText("Nazwa użytkownika: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.SamAccountName)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Nazwa wyświetlana: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.DisplayName)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Konto utworzone: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.Created)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Konto aktywne: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.Enabled)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Ostatnie logowanie: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.LastLogonDate)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Hasło ostatnio ustawione: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.PasswordLastSet)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Hasło ważne do: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$passwordExpires`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Hasło wygasłe: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.PasswordExpired)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Zablokowany (lockout): ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.LockedOut)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Ost. bledna proba: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.LastBadPasswordAttempt)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
+            $textBox.AppendText("Liczba blednych prob: ")
+            $textBox.SelectionColor = [System.Drawing.Color]::Green
+            $textBox.AppendText("$($user.badPwdCount)`r`n")
+            $textBox.SelectionColor = $textBox.ForeColor
+
             # Ustawienia przyciskow wg statusu
             if ($user.Enabled) { $lockButton.Text = "Zablokuj konto" } else { $lockButton.Text = "Odblokuj (aktywuj) konto" }
             if ($unlockButton) { $unlockButton.Enabled = [bool]$user.LockedOut }
         }
         catch {
-            $textBox.Text = "Błąd: Nie znaleziono użytkownika lub brak uprawnień`r`n$($_.Exception.Message)"
+            $textBox.Clear()
+            $errorMessage = "Błąd: Nie znaleziono użytkownika lub brak uprawnień`r`n" + $_.Exception.Message
+            $textBox.SelectionColor = [System.Drawing.Color]::Red
+            $textBox.AppendText($errorMessage)
+            $textBox.SelectionColor = $textBox.ForeColor
         }
     }
 }

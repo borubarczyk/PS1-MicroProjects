@@ -207,19 +207,19 @@ $textBox.AllowDrop = $true
 $historyTextBox.AllowDrop = $true
 
 $dragEnterHandler = {
-    param($sender, $eventArgs)
-    if ($eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
-        $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::Copy
+    param($_sender, $_eventArgs)
+    if ($_eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+        $_eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::Copy
     }
     else {
-        $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::None
+        $_eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::None
     }
 }
 
 $dragDropHandler = {
-    param($sender, $eventArgs)
-    if ($eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
-        $files = [string[]]$eventArgs.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
+    param($_sender, $_eventArgs)
+    if ($_eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+        $files = [string[]]$_eventArgs.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
         & $processFiles $files
     }
 }

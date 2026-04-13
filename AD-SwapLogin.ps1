@@ -1,11 +1,43 @@
-<# 
-    AD_Swap_GUI.ps1
-    - Wklej loginy (SamAccountName) w lewym polu
-    - Kliknij "Sprawdź w AD" -> w tabeli zobaczysz Imię/Nazwisko
-    - Zaznacz "Zamień?" dla tych, gdzie trzeba zamienić
-    - Kliknij "Zamień imię <-> nazwisko (zaznaczone)"
-    - "Tryb testowy" => nie zapisuje zmian w AD
-    Wymaga: Import-Module ActiveDirectory
+<#
+.SYNOPSIS
+    A GUI utility for bulk-checking Active Directory users and swapping their GivenName (first name) and Surname (last name).
+
+.DESCRIPTION
+    This PowerShell script provides a graphical user interface (GUI) to facilitate the management of user account names in Active Directory.
+
+    An administrator can paste a list of user logins (SamAccountNames) to query their current First Name (GivenName), Last Name (Surname), and Display Name. The script displays this information in a grid and allows the administrator to select users for whom the First Name and Last Name attributes should be swapped.
+
+    Features:
+    - Bulk query of user accounts from a list of logins.
+    - Grid view of user details with an automatic suggestion for swapping names based on a heuristic analysis of the DisplayName.
+    - Manual selection of users for the name swap operation.
+    - A "Test Mode" to simulate the operation without making any actual changes in Active Directory.
+    - An option to automatically update the user's DisplayName to match the new "FirstName LastName" format after the swap.
+    - Ability to export the current view to a CSV file.
+    - Controls for selecting all, deselecting all, and clearing the interface.
+
+.EXAMPLE
+    powershell.exe -STA -File .\AD-SwapLogin.ps1
+
+    Launches the graphical user interface.
+
+    Inside the application:
+    1. Paste a list of user SamAccountNames into the text box.
+    2. Click "Check in AD" to populate the grid with user details.
+    3. The "Swap?" column may be pre-selected for some users based on a name analysis. You can manually check or uncheck any user.
+    4. To perform the swap, click the "Swap FirstName <-> Surname (selected)" button.
+    5. Use the "Test Mode" checkbox to perform a dry run before committing changes.
+
+.NOTES
+    Author: Borys
+    Version: 1.1
+    Requires:
+    - Windows PowerShell or PowerShell 7.
+    - The Active Directory module (typically installed via Remote Server Administration Tools - RSAT).
+    - The script must be run in a Single-Threaded Apartment (STA) state, which is required for Windows Forms applications. Use the -STA switch when running from the command line.
+
+.LINK
+    https://github.com/BorysMagier/
 #>
 
 # --- WSTĘPNE SPRAWDZENIA ---

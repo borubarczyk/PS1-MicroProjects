@@ -1,6 +1,28 @@
 {
   "BaseOU": "OU=Użytkownicy,OU=USERS,OU=HOME,DC=home,DC=local",
   "TargetOU": "OU=Użytkownicy,OU=USERS,OU=HOME,DC=home,DC=local",
-  "LastUsed": "2026-03-11T12:54:56.4368206+01:00",
-  "Version": "1.0"
+  "ExceptionUsers": [
+    "Guest",
+    "krbtgt",
+    "Gość",
+    "Admin2",
+    "Konto domyślne",
+    "any connect"
+  ],
+  "ProtectedGroups": [
+    "Domain Users",
+    "Administrators",
+    "Domain Admins",
+    "Enterprise Admins",
+    "Schema Admins",
+    "Protected Users",
+    "DnsAdmins",
+    "Backup Operators",
+    "Account Operators",
+    "Server Operators",
+    "Print Operators",
+    "Read-only Domain Controllers"
+  ],
+  "LastUsed": "2026-03-15T07:23:49.6317792+01:00",
+  "Version": "2.0"
 }
