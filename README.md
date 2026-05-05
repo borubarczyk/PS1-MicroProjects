@@ -36,6 +36,8 @@ Zbior mikroprojektow PowerShell wspomagajacych codzienna administracje Active Di
 | `AD-BulkOUGroupCreator.ps1` | Kreator WinForms do budowy wielu OU oraz zestawu grup w kazdym OU; wspiera tryb WhatIf, transliteracje nazw i dbanie o unikalne sAM. |
 | `AD-BulkUserCreator.ps1` | Rozbudowany kreator masowego tworzenia kont (role: uczen, student, pracownik, wykladowca, inne), walidacja danych, generowanie loginow/e-maili, wybor OU i UPN, zapisywanie ustawien w `.AD-BulkUserCreator.json`. |
 | `AD-DeleteNewAccoutsGUI.ps1` | Okno z lista kont utworzonych w ostatnich X minutach; pozwala filtrowac, zaznaczac i usuwac wylapane konta, zapisujac log na Pulpicie. |
+| `AD-DomainGroupTree.ps1` | Skrypt generujący pełne drzewo zagnieżdżeń grup w AD (relacje grupa-grupa) z opcjonalnymi członkami i eksportem do pliku HTML. |
+| `AD-LastActiviti.ps1` | Interfejs WPF generujący raporty ostatniego logowania użytkowników AD z możliwością zaawansowanego filtrowania. |
 | `AD-ManagerDiamond.ps1` | Kompleksowe narzedzie Domain Ops do zarzadzania stacjami w AD (zdalne polecenia, BitLocker, dyski, uslugi, konta lokalne, udzialy, instalacja softu, GPUpdate, Windows Update, logi zdarzen, Defender, zmiana nazwy, firewall, LAPS, diagnostyka sieci). |
 | `AD-MoveDisabledUsersGUI.ps1` | Wykrywa konta uzytkownikow z `Enabled=$false`, pozwala je przefiltrowac i przeniesc do wybranego OU za pomoca wbudowanego przegladacza drzewa AD. |
 | `AD-NTFS-AuditGUI.ps1` | WPF-owy audytor NTFS: rekursywnie czyta ACL, wykrywa bezposrednie wpisy uzytkownikow, prezentuje je w interfejsie z filtrami i eksportem wynikow. |
@@ -48,6 +50,7 @@ Zbior mikroprojektow PowerShell wspomagajacych codzienna administracje Active Di
 | `AD-User-Manager.ps1` | Lekki manager uzytkownikow: wyszukuje po SamAccountName, wyswietla najwazniejsze atrybuty, pozwala blokowac/odblokowac konto i resetowac haslo. |
 | `File-HashChecker.ps1` | Prosta aplikacja WinForms liczaca hashe MD5/SHA1/SHA256 dla wskazanych plikow lub folderow (rekurencyjnie) z paskiem postepu i zakladka historii wynikow. |
 | `Get-PremissionReport.ps1` | Generator raportu ACL (CSV) dla folderow i plikow wraz z wersja "clean" bez wbudowanych kont; wczytuje katalog przez okno wyboru. |
+| `PasswordGenerator.ps1` | Bezpieczny generator haseł (WPF) z dostosowywalnymi regułami, historią tworzonych haseł w schowku i profilami ustawień. |
 | `PC-CheckHashFoldersIntegrity.ps1` | WinForms do indeksowania katalogow (hash SHA256) oraz porownywania aktualnej struktury z referencja, co ulatwia wykrycie zmian i sabotażu. |
 | `PC-Folder-TreeView.ps1` | Wizualizuje drzewo folderu w ASCII, wspiera ukryte pliki oraz eksport do TXT. |
 
