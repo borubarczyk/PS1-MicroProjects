@@ -261,7 +261,7 @@ $reposition = {
     try {
         $newChkUpdateLeft = $chkDryRun.Left + ($chkDryRun.PreferredSize.Width) + $pad
         $chkUpdateDN.Location = New-Object System.Drawing.Point($newChkUpdateLeft, 7)
-    } catch {}
+    } catch { <# Ignored: UI elements may not be fully initialized or visible yet #> }
 
     $btnExport.Location = New-Object System.Drawing.Point(($x - $btnExport.Width), 7)
     $x -= ($btnExport.Width + $pad)
@@ -299,7 +299,7 @@ foreach ($colName in @('Login','Istnieje','Imię','Nazwisko','Wyświetlana','DN'
   # Ustawienia widocznosci/scrollingu, aby kolumny od lewej byly zawsze widoczne
   $grid.RowHeadersVisible = $false
   $grid.ScrollBars = 'Both'
-  try { $grid.FirstDisplayedScrollingColumnIndex = 0 } catch {}
+  try { $grid.FirstDisplayedScrollingColumnIndex = 0 } catch { <# Ignored: UI elements may not be fully initialized or visible yet #> }
 
   # Ustal nazwy kolumn (Name) na podstawie naglowkow, aby dzialalo indeksowanie po nazwie
 foreach ($c in $grid.Columns) {
@@ -319,7 +319,7 @@ try {
     $grid.Columns['Zamien?'].Frozen = $true
     $grid.Columns['Login'].Frozen   = $true
     $grid.Columns['Istnieje'].Frozen= $true
-} catch {}
+} catch { <# Ignored: UI elements may not be fully initialized or visible yet #> }
 
 # Status
 $status = New-Object System.Windows.Forms.StatusStrip
@@ -336,7 +336,7 @@ $grid.DataSource = $binding
 
 # Po odswiezeniu danych ustaw widok na pierwsza kolumne
 $grid.add_DataBindingComplete({
-    try { $grid.FirstDisplayedScrollingColumnIndex = 0 } catch {}
+    try { $grid.FirstDisplayedScrollingColumnIndex = 0 } catch { <# Ignored: UI elements may not be fully initialized or visible yet #> }
 })
 
 # --- ZDARZENIA ---
@@ -440,5 +440,5 @@ $btnExport.Add_Click({
 })
 
 # --- START ---
-$form.Add_Shown({ $txtLoginy.Focus(); try { $grid.FirstDisplayedScrollingColumnIndex = 0 } catch {} })
+$form.Add_Shown({ $txtLoginy.Focus(); try { $grid.FirstDisplayedScrollingColumnIndex = 0 } catch { <# Ignored: UI elements may not be fully initialized or visible yet #> } })
 [void]$form.ShowDialog()
