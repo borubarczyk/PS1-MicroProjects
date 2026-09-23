@@ -1,4 +1,4 @@
-Add-Type -AssemblyName System.Windows.Forms
+﻿Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # -----------------------------
@@ -42,14 +42,15 @@ function Get-AsciiTree {
         }
 
         # Sort: foldery -> pliki, alfabetycznie
-        $entries = $entries | Sort-Object @{e={-not $_.PSIsContainer}}, @{e={$_.Name.ToLower()}}
+        $entries = @($entries | Sort-Object @{e={-not $_.PSIsContainer}}, @{e={$_.Name.ToLower()}})
 
         for ($i=0; $i -lt $entries.Count; $i++) {
             $e = $entries[$i]
             $isLast = ($i -eq $entries.Count - 1)
             $joint = $(if ($isLast) {'└── '} else {'├── '})
             $lines.Add("$Prefix$joint$($e.Name)")
-            if ($e.PSIsContainer) {
+            # Nie wchodzimy w junction/symlink (np. "Application Data") - grozi nieskonczona rekurencja
+            if ($e.PSIsContainer -and -not ($e.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
                 $childPrefix = $Prefix + $(if ($isLast) {'    '} else {'│   '})
                 Add-Branch -Path $e.FullName -Prefix $childPrefix
             }
@@ -170,7 +171,7 @@ function Populate-Children {
         $child.Tag = $e.FullName
         $child.ToolTipText = $e.FullName
         [void]$ParentNode.Nodes.Add($child)
-        if ($e.PSIsContainer) {
+        if ($e.PSIsContainer -and -not ($e.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             Add-PlaceholderNode -Node $child
         }
     }
@@ -283,7 +284,9 @@ $btnSave.Add_Click({
     $sfd = New-Object System.Windows.Forms.SaveFileDialog
     $sfd.Filter = "Plik tekstowy|*.txt"
     $sfd.OverwritePrompt = $true
-    $sfd.FileName = (Split-Path -Leaf $global:CurrentRootPath) + "_tree.txt"
+    $baseName = (Split-Path -Leaf $global:CurrentRootPath) -replace '[\\/:*?"<>|]', ''
+    if (-not $baseName) { $baseName = 'root' }
+    $sfd.FileName = $baseName + "_tree.txt"
 
     if ($sfd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         try {

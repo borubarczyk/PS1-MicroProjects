@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Interaktywne narzędzie GUI do liczenia hashy (MD5/SHA1/SHA256) dla wielu plików i folderów.
 
@@ -39,6 +39,7 @@ $form.StartPosition = "CenterScreen"
 $combo = New-Object System.Windows.Forms.ComboBox
 $combo.Location = New-Object System.Drawing.Point(20,20)
 $combo.Size = New-Object System.Drawing.Size(120,20)
+$combo.DropDownStyle = "DropDownList"
 $combo.Items.AddRange(@("MD5","SHA1","SHA256"))
 $combo.SelectedIndex = 2
 $form.Controls.Add($combo)

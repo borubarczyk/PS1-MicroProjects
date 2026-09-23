@@ -1,4 +1,4 @@
-#requires -Modules ActiveDirectory
+﻿#requires -Modules ActiveDirectory
 <#
 .SYNOPSIS
     Uniwersalny kreator GUI do hurtowej zmiany atrybutów kont Active Directory.
@@ -166,7 +166,7 @@ function Show-CsvPreview {
             $values = foreach ($colName in $script:AppState.Columns) {
                 [string](Get-CsvValue -Row $row -Column $colName)
             }
-            [void]$gridPreview.Rows.Add($values)
+            [void]$gridPreview.Rows.Add([object[]]@($values))
         }
         $gridPreview.AutoResizeColumns([System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::DisplayedCells)
         if ($limit -gt 0) {
@@ -263,7 +263,7 @@ function Get-MappingRows {
 }
 
 function Test-MappingDefinition {
-    param([Parameter(Mandatory)][array]$Mappings)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][array]$Mappings)
     if (-not $Mappings -or $Mappings.Count -eq 0) {
         Show-DialogMessage "Brak zdefiniowanych mapowań. Dodaj co najmniej jedną kolumnę." "Mapowanie" ([System.Windows.Forms.MessageBoxIcon]::Warning)
         return $false
@@ -285,7 +285,7 @@ function Test-MappingDefinition {
 
 function Invoke-Verification {
     param(
-        [Parameter(Mandatory)][array]$Mappings,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Mappings,
         [Parameter(Mandatory)][System.Windows.Forms.ListView]$ListView,
         [Parameter(Mandatory)][System.Windows.Forms.Label]$SummaryLabel
     )
@@ -377,7 +377,7 @@ function Invoke-Verification {
 }
 
 function Build-ChangePreview {
-    param([Parameter(Mandatory)][array]$Mappings)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][array]$Mappings)
     $script:AppState.ChangePreview = @()
     $updateMappings = $Mappings | Where-Object { (-not $_.IsKey) -and $_.Use }
     foreach ($entry in $script:AppState.Verified) {
@@ -536,7 +536,7 @@ function Update-RollbackList {
         foreach ($file in $files) {
             $meta = $null
             try {
-                $meta = Get-Content -Path $file.FullName -Raw | ConvertFrom-Json -Depth 5
+                $meta = Get-Content -Path $file.FullName -Raw | ConvertFrom-Json
             } catch {
                 $meta = $null
             }
@@ -566,7 +566,7 @@ function Update-RollbackPreview {
         return
     }
     try {
-        $snapshot = Get-Content -Path $Path -Raw | ConvertFrom-Json -Depth 6
+        $snapshot = Get-Content -Path $Path -Raw | ConvertFrom-Json
     } catch {
         Show-DialogMessage "Nie można odczytać pliku cofania.`n$($_.Exception.Message)" "Cofnięcie" ([System.Windows.Forms.MessageBoxIcon]::Error)
         return
@@ -756,7 +756,7 @@ $script:AllowedAttributes = @(
     'title','department','description','company','mail','telephoneNumber','mobile','otherTelephone',
     'homePhone','ipPhone','pager','facsimileTelephoneNumber','physicalDeliveryOfficeName','streetAddress',
     'postOfficeBox','l','st','postalCode','co','countryCode','employeeID','employeeNumber','manager',
-    'givenName','sn','displayName','initials','office','info','wWWHomePage',
+    'givenName','sn','displayName','initials','info','wWWHomePage',
     'extensionAttribute1','extensionAttribute2','extensionAttribute3','extensionAttribute4','extensionAttribute5',
     'extensionAttribute6','extensionAttribute7','extensionAttribute8','extensionAttribute9','extensionAttribute10',
     'extensionAttribute11','extensionAttribute12','extensionAttribute13','extensionAttribute14','extensionAttribute15'
@@ -785,7 +785,7 @@ function Import-CsvData {
         throw "Plik nie istnieje: $Path"
     }
     $delimiter = if ($DelimiterMode -eq 'auto') { Get-CsvDelimiter -Path $Path } else { $DelimiterMode }
-    $rows = Import-Csv -Path $Path -Delimiter $delimiter
+    $rows = @(Import-Csv -Path $Path -Delimiter $delimiter)
     if (-not $rows -or $rows.Count -eq 0) {
         throw "Plik nie zawiera danych."
     }
@@ -1209,7 +1209,8 @@ $btnAddMapping.Add_Click({
 })
 
 $btnRemoveMapping.Add_Click({
-    foreach ($row in $gridMapping.SelectedRows) {
+    # Kopia kolekcji - usuwanie w trakcie iteracji po SelectedRows rzuca wyjatek
+    foreach ($row in @($gridMapping.SelectedRows)) {
         if ($row.Tag -eq 'key') { continue }
         $gridMapping.Rows.Remove($row)
     }
@@ -1233,7 +1234,7 @@ $runVerification = {
     if (-not $script:AppState.VerificationStale -and $script:AppState.Verified.Count -gt 0) {
         return
     }
-    $mappings = Get-MappingRows -Grid $gridMapping
+    $mappings = @(Get-MappingRows -Grid $gridMapping)
     $form.Cursor = 'WaitCursor'
     try {
         if (Invoke-Verification -Mappings $mappings -ListView $lvVerify -SummaryLabel $lblVerifySummary) {

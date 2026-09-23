@@ -8,20 +8,28 @@ $configFile = Join-Path $appDataPath "CyberGenConfig.json"
 # 2. Historia ląduje w ulotnym Tempie (bezpieczeństwo po restarcie)
 $historyFile = Join-Path $env:TEMP "CyberGenHistory.json"
 
-$historyList = @()
+$script:historyList = @()
 if (Test-Path $historyFile) {
     try {
         $loadedHist = @(Get-Content $historyFile -Raw | ConvertFrom-Json)
         $cutoff = (Get-Date).AddHours(-24)
-        $historyList = @($loadedHist | Where-Object { [datetime]$_.Date -ge $cutoff })
+        $script:historyList = @($loadedHist | Where-Object { [datetime]$_.Date -ge $cutoff })
     } catch {}
 }
 
 # --- KRYPTOGRAFIA I LOGIKA ---
+$script:rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
 function Get-RandomIndex([int]$Max) {
+    # Losowanie bez obciazenia modulo (rejection sampling)
     $bytes = [Byte[]]::new(4)
-    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    return ([System.BitConverter]::ToUInt32($bytes, 0) % $Max)
+    $range = [uint64]4294967296
+    $limit = $range - ($range % [uint64]$Max)
+    do {
+        $script:rng.GetBytes($bytes)
+        $value = [uint64][System.BitConverter]::ToUInt32($bytes, 0)
+    } while ($value -ge $limit)
+    return [int]($value % [uint64]$Max)
 }
 
 function Shuffle-String([string]$str) {
@@ -285,7 +293,7 @@ function Get-CurrentConfig {
 
 function Add-ToHistory($pass) {
     $entry = @{ Pass = $pass; Date = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
-    $global:historyList = @($entry) + $global:historyList
+    $script:historyList = @($entry) + $script:historyList
     $LstHistory.Items.Insert(0, "[$($entry.Date)] $($entry.Pass)")
 }
 
@@ -297,7 +305,7 @@ function Do-Refresh {
     Add-ToHistory $newPass
 }
 
-foreach ($h in $historyList) { $LstHistory.Items.Add("[$($h.Date)] $($h.Pass)") | Out-Null }
+foreach ($h in $script:historyList) { $LstHistory.Items.Add("[$($h.Date)] $($h.Pass)") | Out-Null }
 
 $script:isUpdating = $false
 
@@ -356,12 +364,13 @@ $BtnMass.add_Click({
 
 $LstHistory.add_MouseDoubleClick({
     if ($LstHistory.SelectedItem) {
-        $pass = ($LstHistory.SelectedItem -split '] ')[1]
+        $item = [string]$LstHistory.SelectedItem
+        $pass = $item.Substring($item.IndexOf('] ') + 2)
         [System.Windows.Clipboard]::SetText($pass)
     }
 })
 
-$BtnClearHist.add_Click({ $global:historyList = @(); $LstHistory.Items.Clear() })
+$BtnClearHist.add_Click({ $script:historyList = @(); $LstHistory.Items.Clear() })
 
 $BtnSms.add_Click({
     $email = $TxtSmsEmail.Text.Trim(); $subj = [uri]::EscapeDataString($TxtSmsSubj.Text); $body = [uri]::EscapeDataString($TxtResult.Text)
@@ -375,7 +384,7 @@ $window.add_Closing({
     $cfgToSave.IsLightTheme = [bool]$ChkTheme.IsChecked
     
     $cfgToSave | ConvertTo-Json | Set-Content -Path $configFile -Encoding UTF8
-    $global:historyList | ConvertTo-Json | Set-Content -Path $historyFile -Encoding UTF8
+    ConvertTo-Json -InputObject @($script:historyList) | Set-Content -Path $historyFile -Encoding UTF8
 })
 
 Do-Refresh

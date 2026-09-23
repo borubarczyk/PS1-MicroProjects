@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 NTFS-Audit-GUI.ps1 (clean sync build)
 Cel: Audyt NTFS rekursywnie, wykrywanie wpisów nadanych użytkownikom (zamiast grup), GUI WPF z filtrami i eksportem.
@@ -93,7 +93,7 @@ function Write-LogDebug {
 }
 
 function Test-ExcelAvailable {
-    try { [void][type]::GetTypeFromProgID('Excel.Application'); return $true } catch { return $false }
+    try { return ($null -ne [type]::GetTypeFromProgID('Excel.Application')) } catch { return $false }
 }
 
 function Get-PrincipalInfo {
@@ -305,8 +305,8 @@ function Get-NTFSAclReport {
             if (-not $includeInherited -and $ace.IsInherited) { continue }
 
             $principal = Get-PrincipalInfo -Identity $ace.IdentityReference
-            if ($onlyUsers -and $principal.PrincipalType -ne 'User') { continue }
-            if ($onlyGroups -and $principal.PrincipalType -ne 'Group') { continue }
+            if ($onlyUsers -and $principal.Type -ne 'User') { continue }
+            if ($onlyGroups -and $principal.Type -ne 'Group') { continue }
 
             Write-LogDebug ("Przetwarzanie ACE: {0}" -f $ace.IdentityReference.Value)
 
@@ -385,7 +385,7 @@ function Test-IsProblemACE {
     param([object]$Row)
     # Problem: ACE niedziedziczony nadany USEROWI, który nie pasuje do whitelisty
     if ($Row.PrincipalType -eq 'User' -and $Row.IsExplicit) {
-        $sam = ($Row.PrincipalName ?? '').ToString()
+        $sam = "$($Row.PrincipalName)"
         foreach ($rx in $script:AllowedUserSamPatterns) { if ($sam -match $rx) { return $false } }
         return $true
     }
@@ -525,7 +525,7 @@ function Set-GridFilter {
         $onlyUsers    = $cbOnlyUsers.IsChecked
         $onlyGroups   = $cbOnlyGroups.IsChecked
         $onlyExplicit = $cbOnlyExplicit.IsChecked
-        $query        = ($tbSearch.Text ?? "").Trim()
+        $query        = "$($tbSearch.Text)".Trim()
         if ($onlyUsers -and $row.PrincipalType -ne 'User') { return $false }
         if ($onlyGroups -and $row.PrincipalType -ne 'Group') { return $false }
         if ($onlyExplicit -and -not $row.IsExplicit) { return $false }
@@ -603,8 +603,8 @@ $btnScan.Add_Click({
         }
 
         Write-LogDebug ("Task start (thread {0})" -f [System.Threading.Thread]::CurrentThread.ManagedThreadId)
-        $result = Get-NTFSAclReport -RootPath $scanPath -Options $opts
-        $itemsCount = if ($null -ne $result) { $result.Count } else { 0 }
+        $result = @(Get-NTFSAclReport -RootPath $scanPath -Options $opts)
+        $itemsCount = $result.Count
         Write-LogDebug ("Get-NTFSAclReport zwrocil {0} elementow" -f $itemsCount)
 
         if ($result) {

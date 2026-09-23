@@ -17,8 +17,11 @@
     }
     Import-Module ActiveDirectory
 
-    $script:visitedGroups = @()
+    # Grupy na biezacej sciezce (od korzenia do wezla) - wykrywanie prawdziwych petli,
+    # a nie wielokrotnego wystapienia tej samej grupy w roznych galeziach
+    $script:visitedGroups = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $script:htmlContent = @()
+    $enc = { param($t) [System.Net.WebUtility]::HtmlEncode([string]$t) }
 
     Write-Host "🔍 Pobieranie wszystkich grup z Active Directory (To może potrwać)..." -ForegroundColor Cyan
     # Szukamy grup, które nie mają rodziców (Top-Level)
@@ -82,11 +85,20 @@
     function Process-GroupNode {
         param([string]$Name)
 
-        if ($script:visitedGroups -contains $Name) {
-            $script:htmlContent += "<div class='item'><span class='member-icon'>&#9888;</span> Zapętlenie ($Name)</div>"
+        if ($script:visitedGroups.Contains($Name)) {
+            $script:htmlContent += "<div class='item'><span class='member-icon'>&#9888;</span> Zapętlenie ($(& $enc $Name))</div>"
             return
         }
-        $script:visitedGroups += $Name
+        [void]$script:visitedGroups.Add($Name)
+        try {
+            Process-GroupMembers -Name $Name
+        } finally {
+            [void]$script:visitedGroups.Remove($Name)
+        }
+    }
+
+    function Process-GroupMembers {
+        param([string]$Name)
 
         try {
             $members = @(Get-ADGroupMember -Identity $Name -ErrorAction Stop)
@@ -103,19 +115,19 @@
         foreach ($member in $members) {
             $descHtml = ""
             if ($IncludeDescription) {
-                $adObj = Get-ADObject -Identity $member.distinguishedName -Properties Description -ErrorAction SilentlyContinue
+                $adObj = try { Get-ADObject -Identity $member.distinguishedName -Properties Description -ErrorAction Stop } catch { $null }
                 if ($adObj.Description) {
-                    $descHtml = " <span style='color:#888; font-style:italic; font-weight:normal;'>- $($adObj.Description)</span>"
+                    $descHtml = " <span style='color:#888; font-style:italic; font-weight:normal;'>- $(& $enc $adObj.Description)</span>"
                 }
             }
 
             if ($member.objectClass -eq 'group') {
-                $script:htmlContent += "<details><summary><span class='group-icon'>&#128193;</span> $($member.Name)$descHtml</summary>"
+                $script:htmlContent += "<details><summary><span class='group-icon'>&#128193;</span> $(& $enc $member.Name)$descHtml</summary>"
                 Process-GroupNode -Name $member.samAccountName
                 $script:htmlContent += "</details>"
             } else {
                 $icon = switch ($member.objectClass) { 'user' { "&#128100;" }; 'computer' { "&#128187;" }; default { "&#128196;" } }
-                $script:htmlContent += "<div class='item'><span class='member-icon'>$icon</span> $($member.Name) <small style='color:#999; margin-left:5px;'>($($member.objectClass))</small>$descHtml</div>"
+                $script:htmlContent += "<div class='item'><span class='member-icon'>$icon</span> $(& $enc $member.Name) <small style='color:#999; margin-left:5px;'>($($member.objectClass))</small>$descHtml</div>"
             }
         }
     }
@@ -128,13 +140,13 @@
 
         $rootDescHtml = ""
         if ($IncludeDescription -and $rootGroup.Description) {
-            $rootDescHtml = " <span style='color:#888; font-weight:normal; font-style:italic;'>- $($rootGroup.Description)</span>"
+            $rootDescHtml = " <span style='color:#888; font-weight:normal; font-style:italic;'>- $(& $enc $rootGroup.Description)</span>"
         }
 
         # Zaczynamy każdy korzeń jako zamknięty szczegół (inaczej strona HTML by się ładowała pół minuty)
-        $script:htmlContent += "<details class='root-group'><summary><span class='group-icon'>&#128193;</span> $($rootGroup.Name)$rootDescHtml</summary>"
+        $script:htmlContent += "<details class='root-group'><summary><span class='group-icon'>&#128193;</span> $(& $enc $rootGroup.Name)$rootDescHtml</summary>"
         
-        $script:visitedGroups = @() # Resetujemy ochronę przed zapętleniem dla każdego nowego drzewa
+        $script:visitedGroups.Clear()
         Process-GroupNode -Name $rootGroup.samAccountName
         
         $script:htmlContent += "</details>"

@@ -1,4 +1,4 @@
-#>
+﻿#>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -24,8 +24,14 @@ function New-FixedColumn {
     (New-Object System.Windows.Forms.ColumnHeader -Property @{Text = $text; Width = $width }) 
 }
 
-function Show-Error([string]$msg, [Exception]$ex = $null) {
-    [System.Windows.Forms.MessageBox]::Show(($msg + (if ($ex) "`r`n`r`n$($ex.Message)" else '')), 'Błąd', 'OK', 'Error') | Out-Null
+function Show-Error([string]$msg, $ex = $null) {
+    # $ex moze byc ErrorRecord ($_ z bloku catch), Exception albo tekst
+    $detail = if ($ex -is [System.Management.Automation.ErrorRecord]) { $ex.Exception.Message }
+    elseif ($ex -is [Exception]) { $ex.Message }
+    elseif ($ex) { [string]$ex }
+    else { '' }
+    $text = if ($detail) { "$msg`r`n`r`n$detail" } else { $msg }
+    [System.Windows.Forms.MessageBox]::Show($text, 'Błąd', 'OK', 'Error') | Out-Null
 }
 
 function Format-Bytes([long]$bytes) {
@@ -362,6 +368,14 @@ $btnClearSel.Add_Click({
     })
 
 # ======= INFRA: rejestracja modułów (każdy moduł = zakładka) =======
+# Handlery zdarzen uruchamiaja sie dopiero po zakonczeniu buildera zakladki, wiec jego
+# zmienne lokalne ($grid, $cmbHost, $refreshAction, funkcje pomocnicze...) juz wtedy nie istnieja.
+# Dlatego zapamietujemy je w Tag zakladki:
+#  - Invoke-InModuleContext udostepnia je akcji jako $ctx.Controls,
+#  - Restore-ModuleScope przywraca je do zakresu skryptu przy aktywacji zakladki
+#    (handlery odwoluja sie wtedy bezposrednio do $grid itp. aktywnej zakladki).
+$script:ModuleVarNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
 function Register-ModuleTab {
     param(
         [string]$Name,
@@ -376,13 +390,74 @@ function Register-ModuleTab {
         $targets = @($targetsRaw)
         if ($targets.Count -eq 0 -or ($targets.Count -eq 1 -and [string]::IsNullOrWhiteSpace([string]$targets[0]))) {
             Show-Error "Wybierz najpierw komputery z listy po lewej."
-            throw "Brak host�w"
+            throw "Brak hostów"
         }
         $targets
     }
     $script:getTargets = $getTargets
-    & $Builder $tab $getTargets
+
+    # Builder wykonywany (dot-source) we wlasnym zakresie, aby mozna bylo zebrac jego zmienne i funkcje
+    $captured = & {
+        param($__builder, $tab, $getTargets)
+        $__varsBefore = @(Get-Variable -Scope 0 | ForEach-Object { $_.Name })
+        $__fnBefore = @(Get-ChildItem -Path function: | ForEach-Object { $_.Name })
+        . $__builder $tab $getTargets | Out-Null
+        $__vars = @{ tab = $tab }
+        foreach ($__v in @(Get-Variable -Scope 0)) {
+            if ($__varsBefore -contains $__v.Name -or $__v.Name -like '__*') { continue }
+            $__vars[$__v.Name] = $__v.Value
+        }
+        $__fns = @{}
+        foreach ($__f in @(Get-ChildItem -Path function:)) {
+            if ($__fnBefore -notcontains $__f.Name) { $__fns[$__f.Name] = $__f.ScriptBlock }
+        }
+        [pscustomobject]@{ Variables = $__vars; Functions = $__fns }
+    } $Builder $tab $getTargets
+
+    $tab.Tag = [pscustomobject]@{
+        Name      = $Name
+        Controls  = $captured.Variables
+        Functions = $captured.Functions
+    }
     $App.Modules += $Name
+}
+
+function Restore-ModuleScope([System.Windows.Forms.TabPage]$TabPage) {
+    if (-not $TabPage -or -not $TabPage.Tag) { return }
+    $info = $TabPage.Tag
+    foreach ($entry in $info.Controls.GetEnumerator()) {
+        # Nie nadpisujemy zmiennych samego skryptu (np. $form, $tabs, $State) - tylko te pochodzace z zakladek
+        $existing = Get-Variable -Name $entry.Key -Scope Script -ErrorAction SilentlyContinue
+        if ($existing -and -not $script:ModuleVarNames.Contains($entry.Key)) { continue }
+        Set-Variable -Name $entry.Key -Value $entry.Value -Scope Script
+        [void]$script:ModuleVarNames.Add($entry.Key)
+    }
+    foreach ($fn in $info.Functions.GetEnumerator()) {
+        Set-Item -Path ("function:script:{0}" -f $fn.Key) -Value $fn.Value
+    }
+}
+
+function Invoke-InModuleContext {
+    param(
+        [object]$SourceControl,
+        [scriptblock]$Action
+    )
+    $page = $SourceControl
+    while ($page -and -not ($page -is [System.Windows.Forms.TabPage])) { $page = $page.Parent }
+    $info = if ($page) { $page.Tag } else { $null }
+    $ctx = [pscustomobject]@{
+        Tab      = $page
+        Name     = if ($info) { $info.Name } else { $null }
+        Controls = if ($info) { $info.Controls } else { @{} }
+    }
+    $prev = $script:CurrentModule
+    try {
+        $script:CurrentModule = $ctx.Name
+        & $Action $ctx
+    }
+    finally {
+        $script:CurrentModule = $prev
+    }
 }
 
 # ======= MODUŁY (zakładki) =======
@@ -706,6 +781,8 @@ Register-ModuleTab -Name 'Usługi' -Builder {
 
     # Inicjalizacja listy hostów
     $tab.Add_Enter({
+            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
+            Restore-ModuleScope $this
             Invoke-InModuleContext -SourceControl $this -Action {
                 param($ctx)
                 $combo = $ctx.Controls.cmbHost
@@ -727,7 +804,7 @@ Register-ModuleTab -Name 'Usługi' -Builder {
                     $s = $State.CimSessions[$selectedHost]
                     $svcs = Get-CimInstance -ClassName Win32_Service -CimSession $s | Sort-Object Name
                     if ($filterBox.Text) { $svcs = $svcs | Where-Object { $_.Name -like "*$($filterBox.Text)*" -or $_.DisplayName -like "*$($filterBox.Text)*" } }
-                    $gridCtrl.DataSource = $svcs | Select-Object Name, DisplayName, State, StartMode, ProcessId
+                    $gridCtrl.DataSource = @($svcs | Select-Object Name, DisplayName, State, StartMode, ProcessId)
                 }
                 catch { Write-Log $_.Exception.Message 'ERROR' }
             }
@@ -1321,8 +1398,9 @@ Register-ModuleTab -Name 'Konto komputera (AD)' -Builder {
             @{Btn = $btnEnable; What = 'Enable' },
             @{Btn = $btnDisable; What = 'Disable' }
         )) {
-        $currentAct = $btnAct
-        $currentAct.Btn.Add_Click({
+        # Akcja zapisana w Tag przycisku - zmienna petli w handlerze wskazywalaby zawsze ostatnia akcje
+        $btnAct.Btn.Tag = $btnAct.What
+        $btnAct.Btn.Add_Click({
                 Invoke-InModuleContext -SourceControl $this -Action {
                     param($ctx)
                     $txtDC = $ctx.Controls.txtDC
@@ -1333,13 +1411,29 @@ Register-ModuleTab -Name 'Konto komputera (AD)' -Builder {
                         $targets = & $getTargets
                         $dc = $txtDC.Text.Trim()
                         $rows = @()
+                        $what = [string]$this.Tag
                         foreach ($t in $targets) {
-                            switch ($currentAct.What) {
-                                'Reset' { $p = @{Identity = $t; ErrorAction = 'Stop' }; if ($dc) { $p.Server = $dc }; Reset-ADComputer @p; $act = 'Reset-ADComputer' }
-                                'Enable' { $p = @{Identity = $t; ErrorAction = 'Stop' }; if ($dc) { $p.Server = $dc }; Enable-ADAccount @p; $act = 'Enable-ADAccount' }
-                                'Disable' { $p = @{Identity = $t; ErrorAction = 'Stop' }; if ($dc) { $p.Server = $dc }; Disable-ADAccount @p; $act = 'Disable-ADAccount' }
+                            $srv = @{}; if ($dc) { $srv.Server = $dc }
+                            try {
+                                # Nazwa komputera -> obiekt AD (sAMAccountName komputera konczy sie na '$')
+                                $comp = Get-ADComputer -Identity $t @srv -ErrorAction Stop
+                                switch ($what) {
+                                    'Reset' {
+                                        # Odpowiednik "Reset Account" z ADUC: haslo konta = nazwa konta malymi literami
+                                        $newPwd = ConvertTo-SecureString $comp.SamAccountName.ToLowerInvariant() -AsPlainText -Force
+                                        Set-ADAccountPassword -Identity $comp -Reset -NewPassword $newPwd @srv -ErrorAction Stop
+                                        $act = 'Reset hasla konta komputera'
+                                    }
+                                    'Enable' { Enable-ADAccount -Identity $comp @srv -ErrorAction Stop; $act = 'Enable-ADAccount' }
+                                    'Disable' { Disable-ADAccount -Identity $comp @srv -ErrorAction Stop; $act = 'Disable-ADAccount' }
+                                    default { throw "Nieznana akcja: $what" }
+                                }
+                                $rows += [pscustomobject]@{Komputer = $t; Akcja = $act; Wynik = 'OK' }
                             }
-                            $rows += [pscustomobject]@{Komputer = $t; Akcja = $act; Wynik = 'OK' }
+                            catch {
+                                $rows += [pscustomobject]@{Komputer = $t; Akcja = $what; Wynik = "Błąd: $($_.Exception.Message)" }
+                                Write-Log "[$t] $what : $($_.Exception.Message)" 'ERROR'
+                            }
                         }
                         $grid.DataSource = $rows
                     }
@@ -1470,6 +1564,8 @@ Register-ModuleTab -Name 'Udziały (zarządzanie)' -Builder {
     $tab.Controls.Add($cmbHost)
 
     $tab.Add_Enter({
+            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
+            Restore-ModuleScope $this
             $cmbHost.Items.Clear()
             foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
             if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
@@ -1718,6 +1814,8 @@ Register-ModuleTab -Name 'Lokalni administratorzy' -Builder {
     $tab.Controls.Add($cmbHost)
 
     $tab.Add_Enter({
+            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
+            Restore-ModuleScope $this
             $cmbHost.Items.Clear()
             foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
             if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
@@ -1757,8 +1855,10 @@ Register-ModuleTab -Name 'Lokalni administratorzy' -Builder {
             $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
             Write-Log "[$selectedHost] odczyt grupy Lokalni Administratorzy..."
             $sb = {
+                # Nazwa grupy zalezy od jezyka systemu (Administrators/Administratorzy) - wyznaczamy ja z SID
+                $adminGroup = ([System.Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
                 function Get-NetLocalAdminsFallback {
-                    $raw = (net localgroup administrators) | Out-String
+                    $raw = (net localgroup "$adminGroup") | Out-String
                     $lines = $raw -split "`r?`n"
                     $body = $false; $items = @()
                     foreach ($l in $lines) {
@@ -1772,7 +1872,7 @@ Register-ModuleTab -Name 'Lokalni administratorzy' -Builder {
                 }
                 if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
                     try {
-                        Get-LocalGroupMember -Group 'Administrators' | Select-Object Name, ObjectClass, PrincipalSource, SID
+                        Get-LocalGroupMember -SID 'S-1-5-32-544' | Select-Object Name, ObjectClass, PrincipalSource, SID
                     } catch { Get-NetLocalAdminsFallback }
                 } else { Get-NetLocalAdminsFallback }
             }
@@ -1790,10 +1890,11 @@ Register-ModuleTab -Name 'Lokalni administratorzy' -Builder {
                 $sb = {
                     param($member)
                     if (Get-Command Add-LocalGroupMember -ErrorAction SilentlyContinue) {
-                        Add-LocalGroupMember -Group 'Administrators' -Member $member -ErrorAction Stop
+                        Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $member -ErrorAction Stop
                         'OK (Add-LocalGroupMember)'
                     } else {
-                        cmd.exe /c "net localgroup administrators `"$member`" /add" | Out-Null
+                        $adminGroup = ([System.Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+                        cmd.exe /c "net localgroup `"$adminGroup`" `"$member`" /add" | Out-Null
                         'OK (net localgroup)'
                     }
                 }
@@ -1812,10 +1913,11 @@ Register-ModuleTab -Name 'Lokalni administratorzy' -Builder {
                 $sb = {
                     param($member)
                     if (Get-Command Remove-LocalGroupMember -ErrorAction SilentlyContinue) {
-                        Remove-LocalGroupMember -Group 'Administrators' -Member $member -ErrorAction Stop
+                        Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member $member -ErrorAction Stop
                         'OK (Remove-LocalGroupMember)'
                     } else {
-                        cmd.exe /c "net localgroup administrators `"$member`" /delete" | Out-Null
+                        $adminGroup = ([System.Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+                        cmd.exe /c "net localgroup `"$adminGroup`" `"$member`" /delete" | Out-Null
                         'OK (net localgroup)'
                     }
                 }
@@ -1925,6 +2027,8 @@ Register-ModuleTab -Name 'Zadania (Harmonogram)' -Builder {
     $tab.Controls.Add($grid)
 
     $tab.Add_Enter({
+            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
+            Restore-ModuleScope $this
             $cmbHost.Items.Clear()
             foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
             if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
@@ -1969,13 +2073,16 @@ Register-ModuleTab -Name 'Zadania (Harmonogram)' -Builder {
             @{Btn = $btnDisable; Op = 'Disable' },
             @{Btn = $btnDel; Op = 'Delete' }
         )) {
+        # Operacja zapisana w Tag przycisku - $pair w handlerze wskazywalby zawsze ostatnia pare ('Delete')
+        $pair.Btn.Tag = $pair.Op
         $pair.Btn.Add_Click({
                 try {
+                    $op = [string]$this.Tag
                     $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
                     if (-not $grid.SelectedRows) { Show-Error "Zaznacz zadanie."; return }
                     $tn = $grid.SelectedRows[0].Cells['TaskName'].Value
                     $tp = $grid.SelectedRows[0].Cells['TaskPath'].Value
-                    Write-Log "[$selectedHost] $($pair.Op) zadania $tp$tn ..."
+                    Write-Log "[$selectedHost] $op zadania $tp$tn ..."
                     $sb = {
                         param($tp, $tn, $op)
                         switch ($op) {
@@ -1985,7 +2092,7 @@ Register-ModuleTab -Name 'Zadania (Harmonogram)' -Builder {
                             'Delete' { Unregister-ScheduledTask -TaskPath $tp -TaskName $tn -Confirm:$false; 'Deleted' }
                         }
                     }
-                    $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ tp = $tp; tn = $tn; op = $pair.Op }
+                    $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ tp = $tp; tn = $tn; op = $op }
                     Write-Log "[$selectedHost] $r"
                     $btnLoad.PerformClick()
                 } catch { Write-Log $_.Exception.Message 'ERROR' }
@@ -2075,6 +2182,8 @@ Register-ModuleTab -Name 'Zapora Windows' -Builder {
     $tab.Controls.Add($grid)
 
     $tab.Add_Enter({
+            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
+            Restore-ModuleScope $this
             $cmbHost.Items.Clear()
             foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
             if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
@@ -2211,24 +2320,28 @@ Register-ModuleTab -Name 'LAPS (AD)' -Builder {
                     Write-Log "[AD:$c] pobieram atrybuty LAPS..."
                     try {
                         $obj = Get-ADComputer -Identity $c -Properties * -ErrorAction Stop
-                        $legacyPwd = $obj.'ms-Mcs-AdmPwd'
-                        $legacyExp = Convert-FileTimeLocal $obj.'ms-Mcs-AdmPwdExpirationTime'
+                        # StrictMode: brakujacy atrybut (brak schematu/uprawnien) rzucalby wyjatek przy $obj.'attr'
+                        $getAttr = { param($name) $p = $obj.PSObject.Properties[$name]; if ($p) { $p.Value } else { $null } }
+                        $legacyPwd = & $getAttr 'ms-Mcs-AdmPwd'
+                        $legacyExp = Convert-FileTimeLocal (& $getAttr 'ms-Mcs-AdmPwdExpirationTime')
                         $winPwd = $null
                         $winExp = $null
                         # Preferuj oficjalny cmdlet jeśli dostępny (Windows LAPS)
                         if (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue) {
                             try {
-                                $lp = Get-LapsADPassword -Identity $c -ErrorAction Stop
+                                $lp = Get-LapsADPassword -Identity $c -AsPlainText -ErrorAction Stop
                                 if ($lp -and $lp.Password -and $lp.ExpirationTime) {
-                                    $winPwd = $lp.Password
+                                    $winPwd = [string]$lp.Password
                                     $winExp = $lp.ExpirationTime.ToLocalTime()
                                 }
                             } catch {}
                         }
                         if (-not $winPwd) {
-                            $winPwd = $obj.'msLAPS-Password'
-                            $winExp = $obj.'msLAPS-PasswordExpirationTime'
-                            if ($winExp -and ($winExp -is [string])) { try { $winExp = [datetime]::Parse($winExp).ToLocalTime() } catch {} }
+                            $winPwd = & $getAttr 'msLAPS-Password'
+                            # msLAPS-Password to JSON {"n":konto,"t":czas,"p":haslo}
+                            if ($winPwd) { try { $winPwd = [string](($winPwd | ConvertFrom-Json).p) } catch {} }
+                            # msLAPS-PasswordExpirationTime to FILETIME (jak w legacy LAPS)
+                            $winExp = Convert-FileTimeLocal (& $getAttr 'msLAPS-PasswordExpirationTime')
                         }
                         if ($legacyPwd) {
                             $rows += [pscustomobject]@{Komputer = $c; Rozwiązanie = 'LAPS (legacy)'; Hasło = $legacyPwd; Wygasa = $legacyExp; Info = '' }
@@ -2273,8 +2386,8 @@ Register-ModuleTab -Name 'LAPS (AD)' -Builder {
     $btnCopy.Add_Click({
             try {
                 if (-not $grid.SelectedRows) { Show-Error "Zaznacz pozycję z hasłem."; return }
-                $lapsPassword = $grid.SelectedRows[0].Cells['Haslo'].Value
-                if ([string]::IsNullOrWhiteSpace($lapsPassword) -or $lapsPassword -eq '(niedostepne)') { Show-Error "Brak hasla do skopiowania."; return }
+                $lapsPassword = [string]$grid.SelectedRows[0].Cells['Hasło'].Value
+                if ([string]::IsNullOrWhiteSpace($lapsPassword) -or $lapsPassword -eq '(niedostępne)') { Show-Error "Brak hasla do skopiowania."; return }
                 [System.Windows.Forms.Clipboard]::SetText($lapsPassword)
                 Write-Log "Skopiowano hasło LAPS do schowka (lokalnie)."
             } catch { Write-Log $_.Exception.Message 'ERROR' }
@@ -2323,6 +2436,8 @@ Register-ModuleTab -Name 'Certyfikaty (LM)' -Builder {
     $tab.Controls.Add($grid)
 
     $tab.Add_Enter({
+            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
+            Restore-ModuleScope $this
             $cmbHost.Items.Clear()
             foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
             if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
@@ -2415,5 +2530,9 @@ Register-ModuleTab -Name 'Diagnostyka łączności' -Builder {
 }
 
 # ======= START UI =======
+# Zmienne aktywnej zakladki musza byc widoczne dla jej handlerow (patrz Register-ModuleTab)
+$tabs.add_Selecting({ param($sender, $e) if ($e.TabPage) { Restore-ModuleScope $e.TabPage } })
+$tabs.add_SelectedIndexChanged({ Restore-ModuleScope $tabs.SelectedTab })
+if ($tabs.TabPages.Count -gt 0) { Restore-ModuleScope $tabs.TabPages[0] }
 $form.Add_Shown({ $chkUseCurrent.Checked = $true })
 [void]$form.ShowDialog()

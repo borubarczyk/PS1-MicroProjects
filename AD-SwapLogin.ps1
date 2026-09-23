@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     A GUI utility for bulk-checking Active Directory users and swapping their GivenName (first name) and Surname (last name).
 
@@ -40,6 +40,9 @@
     https://github.com/BorysMagier/
 #>
 
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
 # --- WSTĘPNE SPRAWDZENIA ---
 try { Import-Module ActiveDirectory -ErrorAction Stop }
 catch {
@@ -48,11 +51,8 @@ catch {
 }
 
 if ($host.Runspace.ApartmentState -ne 'STA') {
-    Write-Warning "PowerShell nie działa w STA. Uruchom ten skrypt poleceniem: powershell -STA -File .\AD_Swap_GUI.ps1"
+    Write-Warning "PowerShell nie działa w STA. Uruchom ten skrypt poleceniem: powershell -STA -File .\AD-SwapLogin.ps1"
 }
-
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
 
 # --- UTYLITKI ---
 function New-RowObject {
@@ -92,9 +92,10 @@ function Get-UsersFromAD {
                 # Prosta heurystyka: DisplayName == "Nazwisko Imię" albo "Imię Nazwisko"
                 $isSN_GN = ($disp -eq "$sn $gn")
                 $isGN_SN = ($disp -eq "$gn $sn")
-                # Zasugeruj zamianę, jeżeli wygląda na "Nazwisko Imię" a GivenName==Nazwisko i Surname==Imię
+                # Zasugeruj zamianę, jeżeli DisplayName ("Imię Nazwisko") ma postać "Surname GivenName",
+                # czyli GivenName zawiera nazwisko, a Surname imię
                 if (($gn -match '^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż-]+$') -and ($sn -match '^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż-]+$')) {
-                    if ($isSN_GN -and ($gn -cmatch $sn) -and ($sn -cmatch $gn)) { $autoSwap = $true }
+                    if ($isSN_GN -and -not $isGN_SN) { $autoSwap = $true }
                 }
             }
 
@@ -308,15 +309,15 @@ foreach ($c in $grid.Columns) {
 
 # Uporzadkuj kolejnosc wyswietlania kolumn (lewa -> prawa)
 try {
-    $grid.Columns['Zamien?'].DisplayIndex = 0
+    $grid.Columns['Zamień?'].DisplayIndex = 0
     $grid.Columns['Login'].DisplayIndex   = 1
     $grid.Columns['Istnieje'].DisplayIndex= 2
-    $grid.Columns['Imie'].DisplayIndex    = 3
+    $grid.Columns['Imię'].DisplayIndex    = 3
     $grid.Columns['Nazwisko'].DisplayIndex= 4
-    $grid.Columns['Wyswietlana'].DisplayIndex = 5
+    $grid.Columns['Wyświetlana'].DisplayIndex = 5
     $grid.Columns['DN'].DisplayIndex      = 6
     # Przypnij pierwsze kolumny, aby zawsze byly widoczne po lewej
-    $grid.Columns['Zamien?'].Frozen = $true
+    $grid.Columns['Zamień?'].Frozen = $true
     $grid.Columns['Login'].Frozen   = $true
     $grid.Columns['Istnieje'].Frozen= $true
 } catch {}
@@ -405,12 +406,13 @@ $btnSwap.Add_Click({
                     # odśwież wiersz (lokalnie zamieniamy widok niezależnie od dry-run)
                     $row.Cells[$grid.Columns['Imię'].Index].Value = $sn
                     $row.Cells[$grid.Columns['Nazwisko'].Index].Value = $given
-                    if ($updateDN) { $row.Cells[$grid.Columns['Wyswietlana'].Index].Value = ("{0} {1}" -f $sn, $given) }
+                    if ($updateDN) { $row.Cells[$grid.Columns['Wyświetlana'].Index].Value = ("{0} {1}" -f $sn, $given) }
                     $row.Cells[0].Value = $false
                     $count++
                 }
                 catch {
                     $errors++
+                    $lblStatus.Text = "Błąd dla '$login': $($_.Exception.Message)"
                 }
             }
         }

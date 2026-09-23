@@ -1,4 +1,4 @@
-<#  Usuwa użytkowników WYŁĄCZONYCH z niekrytycznych grup AD.
+﻿<#  Usuwa użytkowników WYŁĄCZONYCH z niekrytycznych grup AD.
     - Domyślnie tylko podgląd (-WhatIf). Usuń -WhatIf żeby wykonać.
     - Można użyć wyboru w GUI (Out-GridView), jeśli jest dostępny.
 #>
@@ -72,6 +72,7 @@ foreach($u in $users){
     foreach($gDN in $u.MemberOf){
         $g = Get-ADGroup -Identity $gDN -ErrorAction SilentlyContinue
         $gName = if($g){ $g.Name } else { $null }
+        $gLabel = if($gName){ $gName } else { $gDN }
 
         # pomiń, jeśli to grupa chroniona (po Name) albo nie udało się pobrać
         if($gName -and $protSet.Contains($gName)){
@@ -79,13 +80,13 @@ foreach($u in $users){
             continue
         }
 
-        Write-Host "  Usuwam z grupy: $($gName ?? $gDN)"
+        Write-Host "  Usuwam z grupy: $gLabel"
         try{
             # -WhatIf chroni przed faktycznym usunięciem, usuń -WhatIf po weryfikacji
             Remove-ADGroupMember -Identity $gDN -Members $u.DistinguishedName -Confirm:$false -ErrorAction Stop -WhatIf
         }
         catch{
-            Write-Warning "  Błąd usuwania z $($gName ?? $gDN): $($_.Exception.Message)"
+            Write-Warning "  Błąd usuwania z ${gLabel}: $($_.Exception.Message)"
         }
     }
 }

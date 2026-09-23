@@ -1,4 +1,4 @@
-Add-Type -AssemblyName System.Windows.Forms
+﻿Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -84,7 +84,8 @@ function Get-FilesIndex {
     )
     $rootClean = (Get-Item -LiteralPath $Root).FullName.TrimEnd('\', '/')
     Write-DebugLog "Get-FilesIndex: Root='$Root' rootClean='$rootClean'"
-    $files = Get-ChildItem -LiteralPath $rootClean -Recurse -File -ErrorAction Stop
+    # -Force: uwzgledniamy rowniez pliki ukryte/systemowe (inaczej zmiany w nich byly niewidoczne)
+    $files = @(Get-ChildItem -LiteralPath $rootClean -Recurse -File -Force -ErrorAction Stop)
     $index = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
     $total = [math]::Max(1, $files.Count)
     Write-DebugLog "Get-FilesIndex: files=$($files.Count)"
@@ -386,10 +387,6 @@ $null = $grid.GetType().GetProperty('DoubleBuffered', [System.Reflection.Binding
 # Zmienna na wyniki
 $script:lastResults = @()
 
-# Podsumowanie wyników w etykiecie (różne/razem)
-$totalCount = ($script:lastResults | Measure-Object).Count
-$diffCount  = ($script:lastResults | Where-Object { $_.Status -notlike 'Same*' } | Measure-Object).Count
-$lblStatus.Text = "Zakończono. Różne: $diffCount / Razem: $totalCount"
 function Update-Grid {
     $items = $script:lastResults
     if ($null -eq $items) { $items = @() }
@@ -476,7 +473,7 @@ $btnRun.Add_Click({
                 -TrustFastPrecheck:($chkTrustPre.Checked) `
                 -ProgressBar $progress -StatusLabel $lblStatus
 
-            $script:lastResults = $results
+            $script:lastResults = @($results)
             Write-DebugLog "Run: results=$(@($results).Count)"
             Update-Grid
 
@@ -484,13 +481,10 @@ $btnRun.Add_Click({
             try {
                 $totalCount = ($script:lastResults | Measure-Object).Count
                 $diffCountLbl = ($script:lastResults | Where-Object { $_.Status -notlike 'Same*' } | Measure-Object).Count
-                $lblStatus.Text = "Zakonczono. Roznice: $diffCountLbl / Razem: $totalCount"
+                $lblStatus.Text = "Zakończono. Różne: $diffCountLbl / Razem: $totalCount"
+                Write-DebugLog "Run: diffCount=$diffCountLbl"
             }
             catch {}
-
-            $diffCount = ($results | Where-Object { $_.Status -notlike 'Same*' }).Count
-            Write-DebugLog "Run: diffCount=$diffCount"
-            $lblStatus.Text = "Zakończono. Różne: $diffCount"
         }
         catch {
             [System.Windows.Forms.MessageBox]::Show("Błąd: " + $_.Exception.Message)

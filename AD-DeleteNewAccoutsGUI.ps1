@@ -1,8 +1,8 @@
-Add-Type -AssemblyName System.Windows.Forms
+﻿Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # --- Konfiguracja logu ---
-$logFile = "$env:USERPROFILE\Desktop\AD_Delete_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$logFile = Join-Path ([Environment]::GetFolderPath('Desktop')) "AD_Delete_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 Function Write-Log {
     param([string]$msg)
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $msg"
@@ -119,9 +119,8 @@ Function Get-NewADUsers {
 
     # Uzyskanie użytkowników - jeśli w Twoim środowisku AD jest dużo użytkowników możesz preferować bardziej zoptymalizowane filtry/LDAP query
     Try {
-        $users = Get-ADUser -Filter * -Properties whenCreated,displayName,sAMAccountName,distinguishedName |
-                 Where-Object { $_.whenCreated -ge $startTime } |
-                 Sort-Object -Property whenCreated -Descending
+        $users = @(Get-ADUser -Filter 'whenCreated -ge $startTime' -Properties whenCreated,displayName,sAMAccountName,distinguishedName -ErrorAction Stop |
+                 Sort-Object -Property whenCreated -Descending)
         Write-Log "Znaleziono $($users.Count) użytkowników."
         return $users
     } Catch {
@@ -138,10 +137,10 @@ Function Populate-List {
     $listView.Items.Clear()
     $users = Get-NewADUsers -minutes $minutes
     foreach ($u in $users) {
-        $lvi = New-Object System.Windows.Forms.ListViewItem($u.DisplayName)
-        $lvi.SubItems.Add($u.sAMAccountName)
-        $lvi.SubItems.Add($u.whenCreated.ToString("yyyy-MM-dd HH:mm:ss"))
-        $lvi.SubItems.Add($u.DistinguishedName)
+        $lvi = New-Object System.Windows.Forms.ListViewItem([string]$u.DisplayName)
+        [void]$lvi.SubItems.Add([string]$u.sAMAccountName)
+        [void]$lvi.SubItems.Add($u.whenCreated.ToString("yyyy-MM-dd HH:mm:ss"))
+        [void]$lvi.SubItems.Add([string]$u.DistinguishedName)
         # przechowaj DN w Tag dla późniejszego użycia
         $lvi.Tag = $u.DistinguishedName
         $listView.Items.Add($lvi) > $null
@@ -232,7 +231,7 @@ $btnDisable.Add_Click({
         $sam = $it.SubItems[1].Text
         Try {
             Write-Log "Wyłączanie konta: $sam, DN: $dn"
-            Set-ADUser -Identity $sam -Enabled $false -ErrorAction Stop
+            Disable-ADAccount -Identity $dn -ErrorAction Stop
             Write-Log "Wyłączono: $sam"
         } Catch {
             Write-Log "Błąd wyłączania $sam : $($_.Exception.Message)"
