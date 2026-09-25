@@ -1,4 +1,4 @@
-#Requires -Modules ActiveDirectory
+﻿#Requires -Modules ActiveDirectory
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -375,7 +375,7 @@ function Show-MoveDisabledUsersGUI {
     # ===== Logika =====
     function Get-DisabledUsersOutsideOU([string]$BaseOU){
         Get-ADUser -Filter 'Enabled -eq $false' -Properties DistinguishedName,SamAccountName,Name |
-            Where-Object { $_.DistinguishedName -notlike "*$BaseOU*" } |
+            Where-Object { -not $_.DistinguishedName.EndsWith(",$BaseOU", [StringComparison]::OrdinalIgnoreCase) } |
             Select-Object Name,SamAccountName,DistinguishedName |
             Sort-Object Name
     }
@@ -396,7 +396,7 @@ function Show-MoveDisabledUsersGUI {
                 $btnScan.Enabled = $true
                 $btnPickTarget.Enabled = $true
                 $tbLog.AppendText("Autowybrano bazowe OU: $maybe`r`n")
-                Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text
+                [void](Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text)
             }
         } catch {}
     }
@@ -407,7 +407,7 @@ function Show-MoveDisabledUsersGUI {
             $tbBase.Text = $sel; $lblStatus.Text = "Bazowe OU: $sel"; $tbTarget.Text = ""
             $btnScan.Enabled = $true; $btnPickTarget.Enabled = $true
             $tbLog.AppendText("Wybrano bazowe OU: $sel`r`n")
-            Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text
+            [void](Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text)
         }
     })
 
@@ -417,7 +417,7 @@ function Show-MoveDisabledUsersGUI {
         if ($sel) {
             $tbTarget.Text = $sel
             $tbLog.AppendText("Wybrano docelowe OU: $sel`r`n")
-            Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text
+            [void](Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text)
         }
     })
 
@@ -477,7 +477,9 @@ function Show-MoveDisabledUsersGUI {
             
             # --- 1. PRZENOSZENIE ---
             try {
-                if ($u.DN -like "*$target*") {
+                # OU nadrzedne obiektu (pomija przecinki escapowane w CN, np. "CN=Kowalski\, Jan")
+                $parentDn = $u.DN -replace '^(?:\\.|[^,])+,', ''
+                if ($parentDn -ieq $target) {
                     $tbLog.AppendText("  Pominięto (już w docelowym OU).`r`n")
                 } else {
                     if ($whatIf) {
@@ -535,7 +537,7 @@ function Show-MoveDisabledUsersGUI {
     $btnMoveAndClean.Add_Click({ Execute-Process -CleanGroups $true })
 
     $form.Add_Shown({ $form.Activate() }) | Out-Null
-    $form.Add_FormClosing({ Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text }) | Out-Null
+    $form.Add_FormClosing({ [void](Save-Config -BaseOU $tbBase.Text -TargetOU $tbTarget.Text) }) | Out-Null
     [void]$form.ShowDialog()
 }
 

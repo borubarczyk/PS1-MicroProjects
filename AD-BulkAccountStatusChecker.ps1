@@ -1,15 +1,15 @@
-#Requires -Modules ActiveDirectory
-
-#region Active Directory Setup
-Import-Module ActiveDirectory -ErrorAction Stop
-try { [void](Get-ADDomain) } catch { [System.Windows.Forms.MessageBox]::Show("Brak polaczenia z AD: $($_.Exception.Message)"); return }
-#endregion Active Directory Setup
+﻿#Requires -Modules ActiveDirectory
 
 #region WinForms Bootstrapping
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 #endregion WinForms Bootstrapping
+
+#region Active Directory Setup
+Import-Module ActiveDirectory -ErrorAction Stop
+try { [void](Get-ADDomain) } catch { [System.Windows.Forms.MessageBox]::Show("Brak polaczenia z AD: $($_.Exception.Message)") | Out-Null; return }
+#endregion Active Directory Setup
 
 #region GUI Construction
 
@@ -244,7 +244,9 @@ function Invoke-AccountCheck {
     $statsLabel.Text = "Przetwarzanie..."
 
     $logins = @($inputBox.Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    $logins = @($logins | Select-Object -Unique)
+    # Loginy AD nie rozrozniaja wielkosci liter - deduplikacja bez uwzglednienia wielkosci
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $logins = @($logins | Where-Object { $seen.Add($_) })
 
     if (-not $logins -or $logins.Count -eq 0) {
         $statsLabel.Text = "Brak loginów do sprawdzenia"
@@ -325,8 +327,9 @@ $exportBtn.Add_Click({
 
 $inputBox.Add_TextChanged({
     $lines = $inputBox.Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-    $uniq = $lines | Select-Object -Unique
-    $countLabel.Text = "Liczba kont: {0} | Unikalne: {1}" -f $lines.Count, $uniq.Count
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($l in $lines) { [void]$seen.Add($l) }
+    $countLabel.Text = "Liczba kont: {0} | Unikalne: {1}" -f @($lines).Count, $seen.Count
 })
 
 # Odświeżanie widoku po zmianie filtra/sortowania

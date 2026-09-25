@@ -1,4 +1,4 @@
-#Requires -Modules ActiveDirectory
+﻿#Requires -Modules ActiveDirectory
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -23,11 +23,27 @@ function Write-LogUI([string]$Text){
 }
 
 # ===== AD helpers =====
+function ConvertTo-LdapFilterValue([string]$value){
+    # RFC 4515 - escapowanie znakow specjalnych w filtrze LDAP
+    $sb = New-Object System.Text.StringBuilder
+    foreach($ch in $value.ToCharArray()){
+        switch($ch){
+            '\' { [void]$sb.Append('\5c') }
+            '*'  { [void]$sb.Append('\2a') }
+            '('  { [void]$sb.Append('\28') }
+            ')'  { [void]$sb.Append('\29') }
+            ([char]0) { [void]$sb.Append('\00') }
+            default { [void]$sb.Append($ch) }
+        }
+    }
+    return $sb.ToString()
+}
 function Resolve-Group([string]$id){
     if([string]::IsNullOrWhiteSpace($id)){ return $null }
     $id = $id.Trim()
-    $g = Get-ADGroup -LDAPFilter "(sAMAccountName=$id)" -ErrorAction SilentlyContinue
-    if(-not $g){ $g = Get-ADGroup -LDAPFilter "(name=$id)" -ErrorAction SilentlyContinue }
+    $esc = ConvertTo-LdapFilterValue $id
+    $g = Get-ADGroup -LDAPFilter "(sAMAccountName=$esc)" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if(-not $g){ $g = Get-ADGroup -LDAPFilter "(name=$esc)" -ErrorAction SilentlyContinue | Select-Object -First 1 }
     if(-not $g){ try{ $g = Get-ADGroup -Identity $id -ErrorAction Stop } catch{} }
     return $g
 }
@@ -95,7 +111,9 @@ function Add-NTFSPerms {
     $acl = Get-Acl -LiteralPath $Path
     if($ProtectInheritance){ $acl.SetAccessRuleProtection($true, $true) }
 
-    $nt = New-Object System.Security.Principal.NTAccount($Identity)
+    # Identity jako SID (S-1-...) jednoznacznie wskazuje grupe domenowa; nazwa moglaby
+    # zostac rozwiazana na grupe lokalna/BUILTIN o tej samej nazwie (np. "Users")
+    $nt = if($Identity -match '^S-1-'){ New-Object System.Security.Principal.SecurityIdentifier($Identity) } else { New-Object System.Security.Principal.NTAccount($Identity) }
     if($PurgeExisting){ $acl.PurgeAccessRules($nt) | Out-Null }
 
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($nt, $rights, $inh, $prop, [System.Security.AccessControl.AccessControlType]::Allow)
@@ -277,7 +295,7 @@ function Build-Form {
                 if(-not $g){ $r.Cells['Result'].Value="Grupa nieznaleziona"; $err++; continue }
 
                 try{
-                    Add-NTFSPerms -Path $path -Identity $g.SamAccountName -RightsName $perm -AppliesName $appl -PurgeExisting:$script:cbPurge.Checked -ProtectInheritance:$script:cbProtect.Checked -WhatIf:$script:cbWhatIf.Checked
+                    Add-NTFSPerms -Path $path -Identity $g.SID.Value -RightsName $perm -AppliesName $appl -PurgeExisting:$script:cbPurge.Checked -ProtectInheritance:$script:cbProtect.Checked -WhatIf:$script:cbWhatIf.Checked
                     $r.Cells['Result'].Value = $(if($script:cbWhatIf.Checked){'WhatIf'}else{'OK'})
                     if(-not $script:cbWhatIf.Checked){ $ok++ }
                 } catch {

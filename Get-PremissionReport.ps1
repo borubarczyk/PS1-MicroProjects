@@ -1,4 +1,4 @@
-
+﻿
 # Skrypt do generowania raportu uprawnień do folderów i plików
 # Napisał: Borys Kaleta
 
@@ -56,7 +56,11 @@ Function Get-FolderName($Description) {
 function Get-AclPremmisionReport($Path, $ReportPath) {
     try {
         Write-Progress -Activity "Trwa generowanie raportu..." -Status "Czekaj" -PercentComplete -1
-        Get-ChildItem -Recurse $path | Where-Object { $_.PsIsContainer } | ForEach-Object { $path1 = $_.fullname; Get-Acl $_.Fullname | ForEach-Object { $_.access | Add-Member -MemberType NoteProperty 'Path' -Value $path1 -passthru } } | Export-Csv -Path $ReportPath -Encoding UTF8 -NoTypeInformation -Delimiter ";"
+        # Kolejnosc kolumn zgodna z $Header (Sciezka jako pierwsza); uwzgledniamy tez folder glowny
+        @(Get-Item -LiteralPath $Path) + @(Get-ChildItem -LiteralPath $Path -Recurse -Directory -Force -ErrorAction SilentlyContinue) | ForEach-Object {
+            $path1 = $_.FullName
+            (Get-Acl -LiteralPath $path1).Access | Select-Object @{ n = 'Path'; e = { $path1 } }, FileSystemRights, AccessControlType, IdentityReference, IsInherited, InheritanceFlags, PropagationFlags
+        } | Export-Csv -Path $ReportPath -Encoding UTF8 -NoTypeInformation -Delimiter ";"
         Write-Progress -Activity "Trwa generowanie raportu..." -Completed
     }
     catch {
@@ -67,7 +71,7 @@ function Get-AclPremmisionReport($Path, $ReportPath) {
 function Get-CleanAclPremmisionReport($ReportLocation, $NewReportLocation) {
     try {
         Write-Host "Czyszczenie raportu z wyjatkow" -ForegroundColor Green
-        Import-Csv $ReportLocation -Delimiter ";" -Encoding UTF8  | Where-Object { ($Exceptions -notcontains $_.IdentityReference) -and (-not $_.IdentityReference.StartsWith("S-1-")) } | Export-Csv -Path $NewReportLocation -Encoding UTF8 -NoTypeInformation -Delimiter ";" 
+        Import-Csv -LiteralPath $ReportLocation -Delimiter ";" -Encoding UTF8  | Where-Object { ($Exceptions -notcontains $_.IdentityReference) -and (-not $_.IdentityReference.StartsWith("S-1-")) } | Export-Csv -Path $NewReportLocation -Encoding UTF8 -NoTypeInformation -Delimiter ";" 
         Write-Host "Raport zostal wyczyszczony pomyslnie" -ForegroundColor Green
     }
     catch {
@@ -76,9 +80,11 @@ function Get-CleanAclPremmisionReport($ReportLocation, $NewReportLocation) {
 }
 
 function Set-Headers($ReportPath, $Header){
-    $content = Get-Content $ReportPath
+    if (-not (Test-Path -LiteralPath $ReportPath)) { return }
+    $content = @(Get-Content -LiteralPath $ReportPath -Encoding UTF8)
+    if ($content.Count -eq 0) { return }
     $content[0] = $Header
-    $content | Set-Content $ReportPath
+    $content | Set-Content -LiteralPath $ReportPath -Encoding UTF8
 }
 
 function Get-PremissionReport() {
@@ -94,6 +100,7 @@ function Get-PremissionReport() {
             Write-Host "Lokalizacja raportu: $SaveReportPath" -ForegroundColor Green
             Get-CleanAclPremmisionReport $SaveReportPath $CleandReportPath
             Write-Host "Lokalizacja wyczyszczonego raportu: $CleandReportPath" -ForegroundColor Green
+            Set-Headers $SaveReportPath $Header
             Set-Headers $CleandReportPath $Header
         }
         else {

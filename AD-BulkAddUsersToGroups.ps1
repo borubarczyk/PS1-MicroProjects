@@ -1,4 +1,4 @@
-#Requires -Modules ActiveDirectory
+﻿#Requires -Modules ActiveDirectory
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -22,19 +22,36 @@ function Write-LogUI([string]$Text){
 }
 
 # === GLOBAL: AD RESOLVERS ===
+function ConvertTo-LdapFilterValue([string]$value){
+    # RFC 4515 - escapowanie znakow specjalnych w filtrze LDAP
+    $sb = New-Object System.Text.StringBuilder
+    foreach($ch in $value.ToCharArray()){
+        switch($ch){
+            '\' { [void]$sb.Append('\5c') }
+            '*'  { [void]$sb.Append('\2a') }
+            '('  { [void]$sb.Append('\28') }
+            ')'  { [void]$sb.Append('\29') }
+            ([char]0) { [void]$sb.Append('\00') }
+            default { [void]$sb.Append($ch) }
+        }
+    }
+    return $sb.ToString()
+}
 function Resolve-User([string]$id){
     if([string]::IsNullOrWhiteSpace($id)){ return $null }
     $id = $id.Trim()
-    $u = Get-ADUser -LDAPFilter "(sAMAccountName=$id)" -ErrorAction SilentlyContinue
-    if(-not $u){ $u = Get-ADUser -LDAPFilter "(userPrincipalName=$id)" -ErrorAction SilentlyContinue }
+    $esc = ConvertTo-LdapFilterValue $id
+    $u = Get-ADUser -LDAPFilter "(sAMAccountName=$esc)" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if(-not $u){ $u = Get-ADUser -LDAPFilter "(userPrincipalName=$esc)" -ErrorAction SilentlyContinue | Select-Object -First 1 }
     if(-not $u){ try{ $u = Get-ADUser -Identity $id -ErrorAction Stop } catch{} }
     return $u
 }
 function Resolve-Group([string]$id){
     if([string]::IsNullOrWhiteSpace($id)){ return $null }
     $id = $id.Trim()
-    $g = Get-ADGroup -LDAPFilter "(sAMAccountName=$id)" -ErrorAction SilentlyContinue
-    if(-not $g){ $g = Get-ADGroup -LDAPFilter "(name=$id)" -ErrorAction SilentlyContinue }
+    $esc = ConvertTo-LdapFilterValue $id
+    $g = Get-ADGroup -LDAPFilter "(sAMAccountName=$esc)" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if(-not $g){ $g = Get-ADGroup -LDAPFilter "(name=$esc)" -ErrorAction SilentlyContinue | Select-Object -First 1 }
     if(-not $g){ try{ $g = Get-ADGroup -Identity $id -ErrorAction Stop } catch{} }
     return $g
 }
@@ -196,18 +213,22 @@ function Build-Form {
     $script:btnRun.Add_Click({
         $script:btnRun.Enabled = $false
         try{
-            $users = @()
+            # Listy wierszowe (z $null dla nierozpoznanych) - potrzebne do trybu wiersz-do-wiersza,
+            # zeby pominiecie jednego wiersza nie przesuwalo kolejnych par
+            $userRows = @()
             foreach($r in $script:gridU.Rows){
                 if($r.IsNewRow){ continue }
                 $id = "$($r.Cells['UserId'].Value)".Trim()
-                if($id){ $u = Resolve-User $id; if($u){ $users += $u } else { Write-LogUI "Użytkownik '$id' nie znaleziony – pomijam." } }
+                if($id){ $u = Resolve-User $id; if($u){ $userRows += ,$u } else { $userRows += ,$null; Write-LogUI "Użytkownik '$id' nie znaleziony – pomijam." } }
             }
-            $groups = @()
+            $groupRows = @()
             foreach($r in $script:gridG.Rows){
                 if($r.IsNewRow){ continue }
                 $id = "$($r.Cells['GroupId'].Value)".Trim()
-                if($id){ $g = Resolve-Group $id; if($g){ $groups += $g } else { Write-LogUI "Grupa '$id' nie znaleziona – pomijam." } }
+                if($id){ $g = Resolve-Group $id; if($g){ $groupRows += ,$g } else { $groupRows += ,$null; Write-LogUI "Grupa '$id' nie znaleziona – pomijam." } }
             }
+            $users  = @($userRows  | Where-Object { $_ })
+            $groups = @($groupRows | Where-Object { $_ })
 
             if(-not $users.Count){ Write-LogUI "Brak poprawnych użytkowników."; return }
             if(-not $groups.Count){ Write-LogUI "Brak poprawnych grup."; return }
@@ -229,9 +250,10 @@ function Build-Form {
                     }
                 }
             } else {
-                $n = [Math]::Min($users.Count,$groups.Count)
+                $n = [Math]::Min($userRows.Count,$groupRows.Count)
                 for($i=0;$i -lt $n; $i++){
-                    $u = $users[$i]; $g = $groups[$i]
+                    $u = $userRows[$i]; $g = $groupRows[$i]
+                    if(-not $u -or -not $g){ Write-LogUI "Wiersz $($i+1): brak rozpoznanego użytkownika lub grupy – pomijam."; continue }
                     try{
                         if($whatIf){
                             Write-LogUI "[WhatIf] Add-ADGroupMember '$($g.SamAccountName)' ← '$($u.SamAccountName)'."
@@ -243,7 +265,7 @@ function Build-Form {
                         Write-LogUI "BŁĄD: '$($u.SamAccountName)' → '$($g.SamAccountName)': $($_.Exception.Message)"
                     }
                 }
-                if($users.Count -ne $groups.Count){
+                if($userRows.Count -ne $groupRows.Count){
                     Write-LogUI "Uwaga: różna liczba użytkowników i grup. Sparowano $n wierszy."
                 }
             }

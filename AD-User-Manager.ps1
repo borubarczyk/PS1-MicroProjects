@@ -57,10 +57,12 @@ function Show-UserInfo {
     $selectedUser = $comboBox.Text
     if ($selectedUser) {
         try {
-            $user = Get-ADUser -Identity $selectedUser -Properties Enabled,LockedOut,LastBadPasswordAttempt,badPwdCount,LastLogonDate,PasswordLastSet,PasswordExpired,DisplayName,Created
+            $user = Get-ADUser -Identity $selectedUser -Properties Enabled,LockedOut,LastBadPasswordAttempt,badPwdCount,LastLogonDate,PasswordLastSet,PasswordExpired,PasswordNeverExpires,DisplayName,Created -ErrorAction Stop
             # Obliczanie daty wygaśnięcia hasła
             $maxPasswordAge = (Get-ADDefaultDomainPasswordPolicy).MaxPasswordAge.Days
-            $passwordExpires = if ($user.PasswordLastSet) { $user.PasswordLastSet.AddDays($maxPasswordAge) } else { "Nigdy nie ustawiono" }
+            $passwordExpires = if (-not $user.PasswordLastSet) { "Nigdy nie ustawiono" }
+                elseif ($user.PasswordNeverExpires -or $maxPasswordAge -le 0) { "Nigdy nie wygasa" }
+                else { $user.PasswordLastSet.AddDays($maxPasswordAge) }
             
             $textBox.Clear()
 
@@ -138,8 +140,20 @@ $lockButton.Add_Click({
     $selectedUser = $comboBox.Text
     if ($selectedUser) {
         try {
-            $u = Get-ADUser -Identity $selectedUser -Properties Enabled; if ($u.Enabled) { $confirm = [System.Windows.Forms.MessageBox]::Show("Czy na pewno zablokowac (wylaczyc) konto '" + $selectedUser + "'?","Potwierdzenie",[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning); if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) { Disable-ADAccount -Identity $selectedUser; [System.Windows.Forms.MessageBox]::Show("Konto zostalo zablokowane (wylaczone)", "Sukces") | Out-Null } } else { $confirm = [System.Windows.Forms.MessageBox]::Show("Czy na pewno odblokowac (wlaczyc) konto '" + $selectedUser + "'?","Potwierdzenie",[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question); if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) { Enable-ADAccount -Identity $selectedUser; [System.Windows.Forms.MessageBox]::Show("Konto zostalo odblokowane (wlaczone)", "Sukces") | Out-Null } }
-            [System.Windows.Forms.MessageBox]::Show("Konto zostało zablokowane", "Sukces")
+            $u = Get-ADUser -Identity $selectedUser -Properties Enabled -ErrorAction Stop
+            if ($u.Enabled) {
+                $confirm = [System.Windows.Forms.MessageBox]::Show("Czy na pewno zablokowac (wylaczyc) konto '" + $selectedUser + "'?","Potwierdzenie",[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning)
+                if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    Disable-ADAccount -Identity $selectedUser -ErrorAction Stop
+                    [System.Windows.Forms.MessageBox]::Show("Konto zostalo zablokowane (wylaczone)", "Sukces") | Out-Null
+                }
+            } else {
+                $confirm = [System.Windows.Forms.MessageBox]::Show("Czy na pewno odblokowac (wlaczyc) konto '" + $selectedUser + "'?","Potwierdzenie",[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question)
+                if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    Enable-ADAccount -Identity $selectedUser -ErrorAction Stop
+                    [System.Windows.Forms.MessageBox]::Show("Konto zostalo odblokowane (wlaczone)", "Sukces") | Out-Null
+                }
+            }
             Show-UserInfo
         }
         catch {
@@ -178,7 +192,11 @@ $resetButton.Add_Click({
         
         if ($resetForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             try {
-                Set-ADAccountPassword -Identity $selectedUser -NewPassword (ConvertTo-SecureString $passBox.Text -AsPlainText -Force)
+                if ([string]::IsNullOrEmpty($passBox.Text)) {
+                    [System.Windows.Forms.MessageBox]::Show("Hasło nie może być puste.", "Błąd") | Out-Null
+                    return
+                }
+                Set-ADAccountPassword -Identity $selectedUser -Reset -NewPassword (ConvertTo-SecureString $passBox.Text -AsPlainText -Force) -ErrorAction Stop
                 [System.Windows.Forms.MessageBox]::Show("Hasło zostało zresetowane", "Sukces")
                 Show-UserInfo
             }
@@ -214,7 +232,7 @@ $unlockButton.Add_Click({
         }
         $confirm = [System.Windows.Forms.MessageBox]::Show("Odblokowac konto po zbyt wielu probach logowania?", "Potwierdzenie", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
         if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-        Unlock-ADAccount -Identity $selectedUser
+        Unlock-ADAccount -Identity $selectedUser -ErrorAction Stop
         [System.Windows.Forms.MessageBox]::Show("Konto zostalo odblokowane (lockout)", "Sukces") | Out-Null
         Show-UserInfo
     }
@@ -227,4 +245,4 @@ $unlockButton.Add_Click({
 $form.Controls.AddRange(@($comboBox,$textBox,$lockButton,$resetButton,$unlockButton))
 
 # Pokazanie formularza
-$form.ShowDialog()
+[void]$form.ShowDialog()

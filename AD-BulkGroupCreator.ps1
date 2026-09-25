@@ -1,4 +1,4 @@
-# Created by BK
+﻿# Created by BK
 #Requires -Modules ActiveDirectory
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -128,7 +128,7 @@ function New-GroupsUI([string]$OuDn) {
         $item = $scopeMenu.Items.Add($scopeOption)
         $item.Tag = $scopeOption
         $item.add_Click({
-            param($sender,$args)
+            param($sender,$e)
             if ($sender.Tag) {
                 & $setColumnForAll 'Scope' $sender.Tag
             }
@@ -140,7 +140,7 @@ function New-GroupsUI([string]$OuDn) {
         $item = $categoryMenu.Items.Add($catOption)
         $item.Tag = $catOption
         $item.add_Click({
-            param($sender,$args)
+            param($sender,$e)
             if ($sender.Tag) {
                 & $setColumnForAll 'Category' $sender.Tag
             }
@@ -168,8 +168,11 @@ function New-GroupsUI([string]$OuDn) {
                 $name  = $parts[0].Trim()
                 if ([string]::IsNullOrWhiteSpace($name)) { continue }
                 $desc  = if ($parts.Count -ge 2) { $parts[1] } else { "" }
-                $scope = if ($parts.Count -ge 3 -and @('Global','DomainLocal','Universal') -contains $parts[2]) { $parts[2] } else { 'Global' }
-                $cat   = if ($parts.Count -ge 4 -and @('Security','Distribution') -contains $parts[3]) { $parts[3] } else { 'Security' }
+                # Normalizacja do dokladnej wartosci z listy (ComboBox wymaga identycznego tekstu)
+                $scope = 'Global'
+                if ($parts.Count -ge 3) { $m = @('Global','DomainLocal','Universal') | Where-Object { $_ -eq $parts[2].Trim() } | Select-Object -First 1; if ($m) { $scope = $m } }
+                $cat = 'Security'
+                if ($parts.Count -ge 4) { $m = @('Security','Distribution') | Where-Object { $_ -eq $parts[3].Trim() } | Select-Object -First 1; if ($m) { $cat = $m } }
                 $email = if ($parts.Count -ge 5) { $parts[4].Trim() } else { "" }
 
                 $idx = $grid.Rows.Add()
@@ -201,6 +204,8 @@ function New-GroupsUI([string]$OuDn) {
                 $desc  = "$($row.Cells['Desc'].Value)".Trim()
                 $scp   = "$($row.Cells['Scope'].Value)"
                 $cat   = "$($row.Cells['Category'].Value)"
+                if ([string]::IsNullOrWhiteSpace($scp)) { $scp = 'Global' }
+                if ([string]::IsNullOrWhiteSpace($cat)) { $cat = 'Security' }
                 $email = "$($row.Cells['Email'].Value)".Trim()
 
                 if ([string]::IsNullOrWhiteSpace($name)) { $row.Cells['Result'].Value = "Pominięto: brak Nazwy"; continue }
@@ -211,7 +216,7 @@ function New-GroupsUI([string]$OuDn) {
 
                 try {
                     if (-not [string]::IsNullOrWhiteSpace($sam) -and
-                        Get-ADGroup -LDAPFilter "(sAMAccountName=$sam)" -ErrorAction SilentlyContinue) {
+                        (Get-ADGroup -LDAPFilter "(sAMAccountName=$sam)" -ErrorAction SilentlyContinue)) {
                         $row.Cells['Result'].Value = "Istnieje (sAM=$sam)"
                         continue
                     }

@@ -100,7 +100,10 @@ $Script:AllUsers = @()
 
 # Główna funkcja aplikująca filtry (odpala się przy każdej zmianie na UI)
 function Apply-Filters {
-    if ($Script:AllUsers.Count -eq 0) { return }
+    if ($Script:AllUsers.Count -eq 0) {
+        $GridUsers.ItemsSource = $null
+        return
+    }
 
     # Formatowanie podstawowe (dodano Miasto)
     $DisplayList = foreach ($User in $Script:AllUsers) {
@@ -149,7 +152,8 @@ function Apply-Filters {
     }
 
     # Zabezpieczenie przed błędem Overload - rzutowanie na tablicę [object[]]
-    $SafeArray = @($DisplayList | Sort-Object InactiveDays -Descending)
+    # Konta bez logowania ("Nigdy") na gorze, potem malejaco po liczbie dni
+    $SafeArray = @($DisplayList | Sort-Object @{ Expression = { if ($_.LastLogonDate) { [int]$_.InactiveDays } else { [int]::MaxValue } } } -Descending)
     $GridUsers.ItemsSource = [System.Collections.ObjectModel.ObservableCollection[System.Object]]::new([object[]]$SafeArray)
     
     $Count = $SafeArray.Count
@@ -161,8 +165,14 @@ $BtnRefresh.Add_Click({
     $TxtStatus.Text = "Pobieranie danych z AD... Proszę czekać."
     
     # Odpytanie AD
-    $Script:AllUsers = Get-ADUser -Filter * -Properties LastLogonDate, Enabled, City | 
-                       Select-Object Name, SamAccountName, Enabled, LastLogonDate, City
+    try {
+        $Script:AllUsers = @(Get-ADUser -Filter * -Properties LastLogonDate, Enabled, City -ErrorAction Stop |
+                           Select-Object Name, SamAccountName, Enabled, LastLogonDate, City)
+    } catch {
+        $TxtStatus.Text = "Błąd pobierania danych z AD."
+        [System.Windows.MessageBox]::Show("Błąd pobierania danych z AD: $($_.Exception.Message)", "Błąd", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        return
+    }
     
     # Zaaplikowanie filtrów po pobraniu
     Apply-Filters

@@ -1,4 +1,4 @@
-<# 
+﻿<# 
 GUI do tworzenia wielu OU oraz (tych samych) grup w kazdym OU.
 - Wspiera podglad (WhatIf) i wykonanie.
 - Transliteration do sAMAccountName: ASCII, max 20, zamiana spacji/symboli na '-'.
@@ -130,7 +130,7 @@ function Select-OrganizationalUnit {
     $btnCancel.Size = '90,28'
 
     $all = [System.Collections.ArrayList]::new()
-    [void]$all.AddRange($ous)
+    if ($ous) { [void]$all.AddRange(@($ous)) }
     function Refresh-List { param($filter)
         $lst.Items.Clear()
         $items = if ([string]::IsNullOrWhiteSpace($filter)) { $all } else { $all | Where-Object { $_.Display -like "*${filter}*" } }
@@ -189,7 +189,7 @@ function Ensure-OU {
         return $targetDN 
     }
 
-    if ($PSCmdlet.ShouldProcess($targetDN, "Utw�rz OU")) {
+    if ($PSCmdlet.ShouldProcess($targetDN, "Utworz OU")) {
         try {
             if ($script:DoWhatIf) {
                 Write-Log "[WHATIF] Utworzylbym OU: $targetDN (Protected=$Protect)"
@@ -216,14 +216,15 @@ function Ensure-Group {
         [Parameter(Mandatory)][string] $Path,      # OU docelowe (DN)
         [string] $Description
     )
-    $nameEsc = $Name.Replace("'", "'")
-    $existing = Get-ADGroup -Filter "Name -eq '$nameEsc'" -SearchBase $Path -ErrorAction SilentlyContinue
+    $nameEsc = $Name.Replace("'", "''")
+    # W trybie WhatIf OU moze jeszcze nie istniec - Get-ADGroup rzuca wtedy blad terminujacy
+    $existing = try { Get-ADGroup -Filter "Name -eq '$nameEsc'" -SearchBase $Path -ErrorAction Stop } catch { $null }
     if ($existing) { 
         Write-Log "[=] Grupa istnieje: $($existing.DistinguishedName)"
         return $existing.DistinguishedName 
     }
 
-    if ($PSCmdlet.ShouldProcess("$Name @ $Path", "Utw�rz grupe")) {
+    if ($PSCmdlet.ShouldProcess("$Name @ $Path", "Utworz grupe")) {
         try {
             if ($script:DoWhatIf) {
                 Write-Log "[WHATIF] Utworzylbym grupe: $Name (sAM=$Sam, $Scope/$Category) w $Path"

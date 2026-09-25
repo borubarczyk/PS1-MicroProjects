@@ -182,12 +182,17 @@ $loadButton.Add_Click({
 
 $logTimer.Add_Tick({
     if ($script:job) {
-        while ($script:job.HasMoreData) {
-            $message = $script:job | Receive-Job
+        foreach ($message in @($script:job | Receive-Job)) {
             $logTextBox.AppendText("`r`n$message")
         }
 
         if ($script:job.State -in ('Completed', 'Failed', 'Stopped')) {
+            # Odbierz ewentualne pozostale komunikaty oraz bledy zadania
+            try {
+                foreach ($message in @($script:job | Receive-Job -ErrorAction Stop)) { $logTextBox.AppendText("`r`n$message") }
+            } catch {
+                $logTextBox.AppendText("`r`n[ERROR] $($_.Exception.Message)")
+            }
             $logTextBox.AppendText("`r`n`r`n[INFO] Analysis finished with state: $($script:job.State).")
             # Clean up the job
             Remove-Job $script:job
@@ -202,6 +207,33 @@ $logTimer.Add_Tick({
 })
 
 $startButton.Add_Click({
+    # Walidacja danych wejsciowych przed zablokowaniem kontrolek
+    $daysBack = 0
+    if (-not [int]::TryParse($daysBackTextBox.Text.Trim(), [ref]$daysBack) -or $daysBack -le 0) {
+        [System.Windows.Forms.MessageBox]::Show('Days Back must be a positive integer.', 'Validation', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $eventIds = @()
+    foreach ($idText in ($eventIdsTextBox.Text -split ',')) {
+        $idText = $idText.Trim()
+        if (-not $idText) { continue }
+        $id = 0
+        if (-not [int]::TryParse($idText, [ref]$id)) {
+            [System.Windows.Forms.MessageBox]::Show("Invalid event ID: '$idText'.", 'Validation', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $eventIds += $id
+    }
+    if ($eventIds.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('Specify at least one event ID.', 'Validation', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $computers = @($computersTextBox.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (-not $queryDCsCheckBox.Checked -and $computers.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('Specify at least one computer.', 'Validation', 'OK', 'Warning') | Out-Null
+        return
+    }
+
     $logTextBox.Clear()
     $logTextBox.AppendText("[INFO] Starting analysis... The UI will remain responsive.")
 
@@ -212,11 +244,11 @@ $startButton.Add_Click({
 
     # Gather parameters from form
     $params = @{
-        DaysBack  = [int]$daysBackTextBox.Text
-        EventIDs  = $eventIdsTextBox.Text -split ',' | ForEach-Object { $_.Trim() }
+        DaysBack  = $daysBack
+        EventIDs  = $eventIds
         OutputDir = $outputDirTextBox.Text
         QueryDCs  = $queryDCsCheckBox.Checked
-        Computers = $computersTextBox.Text -split ',' | ForEach-Object { $_.Trim() }
+        Computers = $computers
     }
 
     # This scriptblock runs in the background
@@ -266,6 +298,7 @@ $startButton.Add_Click({
             }
             try {
                 $events = Get-WinEvent -FilterHashtable $filter -ComputerName $computer -ErrorAction Stop
+                $events = @($events)
                 $allEvents.AddRange($events)
                 Write-Output "[INFO] Found $($events.Count) events on $computer."
             } catch {
@@ -282,22 +315,27 @@ $startButton.Add_Click({
 
         # 4. Process events into a readable format
         Write-Output "[INFO] Processing $($allEvents.Count) total events..."
-        $results = foreach ($event in $allEvents) {
-            $properties = @{}
-            for ($i = 0; $i -lt $event.Properties.Count; $i++) {
-                # Attempt to get a meaningful name, otherwise use index
-                $propName = try { ($event.ToXml() | Select-Xml -XPath "/*/*[local-name()='EventData']/*[@Name][position()=$($i+1)]").Node.Name } catch { "Property_$i" }
-                $properties[$propName] = $event.Properties[$i].Value
+        $results = @(foreach ($evt in $allEvents) {
+            $properties = [ordered]@{}
+            # Nazwy pol z EventData (XML parsowany raz na zdarzenie)
+            $dataNames = @()
+            try {
+                $xmlEvt = [xml]$evt.ToXml()
+                $dataNames = @($xmlEvt.Event.EventData.Data | ForEach-Object { $_.Name })
+            } catch { }
+            for ($i = 0; $i -lt $evt.Properties.Count; $i++) {
+                $propName = if ($i -lt $dataNames.Count -and $dataNames[$i]) { [string]$dataNames[$i] } else { "Property_$i" }
+                $properties[$propName] = $evt.Properties[$i].Value
             }
             
             [pscustomobject]@{
-                TimeCreated = $event.TimeCreated
-                EventID     = $event.Id
-                Computer    = $event.MachineName
-                Message     = $event.Message -replace "`r|`n"," "
+                TimeCreated = $evt.TimeCreated
+                EventID     = $evt.Id
+                Computer    = $evt.MachineName
+                Message     = $evt.Message -replace "`r|`n"," "
                 Properties  = $properties | ConvertTo-Json -Compress
             }
-        }
+        })
         
         # 5. Save report
         $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -319,7 +357,7 @@ $startButton.Add_Click({
 
 
 # --- SHOW THE FORM ---
-$mainForm.ShowDialog()
+[void]$mainForm.ShowDialog()
 
 # --- CLEANUP ---
 $mainForm.Dispose()

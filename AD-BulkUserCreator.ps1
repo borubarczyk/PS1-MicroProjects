@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Bulk Active Directory user creation wizard with a modern WinForms UI.
 
@@ -35,33 +35,8 @@ friendly error hints for typical AD creation problems.
 - Windows desktop session (WinForms UI).
 
 .USAGE
-- Run the script: .$btnPomoc.Add_Click({
-    $msg = @" 
-OPIS
-- Narzedzie do masowego tworzenia kont AD z wklejanych danych (TAB).
-- Normalizuje imiona/nazwiska, generuje loginy/e-maile, wybor Domena/UPN i OU.
-- Sprawdza kolizje (login/CN), koloruje wiersze, podpowiada unikalne loginy.
-- Po utworzeniu kont uruchamia synchronizacje: Start-ADSyncSyncCycle -PolicyType Delta.
-- Nazwa uzytkownika (Name) oraz DisplayName w AD sa identyczne i wynikaja z formatu ustawionego per zakladka; dostepne tokeny: {Imie}, {Nazwisko}, {Rola}, {Login}/{SamAccountName}, {Album}.
-
-WKLEJANIE (TAB)
-- Uczen/Pracownik/Wykladowca/Inne: Imie[TAB]Nazwisko
-- Student: Imie[TAB]Nazwisko[TAB]NrAlbumu
-
-PRZYCISKI (w zakladce)
-- Wklej: wkleja dane z schowka.
-- Usun: usuwa zaznaczony wiersz. WhatIf: tryb podgladu.
-- Sprawdz: waliduje dane i kolizje AD. Odswiez: przelicza loginy/e‑maile.
-- Utworz: tworzy konta w OU i startuje Delta sync do M365.
-- Kopiuj: kopiuje TSV: Email, Nazwa wyswietlana, Haslo.
-- Eksport CSV: zapisuje biezaca zakladke do CSV.
-- Wyczysc: czysci wszystkie wiersze.
-
-WYMAGANIA
-- RSAT ActiveDirectory, uprawnienia do OU, sesja desktop Windows.
-"@
-    [Windows.Forms.MessageBox]::Show($msg, 'Pomoc – Kreator Kont AD') | Out-Null
-  })- Select a tab (role). Paste data from clipboard:
+- Run the script: .\AD-BulkUserCreator.ps1
+- Select a tab (role). Paste data from clipboard:
   • Uczen/Pracownik/Wykladowca/Inne:  Imie<TAB>Nazwisko
   • Student:                           Imie<TAB>Nazwisko<TAB>NrAlbumu
 - Pick Domena/UPN and choose OU. Adjust formats if applicable and click
@@ -902,6 +877,23 @@ function Show-InvalidDataDialog {
 }
 #endregion Names & Validation
 
+# Escapowanie wartosci w filtrze LDAP (RFC 4515) - np. nawiasy w "Jan Kowalski (Student)"
+function ConvertTo-LdapFilterValue {
+  param([string]$Value)
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($ch in $Value.ToCharArray()) {
+    switch ($ch) {
+      '\' { [void]$sb.Append('\5c') }
+      '*' { [void]$sb.Append('\2a') }
+      '(' { [void]$sb.Append('\28') }
+      ')' { [void]$sb.Append('\29') }
+      ([char]0) { [void]$sb.Append('\00') }
+      default { [void]$sb.Append($ch) }
+    }
+  }
+  return $sb.ToString()
+}
+
 # Sprawdza typowe konflikty przed utworzeniem konta w AD
 #region AD Pre-checks & Errors
 function Test-ADPreCreateConflicts {
@@ -912,13 +904,13 @@ function Test-ADPreCreateConflicts {
   )
   $res = [ordered]@{ LoginExists = $false; NameExists = $false; Messages = New-Object System.Collections.Generic.List[string] }
   try {
-    $u = Get-ADUser -LDAPFilter "(sAMAccountName=$Sam)" -ErrorAction Stop
+    $u = Get-ADUser -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapFilterValue $Sam))" -ErrorAction Stop
     if ($u) { $res.LoginExists = $true; $null = $res.Messages.Add("Login zajęty w AD: $Sam") }
   }
   catch {}
   if (-not [string]::IsNullOrWhiteSpace($Path)) {
     try {
-      $o = Get-ADObject -LDAPFilter "(name=$CN)" -SearchBase $Path -SearchScope OneLevel -ErrorAction Stop
+      $o = Get-ADObject -LDAPFilter "(name=$(ConvertTo-LdapFilterValue $CN))" -SearchBase $Path -SearchScope OneLevel -ErrorAction Stop
       if ($o) { $res.NameExists = $true; $null = $res.Messages.Add("Nazwa (CN/Name) już istnieje w OU: '$CN'") }
     }
     catch {}
@@ -987,10 +979,14 @@ function Get-FriendlyADError {
 
 #region Password Generation
 function Get-RandChar([Parameter(Mandatory)][string]$Pool) {
+  # UInt32 zamiast [math]::Abs(Int32) - Abs(Int32.MinValue) rzuca OverflowException
   $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
-  $bytes = New-Object 'Byte[]' 4; $rng.GetBytes($bytes)
-  $idx = [math]::Abs([BitConverter]::ToInt32($bytes, 0)) % $Pool.Length
-  $Pool[$idx]
+  try {
+    $bytes = New-Object 'Byte[]' 4; $rng.GetBytes($bytes)
+    $idx = [BitConverter]::ToUInt32($bytes, 0) % [uint32]$Pool.Length
+  }
+  finally { $rng.Dispose() }
+  $Pool[[int]$idx]
 }
 function Test-Sequential([char]$Prev, [char]$Curr) { if (-not $Prev) { return $false }; return ([math]::Abs([int][char]$Prev - [int][char]$Curr) -eq 1) }
 function New-RandomPassword([ValidateRange(8, 128)][int]$Length = 8) {
@@ -1171,7 +1167,8 @@ function Invoke-ActiveTabCheck {
     $colorExists = [System.Drawing.Color]::LightCoral    # czerwony: konto istnieje
     $colorFree = [System.Drawing.Color]::PaleGreen     # zielony: konto wolne
     # Wyczyść wcześniejsze kolory
-    foreach ($r in 0..($grid.Rows.Count - 1)) {
+    # for zamiast 0..(Count-1): przy pustej siatce zakres 0..-1 dawal indeks spoza zakresu
+    for ($r = 0; $r -lt $grid.Rows.Count; $r++) {
       $rowClr = $grid.Rows[$r]
       if ($rowClr -and -not $rowClr.IsNewRow) { $rowClr.DefaultCellStyle.BackColor = [System.Drawing.Color]::Empty }
     }
@@ -2005,7 +2002,10 @@ foreach ($name in $tabNames) {
           if ([string]::IsNullOrWhiteSpace($login)) { Write-ToTextBox "Pomijam wiersz bez loginu" 'Warning'; continue }
           if (-not $isStrictDuplicateTab) {
             $loginU = Get-UniqueLogin -BaseLogin $login -Rola $selectedTab
-            if ($loginU -ne $login) { $row.Cells['Login'].Value = $loginU; $login = $loginU }
+            if ($loginU -ne $login) {
+              $row.Cells['Login'].Value = $loginU; $login = $loginU
+              Write-ToTextBox "Login zajety - uzyto unikalnego: $login" 'Info'
+            }
           }
 
           $studentAlbumForDisplay = if ($selectedTab -eq 'Student') { ([string]$row.Cells[$ColNrAlbumu].Value).Trim() } else { '' }
@@ -2016,6 +2016,9 @@ foreach ($name in $tabNames) {
             "{0}@{1}" -f $login, $domainForAccount
           }
 
+          # Email w siatce musi odpowiadac faktycznie tworzonemu kontu (uzywa go przycisk Kopiuj)
+          if ($row.Cells[$ColEmail]) { $row.Cells[$ColEmail].Value = $email }
+
           $dn = Get-DisplayNameForRole -TabName $selectedTab -Imie $imi -Nazwisko $naz -Login $login -StudentAlbum $studentAlbumForDisplay
           if ($row.Cells[$ColNazwaWyswietlana]) { $row.Cells[$ColNazwaWyswietlana].Value = $dn }
 
@@ -2025,7 +2028,9 @@ foreach ($name in $tabNames) {
           if ([string]::IsNullOrWhiteSpace($PlainPassword)) { $PlainPassword = New-RandomPassword; $row.Cells['Haslo'].Value = $PlainPassword }
 
           try {
-            $targetPath = if (-not [string]::IsNullOrWhiteSpace($tbOU_Edit.Text)) { $tbOU_Edit.Text } else { $OU_Defaults[$selectedTab] }
+            # Pole OU moze zawierac tekst zastepczy - uzywamy go tylko, gdy wyglada na DN
+            $targetPath = if (-not [string]::IsNullOrWhiteSpace($tbOU_Edit.Text) -and $tbOU_Edit.Text -match '=') { $tbOU_Edit.Text } else { $OU_Defaults[$selectedTab] }
+            if ([string]::IsNullOrWhiteSpace($targetPath)) { Write-ToTextBox "Brak OU dla zakladki $selectedTab - wybierz OU." 'Error'; return }
             # Pre-check typowych konfliktów przed New-ADUser
             $conf = Test-ADPreCreateConflicts -Sam $login -CN $cn -Path $targetPath
             $conflictReasons = @()
@@ -2051,6 +2056,8 @@ foreach ($name in $tabNames) {
               Path              = $targetPath
               AccountPassword   = (ConvertTo-SecureString $PlainPassword -AsPlainText -Force)
             }
+            $miasto = [string]$row.Cells[$ColMiasto].Value
+            if (-not [string]::IsNullOrWhiteSpace($miasto)) { $params['City'] = $miasto.Trim() }
             if ($WhatIf_ByTab.ContainsKey($selectedTab) -and $WhatIf_ByTab[$selectedTab].Checked) {
               Write-ToTextBox ("[WHATIF] New-ADUser " + ($params | Out-String)) 'Info'
             }
@@ -2322,7 +2329,7 @@ $form.Add_Shown({
     catch {}
     try {
       $cbDomain.Items.Clear()
-      [void]$cbDomain.Items.AddRange((Get-AvailableDomains))
+      [void]$cbDomain.Items.AddRange([object[]]@(Get-AvailableDomains))
       if ($tabs.SelectedTab) {
         $dnm = $Domain_Defaults[$tabs.SelectedTab.Text]
         if ($cbDomain.Items.Contains($dnm)) { $cbDomain.SelectedItem = $dnm }
