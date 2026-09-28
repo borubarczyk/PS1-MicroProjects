@@ -29,6 +29,16 @@ Get-ADDomainGroupTree -ExportHtmlPath C:\Temp\GrupyAD.html              # tylko 
 Get-ADDomainGroupTree -ExportHtmlPath C:\Temp\GrupyAD.html -ShowMembers -IncludeDescription
 ```
 
+`NET-SharePermissionAudit.ps1` to skrypt konsolowy z parametrami (bez GUI) — wynik to interaktywny raport HTML oraz pliki CSV:
+
+```powershell
+.\NET-SharePermissionAudit.ps1                                            # udziały komputera lokalnego
+.\NET-SharePermissionAudit.ps1 -ComputerName FS01, FS02 -Depth 4 -ExpandGroups
+.\NET-SharePermissionAudit.ps1 -FromAD -SearchBase 'OU=Serwery,DC=firma,DC=local' -ShareOnly
+.\NET-SharePermissionAudit.ps1 -Path '\\FS01\Dzialy\Kadry' -Depth -1 -UserAccess jkowalski
+Get-Help .\NET-SharePermissionAudit.ps1 -Full                               # opis wszystkich parametrów
+```
+
 ## Kodowanie plików
 
 Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows PowerShell 5.1 bez BOM czyta pliki w kodowaniu systemowym (np. cp1250), przez co polskie znaki psują napisy, a część skryptów w ogóle się nie parsuje. Przy edycji zachowuj kodowanie „UTF-8 with BOM” (w VS Code: *Save with Encoding → UTF-8 with BOM*).
@@ -43,6 +53,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | `Dokumenty\AD-BulkAttributeUpdater\Logs`, `...\Rollback` | `AD-UpdateUserTitleDepartment.ps1` | Logi oraz pliki JSON pozwalające cofnąć wprowadzone zmiany. |
 | `Pulpit\AD_Delete_Log_*.log` | `AD-DeleteNewAccoutsGUI.ps1` | Log usuniętych/wyłączonych kont. |
 | `Pulpit\NTFS_Audit_*.csv/.xlsx` | `AD-NTFS-AuditGUI.ps1` | Eksport wyników audytu NTFS. |
+| `Pulpit\ShareAudit_<data>\` (lub folder z `-OutputPath`) | `NET-SharePermissionAudit.ps1` | `Raport.html`, pliki CSV (ustalenia, udziały, uprawnienia udziałów i NTFS, członkowie grup, dostęp użytkowników, serwery, błędy), opcjonalnie `Raport.json`/`Raport.xlsx` oraz `Audyt.log`. |
 | `%TEMP%\DisabledUsersGroupsBackup.csv` | `AD-RemoveDisabledUsersFromGroups.ps1` | Kopia członkostw w grupach przed usunięciem. |
 | `%TEMP%\PC-CheckHashFoldersIntegrity.log` | `PC-CheckHashFoldersIntegrity.ps1` | Log diagnostyczny porównania. |
 | `%APPDATA%\CyberGenPro\CyberGenConfig.json`, `%TEMP%\CyberGenHistory.json` | `PasswordGenerator.ps1` | Ustawienia generatora oraz historia haseł z ostatnich 24 h (zapisana jawnym tekstem). |
@@ -72,6 +83,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | `AD-User-Manager.ps1` | Lekki manager użytkowników: wyszukuje po SamAccountName, wyświetla najważniejsze atrybuty (hasło, logowania, blokady), pozwala wyłączyć/włączyć konto, odblokować po lockoucie i zresetować hasło. |
 | `File-HashChecker.ps1` | Aplikacja WinForms licząca hashe MD5/SHA1/SHA256 dla wskazanych plików lub folderów (rekurencyjnie, również przez przeciągnij-i-upuść), z paskiem postępu i zakładką historii. |
 | `Get-PremissionReport.ps1` | Generator raportu ACL (CSV, separator `;`) dla wybranego folderu i jego podfolderów, wraz z wersją „clean” bez kont wbudowanych i nierozwiązanych SID. Folder źródłowy i miejsce zapisu wybierane są w oknach dialogowych. |
+| `NET-SharePermissionAudit.ps1` | Audyt uprawnień udziałów sieciowych na wielu serwerach (lista, OU w AD lub konkretne ścieżki): uprawnienia udziału (NetShareEnum — wystarczy port 445, bez WMI/WinRM), właściwości udziału (ABE, szyfrowanie, offline), NTFS do zadanej głębokości (równolegle, opcjonalnie po stronie serwera przez WinRM). Rozwiązuje SID-y w kontekście serwera, wykrywa ryzyka z wagą (m.in. zapis dla Everyone/Domain Users, dostęp anonimowy, pełna kontrola dla zwykłych kont, uprawnienia bezpośrednio dla użytkowników, osierocone SID-y, wyłączone konta, Deny, przerwane dziedziczenie), opcjonalnie rozwija grupy i liczy efektywny dostęp wskazanych użytkowników. Raport HTML z filtrami + CSV/JSON/XLSX. Tylko odczyt. |
 | `PasswordGenerator.ps1` | Generator haseł (WPF, kryptograficzne losowanie) z konfigurowalnymi regułami, generowaniem paczek do schowka, historią z ostatnich 24 h, motywem jasnym/ciemnym i wysyłką przez `mailto:`. |
 | `PC-CheckHashFoldersIntegrity.ps1` | WinForms do porównywania dwóch folderów (np. lokalnego z udziałem sieciowym): indeksuje pliki (także ukryte), porównuje rozmiar/datę i opcjonalnie SHA-256, pokazuje różnice i eksportuje je do CSV. |
 | `PC-Folder-TreeView.ps1` | Podgląd drzewa folderu (leniwe wczytywanie, opcjonalnie pliki ukryte) z eksportem do TXT w formie ASCII. Nie wchodzi w junctiony/symlinki. |
@@ -104,6 +116,7 @@ Po lewej stronie ładujesz komputery z AD (opcjonalnie SearchBase i filtr nazwy)
 - `AD-DeleteNewAccoutsGUI` usuwa konta nieodwracalnie (poza przywróceniem z Kosza AD) — jeśli nie masz pewności, użyj przycisku wyłączenia konta.
 - „Reset konta w AD” w `AD-ManagerDiamond` ustawia hasło konta komputera na jego `sAMAccountName` małymi literami; komputer trzeba potem ponownie połączyć z domeną lub naprawić kanał zaufania.
 - `PasswordGenerator` i `AD-BulkUserCreator` przechowują wygenerowane hasła jawnym tekstem (historia w `%TEMP%`, kolumna w siatce/schowek) — czyść historię i schowek po pracy.
+- Raport `NET-SharePermissionAudit` to pełna mapa „kto ma dostęp do czego” (w tym słabo zabezpieczone lokalizacje) — przechowuj go w miejscu z ograniczonym dostępem i usuń, gdy nie jest już potrzebny.
 
 ## Kontakt
 
