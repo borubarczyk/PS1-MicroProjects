@@ -1,2538 +1,4537 @@
-﻿#>
+﻿<#
+.SYNOPSIS
+    Domain Ops (AD-ManagerDiamond) - graficzne narzędzie do zdalnej administracji komputerami w domenie Active Directory.
+
+.DESCRIPTION
+    Okno składa się z trzech części:
+      - lewy panel: lista komputerów (z Active Directory, wpisanych ręcznie lub wczytanych z pliku)
+        z zaznaczaniem hostów docelowych, szybkim wyszukiwaniem i menu kontekstowym,
+      - drzewo modułów pogrupowanych w kategorie (diagnostyka, zdalne wykonanie, system, oprogramowanie,
+        bezpieczeństwo, udostępnianie, Active Directory),
+      - aktywny moduł z wynikami w tabeli: filtrowanie, sortowanie, eksport CSV, kopiowanie, podgląd szczegółów.
+
+    Wszystkie operacje wykonywane są w tle i równolegle (pula wątków PowerShell), więc okno nie zawiesza się,
+    a wyniki pojawiają się na bieżąco dla kolejnych hostów. Trwające operacje można anulować z paska stanu.
+    Operacje zdalne korzystają z PowerShell Remoting (WinRM); operacje na obiektach AD (konto komputera, LAPS,
+    klucze odzyskiwania BitLocker) wykonywane są lokalnie modułem ActiveDirectory.
+
+.NOTES
+    Wymagania:
+      - Windows PowerShell 5.1 lub PowerShell 7 w systemie Windows (skrypt sam uruchomi się ponownie w trybie STA),
+      - RSAT: moduł ActiveDirectory (lista komputerów i moduły AD), opcjonalnie moduł LAPS (Windows LAPS),
+      - włączony WinRM na hostach docelowych i uprawnienia administratora lokalnego.
+    Ustawienia: %APPDATA%\AD-ManagerDiamond\settings.json
+    Dziennik:   %LOCALAPPDATA%\AD-ManagerDiamond\Logs\DomainOps_RRRRMMDD.log
+    Pliki robocze na hostach: %SystemRoot%\Temp\DomainOps
+    Plik musi pozostać zapisany jako UTF-8 z BOM (polskie znaki w Windows PowerShell 5.1).
+
+.EXAMPLE
+    powershell.exe -STA -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1
+#>
+#Requires -Version 5.1
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+#region Start: platforma i tryb STA
+if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+    throw 'Domain Ops działa wyłącznie w systemie Windows.'
+}
+
+# WinForms wymaga wątku STA - jeśli go nie mamy, uruchamiamy skrypt ponownie z przełącznikiem -STA
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
+    if ($PSCommandPath) {
+        $exe = (Get-Process -Id $PID).Path
+        Start-Process -FilePath $exe -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath)) | Out-Null
+        return
+    }
+    throw 'Uruchom skrypt w trybie STA: powershell.exe -STA -File .\AD-ManagerDiamond.ps1'
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
 
-# ======= KONFIGURACJA APLIKACJI =======
-$App = [ordered]@{
-    Title            = 'Domain Ops - Remote Admin GUI'
-    Width            = 1500
-    Height           = 820
-    DefaultSharePath = 'C$\Windows\Temp\DomainOps' # gdzie kopiujemy instalatory
-    Modules          = @()  # kontenery rejestracji modułów (zakładek)
+# Moduł ActiveDirectory nie musi tworzyć dysku AD: (szybszy import, mniej błędów przy braku DC)
+$env:ADPS_LoadDefaultDrive = '0'
+#endregion
+
+#region Konfiguracja i stan
+$script:AppVersion = '3.0'
+
+$script:App = @{
+    Name    = 'Domain Ops'
+    DataDir = Join-Path $env:APPDATA 'AD-ManagerDiamond'
+    LogDir  = Join-Path $env:LOCALAPPDATA 'AD-ManagerDiamond\Logs'
+}
+$script:App.SettingsFile = Join-Path $script:App.DataDir 'settings.json'
+$script:App.LogFile = Join-Path $script:App.LogDir ('DomainOps_{0:yyyyMMdd}.log' -f (Get-Date))
+
+# Ustawienia zapamiętywane między uruchomieniami
+$script:Settings = [ordered]@{
+    SearchBase       = ''
+    NameFilter       = ''
+    OnlyEnabled      = $true
+    DomainController = ''
+    ThrottleLimit    = 16
+    TimeoutSec       = 20
+    LastModule       = 'Connectivity'
+    WindowWidth      = 1500
+    WindowHeight     = 900
+    WindowMaximized  = $false
 }
 
-# ======= NARZĘDZIA WSPÓLNE =======
-function New-FixedColumn {
+# Poświadczenia bieżącej sesji (nie są zapisywane na dysku)
+$script:State = @{
+    Credential = $null
+    UseCurrent = $true
+}
+
+# Kontrolki i konteksty modułów
+$script:UI = @{
+    Font        = New-Object System.Drawing.Font('Segoe UI', 9)
+    FontBold    = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    FontMono    = New-Object System.Drawing.Font('Consolas', 9.5)
+    Form        = $null
+    Modules     = @{}
+    ModuleDefs  = New-Object System.Collections.ArrayList
+    Categories  = @('Diagnostyka', 'Zdalne wykonanie', 'System', 'Oprogramowanie', 'Bezpieczeństwo', 'Udostępnianie', 'Active Directory')
+    ActiveModule = $null
+}
+
+# Silnik operacji w tle
+$script:Engine = @{
+    Pool       = $null
+    Operations = New-Object System.Collections.ArrayList
+    Timer      = $null
+    NextId     = 1
+    InTick     = $false
+    Deferred   = New-Object System.Collections.ArrayList
+}
+
+$script:LogContext = $null
+$script:Clipboard = @{ Secret = $null; Timer = $null }
+
+# Kolumny dodawane przez PowerShell Remoting, których nie pokazujemy w tabelach
+$script:HiddenProperties = @('PSComputerName', 'RunspaceId', 'PSShowComputerName', 'PSSourceJobInstanceId')
+#endregion
+
+#region Narzędzia ogólne
+function Write-Log {
     param(
-        [string]$text,
-        [int]$width
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
+        [ValidateSet('INFO', 'OK', 'WARN', 'ERROR')][string]$Level = 'INFO',
+        [string]$Module = $script:LogContext
     )
-    (New-Object System.Windows.Forms.ColumnHeader -Property @{Text = $text; Width = $width }) 
+    $prefix = if ($Module) { "[$Module] " } else { '' }
+    $now = Get-Date
+    $box = $script:UI['LogBox']
+    if ($box) {
+        try {
+            if ($box.TextLength -gt 500000) {
+                $box.Clear()
+                $box.AppendText('(dziennik w oknie został skrócony - pełny zapis znajduje się w pliku logu)' + [Environment]::NewLine)
+            }
+            $color = switch ($Level) {
+                'OK' { [System.Drawing.Color]::ForestGreen }
+                'WARN' { [System.Drawing.Color]::DarkOrange }
+                'ERROR' { [System.Drawing.Color]::Firebrick }
+                default { [System.Drawing.Color]::FromArgb(40, 40, 40) }
+            }
+            $box.SelectionStart = $box.TextLength
+            $box.SelectionLength = 0
+            $box.SelectionColor = $color
+            $box.AppendText(('{0:HH:mm:ss}  {1,-5}  {2}{3}' -f $now, $Level, $prefix, $Message) + [Environment]::NewLine)
+            $box.ScrollToCaret()
+        }
+        catch { }
+    }
+    try {
+        $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}{3}' -f $now, $Level, $prefix, $Message
+        [System.IO.File]::AppendAllText($script:App.LogFile, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
+    }
+    catch { }
 }
 
-function Show-Error([string]$msg, $ex = $null) {
-    # $ex moze byc ErrorRecord ($_ z bloku catch), Exception albo tekst
-    $detail = if ($ex -is [System.Management.Automation.ErrorRecord]) { $ex.Exception.Message }
-    elseif ($ex -is [Exception]) { $ex.Message }
-    elseif ($ex) { [string]$ex }
+function Show-Message {
+    param(
+        [string]$Text,
+        [string]$Title = 'Domain Ops',
+        [System.Windows.Forms.MessageBoxIcon]$Icon = [System.Windows.Forms.MessageBoxIcon]::Information
+    )
+    $owner = $script:UI.Form
+    if ($owner) { [void][System.Windows.Forms.MessageBox]::Show($owner, $Text, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, $Icon) }
+    else { [void][System.Windows.Forms.MessageBox]::Show($Text, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, $Icon) }
+}
+
+function Show-Warning([string]$Text) {
+    Show-Message -Text $Text -Title 'Uwaga' -Icon ([System.Windows.Forms.MessageBoxIcon]::Warning)
+}
+
+function Show-Error {
+    param([string]$Text, $ErrorObject = $null)
+    # $ErrorObject może być ErrorRecord ($_ z bloku catch), wyjątkiem albo tekstem
+    $detail = if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) { $ErrorObject.Exception.Message }
+    elseif ($ErrorObject -is [System.Exception]) { $ErrorObject.Message }
+    elseif ($ErrorObject) { [string]$ErrorObject }
     else { '' }
-    $text = if ($detail) { "$msg`r`n`r`n$detail" } else { $msg }
-    [System.Windows.Forms.MessageBox]::Show($text, 'Błąd', 'OK', 'Error') | Out-Null
+    $message = if ($detail) { "$Text`r`n`r`n$detail" } else { $Text }
+    Show-Message -Text $message -Title 'Błąd' -Icon ([System.Windows.Forms.MessageBoxIcon]::Error)
 }
 
-function Format-Bytes([long]$bytes) {
-    if ($bytes -lt 1KB) { return "$bytes B" }
-    elseif ($bytes -lt 1MB) { return "{0:N2} KB" -f ($bytes / 1KB) }
-    elseif ($bytes -lt 1GB) { return "{0:N2} MB" -f ($bytes / 1MB) }
-    else { return "{0:N2} GB" -f ($bytes / 1GB) }
-}
-
-# Globalny stan (poświadczenia, sesje CIM, itp.)
-$State = [ordered]@{
-    Cred            = $null
-    UseCurrentCreds = $true
-    CimSessions     = @{}   # ComputerName -> CimSession
-    AdComputers     = @()   # cache wyników z AD
-}
-
-# Prosty logger do okienka na dole
-$script:CurrentModule = $null
-
-function Write-Log([string]$msg, [string]$level = 'INFO') {
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $modulePart = if ($script:CurrentModule) { "[Module=$($script:CurrentModule)] " } else { '' }
-    $line = "[{0}] [{1}] {2}{3}" -f $ts, $level, $modulePart, $msg
-    $Global:txtLog.AppendText($line + [Environment]::NewLine)
-}
-
-function Invoke-ModuleAction {
-    param(
-        [string]$ModuleName,
-        [scriptblock]$Action
-    )
-    $prev = $script:CurrentModule
-    try {
-        $script:CurrentModule = $ModuleName
-        & $Action
+function Confirm-Action {
+    param([string]$Text, [string[]]$Items = @())
+    $message = $Text
+    $list = @($Items | Where-Object { $_ })
+    if ($list.Count -gt 0) {
+        $message += "`r`n`r`n" + ((@($list | Select-Object -First 15)) -join "`r`n")
+        if ($list.Count -gt 15) { $message += "`r`n… i $($list.Count - 15) więcej" }
     }
-    finally {
-        $script:CurrentModule = $prev
+    $answer = [System.Windows.Forms.MessageBox]::Show($script:UI.Form, $message, 'Potwierdzenie',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning,
+        [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    return ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
+function Get-EffectiveCredential {
+    if (-not $script:State.UseCurrent -and $script:State.Credential) { return $script:State.Credential }
+    return $null
+}
+
+function Get-AdSplat {
+    # Parametry -Server/-Credential dla poleceń AD wykonywanych w wątku okna
+    $p = @{}
+    if ($script:Settings.DomainController) { $p.Server = [string]$script:Settings.DomainController }
+    $cred = Get-EffectiveCredential
+    if ($cred) { $p.Credential = $cred }
+    return $p
+}
+
+function Import-AdModule {
+    if (Get-Module -Name ActiveDirectory) { return }
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        throw 'Brak modułu ActiveDirectory (RSAT). Zainstaluj «RSAT: Active Directory Domain Services» i spróbuj ponownie.'
+    }
+    Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false | Out-Null
+}
+
+function Get-ObjectValue {
+    param($InputObject, [string]$Name)
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Data.DataRowView]) {
+        if (-not $InputObject.Row.Table.Columns.Contains($Name)) { return $null }
+        $v = $InputObject.Row[$Name]
+        if ($v -is [System.DBNull]) { return $null }
+        return $v
+    }
+    if ($InputObject -is [System.Collections.IDictionary]) { return $InputObject[$Name] }
+    $p = $InputObject.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function ConvertTo-CellValue {
+    # Zamienia wartość z wyników na postać do tabeli: liczby zostają liczbami (sortowanie),
+    # daty -> tekst ISO (sortuje się poprawnie), bool -> Tak/Nie, kolekcje -> tekst
+    param($Value)
+    if ($null -eq $Value) { return [System.DBNull]::Value }
+    if ($Value -is [System.Management.Automation.PSObject]) { $Value = $Value.PSObject.BaseObject }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [bool]) { if ($Value) { return 'Tak' } else { return 'Nie' } }
+    if ($Value -is [datetime]) {
+        if ($Value.Year -lt 1700) { return [System.DBNull]::Value }
+        return $Value.ToString('yyyy-MM-dd HH:mm:ss')
+    }
+    if ($Value -is [enum] -or $Value -is [timespan] -or $Value -is [guid] -or $Value -is [char]) { return [string]$Value }
+    if ($Value -is [System.ValueType]) { return $Value }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        return (@($Value | ForEach-Object { [string]$_ }) -join ', ')
+    }
+    return [string]$Value
+}
+
+function ConvertTo-LikeLiteral {
+    # Ucieka znaki specjalne wyrażenia LIKE w DataView.RowFilter
+    param([string]$Text)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Text.ToCharArray()) {
+        if ('*%[]'.IndexOf($ch) -ge 0) { [void]$sb.Append('[').Append($ch).Append(']') }
+        elseif ($ch -eq "'") { [void]$sb.Append("''") }
+        else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
+}
+
+function Format-LogObject {
+    param($InputObject)
+    if ($null -eq $InputObject) { return '' }
+    if ($InputObject -is [System.Management.Automation.PSObject]) {
+        $base = $InputObject.PSObject.BaseObject
+        if ($base -is [string] -or $base -is [System.ValueType]) { return [string]$base }
+    }
+    if ($InputObject -is [string] -or $InputObject -is [System.ValueType]) { return [string]$InputObject }
+    $parts = foreach ($p in $InputObject.PSObject.Properties) {
+        if ($script:HiddenProperties -contains $p.Name) { continue }
+        $v = ConvertTo-CellValue $p.Value
+        if ($v -is [System.DBNull] -or [string]$v -eq '') { continue }
+        '{0}: {1}' -f $p.Name, $v
+    }
+    return (@($parts) -join '; ')
+}
+
+function Split-ListText {
+    # "a, b; c" -> @('a','b','c')
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    return @($Text -split '[,;\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Get-ParentDN([string]$DistinguishedName) {
+    return ($DistinguishedName -replace '^(?:\\.|[^,])+,', '')
+}
+
+function Get-RdnValue([string]$DistinguishedName) {
+    $first = [regex]::Match($DistinguishedName, '^(?:\\.|[^,])+').Value
+    return (($first -replace '^[^=]+=', '') -replace '\\(.)', '$1')
+}
+
+function Test-NetBiosName {
+    # Zwraca opis problemu albo pusty tekst, gdy nazwa jest poprawna
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return 'Brak nowej nazwy' }
+    if ($Name.Length -gt 15) { return 'Maksymalnie 15 znaków' }
+    if ($Name -notmatch '^[A-Za-z0-9-]+$') { return 'Dozwolone są tylko litery, cyfry i myślnik' }
+    if ($Name -match '^\d+$') { return 'Nazwa nie może składać się z samych cyfr' }
+    if ($Name.StartsWith('-') -or $Name.EndsWith('-')) { return 'Nazwa nie może zaczynać się ani kończyć myślnikiem' }
+    return ''
+}
+
+function Set-ClipboardSecret {
+    # Kopiuje poufny tekst do schowka i czyści go po upływie czasu (o ile nadal tam jest)
+    param([string]$Text, [int]$Seconds = 60)
+    if ([string]::IsNullOrEmpty($Text)) { return }
+    [System.Windows.Forms.Clipboard]::SetText($Text)
+    $script:Clipboard.Secret = $Text
+    $timer = $script:Clipboard.Timer
+    if ($timer) {
+        $timer.Stop()
+        $timer.Interval = [Math]::Max(5, $Seconds) * 1000
+        $timer.Start()
     }
 }
 
-# Pobieranie komputerów z AD
-function Get-AdComputersUI {
+function Clear-ClipboardSecret {
+    if (-not $script:Clipboard.Secret) { return }
     try {
-        if (-not (Get-Module -ListAvailable ActiveDirectory)) {
-            throw "Brak modułu ActiveDirectory (RSAT). Zainstaluj RSAT i spróbuj ponownie."
+        if ([System.Windows.Forms.Clipboard]::ContainsText() -and [System.Windows.Forms.Clipboard]::GetText() -eq $script:Clipboard.Secret) {
+            [System.Windows.Forms.Clipboard]::Clear()
+            Write-Log 'Wyczyszczono poufną wartość ze schowka.' -Module ''
         }
-        Import-Module ActiveDirectory -ErrorAction Stop | Out-Null
+    }
+    catch { }
+    $script:Clipboard.Secret = $null
+}
 
-        $filter = if ($txtNameFilter.Text) { "(Name -like '*$($txtNameFilter.Text.Replace('*','').Replace('?',''))*')" } else { '*' }
-        $searchBase = if ($txtSearchBase.Text.Trim()) { $txtSearchBase.Text.Trim() } else { $null }
-
-        Write-Log "Pobieram komputery z AD (Filter=$filter; SearchBase=$searchBase)..."
-        $params = @{ Filter = $filter; Properties = @('OperatingSystem', 'LastLogonDate') }
-        if ($searchBase) { $params.SearchBase = $searchBase }
-
-        $State.AdComputers = @(Get-ADComputer @params | Sort-Object Name)
-        $clbComputers.Items.Clear()
-        foreach ($c in $State.AdComputers) {
-            [void]$clbComputers.Items.Add($c.Name)
+function Import-Settings {
+    try {
+        if (-not (Test-Path -LiteralPath $script:App.SettingsFile)) { return }
+        $json = Get-Content -LiteralPath $script:App.SettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($key in @($script:Settings.Keys)) {
+            $p = $json.PSObject.Properties[$key]
+            if ($p -and $null -ne $p.Value) { $script:Settings[$key] = $p.Value }
         }
-        Write-Log "Załadowano: $($State.AdComputers.Count) komputerów."
+    }
+    catch { }
+    $script:Settings.ThrottleLimit = [Math]::Min(64, [Math]::Max(1, [int]$script:Settings.ThrottleLimit))
+    $script:Settings.TimeoutSec = [Math]::Min(300, [Math]::Max(5, [int]$script:Settings.TimeoutSec))
+    $script:Settings.OnlyEnabled = [bool]$script:Settings.OnlyEnabled
+    $script:Settings.WindowMaximized = [bool]$script:Settings.WindowMaximized
+}
+
+function Export-Settings {
+    try {
+        if (-not (Test-Path -LiteralPath $script:App.DataDir)) { New-Item -ItemType Directory -Path $script:App.DataDir -Force | Out-Null }
+        $script:Settings | ConvertTo-Json | Set-Content -LiteralPath $script:App.SettingsFile -Encoding UTF8
+    }
+    catch { }
+}
+#endregion
+
+#region Fabryka kontrolek
+function Add-DockStack {
+    # Układa kontrolki: -Top od góry (w podanej kolejności), -Bottom od dołu (ostatnia na samym dole), -Fill w pozostałym miejscu.
+    # WinForms dokuje kontrolki w odwrotnej kolejności dodawania, stąd odwrócone pętle.
+    param($Parent, [object[]]$Top = @(), $Fill = $null, [object[]]$Bottom = @())
+    if ($Fill) {
+        $Fill.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $Parent.Controls.Add($Fill)
+    }
+    foreach ($c in $Bottom) {
+        $c.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $Parent.Controls.Add($c)
+    }
+    for ($i = $Top.Count - 1; $i -ge 0; $i--) {
+        $Top[$i].Dock = [System.Windows.Forms.DockStyle]::Top
+        $Parent.Controls.Add($Top[$i])
+    }
+}
+
+function New-FlowRow {
+    $p = New-Object System.Windows.Forms.FlowLayoutPanel
+    $p.AutoSize = $true
+    $p.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $p.WrapContents = $true
+    $p.Margin = New-Object System.Windows.Forms.Padding(0)
+    $p.Padding = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
+    return $p
+}
+
+function New-StretchRow {
+    # Wiersz: kontrolka rozciągana na całą szerokość, z kontrolkami o stałym rozmiarze przed (-Before) i za nią (-After)
+    param($Stretch, [object[]]$Before = @(), [object[]]$After = @())
+    $t = New-Object System.Windows.Forms.TableLayoutPanel
+    $t.AutoSize = $true
+    $t.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $t.RowCount = 1
+    $t.ColumnCount = $Before.Count + 1 + $After.Count
+    $t.Margin = New-Object System.Windows.Forms.Padding(0)
+    [void]$t.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    $col = 0
+    foreach ($c in $Before) {
+        [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        $t.Controls.Add($c, $col, 0)
+        $col++
+    }
+    [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $Stretch.Anchor = [System.Windows.Forms.AnchorStyles]'Left,Right'
+    $t.Controls.Add($Stretch, $col, 0)
+    $col++
+    foreach ($c in $After) {
+        [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        $t.Controls.Add($c, $col, 0)
+        $col++
+    }
+    return $t
+}
+
+function Add-Label {
+    param($Parent, [string]$Text, [switch]$Hint, [switch]$Bold)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $Text
+    $l.AutoSize = $true
+    $l.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+    $l.Margin = New-Object System.Windows.Forms.Padding(3, 7, 3, 3)
+    if ($Hint) { $l.ForeColor = [System.Drawing.Color]::DimGray }
+    if ($Bold) { $l.Font = $script:UI.FontBold }
+    if ($Parent) { $Parent.Controls.Add($l) }
+    return $l
+}
+
+function Add-TextBox {
+    param($Parent, [int]$Width = 160, [string]$Text = '')
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Width = $Width
+    $t.Text = $Text
+    $t.Margin = New-Object System.Windows.Forms.Padding(3, 4, 3, 3)
+    if ($Parent) { $Parent.Controls.Add($t) }
+    return $t
+}
+
+function Add-ComboBox {
+    param($Parent, [string[]]$Items, [int]$Width = 150, [int]$SelectedIndex = 0)
+    $c = New-Object System.Windows.Forms.ComboBox
+    $c.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $c.Width = $Width
+    $c.Margin = New-Object System.Windows.Forms.Padding(3, 4, 3, 3)
+    foreach ($i in $Items) { [void]$c.Items.Add($i) }
+    if ($c.Items.Count -gt $SelectedIndex) { $c.SelectedIndex = $SelectedIndex }
+    if ($Parent) { $Parent.Controls.Add($c) }
+    return $c
+}
+
+function Add-Numeric {
+    param($Parent, [int]$Minimum = 0, [int]$Maximum = 100, [int]$Value = 0, [int]$Width = 70)
+    $n = New-Object System.Windows.Forms.NumericUpDown
+    $n.Minimum = $Minimum
+    $n.Maximum = $Maximum
+    $n.Value = [Math]::Min($Maximum, [Math]::Max($Minimum, $Value))
+    $n.Width = $Width
+    $n.Margin = New-Object System.Windows.Forms.Padding(3, 4, 3, 3)
+    if ($Parent) { $Parent.Controls.Add($n) }
+    return $n
+}
+
+function Add-CheckBox {
+    param($Parent, [string]$Text, [bool]$Checked = $false)
+    $c = New-Object System.Windows.Forms.CheckBox
+    $c.Text = $Text
+    $c.Checked = $Checked
+    $c.AutoSize = $true
+    $c.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+    $c.Margin = New-Object System.Windows.Forms.Padding(6, 6, 6, 3)
+    if ($Parent) { $Parent.Controls.Add($c) }
+    return $c
+}
+
+function Add-RadioButton {
+    param($Parent, [string]$Text, [bool]$Checked = $false)
+    $r = New-Object System.Windows.Forms.RadioButton
+    $r.Text = $Text
+    $r.Checked = $Checked
+    $r.AutoSize = $true
+    $r.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+    $r.Margin = New-Object System.Windows.Forms.Padding(6, 6, 6, 3)
+    if ($Parent) { $Parent.Controls.Add($r) }
+    return $r
+}
+
+function New-PlainButton {
+    param($Parent, [string]$Text)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $Text
+    $b.AutoSize = $true
+    $b.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $b.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 2)
+    $b.MinimumSize = New-Object System.Drawing.Size(0, 27)
+    $b.Margin = New-Object System.Windows.Forms.Padding(3, 3, 3, 3)
+    $b.UseVisualStyleBackColor = $true
+    if ($Parent) { $Parent.Controls.Add($b) }
+    return $b
+}
+
+# Obsługa zdarzeń kontrolek modułów: handler dostaje kontekst modułu ($m) niezależnie od tego,
+# gdzie został zdefiniowany (zmienne lokalne buildera modułu nie istnieją już w chwili kliknięcia).
+$script:Dispatchers = @{
+    Click                = { param($s) Invoke-ControlHandler -Source $s -EventName 'Click' }
+    TextChanged          = { param($s) Invoke-ControlHandler -Source $s -EventName 'TextChanged' }
+    CheckedChanged       = { param($s) Invoke-ControlHandler -Source $s -EventName 'CheckedChanged' }
+    SelectedIndexChanged = { param($s) Invoke-ControlHandler -Source $s -EventName 'SelectedIndexChanged' }
+}
+
+function Register-ControlHandler {
+    param($Control, [string]$EventName, [hashtable]$Module, [scriptblock]$Action)
+    $tag = $Control.Tag
+    if (-not ($tag -is [hashtable])) {
+        $tag = @{}
+        $Control.Tag = $tag
+    }
+    $tag['ModuleKey'] = $Module.Key
+    $tag["On$EventName"] = $Action
+    $Control."add_$EventName"($script:Dispatchers[$EventName])
+}
+
+function Invoke-ControlHandler {
+    param($Source, [string]$EventName)
+    try {
+        $tag = $Source.Tag
+        if (-not ($tag -is [hashtable])) { return }
+        $module = $script:UI.Modules[[string]$tag['ModuleKey']]
+        $action = $tag["On$EventName"]
+        if ($action) { Invoke-UiAction -Module $module -Action $action -Source $Source }
     }
     catch {
-        Show-Error "Nie udało się pobrać komputerów z AD." $_
-        Write-Log "AD błąd: $($_.Exception.Message)" 'ERROR'
+        Write-Log "Błąd obsługi zdarzenia: $($_.Exception.Message)" 'ERROR'
     }
 }
 
-# Zwraca wybrane komputery z listy
-function Get-SelectedComputers {
-    $list = @()
-    foreach ($idx in $clbComputers.CheckedIndices) {
-        $list += $clbComputers.Items[$idx]
-    }
-    return @($list | Sort-Object -Unique)
-}
-
-# Tworzy/odświeża sesje CIM do wskazanych komputerów
-function Connect-Cim([string[]]$Computers, [switch]$UseDCOM) {
-    $created = 0
-    foreach ($c in $Computers) {
-        if ($State.CimSessions.ContainsKey($c)) { continue }
-        try {
-            $opt = if ($UseDCOM) { New-CimSessionOption -Protocol DCOM } else { New-CimSessionOption -Protocol Wsman }
-            if ($State.UseCurrentCreds -or -not $State.Cred) {
-                $s = New-CimSession -ComputerName $c -SessionOption $opt -ErrorAction Stop
-            }
-            else {
-                $s = New-CimSession -ComputerName $c -Credential $State.Cred -SessionOption $opt -ErrorAction Stop
-            }
-            $State.CimSessions[$c] = $s
-            $created++
-        }
-        catch {
-            Write-Log "CIM do $c nie powiodła się: $($_.Exception.Message)" 'WARN'
-        }
-    }
-    if ($created -gt 0) { Write-Log "Utworzono $created nowych sesji CIM." }
-}
-
-function Close-Cim([string[]]$Computers) {
-    foreach ($c in $Computers) {
-        if ($State.CimSessions.ContainsKey($c)) {
-            try { $State.CimSessions[$c] | Remove-CimSession -ErrorAction Stop } catch {}
-            $State.CimSessions.Remove($c) | Out-Null
-        }
-    }
-}
-
-# Invoke-Command helper
-# --- PATCH: poprawiona wersja Invoke-Remote (obsługa hashtable wg nazw parametrów) ---
-function Invoke-Remote {
-    param(
-        [string]$ComputerName,
-        [scriptblock]$ScriptBlock,
-        $Arg
-    )
-    $p = @{
-        ComputerName = $ComputerName
-        ScriptBlock  = $ScriptBlock
-        ErrorAction  = 'Stop'
-    }
-    if (-not $State.UseCurrentCreds -and $State.Cred) { $p.Credential = $State.Cred }
-
-    $argsList = @()
-    if ($null -ne $Arg) {
-        if ($Arg -is [hashtable]) {
-            $paramBlock = $ScriptBlock.Ast.ParamBlock
-            if ($paramBlock) {
-                foreach ($param in $paramBlock.Parameters) {
-                    $name = $param.Name.VariablePath.UserPath
-                    $argsList += $Arg[$name]
-                }
-            }
-            else {
-                $argsList = @($Arg)
-            }
-        }
-        elseif ($Arg -is [object[]]) {
-            $argsList = $Arg
-        }
-        else {
-            $argsList = @($Arg)
-        }
-    }
-    return Invoke-Command @p -ArgumentList $argsList
-}
-# --- KONIEC PATCHA ---
-
-
-# ======= BUDOWA GUI =======
-$form = New-Object System.Windows.Forms.Form
-$form.Text = $App.Title
-$form.Width = $App.Width
-$form.Height = $App.Height
-$form.StartPosition = 'CenterScreen'
-
-# Glowny layout: naglowek, przestrzen robocza, log
-$layoutRoot = New-Object System.Windows.Forms.TableLayoutPanel
-$layoutRoot.Dock = 'Fill'
-$layoutRoot.RowCount = 3
-$layoutRoot.ColumnCount = 1
-$null = $layoutRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 52)))
-$null = $layoutRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-$null = $layoutRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 140)))
-$null = $layoutRoot.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-$form.Controls.Add($layoutRoot)
-
-# GORA: panel poswiadczen
-$panelTop = New-Object System.Windows.Forms.FlowLayoutPanel
-$panelTop.Height = 60
-$panelTop.Dock = 'Fill'
-$panelTop.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
-$panelTop.WrapContents = $false
-$panelTop.FlowDirection = 'LeftToRight'
-$panelTop.AutoScroll = $true
-$panelTop.Padding = '10,14,10,10'
-$layoutRoot.Controls.Add($panelTop, 0, 0)
-
-$chkUseCurrent = New-Object System.Windows.Forms.CheckBox
-$chkUseCurrent.Text = 'Uzyj biezacych poswiadczen'
-$chkUseCurrent.Checked = $true
-$chkUseCurrent.AutoSize = $true
-$chkUseCurrent.Margin = New-Object System.Windows.Forms.Padding(0, 0, 20, 0)
-$panelTop.Controls.Add($chkUseCurrent)
-
-$btnCred = New-Object System.Windows.Forms.Button
-$btnCred.Text = 'Zmien poswiadczenia...'
-$btnCred.Left = 240
-$btnCred.Top = 12
-$btnCred.Width = 160
-$btnCred.Margin = New-Object System.Windows.Forms.Padding(0, 0, 20, 0)
-$panelTop.Controls.Add($btnCred)
-
-$lblCred = New-Object System.Windows.Forms.Label
-$lblCred.Text = '(biezacy uzytkownik)'
-$lblCred.AutoSize = $true
-$lblCred.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
-$panelTop.Controls.Add($lblCred)
-
-# Panel glowny (split: lewy AD, prawy TabControl)
-$splitMain = New-Object System.Windows.Forms.SplitContainer
-$splitMain.Dock = 'Fill'
-$splitMain.SplitterDistance = 420
-$splitMain.Panel1MinSize = 360
-$splitMain.Orientation = 'Vertical'
-$layoutRoot.Controls.Add($splitMain, 0, 1)
-
-$form.Add_Shown({
-        $splitMain.Panel2MinSize = 700
-        $maxDistance = $splitMain.Width - $splitMain.Panel2MinSize
-        if ($maxDistance -lt $splitMain.Panel1MinSize) {
-            $splitMain.Panel2MinSize = [Math]::Max(200, $splitMain.Width - ($splitMain.Panel1MinSize + 10))
-            $maxDistance = $splitMain.Width - $splitMain.Panel2MinSize
-        }
-        $splitMain.SplitterDistance = [Math]::Max(
-            $splitMain.Panel1MinSize,
-            [Math]::Min($maxDistance, 480)
-        )
-    })
-
-# Lewy panel: AD
-$grpAd = New-Object System.Windows.Forms.GroupBox
-$grpAd.Text = 'Active Directory — Komputery'
-$grpAd.Dock = 'Fill'
-$splitMain.Panel1.Controls.Add($grpAd)
-
-$lblSearchBase = New-Object System.Windows.Forms.Label
-$lblSearchBase.Text = 'SearchBase (OU, opcjonalnie):'
-$lblSearchBase.Left = 12; $lblSearchBase.Top = 24; $lblSearchBase.AutoSize = $true
-$grpAd.Controls.Add($lblSearchBase)
-
-$txtSearchBase = New-Object System.Windows.Forms.TextBox
-$txtSearchBase.Left = 12; $txtSearchBase.Top = 44; $txtSearchBase.Width = 330
-$txtSearchBase.Anchor = 'Top,Left,Right'
-$grpAd.Controls.Add($txtSearchBase)
-
-$lblNameFilter = New-Object System.Windows.Forms.Label
-$lblNameFilter.Text = 'Filtr nazwy (wildcard *):'
-$lblNameFilter.Left = 12; $lblNameFilter.Top = 74; $lblNameFilter.AutoSize = $true
-$grpAd.Controls.Add($lblNameFilter)
-
-$txtNameFilter = New-Object System.Windows.Forms.TextBox
-$txtNameFilter.Left = 12; $txtNameFilter.Top = 94; $txtNameFilter.Width = 210
-$txtNameFilter.Anchor = 'Top,Left,Right'
-$grpAd.Controls.Add($txtNameFilter)
-
-$btnLoadAD = New-Object System.Windows.Forms.Button
-$btnLoadAD.Text = 'Załaduj'
-$btnLoadAD.Left = 230; $btnLoadAD.Top = 92; $btnLoadAD.Width = 110
-$btnLoadAD.Anchor = 'Top,Right'
-$grpAd.Controls.Add($btnLoadAD)
-
-$clbComputers = New-Object System.Windows.Forms.CheckedListBox
-$clbComputers.Left = 12; $clbComputers.Top = 130; $clbComputers.Width = 330; $clbComputers.Height = 500
-$clbComputers.CheckOnClick = $true
-$clbComputers.Anchor = 'Top,Bottom,Left,Right'
-$grpAd.Controls.Add($clbComputers)
-
-$btnSelectAll = New-Object System.Windows.Forms.Button
-$btnSelectAll.Text = 'Zaznacz wszystko'
-$btnSelectAll.Left = 12; $btnSelectAll.Top = 640; $btnSelectAll.Width = 150
-$btnSelectAll.Anchor = 'Bottom,Left'
-$grpAd.Controls.Add($btnSelectAll)
-
-$btnClearSel = New-Object System.Windows.Forms.Button
-$btnClearSel.Text = 'Wyczyść zaznaczenie'
-$btnClearSel.Left = 192; $btnClearSel.Top = 640; $btnClearSel.Width = 150
-$btnClearSel.Anchor = 'Bottom,Left'
-$grpAd.Controls.Add($btnClearSel)
-
-$grpAd.Add_Resize({
-        $margin = 24
-        $availWidth = [Math]::Max(220, $grpAd.ClientSize.Width - $margin)
-        $txtSearchBase.Width = $availWidth
-        $nameWidth = [Math]::Max(150, $availWidth - $btnLoadAD.Width - 16)
-        $txtNameFilter.Width = $nameWidth
-        $btnLoadAD.Left = $txtNameFilter.Left + $nameWidth + 8
-        $clbComputers.Width = $availWidth
-        $clbComputers.Height = [Math]::Max(120, $grpAd.ClientSize.Height - 200)
-        $btnSelectAll.Top = $grpAd.ClientSize.Height - 42
-        $btnClearSel.Top = $btnSelectAll.Top
-    })
-
-# Prawy panel: TabControl (moduły)
-$tabs = New-Object System.Windows.Forms.TabControl
-$tabs.Dock = 'Fill'
-$splitMain.Panel2.Controls.Add($tabs)
-
-# Dol: log
-$txtLog = New-Object System.Windows.Forms.TextBox
-$txtLog.ReadOnly = $true
-$txtLog.Multiline = $true
-$txtLog.ScrollBars = 'Vertical'
-$txtLog.Dock = 'Fill'
-$txtLog.Height = 140
-$layoutRoot.Controls.Add($txtLog, 0, 2)
-$Global:txtLog = $txtLog
-
-# ======= REAKCJE UI (poświadczenia, AD) =======
-$chkUseCurrent.add_CheckedChanged({
-        $State.UseCurrentCreds = $chkUseCurrent.Checked
-        if ($State.UseCurrentCreds) {
-            $lblCred.Text = "(bieżący użytkownik: $env:USERDOMAIN\$env:USERNAME)"
-        }
-        else {
-            $lblCred.Text = if ($State.Cred) { "Używane: $($State.Cred.UserName)" } else { "(brak — ustaw poświadczenia)" }
-        }
-    })
-
-$btnCred.Add_Click({
-        try {
-            $cred = Get-Credential -Message 'Poświadczenia do zdalnych operacji'
-            if ($cred) {
-                $State.Cred = $cred
-                $chkUseCurrent.Checked = $false
-                $lblCred.Text = "Używane: $($cred.UserName)"
-                Write-Log "Ustawiono poświadczenia $($cred.UserName)."
-            }
-        }
-        catch {
-            Show-Error "Nie udało się pobrać poświadczeń." $_
-        }
-    })
-
-$btnLoadAD.Add_Click({ Get-AdComputersUI })
-$btnSelectAll.Add_Click({
-        for ($i = 0; $i -lt $clbComputers.Items.Count; $i++) { $clbComputers.SetItemChecked($i, $true) }
-    })
-$btnClearSel.Add_Click({
-        for ($i = 0; $i -lt $clbComputers.Items.Count; $i++) { $clbComputers.SetItemChecked($i, $false) }
-    })
-
-# ======= INFRA: rejestracja modułów (każdy moduł = zakładka) =======
-# Handlery zdarzen uruchamiaja sie dopiero po zakonczeniu buildera zakladki, wiec jego
-# zmienne lokalne ($grid, $cmbHost, $refreshAction, funkcje pomocnicze...) juz wtedy nie istnieja.
-# Dlatego zapamietujemy je w Tag zakladki:
-#  - Invoke-InModuleContext udostepnia je akcji jako $ctx.Controls,
-#  - Restore-ModuleScope przywraca je do zakresu skryptu przy aktywacji zakladki
-#    (handlery odwoluja sie wtedy bezposrednio do $grid itp. aktywnej zakladki).
-$script:ModuleVarNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-
-function Register-ModuleTab {
-    param(
-        [string]$Name,
-        [scriptblock]$Builder # dostaje $tab,$getTargets
-    )
-    $tab = New-Object System.Windows.Forms.TabPage
-    $tab.Text = $Name
-    $tabs.TabPages.Add($tab)
-    # Pomocnicza funkcja do pobierania hostów
-    $getTargets = {
-        $targetsRaw = Get-SelectedComputers
-        $targets = @($targetsRaw)
-        if ($targets.Count -eq 0 -or ($targets.Count -eq 1 -and [string]::IsNullOrWhiteSpace([string]$targets[0]))) {
-            Show-Error "Wybierz najpierw komputery z listy po lewej."
-            throw "Brak hostów"
-        }
-        $targets
-    }
-    $script:getTargets = $getTargets
-
-    # Builder wykonywany (dot-source) we wlasnym zakresie, aby mozna bylo zebrac jego zmienne i funkcje
-    $captured = & {
-        param($__builder, $tab, $getTargets)
-        $__varsBefore = @(Get-Variable -Scope 0 | ForEach-Object { $_.Name })
-        $__fnBefore = @(Get-ChildItem -Path function: | ForEach-Object { $_.Name })
-        . $__builder $tab $getTargets | Out-Null
-        $__vars = @{ tab = $tab }
-        foreach ($__v in @(Get-Variable -Scope 0)) {
-            if ($__varsBefore -contains $__v.Name -or $__v.Name -like '__*') { continue }
-            $__vars[$__v.Name] = $__v.Value
-        }
-        $__fns = @{}
-        foreach ($__f in @(Get-ChildItem -Path function:)) {
-            if ($__fnBefore -notcontains $__f.Name) { $__fns[$__f.Name] = $__f.ScriptBlock }
-        }
-        [pscustomobject]@{ Variables = $__vars; Functions = $__fns }
-    } $Builder $tab $getTargets
-
-    $tab.Tag = [pscustomobject]@{
-        Name      = $Name
-        Controls  = $captured.Variables
-        Functions = $captured.Functions
-    }
-    $App.Modules += $Name
-}
-
-function Restore-ModuleScope([System.Windows.Forms.TabPage]$TabPage) {
-    if (-not $TabPage -or -not $TabPage.Tag) { return }
-    $info = $TabPage.Tag
-    foreach ($entry in $info.Controls.GetEnumerator()) {
-        # Nie nadpisujemy zmiennych samego skryptu (np. $form, $tabs, $State) - tylko te pochodzace z zakladek
-        $existing = Get-Variable -Name $entry.Key -Scope Script -ErrorAction SilentlyContinue
-        if ($existing -and -not $script:ModuleVarNames.Contains($entry.Key)) { continue }
-        Set-Variable -Name $entry.Key -Value $entry.Value -Scope Script
-        [void]$script:ModuleVarNames.Add($entry.Key)
-    }
-    foreach ($fn in $info.Functions.GetEnumerator()) {
-        Set-Item -Path ("function:script:{0}" -f $fn.Key) -Value $fn.Value
-    }
-}
-
-function Invoke-InModuleContext {
-    param(
-        [object]$SourceControl,
-        [scriptblock]$Action
-    )
-    $page = $SourceControl
-    while ($page -and -not ($page -is [System.Windows.Forms.TabPage])) { $page = $page.Parent }
-    $info = if ($page) { $page.Tag } else { $null }
-    $ctx = [pscustomobject]@{
-        Tab      = $page
-        Name     = if ($info) { $info.Name } else { $null }
-        Controls = if ($info) { $info.Controls } else { @{} }
-    }
-    $prev = $script:CurrentModule
+function Invoke-UiAction {
+    param([hashtable]$Module, [scriptblock]$Action, $Source = $null)
+    $previous = $script:LogContext
+    $script:LogContext = if ($Module) { $Module.Title } else { $null }
     try {
-        $script:CurrentModule = $ctx.Name
-        & $Action $ctx
+        $null = & $Action $Module $Source
+    }
+    catch {
+        Write-Log "Błąd: $($_.Exception.Message)" 'ERROR'
+        Show-Error 'Operacja nie powiodła się.' $_
     }
     finally {
-        $script:CurrentModule = $prev
+        $script:LogContext = $previous
     }
 }
 
-# ======= MODUŁY (zakładki) =======
+function Add-Button {
+    # Przycisk akcji modułu - wyłączany automatycznie na czas operacji tego modułu
+    param(
+        [Parameter(Mandatory)]$Parent,
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][hashtable]$Module,
+        [Parameter(Mandatory)][scriptblock]$OnClick,
+        [switch]$Primary,
+        [switch]$Danger
+    )
+    $b = New-PlainButton -Parent $Parent -Text $Text
+    if ($Primary) { $b.Font = $script:UI.FontBold }
+    if ($Danger) { $b.ForeColor = [System.Drawing.Color]::DarkRed }
+    Register-ControlHandler -Control $b -EventName 'Click' -Module $Module -Action $OnClick
+    [void]$Module.Buttons.Add($b)
+    return $b
+}
 
-# 1) Wiersz poleceń (PS/cmd)
-Register-ModuleTab -Name 'Polecenia' -Builder {
-    param($tab, $getTargets)
+function Add-ToolbarRow([hashtable]$Module) {
+    $row = New-FlowRow
+    [void]$Module.TopControls.Add($row)
+    return $row
+}
 
-    $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = 'Polecenia do uruchomienia (PowerShell lub CMD):'
-    $lbl.Left = 12; $lbl.Top = 12; $lbl.AutoSize = $true
-    $tab.Controls.Add($lbl)
+function Add-TopControl([hashtable]$Module, $Control) {
+    [void]$Module.TopControls.Add($Control)
+    return $Control
+}
+#endregion
 
-    $rbPS = New-Object System.Windows.Forms.RadioButton
-    $rbPS.Text = 'PowerShell'
-    $rbPS.Checked = $true
-    $rbPS.Left = 12; $rbPS.Top = 36
-    $tab.Controls.Add($rbPS)
+#region Okna dialogowe
+function New-DialogForm {
+    param([string]$Title, [int]$Width = 520, [int]$Height = 300, [switch]$Resizable)
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = $Title
+    $f.Size = New-Object System.Drawing.Size($Width, $Height)
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $f.MinimizeBox = $false
+    $f.MaximizeBox = [bool]$Resizable
+    $f.ShowInTaskbar = $false
+    $f.Font = $script:UI.Font
+    $f.Padding = New-Object System.Windows.Forms.Padding(10)
+    if (-not $Resizable) { $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog }
+    return $f
+}
 
-    $rbCmd = New-Object System.Windows.Forms.RadioButton
-    $rbCmd.Text = 'cmd.exe'
-    $rbCmd.Left = 120; $rbCmd.Top = 36
-    $tab.Controls.Add($rbCmd)
+function Add-DialogButtons {
+    param([System.Windows.Forms.Form]$Form, [string]$OkText = 'OK', [string]$CancelText = 'Anuluj')
+    $panel = New-Object System.Windows.Forms.FlowLayoutPanel
+    $panel.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $panel.AutoSize = $true
+    $panel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $panel.WrapContents = $false
+    $panel.Padding = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+    $cancel = New-PlainButton -Parent $null -Text $CancelText
+    $cancel.MinimumSize = New-Object System.Drawing.Size(90, 28)
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $ok = New-PlainButton -Parent $null -Text $OkText
+    $ok.MinimumSize = New-Object System.Drawing.Size(90, 28)
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $panel.Controls.Add($cancel)
+    $panel.Controls.Add($ok)
+    $Form.AcceptButton = $ok
+    $Form.CancelButton = $cancel
+    return @{ Panel = $panel; Ok = $ok; Cancel = $cancel }
+}
 
+function New-FormGrid {
+    # Dwukolumnowa tabela "etykieta: pole" do prostych formularzy
+    param([object[]]$Rows)
+    $t = New-Object System.Windows.Forms.TableLayoutPanel
+    $t.AutoSize = $true
+    $t.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $t.ColumnCount = 2
+    $t.RowCount = $Rows.Count
+    [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        [void]$t.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        $label = Add-Label -Parent $null -Text $Rows[$i][0]
+        $control = $Rows[$i][1]
+        $control.Anchor = [System.Windows.Forms.AnchorStyles]'Left,Right'
+        $t.Controls.Add($label, 0, $i)
+        $t.Controls.Add($control, 1, $i)
+    }
+    return $t
+}
+
+function Show-CredentialDialog {
+    param([string]$Message = 'Podaj poświadczenia konta z uprawnieniami administracyjnymi.', [string]$UserName = '')
+    $dlg = New-DialogForm -Title 'Poświadczenia' -Width 460 -Height 250
+    $lbl = Add-Label -Parent $null -Text $Message
+    $lbl.AutoSize = $false
+    $lbl.Height = 40
+    $txtUser = Add-TextBox -Parent $null -Width 260 -Text $UserName
+    $txtPass = Add-TextBox -Parent $null -Width 260
+    $txtPass.UseSystemPasswordChar = $true
+    $grid = New-FormGrid -Rows @(@('Użytkownik:', $txtUser), @('Hasło:', $txtPass))
+    $hint = Add-Label -Parent $null -Text 'Format: DOMENA\login albo login@domena' -Hint
+    $buttons = Add-DialogButtons -Form $dlg
+    $buttons.Ok.DialogResult = [System.Windows.Forms.DialogResult]::None
+    $buttons.Ok.Add_Click({
+            if ([string]::IsNullOrWhiteSpace($txtUser.Text)) { Show-Warning 'Podaj nazwę użytkownika.'; return }
+            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        })
+    Add-DockStack -Parent $dlg -Top @($lbl, $grid, $hint) -Bottom @($buttons.Panel)
+    $dlg.Add_Shown({ if ($txtUser.Text) { [void]$txtPass.Focus() } else { [void]$txtUser.Focus() } })
+    $result = $null
+    if ($dlg.ShowDialog($script:UI.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $secure = New-Object System.Security.SecureString
+        foreach ($ch in $txtPass.Text.ToCharArray()) { $secure.AppendChar($ch) }
+        $secure.MakeReadOnly()
+        $result = New-Object System.Management.Automation.PSCredential($txtUser.Text.Trim(), $secure)
+    }
+    $dlg.Dispose()
+    return $result
+}
+
+function Show-PasswordDialog {
+    # Nowe hasło wpisane dwukrotnie; zwraca SecureString albo $null
+    param([string]$Message = 'Podaj nowe hasło.')
+    $dlg = New-DialogForm -Title 'Nowe hasło' -Width 460 -Height 260
+    $lbl = Add-Label -Parent $null -Text $Message
+    $lbl.AutoSize = $false
+    $lbl.Height = 40
+    $txt1 = Add-TextBox -Parent $null -Width 260
+    $txt1.UseSystemPasswordChar = $true
+    $txt2 = Add-TextBox -Parent $null -Width 260
+    $txt2.UseSystemPasswordChar = $true
+    $grid = New-FormGrid -Rows @(@('Hasło:', $txt1), @('Powtórz hasło:', $txt2))
+    $buttons = Add-DialogButtons -Form $dlg
+    $buttons.Ok.DialogResult = [System.Windows.Forms.DialogResult]::None
+    $buttons.Ok.Add_Click({
+            if (-not $txt1.Text) { Show-Warning 'Hasło nie może być puste.'; return }
+            if ($txt1.Text -cne $txt2.Text) { Show-Warning 'Hasła nie są identyczne.'; return }
+            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        })
+    Add-DockStack -Parent $dlg -Top @($lbl, $grid) -Bottom @($buttons.Panel)
+    $result = $null
+    if ($dlg.ShowDialog($script:UI.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $result = New-Object System.Security.SecureString
+        foreach ($ch in $txt1.Text.ToCharArray()) { $result.AppendChar($ch) }
+        $result.MakeReadOnly()
+    }
+    $dlg.Dispose()
+    return $result
+}
+
+function Show-InputDialog {
+    param([string]$Title, [string]$Prompt, [string]$Default = '', [switch]$Multiline)
+    $height = if ($Multiline) { 440 } else { 190 }
+    $dlg = New-DialogForm -Title $Title -Width 520 -Height $height -Resizable:$Multiline
+    $lbl = Add-Label -Parent $null -Text $Prompt
+    $lbl.AutoSize = $false
+    $lbl.Height = 40
+    $txt = Add-TextBox -Parent $null -Width 300 -Text $Default
+    if ($Multiline) {
+        $txt.Multiline = $true
+        $txt.AcceptsReturn = $true
+        $txt.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+        $txt.Font = $script:UI.FontMono
+    }
+    $buttons = Add-DialogButtons -Form $dlg
+    if ($Multiline) {
+        $dlg.AcceptButton = $null
+        Add-DockStack -Parent $dlg -Top @($lbl) -Fill $txt -Bottom @($buttons.Panel)
+    }
+    else {
+        Add-DockStack -Parent $dlg -Top @($lbl, $txt) -Bottom @($buttons.Panel)
+    }
+    $result = $null
+    if ($dlg.ShowDialog($script:UI.Form) -eq [System.Windows.Forms.DialogResult]::OK) { $result = $txt.Text }
+    $dlg.Dispose()
+    return $result
+}
+
+function Show-TextDialog {
+    param([string]$Title, [string]$Text)
+    $dlg = New-DialogForm -Title $Title -Width 900 -Height 600 -Resizable
     $txt = New-Object System.Windows.Forms.TextBox
     $txt.Multiline = $true
-    $txt.Left = 12; $txt.Top = 64; $txt.Width = 870; $txt.Height = 120
-    $txt.Font = New-Object System.Drawing.Font('Consolas', 10)
-    $tab.Controls.Add($txt)
+    $txt.ReadOnly = $true
+    $txt.BackColor = [System.Drawing.SystemColors]::Window
+    $txt.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
+    $txt.WordWrap = $false
+    $txt.Font = $script:UI.FontMono
+    $txt.Text = ($Text -replace "`r?`n", "`r`n")
+    $buttons = Add-DialogButtons -Form $dlg -OkText 'Zamknij' -CancelText 'Kopiuj'
+    $buttons.Cancel.DialogResult = [System.Windows.Forms.DialogResult]::None
+    $buttons.Cancel.Add_Click({ if ($txt.Text) { [System.Windows.Forms.Clipboard]::SetText($txt.Text) } })
+    $dlg.CancelButton = $buttons.Ok
+    Add-DockStack -Parent $dlg -Fill $txt -Bottom @($buttons.Panel)
+    $dlg.Add_Shown({ $txt.SelectionLength = 0 })
+    [void]$dlg.ShowDialog($script:UI.Form)
+    $dlg.Dispose()
+}
 
-    $btnRun = New-Object System.Windows.Forms.Button
-    $btnRun.Text = 'Uruchom na zaznaczonych'
-    $btnRun.Left = 900; $btnRun.Top = 64; $btnRun.Width = 220; $btnRun.Height = 34
-    $tab.Controls.Add($btnRun)
+function Show-GridDialog {
+    # Wyświetla dowolne obiekty w tabeli z filtrem, eksportem i kopiowaniem
+    param([string]$Title, [object[]]$Rows, [string[]]$SecretColumns = @())
+    $key = 'Dialog_' + [guid]::NewGuid().ToString('N')
+    $m = New-ModuleContext -Definition @{ Key = $key; Title = $Title; Description = ''; Category = '' }
+    $m.SecretColumns = @($SecretColumns)
+    $script:UI.Modules[$key] = $m
+    $dlg = $null
+    try {
+        $dlg = New-DialogForm -Title $Title -Width 960 -Height 560 -Resizable
+        New-ResultView -Module $m
+        foreach ($r in $Rows) {
+            Add-ResultRows -Module $m -Computer ([string](Get-ObjectValue $r 'Komputer')) -Objects @($r)
+        }
+        Resize-ResultColumns -Module $m
+        $buttons = Add-DialogButtons -Form $dlg -OkText 'Zamknij'
+        $buttons.Cancel.Visible = $false
+        $dlg.CancelButton = $buttons.Ok
+        Add-DockStack -Parent $dlg -Top @($m.ResultBar) -Fill $m.Grid -Bottom @($buttons.Panel)
+        [void]$dlg.ShowDialog($script:UI.Form)
+    }
+    finally {
+        $script:UI.Modules.Remove($key)
+        if ($dlg) { $dlg.Dispose() }
+    }
+}
 
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 200; $grid.Width = 1110; $grid.Height = 470
-    $grid.ReadOnly = $true
-    $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
+function Select-OrganizationalUnit {
+    # Wybór OU z drzewa domeny. Zwraca DN, '' (cała domena - tylko z -AllowDomainRoot) albo $null (anulowano).
+    param([string]$Title = 'Wybierz jednostkę organizacyjną', [string]$Selected = '', [switch]$AllowDomainRoot)
+    Import-AdModule
+    $ad = Get-AdSplat
+    $script:UI.Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        $domain = Get-ADDomain @ad
+        $dns = @(Get-ADOrganizationalUnit -Filter * @ad | ForEach-Object { $_.DistinguishedName })
+        $dns += [string]$domain.ComputersContainer
+    }
+    finally {
+        $script:UI.Form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
 
-    $btnRun.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $rbPS = $ctx.Controls.rbPS
-                $txt = $ctx.Controls.txt
-                $grid = $ctx.Controls.grid
+    $dlg = New-DialogForm -Title $Title -Width 520 -Height 620 -Resizable
+    $tree = New-Object System.Windows.Forms.TreeView
+    $tree.HideSelection = $false
+    $tree.Font = $script:UI.Font
+    $root = $tree.Nodes.Add([string]$domain.DNSRoot)
+    $root.Tag = [string]$domain.DistinguishedName
+    $map = @{ ([string]$domain.DistinguishedName).ToLowerInvariant() = $root }
+    $sorted = $dns | Where-Object { $_ } | Sort-Object { @($_ -split '(?<!\\),').Count }, { $_ }
+    foreach ($dn in $sorted) {
+        $parent = $map[(Get-ParentDN $dn).ToLowerInvariant()]
+        if (-not $parent) { $parent = $root }
+        $node = $parent.Nodes.Add((Get-RdnValue $dn))
+        $node.Tag = $dn
+        $map[$dn.ToLowerInvariant()] = $node
+        if ($Selected -and $dn -eq $Selected) { $tree.SelectedNode = $node }
+    }
+    $root.Expand()
+    if (-not $tree.SelectedNode) { $tree.SelectedNode = $root }
+    if ($tree.SelectedNode) { $tree.SelectedNode.EnsureVisible() }
+
+    $hintText = if ($AllowDomainRoot) { 'Zaznacz OU lub korzeń domeny (cała domena).' } else { 'Zaznacz docelową jednostkę organizacyjną.' }
+    $hint = Add-Label -Parent $null -Text $hintText -Hint
+    $buttons = Add-DialogButtons -Form $dlg
+    $buttons.Ok.DialogResult = [System.Windows.Forms.DialogResult]::None
+    $buttons.Ok.Add_Click({
+            if (-not $tree.SelectedNode) { return }
+            if (-not $AllowDomainRoot -and $tree.SelectedNode -eq $root) { Show-Warning 'Wybierz jednostkę organizacyjną (nie korzeń domeny).'; return }
+            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        })
+    $tree.Add_NodeMouseDoubleClick({ $buttons.Ok.PerformClick() })
+    Add-DockStack -Parent $dlg -Top @($hint) -Fill $tree -Bottom @($buttons.Panel)
+    $result = $null
+    if ($dlg.ShowDialog($script:UI.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $result = if ($tree.SelectedNode -eq $root) { '' } else { [string]$tree.SelectedNode.Tag }
+    }
+    $dlg.Dispose()
+    return $result
+}
+#endregion
+
+#region Tabela wyników (DataTable + DataView + DataGridView)
+$script:GridEvents = @{
+    CellDoubleClick     = {
+        param($s, $e)
+        try {
+            if ($e.RowIndex -lt 0) { return }
+            $m = $script:UI.Modules[[string]$s.Tag]
+            if ($m) { Show-RowDetails -Module $m -RowIndex $e.RowIndex }
+        }
+        catch { Write-Log "Nie można wyświetlić szczegółów: $($_.Exception.Message)" 'ERROR' }
+    }
+    CellFormatting      = {
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $null -eq $e.Value -or $e.Value -is [System.DBNull]) { return }
+        try {
+            $m = $script:UI.Modules[[string]$s.Tag]
+            if (-not $m) { return }
+            $name = $s.Columns[$e.ColumnIndex].DataPropertyName
+            if ($m.SecretColumns.Count -gt 0 -and $m.SecretColumns -contains $name) {
+                if (-not $m.RevealSecrets -and [string]$e.Value -ne '') {
+                    $e.Value = '••••••••••'
+                    $e.FormattingApplied = $true
+                }
+                return
+            }
+            if ($name -eq 'Status' -or $name -eq 'Wynik') {
+                if (([string]$e.Value).StartsWith('Błąd')) { $e.CellStyle.ForeColor = [System.Drawing.Color]::Firebrick }
+                return
+            }
+            if ($m.ColorBools) {
+                $v = [string]$e.Value
+                if ($v -eq 'Tak') { $e.CellStyle.ForeColor = [System.Drawing.Color]::ForestGreen }
+                elseif ($v -eq 'Nie') { $e.CellStyle.ForeColor = [System.Drawing.Color]::Firebrick }
+            }
+        }
+        catch { }
+    }
+    DataBindingComplete = {
+        param($s, $e)
+        try { if ($s.Columns.Contains('__search')) { $s.Columns['__search'].Visible = $false } } catch { }
+    }
+    DataError           = {
+        param($s, $e)
+        $e.ThrowException = $false
+    }
+}
+
+function New-ResultGrid {
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.ReadOnly = $true
+    $g.AllowUserToAddRows = $false
+    $g.AllowUserToDeleteRows = $false
+    $g.AllowUserToResizeRows = $false
+    $g.AllowUserToOrderColumns = $true
+    $g.RowHeadersVisible = $false
+    $g.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $g.MultiSelect = $true
+    $g.AutoGenerateColumns = $true
+    $g.BackgroundColor = [System.Drawing.SystemColors]::Window
+    $g.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $g.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
+    $g.ColumnHeadersDefaultCellStyle.Font = $script:UI.FontBold
+    $g.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 251)
+    $g.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
+    $g.ClipboardCopyMode = [System.Windows.Forms.DataGridViewClipboardCopyMode]::EnableAlwaysIncludeHeaderText
+    $g.RowTemplate.Height = 22
+    try {
+        $prop = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        $prop.SetValue($g, $true, $null)
+    }
+    catch { }
+    $g.add_CellDoubleClick($script:GridEvents.CellDoubleClick)
+    $g.add_CellFormatting($script:GridEvents.CellFormatting)
+    $g.add_DataBindingComplete($script:GridEvents.DataBindingComplete)
+    $g.add_DataError($script:GridEvents.DataError)
+    return $g
+}
+
+function New-ResultView {
+    # Pasek nad tabelą (filtr, licznik, eksport, kopiowanie) + sama tabela
+    param([hashtable]$Module)
+    $bar = New-FlowRow
+    $bar.Padding = New-Object System.Windows.Forms.Padding(0, 8, 0, 2)
+    [void](Add-Label -Parent $bar -Text 'Filtr wyników:')
+    $filter = Add-TextBox -Parent $bar -Width 220
+    Register-ControlHandler -Control $filter -EventName 'TextChanged' -Module $Module -Action { param($m) Update-ResultFilter -Module $m }
+    $count = Add-Label -Parent $bar -Text '0 wierszy' -Hint
+    $count.MinimumSize = New-Object System.Drawing.Size(120, 0)
+    $btnExport = New-PlainButton -Parent $bar -Text 'Eksport CSV…'
+    Register-ControlHandler -Control $btnExport -EventName 'Click' -Module $Module -Action { param($m) Export-ResultView -Module $m }
+    $btnCopy = New-PlainButton -Parent $bar -Text 'Kopiuj'
+    Register-ControlHandler -Control $btnCopy -EventName 'Click' -Module $Module -Action { param($m) Copy-ResultView -Module $m }
+    if ($Module.SecretColumns.Count -gt 0) {
+        $chk = Add-CheckBox -Parent $bar -Text 'Pokaż wartości poufne'
+        Register-ControlHandler -Control $chk -EventName 'CheckedChanged' -Module $Module -Action {
+            param($m, $s)
+            $m.RevealSecrets = $s.Checked
+            $m.Grid.Invalidate()
+        }
+    }
+    [void](Add-Label -Parent $bar -Text 'Dwuklik na wierszu – szczegóły' -Hint)
+
+    $grid = New-ResultGrid
+    $grid.Tag = $Module.Key
+    $Module.Grid = $grid
+    $Module.ResultBar = $bar
+    $Module.FilterBox = $filter
+    $Module.CountLabel = $count
+    Reset-ResultTable -Module $Module
+}
+
+function Reset-ResultTable {
+    param([hashtable]$Module)
+    $table = New-Object System.Data.DataTable 'Wyniki'
+    # Ukryta kolumna z tekstem do wyszukiwania (filtr działa po wszystkich kolumnach naraz)
+    [void]$table.Columns.Add('__search', [string])
+    # Hidden: DataGridView nie generuje dla niej kolumny, a RowFilter nadal może z niej korzystać
+    $table.Columns['__search'].ColumnMapping = [System.Data.MappingType]::Hidden
+    $view = [System.Data.DataView]::new($table)
+    $Module.Table = $table
+    $Module.View = $view
+    if ($Module.Grid) {
+        $Module.Grid.DataSource = $null
+        $Module.Grid.Columns.Clear()
+        $Module.Grid.DataSource = $view
+    }
+    Update-ResultFilter -Module $Module
+}
+
+function Add-ResultRows {
+    # Dodaje obiekty jako wiersze tabeli modułu; nowe właściwości tworzą nowe kolumny
+    param([hashtable]$Module, [string]$Computer, [object[]]$Objects)
+    $table = $Module.Table
+    if ($null -eq $table) { return }
+    $wasEmpty = ($table.Rows.Count -eq 0)
+    $table.BeginLoadData()
+    try {
+        foreach ($obj in $Objects) {
+            if ($null -eq $obj) { continue }
+            $values = New-Object System.Collections.Specialized.OrderedDictionary
+            if ($Computer) { $values['Komputer'] = $Computer }
+            $base = if ($obj -is [System.Management.Automation.PSObject]) { $obj.PSObject.BaseObject } else { $obj }
+            if ($base -is [string] -or $base -is [System.ValueType]) {
+                $values['Wynik'] = ConvertTo-CellValue $base
+            }
+            else {
+                foreach ($p in $obj.PSObject.Properties) {
+                    if ($script:HiddenProperties -contains $p.Name) { continue }
+                    if ($Computer -and $p.Name -eq 'Komputer') { continue }
+                    $values[$p.Name] = ConvertTo-CellValue $p.Value
+                }
+            }
+            foreach ($name in $values.Keys) {
+                if (-not $table.Columns.Contains($name)) { [void]$table.Columns.Add($name, [object]) }
+            }
+            $row = $table.NewRow()
+            $search = New-Object System.Text.StringBuilder
+            foreach ($name in $values.Keys) {
+                $v = $values[$name]
+                $row[$name] = $v
+                if ($v -isnot [System.DBNull] -and $Module.SecretColumns -notcontains $name) {
+                    [void]$search.Append([string]$v).Append(' ')
+                }
+            }
+            $row['__search'] = $search.ToString().ToLowerInvariant()
+            $table.Rows.Add($row)
+        }
+    }
+    finally {
+        $table.EndLoadData()
+    }
+    if ($Module.Grid -and $Module.Grid.Columns.Contains('__search')) { $Module.Grid.Columns['__search'].Visible = $false }
+    if ($wasEmpty -and $table.Rows.Count -gt 0) { Resize-ResultColumns -Module $Module }
+    Update-ResultCount -Module $Module
+}
+
+function Update-ResultFilter {
+    param([hashtable]$Module)
+    # Uwaga: DataView jest dla PowerShella listą - pusty widok byłby fałszem, stąd porównanie z $null
+    if ($null -eq $Module.View) { return }
+    $text = if ($Module.FilterBox) { $Module.FilterBox.Text.Trim().ToLowerInvariant() } else { '' }
+    $terms = @($text -split '\s+' | Where-Object { $_ })
+    $filter = (@($terms | ForEach-Object { "__search LIKE '*{0}*'" -f (ConvertTo-LikeLiteral $_) }) -join ' AND ')
+    try { $Module.View.RowFilter = $filter } catch { $Module.View.RowFilter = '' }
+    Update-ResultCount -Module $Module
+}
+
+function Update-ResultCount {
+    param([hashtable]$Module)
+    if ($null -eq $Module.CountLabel -or $null -eq $Module.View) { return }
+    $total = $Module.Table.Rows.Count
+    $visible = $Module.View.Count
+    $Module.CountLabel.Text = if ($visible -eq $total) { "$total wierszy" } else { "$visible z $total wierszy" }
+}
+
+function Resize-ResultColumns {
+    param([hashtable]$Module)
+    $g = $Module.Grid
+    if (-not $g -or $g.Columns.Count -eq 0) { return }
+    try {
+        $g.AutoResizeColumns([System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::DisplayedCells)
+        foreach ($c in $g.Columns) {
+            if ($c.Width -gt 420) { $c.Width = 420 }
+            if ($c.Width -lt 60) { $c.Width = 60 }
+        }
+    }
+    catch { }
+}
+
+function Get-VisibleColumnNames {
+    param([hashtable]$Module)
+    $cols = @($Module.Grid.Columns | Where-Object { $_.Visible -and $_.DataPropertyName -ne '__search' } | Sort-Object DisplayIndex)
+    return @($cols | ForEach-Object { $_.DataPropertyName })
+}
+
+function Get-ExportValue {
+    # Wartość komórki do eksportu/kopiowania (z maskowaniem wartości poufnych)
+    param([hashtable]$Module, $RowView, [string]$Column)
+    $v = Get-ObjectValue $RowView $Column
+    if ($null -eq $v) { return '' }
+    if ($Module.SecretColumns -contains $Column -and -not $Module.RevealSecrets -and [string]$v -ne '') { return '********' }
+    return $v
+}
+
+function Get-SelectedResultRows {
+    # Zaznaczone wiersze tabeli (DataRowView); gdy nic nie zaznaczono - bieżący wiersz
+    param([hashtable]$Module)
+    $g = $Module.Grid
+    $rows = @(foreach ($r in $g.SelectedRows) { if ($r.DataBoundItem) { $r.DataBoundItem } })
+    if ($rows.Count -eq 0 -and $g.CurrentRow -and $g.CurrentRow.DataBoundItem) { $rows = @($g.CurrentRow.DataBoundItem) }
+    return $rows
+}
+
+function Get-SelectedRowsByHost {
+    # Grupuje zaznaczone wiersze po kolumnie Komputer: host -> lista hashtabel z wartościami kolumn
+    param([hashtable]$Module, [string[]]$Columns)
+    $result = [ordered]@{}
+    foreach ($drv in @(Get-SelectedResultRows -Module $Module)) {
+        $computer = [string](Get-ObjectValue $drv 'Komputer')
+        if (-not $computer -or (Get-ObjectValue $drv 'Status') -eq 'Błąd') { continue }
+        $item = @{}
+        $valid = $true
+        foreach ($c in $Columns) {
+            $v = Get-ObjectValue $drv $c
+            if ($null -eq $v -or [string]$v -eq '') { $valid = $false }
+            $item[$c] = $v
+        }
+        if (-not $valid) { continue }
+        if (-not $result.Contains($computer)) { $result[$computer] = New-Object System.Collections.ArrayList }
+        [void]$result[$computer].Add($item)
+    }
+    return $result
+}
+
+function Export-ResultView {
+    param([hashtable]$Module)
+    if ($null -eq $Module.View -or $Module.View.Count -eq 0) { Show-Warning 'Brak danych do eksportu.'; return }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'CSV (*.csv)|*.csv'
+    $dlg.FileName = '{0}_{1:yyyyMMdd_HHmm}.csv' -f ($Module.Title -replace '[\\/:*?"<>|\s]+', '_'), (Get-Date)
+    if ($dlg.ShowDialog($script:UI.Form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $columns = Get-VisibleColumnNames -Module $Module
+    $objects = foreach ($drv in $Module.View) {
+        $o = [ordered]@{}
+        foreach ($c in $columns) { $o[$c] = Get-ExportValue -Module $Module -RowView $drv -Column $c }
+        [pscustomobject]$o
+    }
+    $encoding = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
+    $objects | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -UseCulture -Encoding $encoding
+    Write-Log "Zapisano $(@($objects).Count) wierszy do pliku $($dlg.FileName)" 'OK'
+}
+
+function Copy-ResultView {
+    # Kopiuje zaznaczone wiersze (albo wszystkie widoczne) jako tekst rozdzielany tabulatorami (Excel)
+    param([hashtable]$Module)
+    if ($null -eq $Module.View -or $Module.View.Count -eq 0) { Show-Warning 'Brak danych do skopiowania.'; return }
+    $columns = Get-VisibleColumnNames -Module $Module
+    $rows = @(foreach ($r in $Module.Grid.SelectedRows) { if ($r.DataBoundItem) { $r.DataBoundItem } })
+    if ($rows.Count -le 1) { $rows = @($Module.View | ForEach-Object { $_ }) }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine(($columns -join "`t"))
+    foreach ($drv in $rows) {
+        $cells = foreach ($c in $columns) { ([string](Get-ExportValue -Module $Module -RowView $drv -Column $c)) -replace '[\t\r\n]+', ' ' }
+        [void]$sb.AppendLine((@($cells) -join "`t"))
+    }
+    [System.Windows.Forms.Clipboard]::SetText($sb.ToString())
+    Write-Log "Skopiowano do schowka $($rows.Count) wierszy." 'OK'
+}
+
+function Show-RowDetails {
+    param([hashtable]$Module, [int]$RowIndex)
+    $drv = $Module.Grid.Rows[$RowIndex].DataBoundItem
+    if (-not $drv) { return }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($col in $Module.Table.Columns) {
+        $name = $col.ColumnName
+        if ($name -eq '__search') { continue }
+        $v = Get-ExportValue -Module $Module -RowView $drv -Column $name
+        if ([string]$v -eq '') { continue }
+        $text = [string]$v
+        if ($text -match "[\r\n]") { [void]$sb.AppendLine("${name}:").AppendLine($text).AppendLine() }
+        else { [void]$sb.AppendLine(('{0}: {1}' -f $name, $text)) }
+    }
+    $title = 'Szczegóły'
+    $computer = Get-ObjectValue $drv 'Komputer'
+    if ($computer) { $title = "Szczegóły – $computer" }
+    Show-TextDialog -Title $title -Text $sb.ToString()
+}
+#endregion
+
+#region Silnik operacji w tle
+# Każdy host to osobne zadanie w puli wątków. Tryb 'Remote' wykonuje blok skryptu na hoście przez
+# Invoke-Command (blok dostaje jeden parametr: hashtablę $P). Tryb 'Local' wykonuje blok lokalnie
+# z parametrami ($Target, $P, $Ctx) - np. dla poleceń AD albo kopiowania plików.
+# Wyniki odbiera timer w wątku okna, więc wszystkie aktualizacje interfejsu są bezpieczne.
+$script:WorkerScript = @'
+param($Target, $Mode, $ScriptText, $P, $Ctx)
+$ProgressPreference = 'SilentlyContinue'
+$result = @{ Target = $Target; Ok = $true; Data = @(); Errors = @() }
+try {
+    $sb = [scriptblock]::Create($ScriptText)
+    if ($Mode -eq 'Remote') {
+        $icErrors = $null
+        $ic = @{
+            ComputerName  = $Target
+            ScriptBlock   = $sb
+            ArgumentList  = @(, $P)
+            ErrorAction   = 'SilentlyContinue'
+            ErrorVariable = 'icErrors'
+        }
+        if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
+        if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
+        $result.Data = @(Invoke-Command @ic)
+        if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { $_.Exception.Message }) }
+    }
+    else {
+        $raw = @(& $sb $Target $P $Ctx 2>&1)
+        $result.Data = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+        $result.Errors = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.Exception.Message })
+    }
+}
+catch {
+    $result.Errors = @($result.Errors) + @($_.Exception.Message)
+}
+if ($result.Errors.Count -gt 0 -and $result.Data.Count -eq 0) { $result.Ok = $false }
+[pscustomobject]$result
+'@
+
+function Initialize-Engine {
+    if ($script:Engine.Pool) { return }
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    # Zasady wykonywania dotyczą tylko Windows (na innych platformach Open() rzuciłby wyjątek)
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        try { $iss.ExecutionPolicy = [Microsoft.PowerShell.ExecutionPolicy]::Bypass } catch { }
+    }
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, [int]$script:Settings.ThrottleLimit, $iss, $Host)
+    $pool.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $pool.Open()
+    $script:Engine.Pool = $pool
+}
+
+function Set-EngineThrottle([int]$Limit) {
+    $script:Settings.ThrottleLimit = $Limit
+    if ($script:Engine.Pool) {
+        try { [void]$script:Engine.Pool.SetMaxRunspaces($Limit) } catch { }
+    }
+}
+
+function Set-ModuleBusy {
+    param([hashtable]$Module, [bool]$Busy)
+    $Module.Busy = $Busy
+    foreach ($b in $Module.Buttons) { $b.Enabled = -not $Busy }
+}
+
+function New-SessionOption {
+    # Odpowiednik New-PSSessionOption -OpenTimeout (obiekt tworzony bezpośrednio)
+    $option = New-Object System.Management.Automation.Remoting.PSSessionOption
+    $option.OpenTimeout = [TimeSpan]::FromSeconds([int]$script:Settings.TimeoutSec)
+    return $option
+}
+
+function Start-HostOperation {
+    <#
+        Uruchamia blok skryptu dla każdego hosta z -Targets.
+        -Output Grid : wyniki trafiają do tabeli modułu (kolumna Komputer + właściwości obiektów)
+        -Output Log  : wyniki wypisywane są w dzienniku
+        -Output None : tylko -OnResult/-OnComplete
+        -PerTarget   : osobna hashtabla $P dla wybranych hostów (np. różne usługi na różnych komputerach)
+        -OnResult { param($m, $r) }   - po zakończeniu każdego hosta ($r: Target, Ok, Data, Errors)
+        -OnComplete { param($m, $op) } - po zakończeniu wszystkich hostów (nie wywoływane po anulowaniu)
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Module,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Targets,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [switch]$Local,
+        [hashtable]$Parameters = @{},
+        [hashtable]$PerTarget = @{},
+        [ValidateSet('Grid', 'Log', 'None')][string]$Output = 'Grid',
+        [switch]$Append,
+        [scriptblock]$OnResult,
+        [scriptblock]$OnComplete
+    )
+    if ($Module.Busy) {
+        Show-Warning "Poprzednia operacja w module «$($Module.Title)» jeszcze trwa. Poczekaj na jej zakończenie lub anuluj ją na pasku stanu."
+        return
+    }
+    $hosts = @($Targets | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    if ($hosts.Count -eq 0) { return }
+
+    Initialize-Engine
+    if ($Output -eq 'Grid' -and -not $Append -and $Module.Grid) { Reset-ResultTable -Module $Module }
+
+    $ctx = @{
+        Credential    = Get-EffectiveCredential
+        Server        = [string]$script:Settings.DomainController
+        SessionOption = New-SessionOption
+    }
+    $mode = if ($Local) { 'Local' } else { 'Remote' }
+    $scriptText = $ScriptBlock.ToString()
+
+    $op = @{
+        Id         = $script:Engine.NextId
+        Name       = $Name
+        Module     = $Module
+        Output     = $Output
+        OnResult   = $OnResult
+        OnComplete = $OnComplete
+        Items      = New-Object System.Collections.ArrayList
+        Total      = $hosts.Count
+        Done       = 0
+        Failed     = 0
+        Cancelled  = $false
+        Started    = Get-Date
+    }
+    $script:Engine.NextId++
+
+    foreach ($t in $hosts) {
+        $p = $Parameters
+        if ($PerTarget.ContainsKey($t)) { $p = $PerTarget[$t] }
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        $ps.RunspacePool = $script:Engine.Pool
+        [void]$ps.AddScript($script:WorkerScript)
+        [void]$ps.AddArgument($t).AddArgument($mode).AddArgument($scriptText).AddArgument($p).AddArgument($ctx)
+        $handle = $ps.BeginInvoke()
+        [void]$op.Items.Add(@{ Target = $t; PS = $ps; Handle = $handle; Finished = $false })
+    }
+
+    Set-ModuleBusy -Module $Module -Busy $true
+    [void]$script:Engine.Operations.Add($op)
+    $list = (@($hosts | Select-Object -First 8) -join ', ')
+    if ($hosts.Count -gt 8) { $list += ", … (+$($hosts.Count - 8))" }
+    Write-Log ("{0} – start dla {1} host(ów): {2}" -f $Name, $hosts.Count, $list) -Module $Module.Title
+    $script:Engine.Timer.Start()
+    Update-StatusBar
+}
+
+function Update-Operations {
+    # Wywoływane przez timer w wątku okna
+    if ($script:Engine.InTick) { return }
+    $script:Engine.InTick = $true
+    try {
+        foreach ($op in @($script:Engine.Operations)) {
+            foreach ($item in $op.Items) {
+                if ($item.Finished -or -not $item.Handle.IsCompleted) { continue }
+                $item.Finished = $true
+                $r = $null
                 try {
-                    $targets = & $getTargets
-                    $cmd = $txt.Text.Trim()
-                    if (-not $cmd) { Show-Error "Wpisz polecenia."; return }
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] uruchamiam polecenia..."
-                        if ($rbPS.Checked) {
-                            $sb = [scriptblock]::Create($cmd)
-                            $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        }
-                        else {
-                            $sb = { param($c) cmd.exe /c $c 2>&1 }
-                            $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb -Arg @{ c = $cmd }
-                        }
-                        $text = ($out | Out-String).Trim()
-                        $rows += [pscustomobject]@{Komputer = $t; Wynik = $text }
+                    $output = $item.PS.EndInvoke($item.Handle)
+                    if ($output -and $output.Count -gt 0) { $r = $output[0] }
+                    if (-not $r) {
+                        $msg = 'Zadanie nie zwróciło wyniku.'
+                        if ($item.PS.Streams.Error.Count -gt 0) { $msg = $item.PS.Streams.Error[0].Exception.Message }
+                        $r = [pscustomobject]@{ Target = $item.Target; Ok = $false; Data = @(); Errors = @($msg) }
                     }
-                    $grid.DataSource = $rows
-                    Write-Log "Zakończono."
                 }
                 catch {
-                    Write-Log $_.Exception.Message 'ERROR'
+                    $msg = if ($op.Cancelled) { 'Anulowano.' } else { $_.Exception.Message }
+                    $r = [pscustomobject]@{ Target = $item.Target; Ok = $false; Data = @(); Errors = @($msg) }
                 }
-            }
-        })
-}
-
-# 2) BitLocker (manage-bde -status, backup do AD)
-Register-ModuleTab -Name 'BitLocker' -Builder {
-    param($tab, $getTargets)
-
-    $btnStatus = New-Object System.Windows.Forms.Button
-    $btnStatus.Text = 'Sprawdz status'
-    $btnStatus.Left = 12; $btnStatus.Top = 12; $btnStatus.Width = 160
-    $tab.Controls.Add($btnStatus)
-
-    $btnBackup = New-Object System.Windows.Forms.Button
-    $btnBackup.Text = 'Backup kluczy do AD (C:)'
-    $btnBackup.Left = 190; $btnBackup.Top = 12; $btnBackup.Width = 220
-    $tab.Controls.Add($btnBackup)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true
-    $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btnStatus.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] sprawdzam BitLocker..."
-                        $sb = {
-                            $vols = @()
-                            if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-                                foreach ($vol in Get-BitLockerVolume) {
-                                    $vols += [pscustomobject]@{
-                                        Volume           = $vol.MountPoint
-                                        ConversionStatus = $vol.VolumeStatus
-                                        Protection       = $vol.ProtectionStatus
-                                        Lock             = $vol.LockStatus
-                                        Version          = $vol.EncryptionMethod
-                                    }
-                                }
-                            }
-                            if (-not $vols) {
-                                $exe = Join-Path $env:SystemRoot 'System32\manage-bde.exe'
-                                if (-not (Test-Path $exe)) { throw 'manage-bde.exe is not available na hoscie.' }
-                                $text = (& $exe -status 2>&1) | Out-String
-                                $current = @{}
-                                foreach ($line in $text -split "`r?`n") {
-                                    if ($line -match 'Volume [A-Z]:') {
-                                        if ($current.Count -gt 0) { $vols += [pscustomobject]$current; $current = @{} }
-                                        $current.Volume = ($line -replace 'Volume ', '').Trim()
-                                    }
-                                    if ($line -match '^\s*Conversion Status:\s*(.+)$') { $current.ConversionStatus = $matches[1].Trim() }
-                                    if ($line -match '^\s*BitLocker Version:\s*(.+)$') { $current.Version = $matches[1].Trim() }
-                                    if ($line -match '^\s*Protection Status:\s*(.+)$') { $current.Protection = $matches[1].Trim() }
-                                    if ($line -match '^\s*Lock Status:\s*(.+)$') { $current.Lock = $matches[1].Trim() }
-                                }
-                                if ($current.Count -gt 0) { $vols += [pscustomobject]$current }
-                            }
-                            $vols
-                        }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        if (-not $out) {
-                            $rows += [pscustomobject]@{Komputer = $t; Wolumin = '(brak informacji)'; Ochrona = 'brak danych'; Konwersja = '-'; Lock = '-'; Wersja = '-' }
-                        }
-                        else {
-                            foreach ($v in $out) {
-                                $rows += [pscustomobject]@{
-                                    Komputer  = $t
-                                    Wolumin   = $v.Volume
-                                    Ochrona   = $v.Protection
-                                    Konwersja = $v.ConversionStatus
-                                    Lock      = $v.Lock
-                                    Wersja    = $v.Version
-                                }
-                            }
-                        }
-                    }
-                    $grid.DataSource = $rows
+                finally {
+                    try { $item.PS.Dispose() } catch { }
                 }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
+                Complete-OperationItem -Operation $op -Result $r
             }
-        })
-
-    $btnBackup.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                try {
-                    $targets = & $getTargets
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] backup kluczy C: do AD..."
-                        $sb = {
-                            try {
-                                if (Get-Command Backup-BitLockerKeyProtector -ErrorAction SilentlyContinue) {
-                                    $vol = Get-BitLockerVolume -MountPoint 'C:'
-                                    $kps = $vol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' }
-                                    if (-not $kps) { return 'Brak RecoveryPassword do backupu.' }
-                                    foreach ($kp in $kps) {
-                                        Backup-BitLockerKeyProtector -MountPoint 'C:' -KeyProtectorId $kp.KeyProtectorId | Out-Null
-                                    }
-                                    'Backup-BitLockerKeyProtector wykonany.'
-                                }
-                                else {
-                                    $exe = Join-Path $env:SystemRoot 'System32\manage-bde.exe'
-                                    if (-not (Test-Path $exe)) { throw 'manage-bde.exe is not available na hoscie.' }
-                                    $output = (& $exe -protectors -get C: -Type RecoveryPassword) -join "`n"
-                                    $ids = [regex]::Matches($output, 'ID:\s*({[^}]+})') | ForEach-Object { $_.Groups[1].Value }
-                                    if ($ids.Count -eq 0) { return 'Nie znaleziono RecoveryPassword.' }
-                                    foreach ($id in $ids) {
-                                        & $exe -protectors -adbackup C: -id $id | Out-Null
-                                    }
-                                    'manage-bde -protectors -adbackup wykonany.'
-                                }
-                            }
-                            catch { $_.Exception.Message }
-                        }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        Write-Log "[$t] $out"
-                    }
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
-}
-
-# 3) Dyski (WMI: Win32_LogicalDisk)
-Register-ModuleTab -Name 'Dyski' -Builder {
-    param($tab, $getTargets)
-
-    $btnRefresh = New-Object System.Windows.Forms.Button
-    $btnRefresh.Text = 'Odśwież'
-    $btnRefresh.Left = 12; $btnRefresh.Top = 12; $btnRefresh.Width = 120
-    $tab.Controls.Add($btnRefresh)
-
-    $btnClean = New-Object System.Windows.Forms.Button
-    $btnClean.Text = 'Wyczyść TEMP + Kosz'
-    $btnClean.Left = 150; $btnClean.Top = 12; $btnClean.Width = 180
-    $tab.Controls.Add($btnClean)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true
-    $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btnRefresh.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    Connect-Cim -Computers $targets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        if (-not $State.CimSessions.ContainsKey($t)) { continue }
-                        $s = $State.CimSessions[$t]
-                        $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" -CimSession $s
-                        foreach ($d in $disks) {
-                            $rows += [pscustomobject]@{
-                                Komputer     = $t
-                                Dysk         = $d.DeviceID
-                                SystemPlikow = $d.FileSystem
-                                Wolne        = (Format-Bytes $d.FreeSpace)
-                                Rozmiar      = (Format-Bytes $d.Size)
-                                Zajetosc     = [math]::Round((($d.Size - $d.FreeSpace) / $d.Size) * 100, 1)
-                            }
-                        }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
-
-    $btnClean.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                try {
-                    $targets = & $getTargets
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] czyszczenie TEMP i Kosza..."
-                        $sb = {
-                            try {
-                                Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
-                                if (Get-Command Clear-RecycleBin -ErrorAction SilentlyContinue) { Clear-RecycleBin -Force -ErrorAction SilentlyContinue }
-                                'OK'
-                            }
-                            catch { $_.Exception.Message }
-                        }
-                        $r = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        Write-Log "[$t] wynik: $r"
-                    }
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
-}
-
-# 4) Usługi (przegląd i sterowanie)
-Register-ModuleTab -Name 'Usługi' -Builder {
-    param($tab, $getTargets)
-
-    $lblHost = New-Object System.Windows.Forms.Label
-    $lblHost.Text = 'Komputer (jedna nazwa):'
-    $lblHost.Left = 12; $lblHost.Top = 16; $lblHost.AutoSize = $true
-    $tab.Controls.Add($lblHost)
-
-    $cmbHost = New-Object System.Windows.Forms.ComboBox
-    $cmbHost.Left = 140; $cmbHost.Top = 12; $cmbHost.Width = 240; $cmbHost.DropDownStyle = 'DropDownList'
-    $tab.Controls.Add($cmbHost)
-
-    $btnLoad = New-Object System.Windows.Forms.Button
-    $btnLoad.Text = 'Załaduj usługi'
-    $btnLoad.Left = 400; $btnLoad.Top = 12; $btnLoad.Width = 140
-    $tab.Controls.Add($btnLoad)
-
-    $txtFilter = New-Object System.Windows.Forms.TextBox
-    $txtFilter.Left = 560; $txtFilter.Top = 14; $txtFilter.Width = 200
-    $tab.Controls.Add($txtFilter)
-    $lblF = New-Object System.Windows.Forms.Label
-    $lblF.Text = 'Filtr'; $lblF.Left = 520; $lblF.Top = 16; $lblF.AutoSize = $true
-    $tab.Controls.Add($lblF)
-
-    $btnStart = New-Object System.Windows.Forms.Button
-    $btnStart.Text = 'Start'
-    $btnStart.Left = 780; $btnStart.Top = 12; $btnStart.Width = 100
-    $tab.Controls.Add($btnStart)
-
-    $btnStop = New-Object System.Windows.Forms.Button
-    $btnStop.Text = 'Stop'
-    $btnStop.Left = 890; $btnStop.Top = 12; $btnStop.Width = 100
-    $tab.Controls.Add($btnStop)
-
-    $btnRestart = New-Object System.Windows.Forms.Button
-    $btnRestart.Text = 'Restart'
-    $btnRestart.Left = 1000; $btnRestart.Top = 12; $btnRestart.Width = 100
-    $tab.Controls.Add($btnRestart)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true
-    $grid.SelectionMode = 'FullRowSelect'
-    $grid.MultiSelect = $false
-    $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    # Inicjalizacja listy hostów
-    $tab.Add_Enter({
-            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
-            Restore-ModuleScope $this
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $combo = $ctx.Controls.cmbHost
-                $combo.Items.Clear()
-                foreach ($i in Get-SelectedComputers) { [void]$combo.Items.Add($i) }
-                if ($combo.Items.Count -gt 0) { $combo.SelectedIndex = 0 }
-            }
-        })
-
-    $btnLoad.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $combo = $ctx.Controls.cmbHost
-                $gridCtrl = $ctx.Controls.grid
-                $filterBox = $ctx.Controls.txtFilter
-                try {
-                    $selectedHost = $combo.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                    Connect-Cim -Computers @($selectedHost)
-                    $s = $State.CimSessions[$selectedHost]
-                    $svcs = Get-CimInstance -ClassName Win32_Service -CimSession $s | Sort-Object Name
-                    if ($filterBox.Text) { $svcs = $svcs | Where-Object { $_.Name -like "*$($filterBox.Text)*" -or $_.DisplayName -like "*$($filterBox.Text)*" } }
-                    $gridCtrl.DataSource = @($svcs | Select-Object Name, DisplayName, State, StartMode, ProcessId)
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
-
-    foreach ($btn in @($btnStart, $btnStop, $btnRestart)) {
-        $btn.Add_Click({
-                Invoke-InModuleContext -SourceControl $this -Action {
-                    param($ctx)
-                    $combo = $ctx.Controls.cmbHost
-                    $gridCtrl = $ctx.Controls.grid
-                    $btnLoad = $ctx.Controls.btnLoad
-                    try {
-                        $selectedHost = $combo.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                        if (-not $gridCtrl.SelectedRows) { Show-Error "Zaznacz jedna usluge."; return }
-                        $name = $gridCtrl.SelectedRows[0].Cells['Name'].Value
-                        Write-Log "[$selectedHost] $($this.Text) uslugi $name ..."
-                        $sb = {
-                            param($n, $op)
-                            $svc = Get-Service -Name $n -ErrorAction Stop
-                            switch ($op) {
-                                'Start' { Start-Service -InputObject $svc -ErrorAction Stop; 'Started' }
-                                'Stop' { Stop-Service  -InputObject $svc -Force -ErrorAction Stop; 'Stopped' }
-                                'Restart' { Restart-Service -InputObject $svc -Force -ErrorAction Stop; 'Restarted' }
-                            }
-                        }
-                        $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ n = $name; op = $this.Text }
-                        Write-Log ("[{0}] {1}: {2}" -f $selectedHost, $name, $out)
-                        $btnLoad.PerformClick()
-                    }
-                    catch { Write-Log $_.Exception.Message 'ERROR' }
-                }
-            })
+            if ($op.Done -ge $op.Total) { Complete-Operation -Operation $op }
+        }
+    }
+    catch {
+        Write-Log "Błąd silnika operacji: $($_.Exception.Message)" 'ERROR' -Module ''
+    }
+    finally {
+        $script:Engine.InTick = $false
+        if ($script:Engine.Operations.Count -eq 0) { $script:Engine.Timer.Stop() }
+        Update-StatusBar
+    }
+    # Akcje odroczone (np. okna z wynikami) - wykonywane po zwolnieniu blokady, aby modalne okno
+    # nie wstrzymywało odbierania wyników pozostałych operacji
+    while ($script:Engine.Deferred.Count -gt 0) {
+        $next = $script:Engine.Deferred[0]
+        $script:Engine.Deferred.RemoveAt(0)
+        Invoke-UiAction -Module $next.Module -Action $next.Action
     }
 }
 
-# 5) Konta lokalne (WMI: Win32_UserAccount LocalAccount=True)
-Register-ModuleTab -Name 'Konta lokalne' -Builder {
-    param($tab, $getTargets)
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = 'Pokaż konta'; $btn.Left = 12; $btn.Top = 12; $btn.Width = 140
-    $tab.Controls.Add($btn)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btn.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    Connect-Cim -Computers $targets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        if (-not $State.CimSessions.ContainsKey($t)) { continue }
-                        $s = $State.CimSessions[$t]
-                        $users = Get-CimInstance Win32_UserAccount -CimSession $s -Filter "LocalAccount=True"
-                        foreach ($u in $users) {
-                            $rows += [pscustomobject]@{Komputer = $t; Nazwa = $u.Name; PełnaNazwa = $u.FullName; Włączone = (-not $u.Disabled); SID = $u.SID }
-                        }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+function Invoke-Deferred {
+    param([hashtable]$Module, [scriptblock]$Action)
+    [void]$script:Engine.Deferred.Add(@{ Module = $Module; Action = $Action })
 }
 
-# 6) Udostępnienia (WMI: Win32_Share)
-Register-ModuleTab -Name 'Udziały (shary)' -Builder {
-    param($tab, $getTargets)
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = 'Pokaż udziały'; $btn.Left = 12; $btn.Top = 12; $btn.Width = 140
-    $tab.Controls.Add($btn)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btn.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    Connect-Cim -Computers $targets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        if (-not $State.CimSessions.ContainsKey($t)) { continue }
-                        $s = $State.CimSessions[$t]
-                        $shares = Get-CimInstance Win32_Share -CimSession $s
-                        foreach ($sh in $shares) {
-                            $rows += [pscustomobject]@{Komputer = $t; Nazwa = $sh.Name; Ścieżka = $sh.Path; Typ = $sh.Type; Opis = $sh.Description }
-                        }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
+function Complete-OperationItem {
+    param([hashtable]$Operation, $Result)
+    $Operation.Done++
+    $m = $Operation.Module
+    $previous = $script:LogContext
+    $script:LogContext = $m.Title
+    try {
+        $errorText = (@($Result.Errors | Where-Object { $_ } | Select-Object -Unique)) -join ' | '
+        if (-not $Result.Ok) {
+            $Operation.Failed++
+            Write-Log ("[{0}] {1}" -f $Result.Target, $errorText) 'ERROR'
+            if ($Operation.Output -eq 'Grid') {
+                Add-ResultRows -Module $m -Computer $Result.Target -Objects @([pscustomobject]@{ 'Status' = 'Błąd'; 'Szczegóły' = $errorText })
             }
-        })
+        }
+        else {
+            if ($errorText) { Write-Log ("[{0}] ostrzeżenia: {1}" -f $Result.Target, $errorText) 'WARN' }
+            $data = @($Result.Data | Where-Object { $null -ne $_ })
+            switch ($Operation.Output) {
+                'Grid' {
+                    if ($data.Count -gt 0) { Add-ResultRows -Module $m -Computer $Result.Target -Objects $data }
+                    else { Write-Log ("[{0}] brak wyników" -f $Result.Target) }
+                }
+                'Log' {
+                    foreach ($d in $data) {
+                        $text = Format-LogObject $d
+                        $level = if ($text -match 'Błąd') { 'WARN' } else { 'OK' }
+                        Write-Log ("[{0}] {1}" -f $Result.Target, $text) $level
+                    }
+                }
+            }
+        }
+        if ($Operation.OnResult) {
+            try { $null = & $Operation.OnResult $m $Result }
+            catch { Write-Log "Błąd obsługi wyniku ($($Result.Target)): $($_.Exception.Message)" 'ERROR' }
+        }
+    }
+    finally {
+        $script:LogContext = $previous
+    }
 }
 
-# 7) Instalacja oprogramowania (MSI/EXE)
-Register-ModuleTab -Name 'Instalacja softu' -Builder {
-    param($tab, $getTargets)
-    $lbl1 = New-Object System.Windows.Forms.Label
-    $lbl1.Text = 'Ścieżka do instalatora (MSI/EXE; lokalna lub UNC):'
-    $lbl1.Left = 12; $lbl1.Top = 16; $lbl1.AutoSize = $true
-    $tab.Controls.Add($lbl1)
-
-    $txtPath = New-Object System.Windows.Forms.TextBox
-    $txtPath.Left = 12; $txtPath.Top = 36; $txtPath.Width = 780
-    $tab.Controls.Add($txtPath)
-
-    $lblArgs = New-Object System.Windows.Forms.Label
-    $lblArgs.Text = 'Argumenty ciche (np. MSI: /qn; EXE: /S, /quiet):'
-    $lblArgs.Left = 12; $lblArgs.Top = 68; $lblArgs.AutoSize = $true
-    $tab.Controls.Add($lblArgs)
-
-    $txtArgs = New-Object System.Windows.Forms.TextBox
-    $txtArgs.Left = 12; $txtArgs.Top = 88; $txtArgs.Width = 780
-    $tab.Controls.Add($txtArgs)
-
-    $btnInstall = New-Object System.Windows.Forms.Button
-    $btnInstall.Text = 'Zainstaluj na zaznaczonych'
-    $btnInstall.Left = 820; $btnInstall.Top = 36; $btnInstall.Width = 300; $btnInstall.Height = 38
-    $tab.Controls.Add($btnInstall)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 140; $grid.Width = 1110; $grid.Height = 530
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btnInstall.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $txtPath = $ctx.Controls.txtPath
-                $txtArgs = $ctx.Controls.txtArgs
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    $path = $txtPath.Text.Trim(); if (-not $path) { Show-Error 'Podaj ścieżkę instalatora.'; return }
-                    $installArgs = $txtArgs.Text.Trim()
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] przygotowuję instalację..."
-                        # utwórz zdalny katalog roboczy i skopiuj plik
-                        $work = "C:\Windows\Temp\DomainOps"
-                        $sbPrep = { param($w) if (-not (Test-Path $w)) { New-Item -Path $w -ItemType Directory -Force | Out-Null } $w }
-                        Invoke-Remote -ComputerName $t -ScriptBlock $sbPrep -Arg @{ w = $work } | Out-Null
-
-                        # Kopia pliku
-                        try {
-                            $sess = if ($State.UseCurrentCreds -or -not $State.Cred) { New-PSSession -ComputerName $t } else { New-PSSession -ComputerName $t -Credential $State.Cred }
-                            Copy-Item -Path $path -Destination $work -ToSession $sess -Force
-                            Remove-PSSession $sess
-                            $file = [System.IO.Path]::GetFileName($path)
-                            $remoteFile = Join-Path $work $file
-
-                            # Uruchomienie
-                            $sbRun = {
-                                param($f, $a)
-                                $ext = [System.IO.Path]::GetExtension($f)
-                                if ($ext -ieq '.msi') {
-                                    $arguments = "/i `"$f`" /qn $a"
-                                    $exe = 'msiexec.exe'
-                                }
-                                else {
-                                    $arguments = "`"$f`" $a"
-                                    $exe = $f
-                                }
-                                $p = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -Wait
-                                [pscustomobject]@{ExitCode = $p.ExitCode; File = $f }
-                            }
-                            $out = Invoke-Remote -ComputerName $t -ScriptBlock $sbRun -Arg @{ f = $remoteFile; a = $installArgs }
-                            $rows += [pscustomobject]@{Komputer = $t; Plik = $out.File; KodWyjscia = $out.ExitCode }
-                            Write-Log "[$t] zakończono instalację (kod=$($out.ExitCode))."
-                        }
-                        catch {
-                            $rows += [pscustomobject]@{Komputer = $t; Plik = $path; KodWyjscia = 'Kopia/Start błąd'; Uwagi = $_.Exception.Message }
-                            Write-Log "[$t] błąd instalacji: $($_.Exception.Message)" 'ERROR'
-                        }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+function Complete-Operation {
+    param([hashtable]$Operation)
+    [void]$script:Engine.Operations.Remove($Operation)
+    $m = $Operation.Module
+    Set-ModuleBusy -Module $m -Busy $false
+    $seconds = [Math]::Round(((Get-Date) - $Operation.Started).TotalSeconds, 1)
+    $okCount = $Operation.Done - $Operation.Failed
+    if ($Operation.Cancelled) {
+        Write-Log ("{0} – anulowano (zakończone: {1}, czas {2} s)" -f $Operation.Name, $okCount, $seconds) 'WARN' -Module $m.Title
+    }
+    else {
+        $level = if ($Operation.Failed -gt 0) { 'WARN' } else { 'OK' }
+        Write-Log ("{0} – zakończono: {1} OK, {2} z błędem, czas {3} s" -f $Operation.Name, $okCount, $Operation.Failed, $seconds) $level -Module $m.Title
+    }
+    if ($Operation.Output -eq 'Grid' -and $m.Grid) { Resize-ResultColumns -Module $m }
+    if ($Operation.OnComplete -and -not $Operation.Cancelled) {
+        $previous = $script:LogContext
+        $script:LogContext = $m.Title
+        try { $null = & $Operation.OnComplete $m $Operation }
+        catch { Write-Log "Błąd po zakończeniu operacji: $($_.Exception.Message)" 'ERROR' }
+        finally { $script:LogContext = $previous }
+    }
 }
 
-# ======= DODATKOWE 5 FUNKCJI „NAJCZĘŚCIEJ W DOMENIE” =======
-
-# 8) GPUpdate (wymuszenie odświeżenia zasad)
-Register-ModuleTab -Name 'GPUpdate' -Builder {
-    param($tab, $getTargets)
-    $btnU = New-Object System.Windows.Forms.Button
-    $btnU.Text = 'Wymuś gpupdate /force'
-    $btnU.Left = 12; $btnU.Top = 12; $btnU.Width = 220
-    $tab.Controls.Add($btnU)
-
-    $btnU.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                try {
-                    $targets = & $getTargets
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] gpupdate /force..."
-                        # jeśli środowisko nie ma Invoke-GPUpdate, użyj gpupdate w zdalnej sesji
-                        $sb = { gpupdate /force /target:computer 2>&1 | Out-String }
-                        $r = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        Write-Log "[$t] GPUpdate: $((($r|Out-String).Trim()) -replace '[\r\n]+',' | ')"
-                    }
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+function Stop-AllOperations {
+    $ops = @($script:Engine.Operations)
+    if ($ops.Count -eq 0) { return }
+    foreach ($op in $ops) {
+        $op.Cancelled = $true
+        foreach ($item in $op.Items) {
+            if (-not $item.Finished) { try { [void]$item.PS.BeginStop($null, $null) } catch { } }
+        }
+    }
+    Write-Log 'Anulowanie trwających operacji…' 'WARN' -Module ''
 }
 
-# 9) Programy zainstalowane (z rejestru Uninstall x64/x86)
-Register-ModuleTab -Name 'Programy (zainstalowane)' -Builder {
-    param($tab, $getTargets)
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = 'Pobierz listę'; $btn.Left = 12; $btn.Top = 12; $btn.Width = 160
-    $tab.Controls.Add($btn)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btn.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    $sb = {
-                        $paths = @(
-                            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                        )
-                        $items = foreach ($p in $paths) {
-                            if (Test-Path $p) {
-                                Get-ItemProperty $p | Where-Object { $_.DisplayName } | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
-                            }
-                        }
-                        $items
-                    }
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] czytam rejestr Uninstall..."
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        foreach ($i in $out) {
-                            $rows += [pscustomobject]@{
-                                Komputer = $t; Nazwa = $i.DisplayName; Wersja = $i.DisplayVersion; Wydawca = $i.Publisher; Data = $i.InstallDate
-                            }
-                        }
-                    }
-                    $grid.DataSource = $rows | Sort-Object Komputer, Nazwa
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+function Close-Engine {
+    try { if ($script:Engine.Timer) { $script:Engine.Timer.Stop() } } catch { }
+    $handles = @()
+    foreach ($op in @($script:Engine.Operations)) {
+        foreach ($item in $op.Items) {
+            if (-not $item.Finished) { try { $handles += $item.PS.BeginStop($null, $null) } catch { } }
+        }
+    }
+    foreach ($h in $handles) { try { [void]$h.AsyncWaitHandle.WaitOne(3000) } catch { } }
+    if ($script:Engine.Pool) {
+        try { $script:Engine.Pool.Close(); $script:Engine.Pool.Dispose() } catch { }
+        $script:Engine.Pool = $null
+    }
 }
 
-# 10) Windows Update (PSWindowsUpdate jeżeli dostępny)
-Register-ModuleTab -Name 'Windows Update' -Builder {
-    param($tab, $getTargets)
-    $btnCheck = New-Object System.Windows.Forms.Button
-    $btnCheck.Text = 'Skanuj dostępne aktualizacje'
-    $btnCheck.Left = 12; $btnCheck.Top = 12; $btnCheck.Width = 240
-    $tab.Controls.Add($btnCheck)
-
-    $btnInstall = New-Object System.Windows.Forms.Button
-    $btnInstall.Text = 'Zainstaluj (jeśli PSWindowsUpdate)'
-    $btnInstall.Left = 270; $btnInstall.Top = 12; $btnInstall.Width = 260
-    $tab.Controls.Add($btnInstall)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btnCheck.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] sprawdzam dostępność modułu PSWindowsUpdate..."
-                        $sb = {
-                            $has = Get-Module -ListAvailable -Name PSWindowsUpdate
-                            if ($has) {
-                                Import-Module PSWindowsUpdate -Force
-                                try { Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -WhatIf } catch { $_ }
-                            }
-                            else {
-                                # tryb awaryjny (tylko skan) — nieinstalacyjny
-                                try { Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile -Command "UsoClient StartScan"' -PassThru | Out-Null } catch {}
-                                'PSWindowsUpdate brak — wymuszono skan USOClient (jeśli wspierane).'
-                            }
-                        }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        $text = ($out | Out-String).Trim()
-                        $rows += [pscustomobject]@{Komputer = $t; Wynik = $text }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
-
-    $btnInstall.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                try {
-                    $targets = & $getTargets
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] próba instalacji z PSWindowsUpdate..."
-                        $sb = {
-                            if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
-                                Import-Module PSWindowsUpdate -Force
-                                Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -AutoReboot
-                                'Zlecono instalację aktualizacji.'
-                            }
-                            else {
-                                'Brak PSWindowsUpdate na hoście — zainstaluj moduł.'
-                            }
-                        }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        Write-Log "[$t] $out"
-                    }
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+function Update-StatusBar {
+    $label = $script:UI['StatusLabel']
+    if (-not $label) { return }
+    $ops = @($script:Engine.Operations)
+    if ($ops.Count -eq 0) {
+        $label.Text = 'Gotowe'
+        $script:UI.StatusProgress.Visible = $false
+        $script:UI.StatusCancel.Enabled = $false
+        return
+    }
+    $total = 0
+    $done = 0
+    $parts = foreach ($op in $ops) {
+        $total += $op.Total
+        $done += $op.Done
+        $text = '{0}: {1}/{2}' -f $op.Name, $op.Done, $op.Total
+        if ($op.Failed -gt 0) { $text += " (błędy: $($op.Failed))" }
+        $text
+    }
+    $label.Text = 'Trwa: ' + (@($parts) -join '   •   ')
+    $bar = $script:UI.StatusProgress
+    $bar.Maximum = [Math]::Max(1, $total)
+    $bar.Value = [Math]::Min($done, $bar.Maximum)
+    $bar.Visible = $true
+    $script:UI.StatusCancel.Enabled = $true
 }
 
-# 11) Zdarzenia (ostatnie 24h: błędy/ostrzeżenia)
-Register-ModuleTab -Name 'Zdarzenia (24h)' -Builder {
-    param($tab, $getTargets)
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = 'Pobierz'; $btn.Left = 12; $btn.Top = 12; $btn.Width = 140
-    $tab.Controls.Add($btn)
+function Get-TargetComputers {
+    # Komputery zaznaczone na liście po lewej
+    param([switch]$Quiet)
+    $rows = @($script:UI.HostTable.Select('Sel = true', 'Name ASC'))
+    $names = @($rows | ForEach-Object { [string]$_['Name'] } | Where-Object { $_ } | Select-Object -Unique)
+    if ($names.Count -eq 0 -and -not $Quiet) { Show-Warning 'Zaznacz komputery na liście po lewej stronie.' }
+    return $names
+}
+#endregion
 
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btn.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] czytam logi (24h, Error/Warning)..."
-                        $sb = {
-                            $start = (Get-Date).AddDays(-1)
-                            Get-WinEvent -FilterHashtable @{ Level = 1, 2, 3; StartTime = $start } -ErrorAction SilentlyContinue |
-                            Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, LogName, Message -First 200
-                        }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        foreach ($e in $out) {
-                            $rows += [pscustomobject]@{
-                                Komputer = $t; Czas = $e.TimeCreated; Poziom = $e.LevelDisplayName; ID = $e.Id; Źródło = $e.ProviderName; Log = $e.LogName; Wiadomość = $e.Message
-                            }
-                        }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+#region Moduły (rejestracja i budowa)
+function Register-Module {
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][string]$Title,
+        [string]$Description = '',
+        [Parameter(Mandatory)][scriptblock]$Build
+    )
+    [void]$script:UI.ModuleDefs.Add(@{ Key = $Key; Category = $Category; Title = $Title; Description = $Description; Build = $Build })
 }
 
-# 12) Restart/Shutdown + Uptime
-Register-ModuleTab -Name 'Zasilanie/Uptime' -Builder {
-    param($tab, $getTargets)
-    $btnUp = New-Object System.Windows.Forms.Button
-    $btnUp.Text = 'Pokaż uptime'; $btnUp.Left = 12; $btnUp.Top = 12; $btnUp.Width = 150
-    $tab.Controls.Add($btnUp)
-
-    $btnRe = New-Object System.Windows.Forms.Button
-    $btnRe.Text = 'Restart'; $btnRe.Left = 180; $btnRe.Top = 12; $btnRe.Width = 120
-    $tab.Controls.Add($btnRe)
-
-    $btnSh = New-Object System.Windows.Forms.Button
-    $btnSh.Text = 'Wyłącz'; $btnSh.Left = 310; $btnSh.Top = 12; $btnSh.Width = 120
-    $tab.Controls.Add($btnSh)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btnUp.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    Connect-Cim -Computers $targets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        if (-not $State.CimSessions.ContainsKey($t)) { continue }
-                        $os = Get-CimInstance Win32_OperatingSystem -CimSession $State.CimSessions[$t]
-                        $lboot = $os.LastBootUpTime
-                        $uptime = (Get-Date) - $lboot
-                        $rows += [pscustomobject]@{Komputer = $t; OstatniStart = $lboot; Uptime = ("{0:%d}d {0:hh}h {0:mm}m" -f $uptime) }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
-
-    $btnRe.Add_Click({
-            try {
-                $targets = & $getTargets
-                foreach ($t in $targets) {
-                    Write-Log "[$t] Restart-Computer..."
-                    $p = @{ ComputerName = $t; Force = $true; ErrorAction = 'SilentlyContinue' }
-                    if (-not $State.UseCurrentCreds -and $State.Cred) { $p.Credential = $State.Cred }
-                    Restart-Computer @p
-                }
-            }
-            catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-
-    $btnSh.Add_Click({
-            try {
-                $targets = & $getTargets
-                foreach ($t in $targets) {
-                    Write-Log "[$t] Stop-Computer..."
-                    $p = @{ ComputerName = $t; Force = $true; ErrorAction = 'SilentlyContinue' }
-                    if (-not $State.UseCurrentCreds -and $State.Cred) { $p.Credential = $State.Cred }
-                    Stop-Computer @p
-                }
-            }
-            catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
+function New-ModuleContext {
+    param([hashtable]$Definition)
+    return @{
+        Key           = $Definition.Key
+        Title         = $Definition.Title
+        Description   = $Definition.Description
+        Category      = $Definition.Category
+        Busy          = $false
+        Buttons       = New-Object System.Collections.ArrayList
+        TopControls   = New-Object System.Collections.ArrayList
+        Actions       = @{}
+        SecretColumns = @()
+        RevealSecrets = $false
+        ColorBools    = $false
+        Root          = $null
+        Grid          = $null
+        Table         = $null
+        View          = $null
+        ResultBar     = $null
+        FilterBox     = $null
+        CountLabel    = $null
+    }
 }
 
-# 13) Defender (status + szybki skan)
-Register-ModuleTab -Name 'Defender' -Builder {
-    param($tab, $getTargets)
-    $btnS = New-Object System.Windows.Forms.Button
-    $btnS.Text = 'Status'; $btnS.Left = 12; $btnS.Top = 12; $btnS.Width = 120
-    $tab.Controls.Add($btnS)
+function Initialize-Module {
+    param([hashtable]$Definition)
+    $m = New-ModuleContext -Definition $Definition
+    $script:UI.Modules[$Definition.Key] = $m
 
-    $btnQ = New-Object System.Windows.Forms.Button
-    $btnQ.Text = 'Szybki skan'; $btnQ.Left = 150; $btnQ.Top = 12; $btnQ.Width = 140
-    $tab.Controls.Add($btnQ)
+    $root = New-Object System.Windows.Forms.Panel
+    $root.Padding = New-Object System.Windows.Forms.Padding(12, 6, 12, 8)
+    $root.Visible = $false
+    $m.Root = $root
 
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = $Definition.Title
+    $title.Font = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = [System.Drawing.Color]::FromArgb(30, 60, 110)
+    $title.AutoSize = $false
+    $title.Height = 32
+    $title.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    [void]$m.TopControls.Add($title)
+    if ($Definition.Description) {
+        $desc = New-Object System.Windows.Forms.Label
+        $desc.Text = $Definition.Description
+        $desc.ForeColor = [System.Drawing.Color]::DimGray
+        $desc.AutoSize = $false
+        $desc.Height = 36
+        [void]$m.TopControls.Add($desc)
+    }
 
-    $btnS.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        $sb = { if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) { Get-MpComputerStatus } else { 'Brak modułu Defender (Get-MpComputerStatus)' } }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        if ($out -is [string]) {
-                            $rows += [pscustomobject]@{Komputer = $t; Status = $out }
-                        }
-                        else {
-                            $rows += [pscustomobject]@{Komputer = $t; Realtime = $out.RealTimeProtectionEnabled; AV = $out.AntivirusEnabled; OstatniaAktualizacja = $out.AntivirusSignatureLastUpdated }
-                        }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+    $null = & $Definition.Build $m
 
-    $btnQ.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                try {
-                    $targets = & $getTargets
-                    foreach ($t in $targets) {
-                        $sb = { if (Get-Command Start-MpScan -ErrorAction SilentlyContinue) { Start-MpScan -ScanType QuickScan; 'Skan zlecony' } else { 'Brak Start-MpScan' } }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb
-                        Write-Log "[$t] $out"
-                    }
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
-            }
-        })
+    New-ResultView -Module $m
+    [void]$m.TopControls.Add($m.ResultBar)
+    Add-DockStack -Parent $root -Top @($m.TopControls) -Fill $m.Grid
+    $script:UI.ContentHost.Controls.Add($root)
+    $root.Dock = [System.Windows.Forms.DockStyle]::Fill
+    return $m
 }
 
-# 14) Konto komputera (AD/Trust): test/napraw kanału, reset w AD, włącz/wyłącz
-Register-ModuleTab -Name 'Konto komputera (AD)' -Builder {
-    param($tab, $getTargets)
+function Show-Module {
+    param([string]$Key)
+    $definition = $null
+    foreach ($d in $script:UI.ModuleDefs) { if ($d.Key -eq $Key) { $definition = $d; break } }
+    if (-not $definition) { return }
+    $m = $script:UI.Modules[$Key]
+    if (-not $m) {
+        $script:UI.Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        try { $m = Initialize-Module -Definition $definition }
+        finally { $script:UI.Form.Cursor = [System.Windows.Forms.Cursors]::Default }
+    }
+    $active = $script:UI.ActiveModule
+    if ($active -and -not [object]::ReferenceEquals($active, $m)) { $active.Root.Visible = $false }
+    $m.Root.Visible = $true
+    $m.Root.BringToFront()
+    $script:UI.ActiveModule = $m
+    $script:Settings.LastModule = $Key
+}
+#endregion
 
-    $lblDC = New-Object System.Windows.Forms.Label
-    $lblDC.Text = 'Kontroler domeny (opcjonalnie):'
-    $lblDC.Left = 12; $lblDC.Top = 16; $lblDC.AutoSize = $true
-    $tab.Controls.Add($lblDC)
+#region Lista komputerów (lewy panel)
+function New-ComputerLdapFilter {
+    param([string]$NamePattern, [bool]$OnlyEnabled)
+    $parts = @('(objectCategory=computer)')
+    $pattern = ([string]$NamePattern).Trim()
+    if ($pattern) {
+        if ($pattern -notmatch '\*') { $pattern = "*$pattern*" }
+        # Znaki specjalne LDAP (poza gwiazdką, która jest symbolem wieloznacznym)
+        $escaped = $pattern -replace '\\', '\5c' -replace '\(', '\28' -replace '\)', '\29'
+        $parts += "(name=$escaped)"
+    }
+    if ($OnlyEnabled) { $parts += '(!(userAccountControl:1.2.840.113556.1.4.803:=2))' }
+    return '(&' + ($parts -join '') + ')'
+}
 
-    $txtDC = New-Object System.Windows.Forms.TextBox
-    $txtDC.Left = 200; $txtDC.Top = 12; $txtDC.Width = 220
-    $tab.Controls.Add($txtDC)
+function New-HostTable {
+    $t = New-Object System.Data.DataTable 'Hosts'
+    [void]$t.Columns.Add('Sel', [bool])
+    [void]$t.Columns.Add('Name', [string])
+    [void]$t.Columns.Add('OS', [string])
+    [void]$t.Columns.Add('LastLogon', [datetime])
+    [void]$t.Columns.Add('Enabled', [string])
+    [void]$t.Columns.Add('DNSHostName', [string])
+    [void]$t.Columns.Add('DN', [string])
+    [void]$t.Columns.Add('Source', [string])
+    $t.Columns['Sel'].DefaultValue = $false
+    $t.PrimaryKey = [System.Data.DataColumn[]]@($t.Columns['Name'])
+    # Przecinek: PowerShell rozwijałby DataTable na wiersze (pusta tabela dałaby $null)
+    return , $t
+}
 
-    $btnTrust = New-Object System.Windows.Forms.Button
-    $btnTrust.Text = 'Test+Napraw kanał (na hoście)'
-    $btnTrust.Left = 440; $btnTrust.Top = 12; $btnTrust.Width = 220
-    $tab.Controls.Add($btnTrust)
+function ConvertTo-DbValue($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return [System.DBNull]::Value }
+    return $Value
+}
 
-    $btnResetAD = New-Object System.Windows.Forms.Button
-    $btnResetAD.Text = 'Reset konta w AD'
-    $btnResetAD.Left = 670; $btnResetAD.Top = 12; $btnResetAD.Width = 160
-    $tab.Controls.Add($btnResetAD)
-
-    $btnEnable = New-Object System.Windows.Forms.Button
-    $btnEnable.Text = 'Włącz konto (AD)'
-    $btnEnable.Left = 840; $btnEnable.Top = 12; $btnEnable.Width = 140
-    $tab.Controls.Add($btnEnable)
-
-    $btnDisable = New-Object System.Windows.Forms.Button
-    $btnDisable.Text = 'Wyłącz konto (AD)'
-    $btnDisable.Left = 990; $btnDisable.Top = 12; $btnDisable.Width = 140
-    $tab.Controls.Add($btnDisable)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btnTrust.Add_Click({
-            Invoke-InModuleContext -SourceControl $this -Action {
-                param($ctx)
-                $txtDC = $ctx.Controls.txtDC
-                $grid = $ctx.Controls.grid
-                try {
-                    $targets = & $getTargets
-                    $dc = $txtDC.Text.Trim()
-                    $rows = @()
-                    foreach ($t in $targets) {
-                        Write-Log "[$t] test/naprawa kanału zaufania..."
-                        $sb = {
-                            param($dc)
-                            try {
-                                $srv = if ($dc) { @{Server = $dc } } else { @{} }
-                                $ok = Test-ComputerSecureChannel @srv -ErrorAction Stop
-                                if (-not $ok) {
-                                    Reset-ComputerMachinePassword @srv -ErrorAction Stop
-                                    [pscustomobject]@{Akcja = 'Repair'; Wynik = 'Reset-ComputerMachinePassword'; Szczegoly = 'Kanał naprawiony' }
-                                }
-                                else {
-                                    [pscustomobject]@{Akcja = 'Test'; Wynik = 'OK'; Szczegoly = 'Kanał poprawny' }
-                                }
-                            }
-                            catch {
-                                try {
-                                    $srv = if ($dc) { @{Server = $dc } } else { @{} }
-                                    Reset-ComputerMachinePassword @srv -ErrorAction Stop
-                                    [pscustomobject]@{Akcja = 'Repair'; Wynik = 'Reset wykonany'; Szczegoly = $_.Exception.Message }
-                                }
-                                catch {
-                                    [pscustomobject]@{Akcja = 'Repair'; Wynik = 'Błąd'; Szczegoly = $_.Exception.Message }
-                                }
-                            }
-                        }
-                        $out = Invoke-Remote -ComputerName $t -ScriptBlock $sb -Arg @{ dc = $dc }
-                        foreach ($o in $out) { $rows += [pscustomobject]@{Komputer = $t; Akcja = $o.Akcja; Wynik = $o.Wynik; Szczegoly = $o.Szczegoly } }
-                    }
-                    $grid.DataSource = $rows
-                }
-                catch { Write-Log $_.Exception.Message 'ERROR' }
+function Import-HostRows {
+    # Dodaje/aktualizuje komputery na liście; zachowuje zaznaczenia istniejących pozycji
+    param([object[]]$Items, [string]$Source, [switch]$Check, [switch]$ReplaceSource)
+    $t = $script:UI.HostTable
+    $grid = $script:UI.HostGrid
+    $checked = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $t.Select('Sel = true')) { [void]$checked.Add([string]$r['Name']) }
+    $added = 0
+    # Odpięcie tabeli od siatki na czas importu - tysiące wierszy dodają się wtedy błyskawicznie
+    $grid.DataSource = $null
+    try {
+        if ($ReplaceSource) {
+            foreach ($r in @($t.Select(("Source = '{0}'" -f $Source.Replace("'", "''"))))) { $t.Rows.Remove($r) }
+        }
+        $existing = @{}
+        foreach ($r in $t.Rows) { $existing[[string]$r['Name']] = $r }
+        foreach ($it in $Items) {
+            $name = ([string](Get-ObjectValue $it 'Name')).Trim()
+            if (-not $name) { continue }
+            $row = $existing[$name]
+            $isNew = ($null -eq $row)
+            if ($isNew) {
+                $row = $t.NewRow()
+                $row['Name'] = $name
+                $row['Sel'] = $false
+                $row['Source'] = $Source
             }
-        })
-    foreach ($btnAct in @(
-            @{Btn = $btnResetAD; What = 'Reset' },
-            @{Btn = $btnEnable; What = 'Enable' },
-            @{Btn = $btnDisable; What = 'Disable' }
+            elseif ($Source -eq 'AD') { $row['Source'] = 'AD' }
+            foreach ($col in @('OS', 'DNSHostName', 'DN')) {
+                $v = Get-ObjectValue $it $col
+                if ($null -ne $v) { $row[$col] = ConvertTo-DbValue ([string]$v) }
+            }
+            $lastLogon = Get-ObjectValue $it 'LastLogon'
+            if ($lastLogon -is [datetime]) { $row['LastLogon'] = $lastLogon }
+            $enabled = Get-ObjectValue $it 'Enabled'
+            if ($null -ne $enabled) { $row['Enabled'] = $(if ([bool]$enabled) { 'Tak' } else { 'Nie' }) }
+            if ($Check -or $checked.Contains($name)) { $row['Sel'] = $true }
+            if ($isNew) {
+                $t.Rows.Add($row)
+                $existing[$name] = $row
+                $added++
+            }
+        }
+        $t.AcceptChanges()
+    }
+    finally {
+        $grid.DataSource = $script:UI.HostView
+    }
+    Update-HostCount
+    return $added
+}
+
+function Update-HostCount {
+    $t = $script:UI.HostTable
+    $selected = @($t.Select('Sel = true')).Count
+    $script:UI.HostCountLabel.Text = 'Zaznaczone: {0} z {1}   (widoczne: {2})' -f $selected, $t.Rows.Count, $script:UI.HostView.Count
+}
+
+function Set-HostCheck {
+    param([ValidateSet('CheckVisible', 'UncheckAll', 'InvertVisible', 'CheckSelected', 'UncheckSelected')][string]$Mode)
+    $g = $script:UI.HostGrid
+    [void]$g.EndEdit()
+    $t = $script:UI.HostTable
+    $t.BeginLoadData()
+    try {
+        switch ($Mode) {
+            'CheckVisible' { foreach ($drv in @($script:UI.HostView | ForEach-Object { $_ })) { $drv.Row['Sel'] = $true } }
+            'UncheckAll' { foreach ($r in $t.Rows) { $r['Sel'] = $false } }
+            'InvertVisible' { foreach ($drv in @($script:UI.HostView | ForEach-Object { $_ })) { $drv.Row['Sel'] = -not [bool]$drv.Row['Sel'] } }
+            'CheckSelected' { foreach ($gr in @($g.SelectedRows)) { if ($gr.DataBoundItem) { $gr.DataBoundItem.Row['Sel'] = $true } } }
+            'UncheckSelected' { foreach ($gr in @($g.SelectedRows)) { if ($gr.DataBoundItem) { $gr.DataBoundItem.Row['Sel'] = $false } } }
+        }
+    }
+    finally {
+        $t.EndLoadData()
+    }
+    $g.Invalidate()
+    Update-HostCount
+}
+
+function Update-HostQuickFilter {
+    $text = $script:UI.HostSearch.Text.Trim()
+    if ($text) {
+        $lit = ConvertTo-LikeLiteral $text
+        $script:UI.HostView.RowFilter = "Name LIKE '*{0}*' OR OS LIKE '*{0}*' OR Source LIKE '*{0}*'" -f $lit
+    }
+    else {
+        $script:UI.HostView.RowFilter = ''
+    }
+    Update-HostCount
+}
+
+function Start-AdHostLoad {
+    param([hashtable]$Module)
+    $script:Settings.SearchBase = $script:UI.HostSearchBase.Text.Trim()
+    $script:Settings.NameFilter = $script:UI.HostNameFilter.Text.Trim()
+    $script:Settings.OnlyEnabled = $script:UI.HostOnlyEnabled.Checked
+    $params = @{
+        LdapFilter = New-ComputerLdapFilter -NamePattern $script:Settings.NameFilter -OnlyEnabled $script:Settings.OnlyEnabled
+        SearchBase = $script:Settings.SearchBase
+    }
+    Start-HostOperation -Module $Module -Name 'Pobieranie komputerów z AD' -Targets @('Active Directory') -Local -Output None -Parameters $params -ScriptBlock {
+        param($Target, $P, $Ctx)
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $q = @{
+            LDAPFilter  = $P.LdapFilter
+            Properties  = @('OperatingSystem', 'LastLogonDate', 'Enabled', 'DNSHostName')
+            ErrorAction = 'Stop'
+        }
+        if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+        if ($Ctx.Server) { $q.Server = $Ctx.Server }
+        if ($Ctx.Credential) { $q.Credential = $Ctx.Credential }
+        Get-ADComputer @q | ForEach-Object {
+            [pscustomobject]@{
+                Name        = $_.Name
+                OS          = $_.OperatingSystem
+                LastLogon   = $_.LastLogonDate
+                Enabled     = $_.Enabled
+                DNSHostName = $_.DNSHostName
+                DN          = $_.DistinguishedName
+            }
+        }
+    } -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) {
+            $m.LastError = (@($r.Errors)) -join "`r`n"
+            Invoke-Deferred -Module $m -Action { param($m) Show-Error 'Nie udało się pobrać komputerów z Active Directory.' $m.LastError }
+            return
+        }
+        $items = @($r.Data)
+        $added = Import-HostRows -Items $items -Source 'AD' -ReplaceSource
+        Write-Log ("Wczytano z AD {0} komputerów (nowych na liście: {1})." -f $items.Count, $added) 'OK'
+    }
+}
+
+function Add-ManualHosts {
+    $text = Show-InputDialog -Title 'Dodaj komputery' -Prompt 'Wpisz lub wklej nazwy komputerów (po jednej w wierszu albo rozdzielone przecinkiem/spacją):' -Multiline
+    if ($null -eq $text) { return }
+    $names = @($text -split '[\s,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($names.Count -eq 0) { return }
+    $added = Import-HostRows -Items @($names | ForEach-Object { [pscustomobject]@{ Name = $_ } }) -Source 'Ręcznie' -Check
+    Write-Log ("Dodano ręcznie {0} komputerów (nowych: {1}); zostały zaznaczone." -f $names.Count, $added) 'OK' -Module 'Komputery'
+}
+
+function Import-HostFile {
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = 'Pliki tekstowe i CSV (*.txt;*.csv)|*.txt;*.csv|Wszystkie pliki (*.*)|*.*'
+    if ($dlg.ShowDialog($script:UI.Form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $names = foreach ($line in (Get-Content -LiteralPath $dlg.FileName -Encoding UTF8)) {
+        $first = (($line -split '[,;\t]')[0]).Trim().Trim('"')
+        if ($first -and $first -notmatch '^(name|computer|computername|hostname|nazwa|komputer)$') { $first }
+    }
+    $names = @($names | Select-Object -Unique)
+    if ($names.Count -eq 0) { Show-Warning 'Plik nie zawiera nazw komputerów.'; return }
+    $added = Import-HostRows -Items @($names | ForEach-Object { [pscustomobject]@{ Name = $_ } }) -Source 'Plik' -Check
+    Write-Log ("Wczytano z pliku {0} komputerów (nowych: {1}); zostały zaznaczone." -f $names.Count, $added) 'OK' -Module 'Komputery'
+}
+
+function Remove-SelectedHosts {
+    $g = $script:UI.HostGrid
+    $rows = @(foreach ($gr in $g.SelectedRows) { if ($gr.DataBoundItem) { $gr.DataBoundItem.Row } })
+    if ($rows.Count -eq 0) { return }
+    foreach ($r in $rows) { $script:UI.HostTable.Rows.Remove($r) }
+    $script:UI.HostTable.AcceptChanges()
+    Update-HostCount
+}
+
+function Rename-HostRow {
+    # Po zmianie nazwy komputera aktualizuje pozycję na liście
+    param([string]$OldName, [string]$NewName)
+    $t = $script:UI.HostTable
+    $row = $t.Rows.Find($OldName)
+    if (-not $row -or $t.Rows.Find($NewName)) { return }
+    $row['Name'] = $NewName
+    $t.AcceptChanges()
+}
+
+function New-HostPanel {
+    $hm = New-ModuleContext -Definition @{ Key = 'Hosts'; Title = 'Komputery'; Description = ''; Category = '' }
+    $script:UI.Modules['Hosts'] = $hm
+
+    $group = New-Object System.Windows.Forms.GroupBox
+    $group.Text = 'Komputery docelowe'
+    $group.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
+
+    # OU / SearchBase
+    $lblOu = Add-Label -Parent $null -Text 'Jednostka OU (puste = cała domena):'
+    $lblOu.Dock = [System.Windows.Forms.DockStyle]::Top
+    $txtBase = Add-TextBox -Parent $null -Width 200 -Text ([string]$script:Settings.SearchBase)
+    $btnOu = New-PlainButton -Parent $null -Text 'Wybierz…'
+    Register-ControlHandler -Control $btnOu -EventName 'Click' -Module $hm -Action {
+        param($m)
+        $dn = Select-OrganizationalUnit -Title 'Zakres wyszukiwania komputerów' -Selected $script:UI.HostSearchBase.Text.Trim() -AllowDomainRoot
+        if ($null -ne $dn) { $script:UI.HostSearchBase.Text = $dn }
+    }
+    $rowOu = New-StretchRow -Stretch $txtBase -After @($btnOu)
+
+    # Filtr nazwy + tylko włączone
+    $rowFilter = New-FlowRow
+    [void](Add-Label -Parent $rowFilter -Text 'Nazwa:')
+    $txtName = Add-TextBox -Parent $rowFilter -Width 150 -Text ([string]$script:Settings.NameFilter)
+    $chkEnabled = Add-CheckBox -Parent $rowFilter -Text 'Tylko włączone konta' -Checked ([bool]$script:Settings.OnlyEnabled)
+
+    # Źródła listy
+    $rowLoad = New-FlowRow
+    [void](Add-Button -Parent $rowLoad -Text 'Wczytaj z AD' -Module $hm -Primary -OnClick { param($m) Start-AdHostLoad -Module $m })
+    $btnManual = New-PlainButton -Parent $rowLoad -Text 'Dodaj ręcznie…'
+    Register-ControlHandler -Control $btnManual -EventName 'Click' -Module $hm -Action { Add-ManualHosts }
+    $btnFile = New-PlainButton -Parent $rowLoad -Text 'Z pliku…'
+    Register-ControlHandler -Control $btnFile -EventName 'Click' -Module $hm -Action { Import-HostFile }
+
+    # Szybkie wyszukiwanie na liście
+    $txtSearch = Add-TextBox -Parent $null -Width 200
+    $lblSearch = Add-Label -Parent $null -Text 'Szukaj na liście:'
+    $rowSearch = New-StretchRow -Stretch $txtSearch -Before @($lblSearch)
+    $txtSearch.Add_TextChanged({ try { Update-HostQuickFilter } catch { } })
+
+    # Tabela komputerów
+    $table = New-HostTable
+    $view = [System.Data.DataView]::new($table)
+    $view.Sort = 'Name ASC'
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.AutoGenerateColumns = $false
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.RowHeadersVisible = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.MultiSelect = $true
+    $grid.BackgroundColor = [System.Drawing.SystemColors]::Window
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $grid.ColumnHeadersDefaultCellStyle.Font = $script:UI.FontBold
+    $grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 251)
+    $grid.RowTemplate.Height = 22
+    try {
+        $prop = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        $prop.SetValue($grid, $true, $null)
+    }
+    catch { }
+    $colSel = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $colSel.Name = 'Sel'
+    $colSel.DataPropertyName = 'Sel'
+    $colSel.HeaderText = '✔'
+    $colSel.Width = 30
+    $colSel.ToolTipText = 'Kliknij nagłówek, aby zaznaczyć/odznaczyć wszystkie widoczne'
+    [void]$grid.Columns.Add($colSel)
+    foreach ($c in @(
+            @{ Name = 'Name'; Header = 'Nazwa'; Width = 130 },
+            @{ Name = 'OS'; Header = 'System'; Width = 150 },
+            @{ Name = 'LastLogon'; Header = 'Ostatnie logowanie'; Width = 120 },
+            @{ Name = 'Enabled'; Header = 'Aktywne'; Width = 60 },
+            @{ Name = 'Source'; Header = 'Źródło'; Width = 65 }
         )) {
-        # Akcja zapisana w Tag przycisku - zmienna petli w handlerze wskazywalaby zawsze ostatnia akcje
-        $btnAct.Btn.Tag = $btnAct.What
-        $btnAct.Btn.Add_Click({
-                Invoke-InModuleContext -SourceControl $this -Action {
-                    param($ctx)
-                    $txtDC = $ctx.Controls.txtDC
-                    $grid = $ctx.Controls.grid
+        $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $col.Name = $c.Name
+        $col.DataPropertyName = $c.Name
+        $col.HeaderText = $c.Header
+        $col.Width = $c.Width
+        $col.ReadOnly = $true
+        $col.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+        [void]$grid.Columns.Add($col)
+    }
+    $grid.Columns['LastLogon'].DefaultCellStyle.Format = 'yyyy-MM-dd HH:mm'
+    $grid.DataSource = $view
+
+    $grid.add_CurrentCellDirtyStateChanged({
+            param($s, $e)
+            if ($s.IsCurrentCellDirty) { [void]$s.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) }
+        })
+    $grid.add_CellValueChanged({
+            param($s, $e)
+            if ($e.RowIndex -ge 0 -and $e.ColumnIndex -eq 0) { try { Update-HostCount } catch { } }
+        })
+    $grid.add_ColumnHeaderMouseClick({
+            param($s, $e)
+            if ($e.ColumnIndex -ne 0) { return }
+            try {
+                $allChecked = $true
+                foreach ($drv in @($script:UI.HostView | ForEach-Object { $_ })) { if (-not [bool]$drv.Row['Sel']) { $allChecked = $false; break } }
+                if ($allChecked) { Set-HostCheck -Mode 'UncheckAll' } else { Set-HostCheck -Mode 'CheckVisible' }
+            }
+            catch { }
+        })
+    $grid.add_KeyDown({
+            param($s, $e)
+            if ($e.KeyCode -ne [System.Windows.Forms.Keys]::Space) { return }
+            try {
+                $rows = @($s.SelectedRows)
+                if ($rows.Count -eq 0 -or -not $rows[0].DataBoundItem) { return }
+                # Spacja przełącza zaznaczenie wszystkich wybranych wierszy (także gdy fokus jest w innej kolumnie)
+                $target = -not [bool]$rows[0].DataBoundItem.Row['Sel']
+                if ($target) { Set-HostCheck -Mode 'CheckSelected' } else { Set-HostCheck -Mode 'UncheckSelected' }
+                $e.Handled = $true
+                $e.SuppressKeyPress = $true
+            }
+            catch { }
+        })
+    $grid.add_DataError({ param($s, $e) $e.ThrowException = $false })
+
+    # Menu kontekstowe listy
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    $miCheck = $menu.Items.Add('Zaznacz wybrane wiersze')
+    $miCheck.add_Click({ try { Set-HostCheck -Mode 'CheckSelected' } catch { } })
+    $miUncheck = $menu.Items.Add('Odznacz wybrane wiersze')
+    $miUncheck.add_Click({ try { Set-HostCheck -Mode 'UncheckSelected' } catch { } })
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $miCopy = $menu.Items.Add('Kopiuj nazwy wybranych')
+    $miCopy.add_Click({
+            try {
+                $names = @(foreach ($gr in $script:UI.HostGrid.SelectedRows) { if ($gr.DataBoundItem) { [string]$gr.DataBoundItem.Row['Name'] } }) | Sort-Object
+                if ($names) { [System.Windows.Forms.Clipboard]::SetText(($names -join [Environment]::NewLine)) }
+            }
+            catch { }
+        })
+    $miRemove = $menu.Items.Add('Usuń wybrane z listy')
+    $miRemove.add_Click({ try { Remove-SelectedHosts } catch { } })
+    $grid.ContextMenuStrip = $menu
+
+    # Przyciski zaznaczania
+    $rowCheck = New-FlowRow
+    $b1 = New-PlainButton -Parent $rowCheck -Text 'Zaznacz widoczne'
+    $b1.add_Click({ try { Set-HostCheck -Mode 'CheckVisible' } catch { } })
+    $b2 = New-PlainButton -Parent $rowCheck -Text 'Odznacz wszystkie'
+    $b2.add_Click({ try { Set-HostCheck -Mode 'UncheckAll' } catch { } })
+    $b3 = New-PlainButton -Parent $rowCheck -Text 'Odwróć'
+    $b3.add_Click({ try { Set-HostCheck -Mode 'InvertVisible' } catch { } })
+    $lblCount = Add-Label -Parent $null -Text ''
+    $lblCount.AutoSize = $false
+    $lblCount.Height = 22
+    $lblCount.ForeColor = [System.Drawing.Color]::FromArgb(30, 60, 110)
+    $lblCount.Font = $script:UI.FontBold
+
+    $script:UI.HostTable = $table
+    $script:UI.HostView = $view
+    $script:UI.HostGrid = $grid
+    $script:UI.HostSearch = $txtSearch
+    $script:UI.HostSearchBase = $txtBase
+    $script:UI.HostNameFilter = $txtName
+    $script:UI.HostOnlyEnabled = $chkEnabled
+    $script:UI.HostCountLabel = $lblCount
+
+    Add-DockStack -Parent $group -Top @($lblOu, $rowOu, $rowFilter, $rowLoad, $rowSearch) -Fill $grid -Bottom @($rowCheck, $lblCount)
+    Update-HostCount
+    return $group
+}
+#endregion
+
+#region Moduły: Diagnostyka
+Register-Module -Key 'Connectivity' -Category 'Diagnostyka' -Title 'Łączność' -Description 'Test DNS, ping, portów TCP i sesji PowerShell Remoting dla zaznaczonych komputerów. Wykonywany lokalnie – działa także dla hostów bez WinRM.' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Porty TCP:')
+    $m.Ports = Add-TextBox $row 200 '5985, 5986, 445, 3389, 135'
+    [void](Add-Label $row 'Limit (ms):')
+    $m.TcpTimeout = Add-Numeric $row 200 10000 1500 70
+    $m.TestSession = Add-CheckBox $row 'Test sesji PowerShell (Invoke-Command)' $true
+    [void](Add-Button $row 'Testuj zaznaczone' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $ports = @(Split-ListText ($m.Ports.Text -replace '\s+', ',') | Where-Object { $_ -match '^\d+$' -and [int]$_ -ge 1 -and [int]$_ -le 65535 } | ForEach-Object { [int]$_ } | Select-Object -Unique)
+            $params = @{ Ports = $ports; TimeoutMs = [int]$m.TcpTimeout.Value; TestSession = $m.TestSession.Checked }
+            Start-HostOperation -Module $m -Name 'Test łączności' -Targets $targets -Local -Parameters $params -ScriptBlock {
+                param($Target, $P, $Ctx)
+                $row = [ordered]@{}
+                $ip = ''
+                try {
+                    $addresses = [System.Net.Dns]::GetHostAddresses($Target) | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+                    $ip = (@($addresses | ForEach-Object { $_.IPAddressToString }) -join ', ')
+                }
+                catch { $ip = '(brak w DNS)' }
+                $row['Adres IP'] = $ip
+                $pingOk = $false
+                $rtt = $null
+                try {
+                    $reply = (New-Object System.Net.NetworkInformation.Ping).Send($Target, 1000)
+                    if ($reply.Status -eq 'Success') { $pingOk = $true; $rtt = [int]$reply.RoundtripTime }
+                }
+                catch { }
+                $row['Ping'] = $pingOk
+                $row['Czas (ms)'] = $rtt
+                foreach ($port in $P.Ports) {
+                    $open = $false
+                    $client = New-Object System.Net.Sockets.TcpClient
                     try {
-                        if (-not (Get-Module -ListAvailable ActiveDirectory)) { throw "Brak modulu ActiveDirectory (RSAT)." }
-                        Import-Module ActiveDirectory -ErrorAction Stop | Out-Null
-                        $targets = & $getTargets
-                        $dc = $txtDC.Text.Trim()
-                        $rows = @()
-                        $what = [string]$this.Tag
-                        foreach ($t in $targets) {
-                            $srv = @{}; if ($dc) { $srv.Server = $dc }
-                            try {
-                                # Nazwa komputera -> obiekt AD (sAMAccountName komputera konczy sie na '$')
-                                $comp = Get-ADComputer -Identity $t @srv -ErrorAction Stop
-                                switch ($what) {
-                                    'Reset' {
-                                        # Odpowiednik "Reset Account" z ADUC: haslo konta = nazwa konta malymi literami
-                                        $newPwd = ConvertTo-SecureString $comp.SamAccountName.ToLowerInvariant() -AsPlainText -Force
-                                        Set-ADAccountPassword -Identity $comp -Reset -NewPassword $newPwd @srv -ErrorAction Stop
-                                        $act = 'Reset hasla konta komputera'
-                                    }
-                                    'Enable' { Enable-ADAccount -Identity $comp @srv -ErrorAction Stop; $act = 'Enable-ADAccount' }
-                                    'Disable' { Disable-ADAccount -Identity $comp @srv -ErrorAction Stop; $act = 'Disable-ADAccount' }
-                                    default { throw "Nieznana akcja: $what" }
-                                }
-                                $rows += [pscustomobject]@{Komputer = $t; Akcja = $act; Wynik = 'OK' }
-                            }
-                            catch {
-                                $rows += [pscustomobject]@{Komputer = $t; Akcja = $what; Wynik = "Błąd: $($_.Exception.Message)" }
-                                Write-Log "[$t] $what : $($_.Exception.Message)" 'ERROR'
-                            }
-                        }
-                        $grid.DataSource = $rows
+                        $async = $client.BeginConnect($Target, [int]$port, $null, $null)
+                        if ($async.AsyncWaitHandle.WaitOne([int]$P.TimeoutMs) -and $client.Connected) { $open = $true }
+                    }
+                    catch { }
+                    finally { $client.Close() }
+                    $row["TCP $port"] = $open
+                }
+                if ($P.TestSession) {
+                    try {
+                        $ic = @{ ComputerName = $Target; ErrorAction = 'Stop'; ScriptBlock = { $PSVersionTable.PSVersion.ToString() } }
+                        if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
+                        if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
+                        $row['PowerShell zdalnie'] = 'Tak (PS ' + (Invoke-Command @ic) + ')'
                     }
                     catch {
-                        Show-Error "Operacja AD nie powiodla sie." $_
-                        Write-Log $_.Exception.Message 'ERROR'
+                        $row['PowerShell zdalnie'] = 'Nie'
+                        $row['Szczegóły'] = ($_.Exception.Message -split "`n")[0].Trim()
                     }
                 }
-            })
-    }
-}
-
-# 15) Zmiana nazwy komputera (pojedynczo/wsadowo)
-Register-ModuleTab -Name 'Zmiana nazwy' -Builder {
-    param($tab, $getTargets)
-
-    $btnLoad = New-Object System.Windows.Forms.Button
-    $btnLoad.Text = 'Załaduj zaznaczone do siatki'
-    $btnLoad.Left = 12; $btnLoad.Top = 12; $btnLoad.Width = 220
-    $tab.Controls.Add($btnLoad)
-
-    $lblPrefix = New-Object System.Windows.Forms.Label
-    $lblPrefix.Text = 'Prefiks:'; $lblPrefix.Left = 250; $lblPrefix.Top = 16; $lblPrefix.AutoSize = $true
-    $tab.Controls.Add($lblPrefix)
-
-    $txtPrefix = New-Object System.Windows.Forms.TextBox
-    $txtPrefix.Left = 300; $txtPrefix.Top = 12; $txtPrefix.Width = 140
-    $tab.Controls.Add($txtPrefix)
-
-    $lblStart = New-Object System.Windows.Forms.Label
-    $lblStart.Text = 'Start #:'; $lblStart.Left = 450; $lblStart.Top = 16; $lblStart.AutoSize = $true
-    $tab.Controls.Add($lblStart)
-
-    $numStart = New-Object System.Windows.Forms.NumericUpDown
-    $numStart.Left = 510; $numStart.Top = 12; $numStart.Width = 70; $numStart.Minimum = 0; $numStart.Maximum = 100000; $numStart.Value = 1
-    $tab.Controls.Add($numStart)
-
-    $lblPad = New-Object System.Windows.Forms.Label
-    $lblPad.Text = 'Zerowanie (np. 3→001):'; $lblPad.Left = 590; $lblPad.Top = 16; $lblPad.AutoSize = $true
-    $tab.Controls.Add($lblPad)
-
-    $numPad = New-Object System.Windows.Forms.NumericUpDown
-    $numPad.Left = 750; $numPad.Top = 12; $numPad.Width = 60; $numPad.Minimum = 1; $numPad.Maximum = 8; $numPad.Value = 3
-    $tab.Controls.Add($numPad)
-
-    $lblSuffix = New-Object System.Windows.Forms.Label
-    $lblSuffix.Text = 'Sufiks:'; $lblSuffix.Left = 820; $lblSuffix.Top = 16; $lblSuffix.AutoSize = $true
-    $tab.Controls.Add($lblSuffix)
-
-    $txtSuffix = New-Object System.Windows.Forms.TextBox
-    $txtSuffix.Left = 870; $txtSuffix.Top = 12; $txtSuffix.Width = 120
-    $tab.Controls.Add($txtSuffix)
-
-    $btnAuto = New-Object System.Windows.Forms.Button
-    $btnAuto.Text = 'Autonumeracja'
-    $btnAuto.Left = 1000; $btnAuto.Top = 12; $btnAuto.Width = 120
-    $tab.Controls.Add($btnAuto)
-
-    $chkRestart = New-Object System.Windows.Forms.CheckBox
-    $chkRestart.Text = 'Restart po zmianie'
-    $chkRestart.Left = 12; $chkRestart.Top = 44; $chkRestart.Checked = $true
-    $tab.Controls.Add($chkRestart)
-
-    $btnRename = New-Object System.Windows.Forms.Button
-    $btnRename.Text = 'Zmień nazwy'
-    $btnRename.Left = 160; $btnRename.Top = 40; $btnRename.Width = 160
-    $tab.Controls.Add($btnRename)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 80; $grid.Width = 1110; $grid.Height = 590
-    $grid.AllowUserToAddRows = $false
-    $grid.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{Name = 'StaraNazwa'; HeaderText = 'Stara nazwa'; Width = 300 }))
-    $grid.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{Name = 'NowaNazwa'; HeaderText = 'Nowa nazwa'; Width = 300 }))
-    $tab.Controls.Add($grid)
-
-    $btnLoad.Add_Click({
-            $grid.Rows.Clear()
-            foreach ($c in & $getTargets) { [void]$grid.Rows.Add(@($c, '')) }
-        })
-
-    $btnAuto.Add_Click({
-            $start = [int]$numStart.Value; $pad = [int]$numPad.Value
-            for ($i = 0; $i -lt $grid.Rows.Count; $i++) {
-                $n = $start + $i
-                $grid.Rows[$i].Cells['NowaNazwa'].Value = $txtPrefix.Text + ($n.ToString(("D$pad"))) + $txtSuffix.Text
+                [pscustomobject]$row
             }
         })
-
-    $btnRename.Add_Click({
-            try {
-                if ($grid.Rows.Count -eq 0) { Show-Error "Załaduj najpierw hosty do siatki."; return }
-                $credToPass = if (-not $State.UseCurrentCreds -and $State.Cred) { $State.Cred } else { $null }
-                for ($i = 0; $i -lt $grid.Rows.Count; $i++) {
-                    $old = $grid.Rows[$i].Cells['StaraNazwa'].Value
-                    $new = $grid.Rows[$i].Cells['NowaNazwa'].Value
-                    if ([string]::IsNullOrWhiteSpace($new) -or $old -eq $new) { continue }
-                    Write-Log "[$old] zmiana nazwy na '$new'..."
-                    $sb = {
-                        param($newName, [pscredential]$cred, [bool]$doRestart)
-                        $p = @{ NewName = $newName; Force = $true; ErrorAction = 'Stop' }
-                        if ($cred) { $p.DomainCredential = $cred }
-                        if ($doRestart) { $p.Restart = $true }
-                        Rename-Computer @p
-                        'OK'
-                    }
-                    try {
-                        $res = Invoke-Remote -ComputerName $old -ScriptBlock $sb -Arg @{ newName = $new; cred = $credToPass; doRestart = $chkRestart.Checked }
-                        Write-Log "[$old] wynik: $res"
-                    } catch {
-                        Write-Log "[$old] błąd zmiany nazwy: $($_.Exception.Message)" 'ERROR'
-                    }
-                }
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
 }
 
-# 16) Udziały: tworzenie/usuwanie + podgląd
-Register-ModuleTab -Name 'Udziały (zarządzanie)' -Builder {
-    param($tab, $getTargets)
-
-    $lblHost = New-Object System.Windows.Forms.Label
-    $lblHost.Text = 'Komputer (jedna nazwa):'
-    $lblHost.Left = 12; $lblHost.Top = 16; $lblHost.AutoSize = $true
-    $tab.Controls.Add($lblHost)
-
-    $cmbHost = New-Object System.Windows.Forms.ComboBox
-    $cmbHost.Left = 140; $cmbHost.Top = 12; $cmbHost.Width = 220; $cmbHost.DropDownStyle = 'DropDownList'
-    $tab.Controls.Add($cmbHost)
-
-    $tab.Add_Enter({
-            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
-            Restore-ModuleScope $this
-            $cmbHost.Items.Clear()
-            foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
-            if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
-        })
-
-    $btnRefresh = New-Object System.Windows.Forms.Button
-    $btnRefresh.Text = 'Odśwież listę'
-    $btnRefresh.Left = 370; $btnRefresh.Top = 12; $btnRefresh.Width = 120
-    $tab.Controls.Add($btnRefresh)
-
-    $lblPath = New-Object System.Windows.Forms.Label
-    $lblPath.Text = 'Ścieżka lokalna:'
-    $lblPath.Left = 12; $lblPath.Top = 52; $lblPath.AutoSize = $true
-    $tab.Controls.Add($lblPath)
-
-    $txtPath = New-Object System.Windows.Forms.TextBox
-    $txtPath.Left = 120; $txtPath.Top = 48; $txtPath.Width = 360
-    $tab.Controls.Add($txtPath)
-
-    $lblName = New-Object System.Windows.Forms.Label
-    $lblName.Text = 'Nazwa udziału:'
-    $lblName.Left = 500; $lblName.Top = 52; $lblName.AutoSize = $true
-    $tab.Controls.Add($lblName)
-
-    $txtName = New-Object System.Windows.Forms.TextBox
-    $txtName.Left = 600; $txtName.Top = 48; $txtName.Width = 160
-    $tab.Controls.Add($txtName)
-
-    $lblDesc = New-Object System.Windows.Forms.Label
-    $lblDesc.Text = 'Opis:'
-    $lblDesc.Left = 770; $lblDesc.Top = 52; $lblDesc.AutoSize = $true
-    $tab.Controls.Add($lblDesc)
-
-    $txtDesc = New-Object System.Windows.Forms.TextBox
-    $txtDesc.Left = 810; $txtDesc.Top = 48; $txtDesc.Width = 310
-    $tab.Controls.Add($txtDesc)
-
-    $lblFA = New-Object System.Windows.Forms.Label
-    $lblFA.Text = 'FullAccess (grupy, ,/;):'
-    $lblFA.Left = 12; $lblFA.Top = 84; $lblFA.AutoSize = $true
-    $tab.Controls.Add($lblFA)
-
-    $txtFA = New-Object System.Windows.Forms.TextBox
-    $txtFA.Left = 170; $txtFA.Top = 80; $txtFA.Width = 300
-    $tab.Controls.Add($txtFA)
-
-    $lblCA = New-Object System.Windows.Forms.Label
-    $lblCA.Text = 'ChangeAccess:'
-    $lblCA.Left = 480; $lblCA.Top = 84; $lblCA.AutoSize = $true
-    $tab.Controls.Add($lblCA)
-
-    $txtCA = New-Object System.Windows.Forms.TextBox
-    $txtCA.Left = 570; $txtCA.Top = 80; $txtCA.Width = 240
-    $tab.Controls.Add($txtCA)
-
-    $lblRA = New-Object System.Windows.Forms.Label
-    $lblRA.Text = 'ReadAccess:'
-    $lblRA.Left = 820; $lblRA.Top = 84; $lblRA.AutoSize = $true
-    $tab.Controls.Add($lblRA)
-
-    $txtRA = New-Object System.Windows.Forms.TextBox
-    $txtRA.Left = 900; $txtRA.Top = 80; $txtRA.Width = 220
-    $tab.Controls.Add($txtRA)
-
-    $btnCreate = New-Object System.Windows.Forms.Button
-    $btnCreate.Text = 'Utwórz udział'
-    $btnCreate.Left = 12; $btnCreate.Top = 116; $btnCreate.Width = 170
-    $tab.Controls.Add($btnCreate)
-
-    $btnDelete = New-Object System.Windows.Forms.Button
-    $btnDelete.Text = 'Usuń udział (po nazwie)'
-    $btnDelete.Left = 192; $btnDelete.Top = 116; $btnDelete.Width = 190
-    $tab.Controls.Add($btnDelete)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 160; $grid.Width = 1110; $grid.Height = 510
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $refreshAction = {
-        try {
-            $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-            Write-Log "[$selectedHost] odświeżam listę udziałów..."
-            $sb = {
-                if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
-                    Get-SmbShare | Select-Object Name, Path, Description, ScopeName, CurrentUsers
-                } else {
-                    Get-CimInstance Win32_Share | Select-Object Name, Path, Description, Type
+Register-Module -Key 'Inventory' -Category 'Diagnostyka' -Title 'Inwentaryzacja' -Description 'Sprzęt, system, numer seryjny, pamięć, adresy IP i zalogowany użytkownik zaznaczonych komputerów.' -Build {
+    param($m)
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Pobierz informacje' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Inwentaryzacja' -Targets $targets -ScriptBlock {
+                param($P)
+                $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem
+                $bios = Get-CimInstance -ClassName Win32_BIOS
+                $cpu = @(Get-CimInstance -ClassName Win32_Processor)[0]
+                $nics = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = True')
+                $ips = @($nics | ForEach-Object { $_.IPAddress } | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }) -join ', '
+                $macs = @($nics | ForEach-Object { $_.MACAddress } | Where-Object { $_ }) -join ', '
+                $sysDisk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+                $cv = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+                $release = ''
+                if ($cv) {
+                    if ($cv.DisplayVersion) { $release = $cv.DisplayVersion } elseif ($cv.ReleaseId) { $release = $cv.ReleaseId }
+                    if ($null -ne $cv.UBR) { $build = '{0}.{1}' -f $os.BuildNumber, $cv.UBR } else { $build = $os.BuildNumber }
+                }
+                else { $build = $os.BuildNumber }
+                [pscustomobject]@{
+                    'Producent'              = $cs.Manufacturer
+                    'Model'                  = $cs.Model
+                    'Numer seryjny'          = $bios.SerialNumber
+                    'BIOS'                   = $bios.SMBIOSBIOSVersion
+                    'System'                 = $os.Caption
+                    'Wydanie'                = $release
+                    'Kompilacja'             = $build
+                    'Architektura'           = $os.OSArchitecture
+                    'Procesor'               = ([string]$cpu.Name).Trim()
+                    'Rdzenie'                = $cpu.NumberOfCores
+                    'RAM (GB)'               = [Math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+                    'Dysk systemowy (GB)'    = $(if ($sysDisk) { [Math]::Round($sysDisk.Size / 1GB, 1) } else { $null })
+                    'Wolne na systemowym (GB)' = $(if ($sysDisk) { [Math]::Round($sysDisk.FreeSpace / 1GB, 1) } else { $null })
+                    'Zalogowany użytkownik'  = $cs.UserName
+                    'Domena'                 = $cs.Domain
+                    'Adresy IP'              = $ips
+                    'MAC'                    = $macs
+                    'Instalacja systemu'     = $os.InstallDate
+                    'Ostatni start'          = $os.LastBootUpTime
                 }
             }
-            $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb
-            $grid.DataSource = @($out)
-        } catch { Write-Log $_.Exception.Message 'ERROR' }
-    }
-
-    $btnRefresh.Add_Click($refreshAction)
-
-    $btnCreate.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                $path = $txtPath.Text.Trim(); $name = $txtName.Text.Trim()
-                if (-not $path -or -not $name) { Show-Error "Podaj ścieżkę i nazwę udziału."; return }
-                $desc = $txtDesc.Text.Trim()
-                $fa = $txtFA.Text.Trim(); $ca = $txtCA.Text.Trim(); $ra = $txtRA.Text.Trim()
-                Write-Log "[$selectedHost] tworzę udział $name → $path ..."
-                $sb = {
-                    param($name, $path, $desc, $fa, $ca, $ra)
-                    if (-not (Test-Path $path)) { New-Item -Path $path -ItemType Directory -Force | Out-Null }
-                    $split = { param($s) if ([string]::IsNullOrWhiteSpace($s)) { @() } else { $s -split '[,;]\s*' } }
-                    $full = & $split $fa
-                    $chg = & $split $ca
-                    $read = & $split $ra
-
-                    if (Get-Command New-SmbShare -ErrorAction SilentlyContinue) {
-                        $p = @{Name = $name; Path = $path; ErrorAction = 'Stop' }
-                        if ($desc) { $p.Description = $desc }
-                        if ($full.Count -gt 0) { $p.FullAccess = $full }
-                        if ($chg.Count -gt 0) { $p.ChangeAccess = $chg }
-                        if ($read.Count -gt 0) { $p.ReadAccess = $read }
-                        New-SmbShare @p | Out-Null
-                        'OK (SMB)'
-                    } else {
-                        $type = 0
-                        $r = ([wmiclass]"\\.\root\cimv2:Win32_Share").Create($path, $name, $type, $null, $desc)
-                        if ($r.ReturnValue -ne 0) { throw "Win32_Share.Create zwrócił $($r.ReturnValue)" }
-                        $perms = @()
-                        foreach ($u in $full) { if ($u) { $perms += "${u}:(OI)(CI)F" } }
-                        foreach ($u in $chg) { if ($u) { $perms += "${u}:(OI)(CI)M" } }
-                        foreach ($u in $read) { if ($u) { $perms += "${u}:(OI)(CI)R" } }
-                        foreach ($pmt in $perms) { icacls $path /grant $pmt | Out-Null }
-                        'OK (Win32_Share + NTFS ACL)'
-                    }
-                }
-                $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{
-                    name = $name; path = $path; desc = $desc; fa = $fa; ca = $ca; ra = $ra
-                }
-                Write-Log "[$selectedHost] wynik: $out"
-                & $refreshAction
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-
-    $btnDelete.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                $name = $txtName.Text.Trim(); if (-not $name) { Show-Error "Podaj nazwę udziału do usunięcia."; return }
-                Write-Log "[$selectedHost] usuwam udział $name ..."
-                $sb = {
-                    param($name)
-                    if (Get-Command Remove-SmbShare -ErrorAction SilentlyContinue) {
-                        Remove-SmbShare -Name $name -Force -ErrorAction Stop
-                    } else {
-                        $s = Get-CimInstance Win32_Share -Filter "Name='$name'"
-                        if ($s) { Invoke-CimMethod -InputObject $s -MethodName Delete | Out-Null }
-                    }
-                    'Usunięto'
-                }
-                $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ name = $name }
-                Write-Log "[$selectedHost] wynik: $out"
-                & $refreshAction
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
         })
 }
 
-# 17) Sterowniki (PnP Signed) + filtr + eksport CSV
-Register-ModuleTab -Name 'Sterowniki (PnP)' -Builder {
-    param($tab, $getTargets)
-
-    $lblF = New-Object System.Windows.Forms.Label
-    $lblF.Text = 'Filtr (nazwa/producent/dostawca):'
-    $lblF.Left = 12; $lblF.Top = 16; $lblF.AutoSize = $true
-    $tab.Controls.Add($lblF)
-
-    $txtF = New-Object System.Windows.Forms.TextBox
-    $txtF.Left = 220; $txtF.Top = 12; $txtF.Width = 300
-    $tab.Controls.Add($txtF)
-
-    $btnGet = New-Object System.Windows.Forms.Button
-    $btnGet.Text = 'Pobierz'
-    $btnGet.Left = 540; $btnGet.Top = 12; $btnGet.Width = 120
-    $tab.Controls.Add($btnGet)
-
-    $btnExport = New-Object System.Windows.Forms.Button
-    $btnExport.Text = 'Eksport CSV'
-    $btnExport.Left = 670; $btnExport.Top = 12; $btnExport.Width = 120
-    $tab.Controls.Add($btnExport)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btnGet.Add_Click({
+Register-Module -Key 'Power' -Category 'Diagnostyka' -Title 'Zasilanie i uptime' -Description 'Czas pracy, oczekujący restart (CBS, Windows Update, zmiana nazwy, SCCM) oraz zaplanowany restart/wyłączenie z komunikatem dla użytkownika.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Uptime' -Targets $targets -ScriptBlock {
+            param($P)
+            $os = Get-CimInstance -ClassName Win32_OperatingSystem
+            $boot = $os.LastBootUpTime
+            $up = (Get-Date) - $boot
+            $reasons = @()
+            if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $reasons += 'Obsługa składników (CBS)' }
+            if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $reasons += 'Windows Update' }
+            $pending = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+            if ($pending) { $reasons += 'Operacje na plikach' }
+            $active = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue).ComputerName
+            $next = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue).ComputerName
+            if ($active -and $next -and $active -ne $next) { $reasons += "Zmiana nazwy na $next" }
             try {
-                $targets = & $getTargets
-                Connect-Cim -Computers $targets
-                $rows = @()
-                $filter = $txtF.Text.Trim()
-                foreach ($t in $targets) {
-                    if (-not $State.CimSessions.ContainsKey($t)) { continue }
-                    Write-Log "[$t] pobieram sterowniki (Win32_PnPSignedDriver)..."
-                    $drv = Get-CimInstance Win32_PnPSignedDriver -CimSession $State.CimSessions[$t] |
-                    Select-Object DeviceName, DriverVersion, DriverDate, Manufacturer, DriverProviderName, InfName, IsSigned
-                    if ($filter) {
-                        $drv = $drv | Where-Object {
-                            $_.DeviceName -like "*$filter*" -or
-                            $_.Manufacturer -like "*$filter*" -or
-                            $_.DriverProviderName -like "*$filter*"
-                        }
-                    }
-                    foreach ($d in $drv) {
-                        $rows += [pscustomobject]@{
-                            Komputer = $t; Urządzenie = $d.DeviceName; Wersja = $d.DriverVersion; Data = $d.DriverDate
-                            Producent = $d.Manufacturer; Dostawca = $d.DriverProviderName; INF = $d.InfName; Podpisany = $d.IsSigned
-                        }
-                    }
-                }
-                $grid.DataSource = $rows
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-
-    $btnExport.Add_Click({
-            try {
-                if (-not $grid.DataSource) { Show-Error "Brak danych do eksportu."; return }
-                $dlg = New-Object System.Windows.Forms.SaveFileDialog
-                $dlg.Filter = 'CSV (*.csv)|*.csv'
-                $dlg.FileName = 'Sterowniki.csv'
-                if ($dlg.ShowDialog() -eq 'OK') {
-                    @($grid.DataSource) | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $dlg.FileName
-                    Write-Log "Zapisano CSV: $($dlg.FileName)"
-                }
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-}
-
-# 18) Lokalni administratorzy — podgląd/edycja
-Register-ModuleTab -Name 'Lokalni administratorzy' -Builder {
-    param($tab, $getTargets)
-
-    $lblHost = New-Object System.Windows.Forms.Label
-    $lblHost.Text = 'Komputer (jedna nazwa):'
-    $lblHost.Left = 12; $lblHost.Top = 16; $lblHost.AutoSize = $true
-    $tab.Controls.Add($lblHost)
-
-    $cmbHost = New-Object System.Windows.Forms.ComboBox
-    $cmbHost.Left = 140; $cmbHost.Top = 12; $cmbHost.Width = 240; $cmbHost.DropDownStyle = 'DropDownList'
-    $tab.Controls.Add($cmbHost)
-
-    $tab.Add_Enter({
-            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
-            Restore-ModuleScope $this
-            $cmbHost.Items.Clear()
-            foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
-            if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
-        })
-
-    $btnLoad = New-Object System.Windows.Forms.Button
-    $btnLoad.Text = 'Pokaż członków'
-    $btnLoad.Left = 400; $btnLoad.Top = 12; $btnLoad.Width = 140
-    $tab.Controls.Add($btnLoad)
-
-    $txtAcct = New-Object System.Windows.Forms.TextBox
-    $txtAcct.Left = 12; $txtAcct.Top = 48; $txtAcct.Width = 360
-    $tab.Controls.Add($txtAcct)
-    $lblAcct = New-Object System.Windows.Forms.Label
-    $lblAcct.Text = 'Konto/grupa do dodania (DOMENA\użytkownik lub grupa):'
-    $lblAcct.Left = 12; $lblAcct.Top = 74; $lblAcct.AutoSize = $true
-    $tab.Controls.Add($lblAcct)
-
-    $btnAdd = New-Object System.Windows.Forms.Button
-    $btnAdd.Text = 'Dodaj do "Administratorzy"'
-    $btnAdd.Left = 384; $btnAdd.Top = 46; $btnAdd.Width = 200
-    $tab.Controls.Add($btnAdd)
-
-    $btnDel = New-Object System.Windows.Forms.Button
-    $btnDel.Text = 'Usuń zaznaczonego'
-    $btnDel.Left = 600; $btnDel.Top = 46; $btnDel.Width = 160
-    $tab.Controls.Add($btnDel)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 108; $grid.Width = 1110; $grid.Height = 562
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
-    $tab.Controls.Add($grid)
-
-    $loadAction = {
-        try {
-            $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-            Write-Log "[$selectedHost] odczyt grupy Lokalni Administratorzy..."
-            $sb = {
-                # Nazwa grupy zalezy od jezyka systemu (Administrators/Administratorzy) - wyznaczamy ja z SID
-                $adminGroup = ([System.Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
-                function Get-NetLocalAdminsFallback {
-                    $raw = (net localgroup "$adminGroup") | Out-String
-                    $lines = $raw -split "`r?`n"
-                    $body = $false; $items = @()
-                    foreach ($l in $lines) {
-                        if ($l -match '^-{3,}') { $body = -not $body; continue }
-                        if ($body -and $l.Trim()) {
-                            $n = $l.Trim()
-                            if ($n -notmatch '^(Polecenie zostało|The command completed)') { $items += [pscustomobject]@{Name = $n; ObjectClass = '(net)'; PrincipalSource = 'Unknown'; SID = $null } }
-                        }
-                    }
-                    $items
-                }
-                if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
-                    try {
-                        Get-LocalGroupMember -SID 'S-1-5-32-544' | Select-Object Name, ObjectClass, PrincipalSource, SID
-                    } catch { Get-NetLocalAdminsFallback }
-                } else { Get-NetLocalAdminsFallback }
+                $ccm = Invoke-CimMethod -Namespace 'root\ccm\ClientSDK' -ClassName CCM_ClientUtilities -MethodName DetermineIfRebootPending -ErrorAction Stop
+                if ($ccm.RebootPending -or $ccm.IsHardRebootPending) { $reasons += 'SCCM' }
             }
-            $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb
-            $grid.DataSource = @($out)
-        } catch { Write-Log $_.Exception.Message 'ERROR' }
+            catch { }
+            [pscustomobject]@{
+                'Ostatni start'       = $boot
+                'Czas pracy'          = '{0} d {1:00} h {2:00} min' -f $up.Days, $up.Hours, $up.Minutes
+                'Dni pracy'           = [Math]::Round($up.TotalDays, 1)
+                'Oczekuje restartu'   = ($reasons.Count -gt 0)
+                'Powód'               = ($reasons -join ', ')
+                'Zalogowany'          = (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
+            }
+        }
     }
-    $btnLoad.Add_Click($loadAction)
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Pokaż uptime' $m -Primary $m.Actions.List)
 
-    $btnAdd.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                $acct = $txtAcct.Text.Trim(); if (-not $acct) { Show-Error "Podaj konto/grupę (DOMENA\\użytkownik)."; return }
-                Write-Log "[$selectedHost] dodaję $acct do lokalnej grupy Administratorzy..."
-                $sb = {
-                    param($member)
-                    if (Get-Command Add-LocalGroupMember -ErrorAction SilentlyContinue) {
-                        Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $member -ErrorAction Stop
-                        'OK (Add-LocalGroupMember)'
-                    } else {
-                        $adminGroup = ([System.Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
-                        cmd.exe /c "net localgroup `"$adminGroup`" `"$member`" /add" | Out-Null
-                        'OK (net localgroup)'
-                    }
-                }
-                $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ member = $acct }
-                Write-Log "[$selectedHost] $r"
-                & $loadAction
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Opóźnienie (s):')
+    $m.Delay = Add-Numeric $row2 0 86400 60 80
+    [void](Add-Label $row2 'Komunikat:')
+    $m.Message = Add-TextBox $row2 330 'Komputer zostanie uruchomiony ponownie przez administratora. Zapisz swoją pracę.'
+    $m.Force = Add-CheckBox $row2 'Wymuś zamknięcie aplikacji' $true
 
-    $btnDel.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                if (-not $grid.SelectedRows) { Show-Error "Zaznacz pozycję do usunięcia."; return }
-                $name = $grid.SelectedRows[0].Cells['Name'].Value
-                Write-Log "[$selectedHost] usuwam $name z lokalnych Administratorów..."
-                $sb = {
-                    param($member)
-                    if (Get-Command Remove-LocalGroupMember -ErrorAction SilentlyContinue) {
-                        Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member $member -ErrorAction Stop
-                        'OK (Remove-LocalGroupMember)'
-                    } else {
-                        $adminGroup = ([System.Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
-                        cmd.exe /c "net localgroup `"$adminGroup`" `"$member`" /delete" | Out-Null
-                        'OK (net localgroup)'
-                    }
+    $powerAction = {
+        param($m, $s)
+        $mode = [string]$s.Tag['Mode']
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $verb = @{ '/r' = 'Uruchomić ponownie'; '/s' = 'Wyłączyć'; '/a' = 'Anulować zaplanowany restart/wyłączenie na' }[$mode]
+        if (-not (Confirm-Action "$verb $($targets.Count) komputer(ów)?" $targets)) { return }
+        $params = @{ Mode = $mode; Delay = [int]$m.Delay.Value; Message = $m.Message.Text.Trim(); Force = $m.Force.Checked }
+        Start-HostOperation -Module $m -Name "Zasilanie ($mode)" -Targets $targets -Output Log -Parameters $params -ScriptBlock {
+            param($P)
+            $shutdown = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+            if ($P.Mode -eq '/a') {
+                $out = & $shutdown /a 2>&1
+                if ($LASTEXITCODE -eq 0) { return 'Anulowano zaplanowane zamknięcie systemu.' }
+                if ($LASTEXITCODE -eq 1116) { return 'Brak zaplanowanego zamknięcia systemu.' }
+                throw ("shutdown.exe /a: kod {0} {1}" -f $LASTEXITCODE, ($out | Out-String).Trim())
+            }
+            $cmdArgs = @($P.Mode, '/t', [string]$P.Delay, '/d', 'p:0:0')
+            if ($P.Force) { $cmdArgs += '/f' }
+            if ($P.Message) { $cmdArgs += '/c'; $cmdArgs += $P.Message.Substring(0, [Math]::Min(500, $P.Message.Length)) }
+            $out = & $shutdown @cmdArgs 2>&1
+            if ($LASTEXITCODE -ne 0) { throw ("shutdown.exe: kod {0} {1}" -f $LASTEXITCODE, ($out | Out-String).Trim()) }
+            $what = if ($P.Mode -eq '/r') { 'Restart' } else { 'Wyłączenie' }
+            "$what zaplanowane za $($P.Delay) s."
+        }
+    }
+    $b = Add-Button $row2 'Restart' $m -Danger $powerAction
+    $b.Tag['Mode'] = '/r'
+    $b = Add-Button $row2 'Wyłącz' $m -Danger $powerAction
+    $b.Tag['Mode'] = '/s'
+    $b = Add-Button $row2 'Anuluj zaplanowane' $m $powerAction
+    $b.Tag['Mode'] = '/a'
+}
+#endregion
+
+#region Moduły: Zdalne wykonanie
+Register-Module -Key 'Commands' -Category 'Zdalne wykonanie' -Title 'Polecenia' -Description 'Uruchamia polecenia PowerShell lub cmd.exe na zaznaczonych komputerach (sesja WinRM, bez pulpitu użytkownika). Dwuklik na wierszu pokazuje pełny wynik.' -Build {
+    param($m)
+    $m.Templates = @(
+        @{ Name = '(wybierz szablon polecenia)'; Mode = ''; Text = '' },
+        @{ Name = 'Wersja systemu i czas pracy'; Mode = 'PS'; Text = "Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, LastBootUpTime" },
+        @{ Name = 'Ostatnie poprawki (10)'; Mode = 'PS'; Text = "Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 10 HotFixID, Description, InstalledOn" },
+        @{ Name = 'Konfiguracja IP'; Mode = 'CMD'; Text = 'ipconfig /all' },
+        @{ Name = 'Odśwież DNS (flushdns + registerdns)'; Mode = 'CMD'; Text = 'ipconfig /flushdns && ipconfig /registerdns' },
+        @{ Name = 'Wyczyść bilety Kerberos komputera'; Mode = 'CMD'; Text = 'klist -li 0x3e7 purge' },
+        @{ Name = 'Sesje użytkowników (quser)'; Mode = 'CMD'; Text = 'quser' },
+        @{ Name = 'Wynikowe zasady komputera (gpresult)'; Mode = 'CMD'; Text = 'gpresult /r /scope computer' },
+        @{ Name = 'Procesy – top 10 pamięci'; Mode = 'PS'; Text = "Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 10 Name, Id, @{n='MB';e={[math]::Round(`$_.WorkingSet64/1MB)}}" },
+        @{ Name = 'Test połączenia z kontrolerem domeny'; Mode = 'PS'; Text = "Test-NetConnection -ComputerName `$env:USERDNSDOMAIN -Port 389 | Select-Object ComputerName, RemoteAddress, TcpTestSucceeded" }
+    )
+    $row = Add-ToolbarRow $m
+    $m.RbPs = Add-RadioButton $row 'PowerShell' $true
+    $m.RbCmd = Add-RadioButton $row 'cmd.exe' $false
+    [void](Add-Label $row '   Szablon:')
+    $m.Template = Add-ComboBox $row @($m.Templates | ForEach-Object { $_.Name }) 300 0
+    Register-ControlHandler -Control $m.Template -EventName 'SelectedIndexChanged' -Module $m -Action {
+        param($m, $s)
+        $t = $m.Templates[$s.SelectedIndex]
+        if (-not $t.Mode) { return }
+        $m.RbPs.Checked = ($t.Mode -eq 'PS')
+        $m.RbCmd.Checked = ($t.Mode -eq 'CMD')
+        $m.CommandBox.Text = $t.Text
+    }
+
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Multiline = $true
+    $box.AcceptsReturn = $true
+    $box.AcceptsTab = $true
+    $box.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
+    $box.WordWrap = $false
+    $box.Font = $script:UI.FontMono
+    $box.Height = 130
+    $m.CommandBox = Add-TopControl $m $box
+
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Button $row2 'Uruchom na zaznaczonych' $m -Primary {
+            param($m)
+            $command = $m.CommandBox.Text.Trim()
+            if (-not $command) { Show-Warning 'Wpisz polecenie do wykonania.'; return }
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $mode = if ($m.RbPs.Checked) { 'PowerShell' } else { 'cmd.exe' }
+            $preview = if ($command.Length -gt 300) { $command.Substring(0, 300) + '…' } else { $command }
+            if (-not (Confirm-Action "Uruchomić polecenie ($mode) na $($targets.Count) komputer(ach)?`r`n`r`n$preview" $targets)) { return }
+            Write-Log "Polecenie ($mode): $command"
+            if ($m.RbPs.Checked) {
+                Start-HostOperation -Module $m -Name 'Polecenie PowerShell' -Targets $targets -Parameters @{ Command = $command } -ScriptBlock {
+                    param($P)
+                    $sb = [scriptblock]::Create($P.Command)
+                    $text = (& $sb 2>&1 | Out-String -Width 250).Trim()
+                    [pscustomobject]@{ 'Wynik' = $text }
                 }
-                $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ member = $name }
-                Write-Log "[$selectedHost] $r"
-                & $loadAction
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
+            }
+            else {
+                Start-HostOperation -Module $m -Name 'Polecenie cmd.exe' -Targets $targets -Parameters @{ Command = $command } -ScriptBlock {
+                    param($P)
+                    $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+                    $psi.Arguments = '/d /s /c "' + $P.Command + '"'
+                    $psi.UseShellExecute = $false
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $psi.CreateNoWindow = $true
+                    $psi.StandardOutputEncoding = $oem
+                    $psi.StandardErrorEncoding = $oem
+                    $proc = [System.Diagnostics.Process]::Start($psi)
+                    $errTask = $proc.StandardError.ReadToEndAsync()
+                    $stdout = $proc.StandardOutput.ReadToEnd()
+                    $proc.WaitForExit()
+                    $stderr = $errTask.Result
+                    $text = $stdout
+                    if ($stderr) { $text += "`r`n" + $stderr }
+                    [pscustomobject]@{ 'Kod wyjścia' = $proc.ExitCode; 'Wynik' = $text.Trim() }
+                }
+            }
         })
+    [void](Add-Label $row2 'Uwaga: polecenia działają bez profilu i pulpitu użytkownika; zasoby sieciowe mogą być niedostępne (podwójny przeskok).' -Hint)
 }
 
-# 19) Zaplanowane zadania — podgląd/uruchamianie/wyłączanie/usuwanie + proste tworzenie
-Register-ModuleTab -Name 'Zadania (Harmonogram)' -Builder {
-    param($tab, $getTargets)
-
-    $lblHost = New-Object System.Windows.Forms.Label
-    $lblHost.Text = 'Komputer:'
-    $lblHost.Left = 12; $lblHost.Top = 16; $lblHost.AutoSize = $true
-    $tab.Controls.Add($lblHost)
-
-    $cmbHost = New-Object System.Windows.Forms.ComboBox
-    $cmbHost.Left = 80; $cmbHost.Top = 12; $cmbHost.Width = 220; $cmbHost.DropDownStyle = 'DropDownList'
-    $tab.Controls.Add($cmbHost)
-
-    $lblFilter = New-Object System.Windows.Forms.Label
-    $lblFilter.Text = 'Filtr (nazwa/ścieżka):'
-    $lblFilter.Left = 320; $lblFilter.Top = 16; $lblFilter.AutoSize = $true
-    $tab.Controls.Add($lblFilter)
-
-    $txtFilter = New-Object System.Windows.Forms.TextBox
-    $txtFilter.Left = 460; $txtFilter.Top = 12; $txtFilter.Width = 300
-    $tab.Controls.Add($txtFilter)
-
-    $btnLoad = New-Object System.Windows.Forms.Button
-    $btnLoad.Text = 'Pobierz'
-    $btnLoad.Left = 780; $btnLoad.Top = 12; $btnLoad.Width = 100
-    $tab.Controls.Add($btnLoad)
-
-    $btnRun = New-Object System.Windows.Forms.Button
-    $btnRun.Text = 'Uruchom'
-    $btnRun.Left = 890; $btnRun.Top = 12; $btnRun.Width = 80
-    $tab.Controls.Add($btnRun)
-
-    $btnEnable = New-Object System.Windows.Forms.Button
-    $btnEnable.Text = 'Włącz'
-    $btnEnable.Left = 980; $btnEnable.Top = 12; $btnEnable.Width = 70
-    $tab.Controls.Add($btnEnable)
-
-    $btnDisable = New-Object System.Windows.Forms.Button
-    $btnDisable.Text = 'Wyłącz'
-    $btnDisable.Left = 1060; $btnDisable.Top = 12; $btnDisable.Width = 70
-    $tab.Controls.Add($btnDisable)
-
-    $btnDel = New-Object System.Windows.Forms.Button
-    $btnDel.Text = 'Usuń'
-    $btnDel.Left = 1140; $btnDel.Top = 12; $btnDel.Width = 60
-    $tab.Controls.Add($btnDel)
-
-    $grpNew = New-Object System.Windows.Forms.GroupBox
-    $grpNew.Text = 'Utwórz proste zadanie (SYSTEM)'
-    $grpNew.Left = 12; $grpNew.Top = 48; $grpNew.Width = 1188; $grpNew.Height = 100
-    $tab.Controls.Add($grpNew)
-
-    $lblTN = New-Object System.Windows.Forms.Label
-    $lblTN.Text = 'Nazwa zadania:'; $lblTN.Left = 12; $lblTN.Top = 24; $lblTN.AutoSize = $true
-    $grpNew.Controls.Add($lblTN)
-    $txtTN = New-Object System.Windows.Forms.TextBox
-    $txtTN.Left = 110; $txtTN.Top = 20; $txtTN.Width = 240
-    $grpNew.Controls.Add($txtTN)
-
-    $lblAct = New-Object System.Windows.Forms.Label
-    $lblAct.Text = 'Akcja (program):'; $lblAct.Left = 370; $lblAct.Top = 24; $lblAct.AutoSize = $true
-    $grpNew.Controls.Add($lblAct)
-    $txtAct = New-Object System.Windows.Forms.TextBox
-    $txtAct.Left = 480; $txtAct.Top = 20; $txtAct.Width = 280
-    $grpNew.Controls.Add($txtAct)
-
-    $lblArg = New-Object System.Windows.Forms.Label
-    $lblArg.Text = 'Argumenty:'; $lblArg.Left = 770; $lblArg.Top = 24; $lblArg.AutoSize = $true
-    $grpNew.Controls.Add($lblArg)
-    $txtArg = New-Object System.Windows.Forms.TextBox
-    $txtArg.Left = 840; $txtArg.Top = 20; $txtArg.Width = 330
-    $grpNew.Controls.Add($txtArg)
-
-    $lblTrig = New-Object System.Windows.Forms.Label
-    $lblTrig.Text = 'Trigger:'; $lblTrig.Left = 12; $lblTrig.Top = 60; $lblTrig.AutoSize = $true
-    $grpNew.Controls.Add($lblTrig)
-    $cmbTrig = New-Object System.Windows.Forms.ComboBox
-    $cmbTrig.Left = 70; $cmbTrig.Top = 56; $cmbTrig.Width = 150; $cmbTrig.DropDownStyle = 'DropDownList'
-    $cmbTrig.Items.AddRange(@('Na logowanie', 'Codziennie o HH:MM', 'Ręczny (OnDemand)'))
-    $cmbTrig.SelectedIndex = 0
-    $grpNew.Controls.Add($cmbTrig)
-
-    $txtTime = New-Object System.Windows.Forms.TextBox
-    $txtTime.Left = 230; $txtTime.Top = 56; $txtTime.Width = 60
-    $txtTime.Text = '07:00'
-    $grpNew.Controls.Add($txtTime)
-
-    $btnCreate = New-Object System.Windows.Forms.Button
-    $btnCreate.Text = 'Utwórz (SYSTEM, Highest)'
-    $btnCreate.Left = 310; $btnCreate.Top = 54; $btnCreate.Width = 180
-    $grpNew.Controls.Add($btnCreate)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 160; $grid.Width = 1188; $grid.Height = 510
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
-    $tab.Controls.Add($grid)
-
-    $tab.Add_Enter({
-            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
-            Restore-ModuleScope $this
-            $cmbHost.Items.Clear()
-            foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
-            if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
+Register-Module -Key 'Install' -Category 'Zdalne wykonanie' -Title 'Instalacja oprogramowania' -Description 'Kopiuje instalator (MSI, MSP, MSU, EXE) na zaznaczone komputery i uruchamia go w trybie cichym. Wynik zawiera kod wyjścia i jego znaczenie.' -Build {
+    param($m)
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Instalator:')
+    $m.Path = Add-TextBox $row 460
+    [void](Add-Button $row 'Przeglądaj…' $m {
+            param($m)
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Filter = 'Instalatory (*.msi;*.msp;*.msu;*.exe)|*.msi;*.msp;*.msu;*.exe|Wszystkie pliki (*.*)|*.*'
+            if ($dlg.ShowDialog($script:UI.Form) -eq [System.Windows.Forms.DialogResult]::OK) { $m.Path.Text = $dlg.FileName }
         })
-
-    $loadAction = {
-        try {
-            $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-            Write-Log "[$selectedHost] odczyt zadań Harmonogramu..."
-            $sb = {
-                param($flt)
-                $tasks = Get-ScheduledTask
-                if ($flt) {
-                    $tasks = $tasks | Where-Object { $_.TaskName -like "*$flt*" -or $_.TaskPath -like "*$flt*" }
-                }
-                $rows = @()
-                foreach ($t in $tasks) {
-                    try {
-                        $i = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath
-                        $rows += [pscustomobject]@{
-                            TaskName = $t.TaskName; TaskPath = $t.TaskPath; State = $i.State; Enabled = $t.Enabled
-                            LastRun = $i.LastRunTime; NextRun = $i.NextRunTime; Author = $t.Author; Description = $t.Description
-                        }
-                    } catch {
-                        $rows += [pscustomobject]@{
-                            TaskName = $t.TaskName; TaskPath = $t.TaskPath; State = '(brak informacji)'; Enabled = $t.Enabled
-                            LastRun = $null; NextRun = $null; Author = $t.Author; Description = $t.Description
-                        }
-                    }
-                }
-                $rows
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Dodatkowe argumenty:')
+    $m.Args = Add-TextBox $row2 300
+    $m.Cleanup = Add-CheckBox $row2 'Usuń instalator po zakończeniu' $true
+    [void](Add-Button $row2 'Zainstaluj na zaznaczonych' $m -Primary {
+            param($m)
+            $path = $m.Path.Text.Trim().Trim('"')
+            if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { Show-Warning 'Wskaż istniejący plik instalatora.'; return }
+            $ext = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
+            if (@('.msi', '.msp', '.msu', '.exe') -notcontains $ext) { Show-Warning 'Obsługiwane są pliki .msi, .msp, .msu i .exe.'; return }
+            $extra = $m.Args.Text.Trim()
+            if ($ext -eq '.exe' -and -not $extra) {
+                if (-not (Confirm-Action 'Nie podano argumentów cichej instalacji dla pliku EXE. Instalator może czekać na odpowiedź użytkownika, którego nie ma – operacja zawiśnie do czasu anulowania. Kontynuować?')) { return }
             }
-            $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ flt = $txtFilter.Text.Trim() }
-            $grid.DataSource = @($out | Sort-Object TaskPath, TaskName)
-        } catch { Write-Log $_.Exception.Message 'ERROR' }
-    }
-    $btnLoad.Add_Click($loadAction)
-
-    foreach ($pair in @(
-            @{Btn = $btnRun; Op = 'Run' },
-            @{Btn = $btnEnable; Op = 'Enable' },
-            @{Btn = $btnDisable; Op = 'Disable' },
-            @{Btn = $btnDel; Op = 'Delete' }
-        )) {
-        # Operacja zapisana w Tag przycisku - $pair w handlerze wskazywalby zawsze ostatnia pare ('Delete')
-        $pair.Btn.Tag = $pair.Op
-        $pair.Btn.Add_Click({
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            if (-not (Confirm-Action "Zainstalować $([System.IO.Path]::GetFileName($path)) na $($targets.Count) komputer(ach)?" $targets)) { return }
+            $params = @{ LocalPath = $path; FileName = [System.IO.Path]::GetFileName($path); Args = $extra; Cleanup = $m.Cleanup.Checked }
+            Start-HostOperation -Module $m -Name 'Instalacja' -Targets $targets -Local -Parameters $params -ScriptBlock {
+                param($Target, $P, $Ctx)
+                $ErrorActionPreference = 'Stop'
+                $sp = @{ ComputerName = $Target }
+                if ($Ctx.Credential) { $sp.Credential = $Ctx.Credential }
+                if ($Ctx.SessionOption) { $sp.SessionOption = $Ctx.SessionOption }
+                $session = New-PSSession @sp
                 try {
-                    $op = [string]$this.Tag
-                    $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                    if (-not $grid.SelectedRows) { Show-Error "Zaznacz zadanie."; return }
-                    $tn = $grid.SelectedRows[0].Cells['TaskName'].Value
-                    $tp = $grid.SelectedRows[0].Cells['TaskPath'].Value
-                    Write-Log "[$selectedHost] $op zadania $tp$tn ..."
-                    $sb = {
-                        param($tp, $tn, $op)
-                        switch ($op) {
-                            'Run' { Start-ScheduledTask -TaskPath $tp -TaskName $tn; 'Started' }
-                            'Enable' { Enable-ScheduledTask -TaskPath $tp -TaskName $tn; 'Enabled' }
-                            'Disable' { Disable-ScheduledTask -TaskPath $tp -TaskName $tn; 'Disabled' }
-                            'Delete' { Unregister-ScheduledTask -TaskPath $tp -TaskName $tn -Confirm:$false; 'Deleted' }
-                        }
+                    $remoteFile = Invoke-Command -Session $session -ArgumentList $P.FileName -ScriptBlock {
+                        param($name)
+                        $dir = Join-Path $env:SystemRoot 'Temp\DomainOps'
+                        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                        Join-Path $dir $name
                     }
-                    $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ tp = $tp; tn = $tn; op = $op }
-                    Write-Log "[$selectedHost] $r"
-                    $btnLoad.PerformClick()
-                } catch { Write-Log $_.Exception.Message 'ERROR' }
-            })
-    }
-
-    $btnCreate.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                $tn = $txtTN.Text.Trim(); $exe = $txtAct.Text.Trim()
-                if (-not $tn -or -not $exe) { Show-Error "Podaj nazwę i ścieżkę programu."; return }
-                $taskArgs = $txtArg.Text.Trim(); $trig = $cmbTrig.Text; $time = $txtTime.Text.Trim()
-                Write-Log "[$selectedHost] tworze zadanie $tn -> $exe $taskArgs ($trig)..."
-                $sb = {
-                    param($tn, $exe, $taskArgs, $trig, $time)
-                    $act = New-ScheduledTaskAction -Execute $exe -Argument $taskArgs
-                    $prin = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
-                    switch ($trig) {
-                        'Na logowanie' { $tr = New-ScheduledTaskTrigger -AtLogOn }
-                        'Codziennie o HH:MM' {
-                            $h, $m = $time.Split(':'); $dt = (Get-Date).Date.AddHours([int]$h).AddMinutes([int]$m)
-                            $tr = New-ScheduledTaskTrigger -Daily -At $dt.TimeOfDay
+                    # Najpierw szybka kopia przez udział ADMIN$ (tylko dla bieżących poświadczeń), potem przez WinRM
+                    $method = ''
+                    if (-not $Ctx.Credential) {
+                        try {
+                            Copy-Item -LiteralPath $P.LocalPath -Destination ('\\{0}\ADMIN$\Temp\DomainOps\{1}' -f $Target, $P.FileName) -Force
+                            $method = 'SMB'
                         }
-                        default { $tr = $null }
+                        catch { }
                     }
-                    if ($tr) { $t = New-ScheduledTask -Action $act -Trigger $tr -Principal $prin }
-                    else { $t = New-ScheduledTask -Action $act -Principal $prin -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) }
-                    Register-ScheduledTask -TaskName $tn -InputObject $t -Force | Out-Null
-                    'OK'
-                }
-                $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ tn = $tn; exe = $exe; taskArgs = $taskArgs; trig = $trig; time = $time }
-                Write-Log "[$selectedHost] $r"
-                $btnLoad.PerformClick()
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-}
-
-# 20) Zapora Windows — podgląd/enable/disable + szybkie tworzenie i usuwanie
-Register-ModuleTab -Name 'Zapora Windows' -Builder {
-    param($tab, $getTargets)
-
-    $lblHost = New-Object System.Windows.Forms.Label
-    $lblHost.Text = 'Komputer:'; $lblHost.Left = 12; $lblHost.Top = 16; $lblHost.AutoSize = $true
-    $tab.Controls.Add($lblHost)
-
-    $cmbHost = New-Object System.Windows.Forms.ComboBox
-    $cmbHost.Left = 80; $cmbHost.Top = 12; $cmbHost.Width = 220; $cmbHost.DropDownStyle = 'DropDownList'
-    $tab.Controls.Add($cmbHost)
-
-    $btnLoad = New-Object System.Windows.Forms.Button
-    $btnLoad.Text = 'Pokaż reguły (Inbound)'
-    $btnLoad.Left = 320; $btnLoad.Top = 12; $btnLoad.Width = 180
-    $tab.Controls.Add($btnLoad)
-
-    $btnToggle = New-Object System.Windows.Forms.Button
-    $btnToggle.Text = 'Włącz/wyłącz zaznaczoną'
-    $btnToggle.Left = 510; $btnToggle.Top = 12; $btnToggle.Width = 190
-    $tab.Controls.Add($btnToggle)
-
-    $btnDel = New-Object System.Windows.Forms.Button
-    $btnDel.Text = 'Usuń po nazwie'
-    $btnDel.Left = 710; $btnDel.Top = 12; $btnDel.Width = 140
-    $tab.Controls.Add($btnDel)
-
-    $lblNew = New-Object System.Windows.Forms.Label
-    $lblNew.Text = 'Nowa reguła: Nazwa / Port / Protokół'; $lblNew.Left = 12; $lblNew.Top = 48; $lblNew.AutoSize = $true
-    $tab.Controls.Add($lblNew)
-    $txtRule = New-Object System.Windows.Forms.TextBox
-    $txtRule.Left = 220; $txtRule.Top = 44; $txtRule.Width = 260; $txtRule.Text = 'MojaReguła'
-    $tab.Controls.Add($txtRule)
-    $numPort = New-Object System.Windows.Forms.NumericUpDown
-    $numPort.Left = 490; $numPort.Top = 44; $numPort.Width = 80; $numPort.Minimum = 1; $numPort.Maximum = 65535; $numPort.Value = 5985
-    $tab.Controls.Add($numPort)
-    $cmbProto = New-Object System.Windows.Forms.ComboBox
-    $cmbProto.Left = 580; $cmbProto.Top = 44; $cmbProto.Width = 90; $cmbProto.DropDownStyle = 'DropDownList'
-    $cmbProto.Items.AddRange(@('TCP', 'UDP')); $cmbProto.SelectedIndex = 0
-    $tab.Controls.Add($cmbProto)
-    $btnCreate = New-Object System.Windows.Forms.Button
-    $btnCreate.Text = 'Utwórz regułę (Allow, Inbound, Any profile)'
-    $btnCreate.Left = 680; $btnCreate.Top = 42; $btnCreate.Width = 340
-    $tab.Controls.Add($btnCreate)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 80; $grid.Width = 1110; $grid.Height = 590
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
-    $tab.Controls.Add($grid)
-
-    $tab.Add_Enter({
-            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
-            Restore-ModuleScope $this
-            $cmbHost.Items.Clear()
-            foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
-            if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
-        })
-
-    $loadAction = {
-        try {
-            $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-            Write-Log "[$selectedHost] odczyt reguł zapory (Inbound)..."
-            $sb = {
-                if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
-                    $rules = Get-NetFirewallRule -Direction Inbound | Get-NetFirewallRule
-                    $rows = foreach ($r in $rules) {
-                        $pf = (Get-NetFirewallPortFilter -AssociatedNetFirewallRule $r -ErrorAction SilentlyContinue)
+                    if (-not $method) {
+                        Copy-Item -LiteralPath $P.LocalPath -Destination $remoteFile -ToSession $session -Force
+                        $method = 'WinRM'
+                    }
+                    $res = Invoke-Command -Session $session -ArgumentList $remoteFile, $P.Args, $P.Cleanup -ScriptBlock {
+                        param($File, $ExtraArgs, $Cleanup)
+                        $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
+                        $log = [System.IO.Path]::ChangeExtension($File, '.log')
+                        $exe = $File
+                        $arguments = [string]$ExtraArgs
+                        switch ($ext) {
+                            '.msi' { $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $arguments = ('/i "{0}" /qn /norestart /l*v "{1}" {2}' -f $File, $log, $ExtraArgs) }
+                            '.msp' { $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $arguments = ('/p "{0}" /qn /norestart /l*v "{1}" {2}' -f $File, $log, $ExtraArgs) }
+                            '.msu' { $exe = Join-Path $env:SystemRoot 'System32\wusa.exe'; $arguments = ('"{0}" /quiet /norestart {1}' -f $File, $ExtraArgs); $log = '' }
+                            default { $log = '' }
+                        }
+                        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                        $spArgs = @{ FilePath = $exe; PassThru = $true; WindowStyle = 'Hidden' }
+                        if ($arguments.Trim()) { $spArgs.ArgumentList = $arguments.Trim() }
+                        $proc = Start-Process @spArgs
+                        $null = $proc.Handle
+                        $proc.WaitForExit()
+                        $code = $proc.ExitCode
+                        $known = @{
+                            0           = 'Sukces'
+                            3010        = 'Sukces – wymagany restart'
+                            1641        = 'Sukces – instalator uruchomił restart'
+                            1602        = 'Błąd – instalacja anulowana'
+                            1603        = 'Błąd – krytyczny błąd instalacji (1603)'
+                            1618        = 'Błąd – trwa inna instalacja (1618)'
+                            1619        = 'Błąd – nie można otworzyć pakietu (1619)'
+                            1625        = 'Błąd – instalacja zablokowana przez zasady (1625)'
+                            1633        = 'Błąd – nieobsługiwana platforma (1633)'
+                            1638        = 'Błąd – zainstalowana jest inna wersja produktu (1638)'
+                            2359302     = 'Aktualizacja jest już zainstalowana'
+                            -2145124329 = 'Aktualizacja nie dotyczy tego systemu'
+                        }
+                        $meaning = if ($known.ContainsKey($code)) { $known[$code] } else { "Błąd – kod wyjścia $code" }
+                        if ($Cleanup) {
+                            Start-Sleep -Seconds 1
+                            Remove-Item -LiteralPath $File -Force -ErrorAction SilentlyContinue
+                        }
                         [pscustomobject]@{
-                            Name = $r.Name; DisplayName = $r.DisplayName; Enabled = $r.Enabled; Action = $r.Action; Profile = $r.Profile
-                            Protocol = ($pf.Protocol); LocalPort = ($pf.LocalPort -join ','); Program = $r.Program; Group = $r.Group
+                            'Plik'            = [System.IO.Path]::GetFileName($File)
+                            'Kod wyjścia'     = $code
+                            'Wynik'           = $meaning
+                            'Czas (s)'        = [Math]::Round($sw.Elapsed.TotalSeconds)
+                            'Log instalatora' = $log
                         }
                     }
-                    $rows
-                } else {
-                    'Brak modułu NetSecurity — użyj netsh'
+                    [pscustomobject]@{
+                        'Plik'            = $res.Plik
+                        'Kod wyjścia'     = $res.'Kod wyjścia'
+                        'Wynik'           = $res.Wynik
+                        'Czas (s)'        = $res.'Czas (s)'
+                        'Kopiowanie'      = $method
+                        'Log instalatora' = $res.'Log instalatora'
+                    }
+                }
+                finally {
+                    Remove-PSSession -Session $session -ErrorAction SilentlyContinue
                 }
             }
-            $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb
-            $grid.DataSource = @($out)
-        } catch { Write-Log $_.Exception.Message 'ERROR' }
+        })
+    [void](Add-Label (Add-ToolbarRow $m) 'MSI/MSP: automatycznie /qn /norestart i log w %SystemRoot%\Temp\DomainOps;  MSU: /quiet /norestart;  EXE: podaj przełączniki cichej instalacji (np. /S, /quiet, /silent).' -Hint)
+}
+
+Register-Module -Key 'GPUpdate' -Category 'Zdalne wykonanie' -Title 'Aktualizacja zasad grupy' -Description 'Wymusza odświeżenie zasad grupy (gpupdate) na zaznaczonych komputerach.' -Build {
+    param($m)
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Zakres:')
+    $m.Target = Add-ComboBox $row @('Komputer', 'Komputer i użytkownik', 'Użytkownik') 180 0
+    $m.Force = Add-CheckBox $row 'Wymuś ponowne zastosowanie (/force)' $true
+    [void](Add-Button $row 'Uruchom gpupdate' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $scope = @('Computer', '', 'User')[$m.Target.SelectedIndex]
+            Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters @{ Target = $scope; Force = $m.Force.Checked } -ScriptBlock {
+                param($P)
+                $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+                $arguments = @()
+                if ($P.Target) { $arguments += "/target:$($P.Target)" }
+                if ($P.Force) { $arguments += '/force' }
+                $arguments += '/wait:600'
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = Join-Path $env:SystemRoot 'System32\gpupdate.exe'
+                $psi.Arguments = $arguments -join ' '
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $psi.RedirectStandardInput = $true
+                $psi.CreateNoWindow = $true
+                $psi.StandardOutputEncoding = $oem
+                $psi.StandardErrorEncoding = $oem
+                $proc = [System.Diagnostics.Process]::Start($psi)
+                # gpupdate może pytać o wylogowanie/restart - odpowiadamy "N"
+                $proc.StandardInput.WriteLine('N')
+                $proc.StandardInput.WriteLine('N')
+                $proc.StandardInput.Close()
+                $errTask = $proc.StandardError.ReadToEndAsync()
+                $stdout = $proc.StandardOutput.ReadToEnd()
+                $proc.WaitForExit()
+                $lines = @(($stdout + "`n" + $errTask.Result) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                [pscustomobject]@{
+                    'Kod wyjścia' = $proc.ExitCode
+                    'Wynik'       = $(if ($proc.ExitCode -eq 0) { 'OK' } else { "Błąd – kod $($proc.ExitCode)" })
+                    'Komunikaty'  = ($lines -join ' | ')
+                }
+            }
+        })
+}
+#endregion
+
+#region Moduły: System
+Register-Module -Key 'Services' -Category 'System' -Title 'Usługi' -Description 'Lista usług na zaznaczonych komputerach. Akcje dotyczą usług zaznaczonych w tabeli (na właściwych hostach).' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $state = @('All', 'Running', 'Stopped', 'AutoStopped')[$m.StateFilter.SelectedIndex]
+        Start-HostOperation -Module $m -Name 'Usługi' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); State = $state } -ScriptBlock {
+            param($P)
+            $services = @(Get-CimInstance -ClassName Win32_Service)
+            if ($P.Filter) {
+                $f = "*$($P.Filter)*"
+                $services = @($services | Where-Object { $_.Name -like $f -or $_.DisplayName -like $f })
+            }
+            switch ($P.State) {
+                'Running' { $services = @($services | Where-Object { $_.State -eq 'Running' }) }
+                'Stopped' { $services = @($services | Where-Object { $_.State -ne 'Running' }) }
+                'AutoStopped' { $services = @($services | Where-Object { $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' }) }
+            }
+            $services | Sort-Object DisplayName | ForEach-Object {
+                [pscustomobject]@{
+                    'Nazwa'             = $_.Name
+                    'Nazwa wyświetlana' = $_.DisplayName
+                    'Stan'              = $_.State
+                    'Uruchamianie'      = $_.StartMode
+                    'Konto'             = $_.StartName
+                    'PID'               = $_.ProcessId
+                    'Ścieżka'           = $_.PathName
+                }
+            }
+        }
     }
-    $btnLoad.Add_Click($loadAction)
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Filtr nazwy:')
+    $m.Filter = Add-TextBox $row 160
+    [void](Add-Label $row 'Stan:')
+    $m.StateFilter = Add-ComboBox $row @('Wszystkie', 'Uruchomione', 'Zatrzymane', 'Automatyczne, ale zatrzymane') 220 0
+    [void](Add-Button $row 'Pokaż usługi' $m -Primary $m.Actions.List)
 
-    $btnToggle.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                if (-not $grid.SelectedRows) { Show-Error "Zaznacz regułę."; return }
-                $name = $grid.SelectedRows[0].Cells['Name'].Value
-                Write-Log "[$selectedHost] przełączam regułę zapory $name..."
-                $sb = {
-                    param($name)
-                    if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
-                        $r = Get-NetFirewallRule -Name $name -ErrorAction Stop
-                        if ($r.Enabled -eq 'True') { Disable-NetFirewallRule -Name $name | Out-Null; 'Disabled' }
-                        else { Enable-NetFirewallRule -Name $name | Out-Null; 'Enabled' }
-                    } else { 'netsh only — brak toggle' }
-                }
-                $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ name = $name }
-                Write-Log "[$selectedHost] $r"
-                & $loadAction
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-
-    $btnCreate.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                $name = $txtRule.Text.Trim(); $port = [int]$numPort.Value; $proto = $cmbProto.Text
-                if (-not $name) { Show-Error "Podaj nazwę reguły."; return }
-                Write-Log "[$selectedHost] tworzę inbound allow $proto/$port ..."
-                $sb = {
-                    param($name, $proto, $port)
-                    if (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue) {
-                        New-NetFirewallRule -DisplayName $name -Name $name -Direction Inbound -Action Allow -Enabled True -Protocol $proto -LocalPort $port -Profile Any | Out-Null
-                        'OK (New-NetFirewallRule)'
-                    } else {
-                        netsh advfirewall firewall add rule name="$name" dir=in action=allow protocol=$proto localport=$port
-                        'OK (netsh)'
+    $serviceAction = {
+        param($m, $s)
+        $op = [string]$s.Tag['Op']
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Nazwa')
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli usługi, których dotyczy operacja.'; return }
+        $startup = @('Automatic', 'Manual', 'Disabled')[$m.StartupType.SelectedIndex]
+        $question = @{
+            Start       = 'Uruchomić wybrane usługi?'
+            Stop        = 'Zatrzymać wybrane usługi? Zatrzymane zostaną też usługi od nich zależne.'
+            Restart     = 'Uruchomić ponownie wybrane usługi?'
+            StartupType = "Ustawić typ uruchamiania «$($m.StartupType.Text)» dla wybranych usług?"
+        }[$op]
+        $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1}' -f $h, $i['Nazwa'] } }
+        if (-not (Confirm-Action $question @($items))) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $op; StartupType = $startup; Names = @($byHost[$h] | ForEach-Object { [string]$_['Nazwa'] }) } }
+        Start-HostOperation -Module $m -Name "Usługi – $op" -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+            param($P)
+            foreach ($name in $P.Names) {
+                try {
+                    switch ($P.Op) {
+                        'Start' { Start-Service -Name $name -ErrorAction Stop }
+                        'Stop' { Stop-Service -Name $name -Force -ErrorAction Stop }
+                        'Restart' { Restart-Service -Name $name -Force -ErrorAction Stop }
+                        'StartupType' { Set-Service -Name $name -StartupType $P.StartupType -ErrorAction Stop }
                     }
+                    $svc = Get-Service -Name $name
+                    [pscustomobject]@{ 'Usługa' = $name; 'Operacja' = $P.Op; 'Wynik' = 'OK'; 'Stan' = [string]$svc.Status }
                 }
-                $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ name = $name; proto = $proto; port = $port }
-                Write-Log "[$selectedHost] $r"
-                & $loadAction
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
+                catch {
+                    [pscustomobject]@{ 'Usługa' = $name; 'Operacja' = $P.Op; 'Wynik' = "Błąd – $($_.Exception.Message)" }
+                }
+            }
+        }
+    }
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Zaznaczone usługi:')
+    foreach ($a in @(@('Start', 'Start'), @('Stop', 'Stop'), @('Restart', 'Restart'))) {
+        $b = Add-Button $row2 $a[0] $m $serviceAction
+        $b.Tag['Op'] = $a[1]
+    }
+    [void](Add-Label $row2 '   Typ uruchamiania:')
+    $m.StartupType = Add-ComboBox $row2 @('Automatyczny', 'Ręczny', 'Wyłączony') 130 0
+    $b = Add-Button $row2 'Ustaw' $m $serviceAction
+    $b.Tag['Op'] = 'StartupType'
+}
 
-    $btnDel.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                $name = $txtRule.Text.Trim(); if (-not $name) { Show-Error "Podaj nazwę reguły do usunięcia."; return }
-                Write-Log "[$selectedHost] usuwam regułę $name ..."
-                $sb = {
-                    param($name)
-                    if (Get-Command Remove-NetFirewallRule -ErrorAction SilentlyContinue) {
-                        Remove-NetFirewallRule -Name $name -ErrorAction Stop | Out-Null
-                        'Deleted (Remove-NetFirewallRule)'
-                    } else {
-                        netsh advfirewall firewall delete rule name="$name" dir=in | Out-Null
-                        'Deleted (netsh)'
+Register-Module -Key 'Processes' -Category 'System' -Title 'Procesy' -Description 'Procesy uruchomione na zaznaczonych komputerach (pamięć, właściciel, wiersz poleceń) i kończenie wybranych procesów.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Procesy' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); WithOwner = $m.WithOwner.Checked } -ScriptBlock {
+            param($P)
+            $procs = @(Get-CimInstance -ClassName Win32_Process)
+            if ($P.Filter) { $procs = @($procs | Where-Object { $_.Name -like "*$($P.Filter)*" }) }
+            $procs | Sort-Object WorkingSetSize -Descending | ForEach-Object {
+                $owner = ''
+                if ($P.WithOwner) {
+                    try {
+                        $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction Stop
+                        if ($o.User) { $owner = '{0}\{1}' -f $o.Domain, $o.User }
                     }
+                    catch { }
                 }
-                $r = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ name = $name }
-                Write-Log "[$selectedHost] $r"
-                & $loadAction
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
+                [pscustomobject]@{
+                    'Proces'         = $_.Name
+                    'PID'            = [int]$_.ProcessId
+                    'Pamięć (MB)'    = [Math]::Round($_.WorkingSetSize / 1MB, 1)
+                    'Właściciel'     = $owner
+                    'Uruchomiony'    = $_.CreationDate
+                    'Wiersz poleceń' = $_.CommandLine
+                }
+            }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Filtr nazwy:')
+    $m.Filter = Add-TextBox $row 160
+    $m.WithOwner = Add-CheckBox $row 'Pokaż właściciela (wolniej)' $false
+    [void](Add-Button $row 'Pokaż procesy' $m -Primary $m.Actions.List)
+    [void](Add-Button $row 'Zakończ zaznaczone procesy' $m -Danger {
+            param($m)
+            $byHost = Get-SelectedRowsByHost -Module $m -Columns @('PID', 'Proces')
+            if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli procesy do zakończenia.'; return }
+            $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1} (PID {2})' -f $h, $i['Proces'], $i['PID'] } }
+            if (-not (Confirm-Action 'Zakończyć wybrane procesy? Niezapisane dane w tych programach zostaną utracone.' @($items))) { return }
+            $per = @{}
+            foreach ($h in $byHost.Keys) { $per[$h] = @{ Ids = @($byHost[$h] | ForEach-Object { [int]$_['PID'] }) } }
+            Start-HostOperation -Module $m -Name 'Kończenie procesów' -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+                param($P)
+                foreach ($id in $P.Ids) {
+                    try {
+                        $proc = Get-Process -Id $id -ErrorAction Stop
+                        Stop-Process -Id $id -Force -ErrorAction Stop
+                        [pscustomobject]@{ 'Proces' = $proc.ProcessName; 'PID' = $id; 'Wynik' = 'Zakończono' }
+                    }
+                    catch { [pscustomobject]@{ 'PID' = $id; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
+                }
+            }
         })
 }
 
-# 21) LAPS — podgląd hasła/wygaśnięcia + wymuszenie rotacji
-Register-ModuleTab -Name 'LAPS (AD)' -Builder {
-    param($tab, $getTargets)
-
-    $btnGet = New-Object System.Windows.Forms.Button
-    $btnGet.Text = 'Pokaż LAPS dla zaznaczonych'
-    $btnGet.Left = 12; $btnGet.Top = 12; $btnGet.Width = 260
-    $tab.Controls.Add($btnGet)
-
-    $btnRotate = New-Object System.Windows.Forms.Button
-    $btnRotate.Text = 'Wymuś rotację hasła'
-    $btnRotate.Left = 280; $btnRotate.Top = 12; $btnRotate.Width = 200
-    $tab.Controls.Add($btnRotate)
-
-    $btnCopy = New-Object System.Windows.Forms.Button
-    $btnCopy.Text = 'Kopiuj hasło z zaznaczonego'
-    $btnCopy.Left = 490; $btnCopy.Top = 12; $btnCopy.Width = 220
-    $tab.Controls.Add($btnCopy)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
-    $tab.Controls.Add($grid)
-
-    function Convert-FileTimeLocal([string]$ft) {
-        try {
-            if ([string]::IsNullOrWhiteSpace($ft)) { return $null }
-            [DateTime]::FromFileTimeUtc([int64]$ft).ToLocalTime()
-        } catch { $null }
+Register-Module -Key 'Disks' -Category 'System' -Title 'Dyski' -Description 'Zajętość dysków lokalnych oraz czyszczenie plików tymczasowych i Kosza (z raportem odzyskanego miejsca).' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Dyski' -Targets $targets -ScriptBlock {
+            param($P)
+            Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3' | ForEach-Object {
+                $size = [double]$_.Size
+                $free = [double]$_.FreeSpace
+                [pscustomobject]@{
+                    'Dysk'          = $_.DeviceID
+                    'Etykieta'      = $_.VolumeName
+                    'System plików' = $_.FileSystem
+                    'Rozmiar (GB)'  = [Math]::Round($size / 1GB, 1)
+                    'Wolne (GB)'    = [Math]::Round($free / 1GB, 1)
+                    'Zajęte (%)'    = $(if ($size -gt 0) { [Math]::Round(($size - $free) / $size * 100, 1) } else { $null })
+                }
+            }
+        }
     }
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Pokaż dyski' $m -Primary $m.Actions.List)
 
-    $btnGet.Add_Click({
-            try {
-                if (-not (Get-Module -ListAvailable ActiveDirectory)) { throw "Brak modułu ActiveDirectory (RSAT)." }
-                Import-Module ActiveDirectory -ErrorAction Stop | Out-Null
-                $targets = & $getTargets
-                $rows = @()
-                foreach ($c in $targets) {
-                    Write-Log "[AD:$c] pobieram atrybuty LAPS..."
-                    try {
-                        $obj = Get-ADComputer -Identity $c -Properties * -ErrorAction Stop
-                        # StrictMode: brakujacy atrybut (brak schematu/uprawnien) rzucalby wyjatek przy $obj.'attr'
-                        $getAttr = { param($name) $p = $obj.PSObject.Properties[$name]; if ($p) { $p.Value } else { $null } }
-                        $legacyPwd = & $getAttr 'ms-Mcs-AdmPwd'
-                        $legacyExp = Convert-FileTimeLocal (& $getAttr 'ms-Mcs-AdmPwdExpirationTime')
-                        $winPwd = $null
-                        $winExp = $null
-                        # Preferuj oficjalny cmdlet jeśli dostępny (Windows LAPS)
-                        if (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue) {
-                            try {
-                                $lp = Get-LapsADPassword -Identity $c -AsPlainText -ErrorAction Stop
-                                if ($lp -and $lp.Password -and $lp.ExpirationTime) {
-                                    $winPwd = [string]$lp.Password
-                                    $winExp = $lp.ExpirationTime.ToLocalTime()
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Czyszczenie:')
+    $m.WinTemp = Add-CheckBox $row2 'Windows\Temp' $true
+    $m.UserTemp = Add-CheckBox $row2 'TEMP profili użytkowników' $true
+    $m.Recycle = Add-CheckBox $row2 'Kosz (wszystkie dyski)' $true
+    [void](Add-Label $row2 'Pliki starsze niż (dni):')
+    $m.Days = Add-Numeric $row2 0 365 2 60
+    [void](Add-Button $row2 'Wyczyść na zaznaczonych' $m -Danger {
+            param($m)
+            if (-not ($m.WinTemp.Checked -or $m.UserTemp.Checked -or $m.Recycle.Checked)) { Show-Warning 'Wybierz, co ma zostać wyczyszczone.'; return }
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            if (-not (Confirm-Action "Usunąć pliki tymczasowe na $($targets.Count) komputer(ach)?" $targets)) { return }
+            $params = @{ WindowsTemp = $m.WinTemp.Checked; UserTemp = $m.UserTemp.Checked; RecycleBin = $m.Recycle.Checked; OlderThanDays = [int]$m.Days.Value }
+            Start-HostOperation -Module $m -Name 'Czyszczenie dysków' -Targets $targets -Parameters $params -ScriptBlock {
+                param($P)
+                $drive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+                $before = [double]$drive.FreeSpace
+                $limit = (Get-Date).AddDays( - [int]$P.OlderThanDays)
+                $roots = @()
+                if ($P.WindowsTemp) { $roots += (Join-Path $env:SystemRoot 'Temp') }
+                if ($P.UserTemp) {
+                    $profiles = Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = False' -ErrorAction SilentlyContinue
+                    foreach ($pr in $profiles) {
+                        $t = Join-Path $pr.LocalPath 'AppData\Local\Temp'
+                        if (Test-Path -LiteralPath $t) { $roots += $t }
+                    }
+                }
+                $removed = 0
+                $failed = 0
+                foreach ($root in $roots) {
+                    if ($root -like '*\Temp\DomainOps*') { continue }
+                    Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTime -lt $limit -and $_.FullName -notlike '*\Temp\DomainOps\*' } |
+                        ForEach-Object {
+                            try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $removed++ } catch { $failed++ }
+                        }
+                    Get-ChildItem -LiteralPath $root -Recurse -Force -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.FullName -notlike '*\Temp\DomainOps*' } |
+                        Sort-Object { $_.FullName.Length } -Descending |
+                        ForEach-Object {
+                            if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue)) {
+                                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                }
+                if ($P.RecycleBin) {
+                    foreach ($d in Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3') {
+                        $bin = $d.DeviceID + '\$Recycle.Bin'
+                        if (-not (Test-Path -LiteralPath $bin)) { continue }
+                        foreach ($sidDir in Get-ChildItem -LiteralPath $bin -Force -Directory -ErrorAction SilentlyContinue) {
+                            Get-ChildItem -LiteralPath $sidDir.FullName -Force -ErrorAction SilentlyContinue |
+                                Where-Object { $_.Name -ne 'desktop.ini' } |
+                                ForEach-Object {
+                                    try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop; $removed++ } catch { $failed++ }
                                 }
-                            } catch {}
                         }
-                        if (-not $winPwd) {
-                            $winPwd = & $getAttr 'msLAPS-Password'
-                            # msLAPS-Password to JSON {"n":konto,"t":czas,"p":haslo}
-                            if ($winPwd) { try { $winPwd = [string](($winPwd | ConvertFrom-Json).p) } catch {} }
-                            # msLAPS-PasswordExpirationTime to FILETIME (jak w legacy LAPS)
-                            $winExp = Convert-FileTimeLocal (& $getAttr 'msLAPS-PasswordExpirationTime')
-                        }
-                        if ($legacyPwd) {
-                            $rows += [pscustomobject]@{Komputer = $c; Rozwiązanie = 'LAPS (legacy)'; Hasło = $legacyPwd; Wygasa = $legacyExp; Info = '' }
-                        } elseif ($winPwd) {
-                            $rows += [pscustomobject]@{Komputer = $c; Rozwiązanie = 'Windows LAPS'; Hasło = $winPwd; Wygasa = $winExp; Info = '' }
-                        } else {
-                            $rows += [pscustomobject]@{Komputer = $c; Rozwiązanie = 'Brak/No access'; Hasło = '(niedostępne)'; Wygasa = $null; Info = 'Brak uprawnień lub nie skonfigurowano LAPS' }
-                        }
-                    } catch {
-                        $rows += [pscustomobject]@{Komputer = $c; Rozwiązanie = 'Błąd'; Hasło = ''; Wygasa = $null; Info = $_.Exception.Message }
                     }
                 }
-                $grid.DataSource = $rows
-            } catch { Show-Error "Nie mogę odczytać LAPS z AD." $_; Write-Log $_.Exception.Message 'ERROR' }
+                $after = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)).FreeSpace
+                [pscustomobject]@{
+                    'Usunięte elementy'          = $removed
+                    'Nie udało się usunąć'       = $failed
+                    'Odzyskano na systemowym (GB)' = [Math]::Round(($after - $before) / 1GB, 2)
+                    'Wolne na systemowym (GB)'   = [Math]::Round($after / 1GB, 1)
+                }
+            }
         })
+}
 
-    $btnRotate.Add_Click({
-            try {
-                if (-not (Get-Module -ListAvailable ActiveDirectory)) { throw "Brak modułu ActiveDirectory (RSAT)." }
-                Import-Module ActiveDirectory -ErrorAction Stop | Out-Null
-                $targets = & $getTargets
-                foreach ($c in $targets) {
-                    Write-Log "[AD:$c] wymuszam rotację hasła LAPS..."
+Register-Module -Key 'Events' -Category 'System' -Title 'Dziennik zdarzeń' -Description 'Błędy i ostrzeżenia z wybranych dzienników z ostatnich godzin. Filtr wyników działa także po treści komunikatu.' -Build {
+    param($m)
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Ostatnie godziny:')
+    $m.Hours = Add-Numeric $row 1 720 24 60
+    $m.LogSystem = Add-CheckBox $row 'System' $true
+    $m.LogApp = Add-CheckBox $row 'Application' $true
+    $m.LogSec = Add-CheckBox $row 'Security' $false
+    [void](Add-Label $row '  Poziom:')
+    $m.LvlCrit = Add-CheckBox $row 'Krytyczny' $true
+    $m.LvlErr = Add-CheckBox $row 'Błąd' $true
+    $m.LvlWarn = Add-CheckBox $row 'Ostrzeżenie' $true
+    $m.LvlInfo = Add-CheckBox $row 'Informacja' $false
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'ID zdarzeń (opcjonalnie, np. 41, 6008):')
+    $m.Ids = Add-TextBox $row2 160
+    [void](Add-Label $row2 'Maks. na host:')
+    $m.Max = Add-Numeric $row2 10 5000 200 70
+    [void](Add-Button $row2 'Pobierz zdarzenia' $m -Primary {
+            param($m)
+            $logs = @()
+            if ($m.LogSystem.Checked) { $logs += 'System' }
+            if ($m.LogApp.Checked) { $logs += 'Application' }
+            if ($m.LogSec.Checked) { $logs += 'Security' }
+            if ($logs.Count -eq 0) { Show-Warning 'Wybierz co najmniej jeden dziennik.'; return }
+            $levels = @()
+            if ($m.LvlCrit.Checked) { $levels += 1 }
+            if ($m.LvlErr.Checked) { $levels += 2 }
+            if ($m.LvlWarn.Checked) { $levels += 3 }
+            if ($m.LvlInfo.Checked) { $levels += 4; $levels += 0 }
+            if ($levels.Count -eq 0) { Show-Warning 'Wybierz co najmniej jeden poziom zdarzeń.'; return }
+            $ids = @(Split-ListText ($m.Ids.Text -replace '\s+', ',') | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $params = @{ Logs = $logs; Levels = $levels; Ids = $ids; Hours = [int]$m.Hours.Value; Max = [int]$m.Max.Value }
+            Start-HostOperation -Module $m -Name 'Dziennik zdarzeń' -Targets $targets -Parameters $params -ScriptBlock {
+                param($P)
+                $filter = @{ LogName = [string[]]@($P.Logs); StartTime = (Get-Date).AddHours( - [int]$P.Hours) }
+                $ids = @($P.Ids | Where-Object { $null -ne $_ })
+                if ($ids.Count -gt 0) { $filter.Id = [int[]]$ids }
+                # Security nie używa poziomów (wszystko to "Informacje"/audyt) - bez filtra poziomu, gdy wybrano tylko Security
+                $levels = [int[]]@($P.Levels)
+                if (@($P.Logs) -notcontains 'Security' -or @($P.Logs).Count -gt 1) { $filter.Level = $levels }
+                try {
+                    $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents ([int]$P.Max) -ErrorAction Stop)
+                }
+                catch {
+                    if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $events = @() } else { throw }
+                }
+                $events | Sort-Object TimeCreated -Descending | ForEach-Object {
+                    $msg = $_.Message
+                    if (-not $msg) { $msg = '(brak opisu – brak biblioteki komunikatów dostawcy)' }
+                    [pscustomobject]@{
+                        'Czas'      = $_.TimeCreated
+                        'Poziom'    = $_.LevelDisplayName
+                        'ID'        = $_.Id
+                        'Źródło'    = $_.ProviderName
+                        'Dziennik'  = $_.LogName
+                        'Komunikat' = ($msg -replace '\s+', ' ').Trim()
+                    }
+                }
+            }
+        })
+}
+
+Register-Module -Key 'Tasks' -Category 'System' -Title 'Harmonogram zadań' -Description 'Zadania Harmonogramu na zaznaczonych komputerach: podgląd, uruchamianie, włączanie, wyłączanie, usuwanie i tworzenie prostych zadań (konto SYSTEM).' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Harmonogram' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); HideMicrosoft = $m.HideMs.Checked } -ScriptBlock {
+            param($P)
+            $tasks = @(Get-ScheduledTask -ErrorAction Stop)
+            if ($P.HideMicrosoft) { $tasks = @($tasks | Where-Object { $_.TaskPath -notlike '\Microsoft\*' }) }
+            if ($P.Filter) {
+                $f = "*$($P.Filter)*"
+                $tasks = @($tasks | Where-Object { $_.TaskName -like $f -or $_.TaskPath -like $f })
+            }
+            foreach ($t in $tasks) {
+                $info = $null
+                try { $info = Get-ScheduledTaskInfo -InputObject $t -ErrorAction Stop } catch { }
+                $actions = @($t.Actions | ForEach-Object { if ($_.PSObject.Properties['Execute'] -and $_.Execute) { ('{0} {1}' -f $_.Execute, $_.Arguments).Trim() } }) -join ' ; '
+                $lastResult = ''
+                $lastRun = $null
+                $nextRun = $null
+                if ($info) {
+                    $lastRun = $info.LastRunTime
+                    $nextRun = $info.NextRunTime
+                    $code = [int64]$info.LastTaskResult
+                    $lastResult = switch ($code) {
+                        0 { 'Sukces' }
+                        267009 { 'W trakcie' }
+                        267011 { 'Jeszcze nie uruchomiono' }
+                        267014 { 'Zatrzymane przez użytkownika' }
+                        default { '0x{0:X8}' -f $code }
+                    }
+                }
+                [pscustomobject]@{
+                    'Ścieżka'               = $t.TaskPath
+                    'Nazwa'                 = $t.TaskName
+                    'Stan'                  = [string]$t.State
+                    'Ostatnie uruchomienie' = $lastRun
+                    'Ostatni wynik'         = $lastResult
+                    'Następne uruchomienie' = $nextRun
+                    'Konto'                 = $t.Principal.UserId
+                    'Akcja'                 = $actions
+                    'Autor'                 = $t.Author
+                }
+            }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Filtr:')
+    $m.Filter = Add-TextBox $row 160
+    $m.HideMs = Add-CheckBox $row 'Ukryj zadania systemowe (\Microsoft\)' $true
+    [void](Add-Button $row 'Pokaż zadania' $m -Primary $m.Actions.List)
+
+    $taskAction = {
+        param($m, $s)
+        $op = [string]$s.Tag['Op']
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Ścieżka', 'Nazwa')
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli zadania, których dotyczy operacja.'; return }
+        $label = @{ Run = 'Uruchomić'; Stop = 'Zatrzymać'; Enable = 'Włączyć'; Disable = 'Wyłączyć'; Delete = 'USUNĄĆ' }[$op]
+        $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1}{2}' -f $h, $i['Ścieżka'], $i['Nazwa'] } }
+        if (-not (Confirm-Action "$label wybrane zadania?" @($items))) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) {
+            $per[$h] = @{ Op = $op; Tasks = @($byHost[$h] | ForEach-Object { @{ Path = [string]$_['Ścieżka']; Name = [string]$_['Nazwa'] } }) }
+        }
+        Start-HostOperation -Module $m -Name "Harmonogram – $op" -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+            param($P)
+            foreach ($t in $P.Tasks) {
+                try {
+                    $tp = @{ TaskPath = $t.Path; TaskName = $t.Name; ErrorAction = 'Stop' }
+                    switch ($P.Op) {
+                        'Run' { Start-ScheduledTask @tp }
+                        'Stop' { Stop-ScheduledTask @tp }
+                        'Enable' { Enable-ScheduledTask @tp | Out-Null }
+                        'Disable' { Disable-ScheduledTask @tp | Out-Null }
+                        'Delete' { Unregister-ScheduledTask @tp -Confirm:$false }
+                    }
+                    [pscustomobject]@{ 'Zadanie' = $t.Path + $t.Name; 'Operacja' = $P.Op; 'Wynik' = 'OK' }
+                }
+                catch { [pscustomobject]@{ 'Zadanie' = $t.Path + $t.Name; 'Operacja' = $P.Op; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
+            }
+        }
+    }
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Zaznaczone zadania:')
+    foreach ($a in @(@('Uruchom', 'Run'), @('Zatrzymaj', 'Stop'), @('Włącz', 'Enable'), @('Wyłącz', 'Disable'))) {
+        $b = Add-Button $row2 $a[0] $m $taskAction
+        $b.Tag['Op'] = $a[1]
+    }
+    $b = Add-Button $row2 'Usuń' $m -Danger $taskAction
+    $b.Tag['Op'] = 'Delete'
+
+    $row3 = Add-ToolbarRow $m
+    [void](Add-Label $row3 'Nowe zadanie:' -Bold)
+    [void](Add-Label $row3 'Nazwa:')
+    $m.NewName = Add-TextBox $row3 150
+    [void](Add-Label $row3 'Program:')
+    $m.NewExe = Add-TextBox $row3 200
+    [void](Add-Label $row3 'Argumenty:')
+    $m.NewArgs = Add-TextBox $row3 180
+    [void](Add-Label $row3 'Wyzwalacz:')
+    $m.NewTrigger = Add-ComboBox $row3 @('Przy logowaniu', 'Przy uruchomieniu', 'Codziennie o', 'Jednorazowo o', 'Tylko na żądanie') 140 0
+    $m.NewTime = Add-TextBox $row3 50 '07:00'
+    [void](Add-Button $row3 'Utwórz na zaznaczonych' $m {
+            param($m)
+            $name = $m.NewName.Text.Trim()
+            $exe = $m.NewExe.Text.Trim()
+            if (-not $name -or -not $exe) { Show-Warning 'Podaj nazwę zadania i program do uruchomienia.'; return }
+            if ($name -match '[\\/:*?"<>|]') { Show-Warning 'Nazwa zadania zawiera niedozwolone znaki.'; return }
+            $trigger = @('Logon', 'Startup', 'Daily', 'Once', 'None')[$m.NewTrigger.SelectedIndex]
+            $time = $m.NewTime.Text.Trim()
+            if (($trigger -eq 'Daily' -or $trigger -eq 'Once') -and $time -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') { Show-Warning 'Podaj godzinę w formacie GG:MM (np. 07:30).'; return }
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            if (-not (Confirm-Action "Utworzyć zadanie «$name» (konto SYSTEM, najwyższe uprawnienia) na $($targets.Count) komputer(ach)?`r`nProgram: $exe $($m.NewArgs.Text.Trim())" $targets)) { return }
+            $params = @{ Name = $name; Execute = $exe; Arguments = $m.NewArgs.Text.Trim(); Trigger = $trigger; Time = $time }
+            Start-HostOperation -Module $m -Name 'Tworzenie zadania' -Targets $targets -Output Log -Parameters $params -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+                param($P)
+                if ($P.Arguments) { $action = New-ScheduledTaskAction -Execute $P.Execute -Argument $P.Arguments }
+                else { $action = New-ScheduledTaskAction -Execute $P.Execute }
+                $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+                $register = @{ TaskName = $P.Name; Action = $action; Principal = $principal; Settings = $settings; Force = $true; ErrorAction = 'Stop' }
+                $at = $null
+                if ($P.Time) {
+                    $at = [datetime]::Today.Add([timespan]::Parse($P.Time))
+                    if ($P.Trigger -eq 'Once' -and $at -lt (Get-Date)) { $at = $at.AddDays(1) }
+                }
+                switch ($P.Trigger) {
+                    'Logon' { $register.Trigger = New-ScheduledTaskTrigger -AtLogOn }
+                    'Startup' { $register.Trigger = New-ScheduledTaskTrigger -AtStartup }
+                    'Daily' { $register.Trigger = New-ScheduledTaskTrigger -Daily -At $at }
+                    'Once' { $register.Trigger = New-ScheduledTaskTrigger -Once -At $at }
+                }
+                Register-ScheduledTask @register | Out-Null
+                [pscustomobject]@{ 'Zadanie' = '\' + $P.Name; 'Wynik' = 'Utworzono' }
+            }
+        })
+}
+
+Register-Module -Key 'Drivers' -Category 'System' -Title 'Sterowniki i urządzenia' -Description 'Zainstalowane sterowniki (Win32_PnPSignedDriver) oraz urządzenia zgłaszające problem w Menedżerze urządzeń.' -Build {
+    param($m)
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Filtr (urządzenie/producent/klasa):')
+    $m.Filter = Add-TextBox $row 200
+    [void](Add-Button $row 'Pokaż sterowniki' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Sterowniki' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim() } -ScriptBlock {
+                param($P)
+                $drivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver | Where-Object { $_.DeviceName })
+                if ($P.Filter) {
+                    $f = "*$($P.Filter)*"
+                    $drivers = @($drivers | Where-Object { $_.DeviceName -like $f -or $_.Manufacturer -like $f -or $_.DriverProviderName -like $f -or $_.DeviceClass -like $f })
+                }
+                $drivers | Sort-Object DeviceClass, DeviceName | ForEach-Object {
+                    [pscustomobject]@{
+                        'Urządzenie' = $_.DeviceName
+                        'Klasa'      = $_.DeviceClass
+                        'Wersja'     = $_.DriverVersion
+                        'Data'       = $_.DriverDate
+                        'Producent'  = $_.Manufacturer
+                        'Dostawca'   = $_.DriverProviderName
+                        'Plik INF'   = $_.InfName
+                        'Podpisany'  = $_.IsSigned
+                    }
+                }
+            }
+        })
+    [void](Add-Button $row 'Urządzenia z problemami' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Urządzenia z problemami' -Targets $targets -ScriptBlock {
+                param($P)
+                $devices = @(Get-CimInstance -ClassName Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 })
+                if ($devices.Count -eq 0) { return [pscustomobject]@{ 'Urządzenie' = '(brak urządzeń z problemami)' } }
+                foreach ($d in $devices) {
+                    [pscustomobject]@{
+                        'Urządzenie'  = $d.Name
+                        'Kod błędu'   = $d.ConfigManagerErrorCode
+                        'Stan'        = $d.Status
+                        'Klasa'       = $d.PNPClass
+                        'Producent'   = $d.Manufacturer
+                        'ID urządzenia' = $d.DeviceID
+                    }
+                }
+            }
+        })
+}
+#endregion
+
+#region Moduły: Oprogramowanie
+# Skrypt instalacji aktualizacji uruchamiany na hoście jako zadanie SYSTEM - API Windows Update
+# (pobieranie/instalacja) nie działa bezpośrednio w sesji WinRM.
+$script:WuJobScript = @'
+param([switch]$AutoReboot, [switch]$IncludeDrivers)
+$log = Join-Path $PSScriptRoot 'WU.log'
+function Write-WuLog([string]$Text) {
+    Add-Content -LiteralPath $log -Value ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $Text) -Encoding UTF8
+}
+Write-WuLog '==== START ===='
+try {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $session.ClientApplicationID = 'DomainOps'
+    $criteria = "IsInstalled=0 and IsHidden=0"
+    if (-not $IncludeDrivers) { $criteria += " and Type='Software'" }
+    Write-WuLog "Wyszukiwanie aktualizacji ($criteria)…"
+    $search = $session.CreateUpdateSearcher().Search($criteria)
+    if ($search.Updates.Count -eq 0) {
+        Write-WuLog 'Brak aktualizacji do zainstalowania.'
+    }
+    else {
+        $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($u in $search.Updates) {
+            if (-not $u.EulaAccepted) { $u.AcceptEula() }
+            [void]$toInstall.Add($u)
+            Write-WuLog "Do instalacji: $($u.Title)"
+        }
+        Write-WuLog "Pobieranie ($($toInstall.Count))…"
+        $downloader = $session.CreateUpdateDownloader()
+        $downloader.Updates = $toInstall
+        $download = $downloader.Download()
+        Write-WuLog "Pobieranie zakończone (ResultCode=$($download.ResultCode))."
+        $ready = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($u in $toInstall) { if ($u.IsDownloaded) { [void]$ready.Add($u) } }
+        if ($ready.Count -eq 0) {
+            Write-WuLog 'Żadna aktualizacja nie została pobrana.'
+        }
+        else {
+            Write-WuLog "Instalacja ($($ready.Count))…"
+            $installer = $session.CreateUpdateInstaller()
+            $installer.Updates = $ready
+            $result = $installer.Install()
+            for ($i = 0; $i -lt $ready.Count; $i++) {
+                Write-WuLog ('{0} -> ResultCode={1}' -f $ready.Item($i).Title, $result.GetUpdateResult($i).ResultCode)
+            }
+            Write-WuLog "Instalacja zakończona (ResultCode=$($result.ResultCode), RebootRequired=$($result.RebootRequired))."
+            if ($result.RebootRequired -and $AutoReboot) {
+                Write-WuLog 'Restart za 5 minut.'
+                & (Join-Path $env:SystemRoot 'System32\shutdown.exe') /r /t 300 /d p:2:17 /c 'Restart po instalacji aktualizacji (Domain Ops).'
+            }
+        }
+    }
+}
+catch {
+    Write-WuLog "BŁĄD: $($_.Exception.Message)"
+}
+Write-WuLog '==== KONIEC ===='
+'@
+
+Register-Module -Key 'Programs' -Category 'Oprogramowanie' -Title 'Zainstalowane programy' -Description 'Programy z rejestru (64/32-bit i profile zalogowanych użytkowników) oraz ciche odinstalowanie zaznaczonych (MSI albo QuietUninstallString).' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Programy' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); ShowSystem = $m.ShowSystem.Checked } -ScriptBlock {
+            param($P)
+            $roots = @(
+                @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Komputer' },
+                @{ Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Komputer (32-bit)' },
+                @{ Path = 'Registry::HKEY_USERS\*\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Użytkownik' }
+            )
+            foreach ($root in $roots) {
+                Get-ItemProperty -Path $root.Path -ErrorAction SilentlyContinue | ForEach-Object {
+                    if (-not $_.DisplayName) { return }
+                    if (-not $P.ShowSystem -and ($_.SystemComponent -eq 1 -or $_.ParentKeyName -or @('Update', 'Hotfix', 'Security Update') -contains $_.ReleaseType)) { return }
+                    if ($P.Filter -and $_.DisplayName -notlike "*$($P.Filter)*" -and $_.Publisher -notlike "*$($P.Filter)*") { return }
+                    $date = $null
+                    if ($_.InstallDate -match '^\d{8}$') { try { $date = [datetime]::ParseExact($_.InstallDate, 'yyyyMMdd', $null) } catch { } }
+                    $isMsi = ($_.WindowsInstaller -eq 1 -and $_.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$')
+                    $uninstall = if ($_.QuietUninstallString) { $_.QuietUninstallString } else { $_.UninstallString }
+                    [pscustomobject]@{
+                        'Nazwa'           = $_.DisplayName
+                        'Wersja'          = $_.DisplayVersion
+                        'Wydawca'         = $_.Publisher
+                        'Data instalacji' = $date
+                        'Rozmiar (MB)'    = $(if ($_.EstimatedSize) { [Math]::Round($_.EstimatedSize / 1024, 1) } else { $null })
+                        'Zakres'          = $root.Scope
+                        'Typ'             = $(if ($isMsi) { 'MSI' } else { 'Inny' })
+                        'Identyfikator'   = $_.PSChildName
+                        'Odinstalowanie'  = $uninstall
+                    }
+                }
+            }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Filtr (nazwa/wydawca):')
+    $m.Filter = Add-TextBox $row 180
+    $m.ShowSystem = Add-CheckBox $row 'Pokaż aktualizacje i składniki systemowe' $false
+    [void](Add-Button $row 'Pokaż programy' $m -Primary $m.Actions.List)
+    [void](Add-Button $row 'Odinstaluj zaznaczone' $m -Danger {
+            param($m)
+            $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Identyfikator', 'Nazwa', 'Zakres')
+            if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli programy do odinstalowania.'; return }
+            $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1}' -f $h, $i['Nazwa'] } }
+            if (-not (Confirm-Action 'Odinstalować wybrane programy? Operacja jest wykonywana bez interakcji z użytkownikiem i bez restartu.' @($items))) { return }
+            $per = @{}
+            foreach ($h in $byHost.Keys) {
+                $per[$h] = @{ Items = @($byHost[$h] | ForEach-Object { @{ Id = [string]$_['Identyfikator']; Name = [string]$_['Nazwa']; Scope = [string]$_['Zakres'] } }) }
+            }
+            Start-HostOperation -Module $m -Name 'Odinstalowanie' -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+                param($P)
+                foreach ($item in $P.Items) {
                     try {
-                        $ok = $false
-                        if (Get-Command Reset-LapsPassword -ErrorAction SilentlyContinue) {
-                            Reset-LapsPassword -Identity $c -ErrorAction Stop | Out-Null
-                            $ok = $true
+                        if ($item.Scope -eq 'Użytkownik') { throw 'Programy instalowane w profilu użytkownika trzeba odinstalować w jego sesji.' }
+                        $key = $null
+                        foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+                            $candidate = Join-Path $root $item.Id
+                            if (Test-Path -LiteralPath $candidate) { $key = Get-ItemProperty -LiteralPath $candidate; break }
                         }
-                        if (-not $ok) {
-                            # legacy LAPS: ustaw datę ważności na 0, co wymusi odświeżenie
-                            Set-ADComputer -Identity $c -Replace @{'ms-Mcs-AdmPwdExpirationTime' = '0' } -ErrorAction Stop
+                        if (-not $key) { throw 'Nie znaleziono wpisu w rejestrze.' }
+                        if ($key.WindowsInstaller -eq 1 -and $item.Id -match '^\{[0-9A-Fa-f-]{36}\}$') {
+                            $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+                            $arguments = '/x {0} /qn /norestart' -f $item.Id
                         }
-                        Write-Log "[AD:$c] zlecono rotację."
-                    } catch {
-                        Write-Log "[AD:$c] błąd rotacji: $($_.Exception.Message)" 'ERROR'
+                        elseif ($key.QuietUninstallString) {
+                            $exe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+                            $arguments = '/d /s /c "' + $key.QuietUninstallString + '"'
+                        }
+                        else { throw 'Brak cichego odinstalowania (QuietUninstallString) – odinstaluj program ręcznie.' }
+                        $proc = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -WindowStyle Hidden
+                        $null = $proc.Handle
+                        $proc.WaitForExit()
+                        $code = $proc.ExitCode
+                        $status = switch ($code) { 0 { 'Odinstalowano' } 3010 { 'Odinstalowano – wymagany restart' } 1605 { 'Program nie jest zainstalowany' } default { "Błąd – kod wyjścia $code" } }
+                        [pscustomobject]@{ 'Program' = $item.Name; 'Kod wyjścia' = $code; 'Wynik' = $status }
                     }
+                    catch { [pscustomobject]@{ 'Program' = $item.Name; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
                 }
-            } catch { Show-Error "Operacja wymaga RSAT/AD." $_; Write-Log $_.Exception.Message 'ERROR' }
-        })
-
-    $btnCopy.Add_Click({
-            try {
-                if (-not $grid.SelectedRows) { Show-Error "Zaznacz pozycję z hasłem."; return }
-                $lapsPassword = [string]$grid.SelectedRows[0].Cells['Hasło'].Value
-                if ([string]::IsNullOrWhiteSpace($lapsPassword) -or $lapsPassword -eq '(niedostępne)') { Show-Error "Brak hasla do skopiowania."; return }
-                [System.Windows.Forms.Clipboard]::SetText($lapsPassword)
-                Write-Log "Skopiowano hasło LAPS do schowka (lokalnie)."
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
+            }
         })
 }
 
-# 22) Certyfikaty — LM\My / LM\Root + eksport .cer
-Register-ModuleTab -Name 'Certyfikaty (LM)' -Builder {
-    param($tab, $getTargets)
-
-    $lblHost = New-Object System.Windows.Forms.Label
-    $lblHost.Text = 'Komputer:'; $lblHost.Left = 12; $lblHost.Top = 16; $lblHost.AutoSize = $true
-    $tab.Controls.Add($lblHost)
-
-    $cmbHost = New-Object System.Windows.Forms.ComboBox
-    $cmbHost.Left = 80; $cmbHost.Top = 12; $cmbHost.Width = 220; $cmbHost.DropDownStyle = 'DropDownList'
-    $tab.Controls.Add($cmbHost)
-
-    $cmbStore = New-Object System.Windows.Forms.ComboBox
-    $cmbStore.Left = 320; $cmbStore.Top = 12; $cmbStore.Width = 160; $cmbStore.DropDownStyle = 'DropDownList'
-    $cmbStore.Items.AddRange(@('My', 'Root', 'TrustedPublisher', 'CA'))
-    $cmbStore.SelectedIndex = 0
-    $tab.Controls.Add($cmbStore)
-
-    $txtFilter = New-Object System.Windows.Forms.TextBox
-    $txtFilter.Left = 500; $txtFilter.Top = 12; $txtFilter.Width = 300
-    $tab.Controls.Add($txtFilter)
-    $lblF = New-Object System.Windows.Forms.Label
-    $lblF.Text = 'Filtr (Subject/Thumbprint):'; $lblF.Left = 500; $lblF.Top = 36; $lblF.AutoSize = $true
-    $tab.Controls.Add($lblF)
-
-    $btnLoad = New-Object System.Windows.Forms.Button
-    $btnLoad.Text = 'Pobierz'
-    $btnLoad.Left = 820; $btnLoad.Top = 12; $btnLoad.Width = 100
-    $tab.Controls.Add($btnLoad)
-
-    $btnExport = New-Object System.Windows.Forms.Button
-    $btnExport.Text = 'Eksport .cer zaznaczonego'
-    $btnExport.Left = 930; $btnExport.Top = 12; $btnExport.Width = 190
-    $tab.Controls.Add($btnExport)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 60; $grid.Width = 1110; $grid.Height = 610
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
-    $tab.Controls.Add($grid)
-
-    $tab.Add_Enter({
-            # Enter moze nastapic przed SelectedIndexChanged - najpierw zmienne tej zakladki
-            Restore-ModuleScope $this
-            $cmbHost.Items.Clear()
-            foreach ($h in Get-SelectedComputers) { [void]$cmbHost.Items.Add($h) }
-            if ($cmbHost.Items.Count -gt 0) { $cmbHost.SelectedIndex = 0 }
+Register-Module -Key 'WindowsUpdate' -Category 'Oprogramowanie' -Title 'Windows Update' -Description 'Wyszukiwanie dostępnych aktualizacji, historia oraz instalacja (zadanie SYSTEM na hoście, log w %SystemRoot%\Temp\DomainOps\WU.log). Nie wymaga modułu PSWindowsUpdate.' -Build {
+    param($m)
+    $row = Add-ToolbarRow $m
+    $m.Drivers = Add-CheckBox $row 'Uwzględnij sterowniki' $false
+    [void](Add-Button $row 'Wyszukaj dostępne' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Wyszukiwanie aktualizacji' -Targets $targets -Parameters @{ IncludeDrivers = $m.Drivers.Checked } -ScriptBlock {
+                param($P)
+                $session = New-Object -ComObject Microsoft.Update.Session
+                $criteria = "IsInstalled=0 and IsHidden=0"
+                if (-not $P.IncludeDrivers) { $criteria += " and Type='Software'" }
+                $result = $session.CreateUpdateSearcher().Search($criteria)
+                if ($result.Updates.Count -eq 0) { return [pscustomobject]@{ 'Aktualizacja' = '(brak dostępnych aktualizacji)' } }
+                foreach ($u in $result.Updates) {
+                    [pscustomobject]@{
+                        'Aktualizacja'    = $u.Title
+                        'KB'              = (@($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ', ')
+                        'Kategoria'       = (@($u.Categories | ForEach-Object { $_.Name }) -join ', ')
+                        'Ważność'         = $u.MsrcSeverity
+                        'Rozmiar (MB)'    = [Math]::Round([double]$u.MaxDownloadSize / 1MB, 1)
+                        'Pobrana'         = [bool]$u.IsDownloaded
+                        'Wymaga restartu' = ($u.InstallationBehavior.RebootBehavior -ne 0)
+                    }
+                }
+            }
         })
+    [void](Add-Button $row 'Historia (ostatnie 50)' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Historia aktualizacji' -Targets $targets -ScriptBlock {
+                param($P)
+                $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+                $count = $searcher.GetTotalHistoryCount()
+                if ($count -eq 0) { return [pscustomobject]@{ 'Aktualizacja' = '(historia jest pusta)' } }
+                foreach ($h in $searcher.QueryHistory(0, [Math]::Min($count, 50))) {
+                    if (-not $h.Title) { continue }
+                    $status = switch ([int]$h.ResultCode) { 1 { 'W toku' } 2 { 'Sukces' } 3 { 'Sukces z błędami' } 4 { 'Błąd' } 5 { 'Przerwano' } default { 'Nieznany' } }
+                    $operation = switch ([int]$h.Operation) { 1 { 'Instalacja' } 2 { 'Odinstalowanie' } default { '' } }
+                    [pscustomobject]@{
+                        'Data'         = $h.Date.ToLocalTime()
+                        'Aktualizacja' = $h.Title
+                        'Operacja'     = $operation
+                        'Status'       = $status
+                        'Kod HRESULT'  = $(if ($h.HResult) { '0x{0:X8}' -f $h.HResult } else { '' })
+                    }
+                }
+            }
+        })
+    $row2 = Add-ToolbarRow $m
+    $m.AutoReboot = Add-CheckBox $row2 'Automatyczny restart po instalacji (za 5 min), jeśli wymagany' $false
+    [void](Add-Button $row2 'Zainstaluj aktualizacje' $m -Danger {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $reboot = if ($m.AutoReboot.Checked) { 'z automatycznym restartem' } else { 'bez restartu' }
+            if (-not (Confirm-Action "Zainstalować wszystkie dostępne aktualizacje ($reboot) na $($targets.Count) komputer(ach)?" $targets)) { return }
+            $params = @{ Script = $script:WuJobScript; AutoReboot = $m.AutoReboot.Checked; IncludeDrivers = $m.Drivers.Checked }
+            Start-HostOperation -Module $m -Name 'Instalacja aktualizacji' -Targets $targets -Output Log -Parameters $params -ScriptBlock {
+                param($P)
+                $dir = Join-Path $env:SystemRoot 'Temp\DomainOps'
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                $file = Join-Path $dir 'Invoke-DomainOpsWU.ps1'
+                Set-Content -LiteralPath $file -Value $P.Script -Encoding UTF8
+                $taskName = 'DomainOps-WindowsUpdate'
+                $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                if ($existing -and [string]$existing.State -eq 'Running') { return 'Instalacja już trwa (zadanie DomainOps-WindowsUpdate).' }
+                $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $file
+                if ($P.AutoReboot) { $argLine += ' -AutoReboot' }
+                if ($P.IncludeDrivers) { $argLine += ' -IncludeDrivers' }
+                $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argLine
+                $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+                Start-ScheduledTask -TaskName $taskName
+                'Zlecono instalację (zadanie SYSTEM). Postęp: przycisk «Stan instalacji».'
+            }
+        })
+    [void](Add-Button $row2 'Stan instalacji' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Stan instalacji aktualizacji' -Targets $targets -ScriptBlock {
+                param($P)
+                $log = Join-Path $env:SystemRoot 'Temp\DomainOps\WU.log'
+                $task = Get-ScheduledTask -TaskName 'DomainOps-WindowsUpdate' -ErrorAction SilentlyContinue
+                $lines = @()
+                if (Test-Path -LiteralPath $log) {
+                    $all = @(Get-Content -LiteralPath $log -Encoding UTF8)
+                    $start = 0
+                    for ($i = $all.Count - 1; $i -ge 0; $i--) { if ($all[$i] -like '*==== START ====*') { $start = $i; break } }
+                    $lines = @($all[$start..($all.Count - 1)])
+                }
+                $rebootRequired = $false
+                try { $rebootRequired = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired } catch { }
+                [pscustomobject]@{
+                    'Zadanie'         = $(if ($task) { [string]$task.State } else { '(brak – instalacji nie zlecano)' })
+                    'Ostatni wpis'    = $(if ($lines.Count) { $lines[-1] } else { '' })
+                    'Wymaga restartu' = $rebootRequired
+                    'Log'             = ($lines -join "`r`n")
+                }
+            }
+        })
+}
+#endregion
 
-    $btnLoad.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                $store = $cmbStore.Text; $flt = $txtFilter.Text.Trim()
-                Write-Log "[$selectedHost] certyfikaty LocalMachine\\$store ..."
-                $sb = {
-                    param($store, $flt)
-                    $path = "Cert:\LocalMachine\$store"
-                    $list = Get-ChildItem -Path $path -ErrorAction Stop | ForEach-Object {
-                        $eku = $_.EnhancedKeyUsageList | ForEach-Object { $_.FriendlyName } | Where-Object { $_ } | Sort-Object -Unique
+#region Moduły: Bezpieczeństwo
+Register-Module -Key 'Defender' -Category 'Bezpieczeństwo' -Title 'Microsoft Defender' -Description 'Stan ochrony i sygnatur, wykryte zagrożenia, aktualizacja sygnatur oraz skanowanie (skan trwa w tle – można pracować dalej).' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Stan ochrony' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Defender – stan' -Targets $targets -ScriptBlock {
+                param($P)
+                if (-not (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue)) { throw 'Brak modułu Defender (Get-MpComputerStatus) na hoście.' }
+                $s = Get-MpComputerStatus -ErrorAction Stop
+                [pscustomobject]@{
+                    'Antywirus'                 = $s.AntivirusEnabled
+                    'Ochrona w czasie rzecz.'   = $s.RealTimeProtectionEnabled
+                    'Ochrona przed naruszeniem' = $s.IsTamperProtected
+                    'Tryb'                      = $s.AMRunningMode
+                    'Wersja sygnatur'           = $s.AntivirusSignatureVersion
+                    'Sygnatury z dnia'          = $s.AntivirusSignatureLastUpdated
+                    'Wiek sygnatur (dni)'       = $s.AntivirusSignatureAge
+                    'Ostatni szybki skan'       = $s.QuickScanEndTime
+                    'Ostatni pełny skan'        = $s.FullScanEndTime
+                    'Wersja silnika'            = $s.AMEngineVersion
+                }
+            }
+        })
+    [void](Add-Button $row 'Wykryte zagrożenia' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Defender – zagrożenia' -Targets $targets -ScriptBlock {
+                param($P)
+                if (-not (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue)) { throw 'Brak modułu Defender na hoście.' }
+                $names = @{}
+                foreach ($t in @(Get-MpThreat -ErrorAction SilentlyContinue)) { $names[[string]$t.ThreatID] = $t.ThreatName }
+                $detections = @(Get-MpThreatDetection -ErrorAction SilentlyContinue)
+                if ($detections.Count -eq 0) { return [pscustomobject]@{ 'Zagrożenie' = '(brak wykrytych zagrożeń)' } }
+                foreach ($d in $detections) {
+                    [pscustomobject]@{
+                        'Wykryto'       = $d.InitialDetectionTime
+                        'Zagrożenie'    = $names[[string]$d.ThreatID]
+                        'Zasoby'        = (@($d.Resources) -join '; ')
+                        'Akcja udana'   = $d.ActionSuccess
+                        'Proces'        = $d.ProcessName
+                        'Użytkownik'    = $d.DomainUser
+                    }
+                }
+            }
+        })
+    $defAction = {
+        param($m, $s)
+        $op = [string]$s.Tag['Op']
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $label = @{ Update = 'Zaktualizować sygnatury'; QuickScan = 'Uruchomić szybkie skanowanie'; FullScan = 'Uruchomić PEŁNE skanowanie (może trwać godzinami i obciąża dysk)' }[$op]
+        if (-not (Confirm-Action "$label na $($targets.Count) komputer(ach)?" $targets)) { return }
+        Start-HostOperation -Module $m -Name "Defender – $op" -Targets $targets -Output Log -Parameters @{ Op = $op } -ScriptBlock {
+            param($P)
+            if (-not (Get-Command Start-MpScan -ErrorAction SilentlyContinue)) { throw 'Brak modułu Defender na hoście.' }
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            switch ($P.Op) {
+                'Update' { Update-MpSignature -ErrorAction Stop; $v = (Get-MpComputerStatus).AntivirusSignatureVersion; "Sygnatury zaktualizowane (wersja $v)." }
+                'QuickScan' { Start-MpScan -ScanType QuickScan -ErrorAction Stop; "Szybkie skanowanie zakończone ($([Math]::Round($sw.Elapsed.TotalMinutes, 1)) min)." }
+                'FullScan' { Start-MpScan -ScanType FullScan -ErrorAction Stop; "Pełne skanowanie zakończone ($([Math]::Round($sw.Elapsed.TotalMinutes, 1)) min)." }
+            }
+        }
+    }
+    foreach ($a in @(@('Aktualizuj sygnatury', 'Update'), @('Szybki skan', 'QuickScan'), @('Pełny skan', 'FullScan'))) {
+        $b = Add-Button $row $a[0] $m $defAction
+        $b.Tag['Op'] = $a[1]
+    }
+}
+
+Register-Module -Key 'BitLocker' -Category 'Bezpieczeństwo' -Title 'BitLocker' -Description 'Stan szyfrowania woluminów, kopia zapasowa kluczy odzyskiwania do AD oraz odczyt kluczy zapisanych w AD (wymaga uprawnień do msFVE-RecoveryInformation).' -Build {
+    param($m)
+    $m.SecretColumns = @('Hasło odzyskiwania')
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Stan woluminów' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'BitLocker – stan' -Targets $targets -ScriptBlock {
+                param($P)
+                if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+                    foreach ($v in @(Get-BitLockerVolume -ErrorAction Stop)) {
                         [pscustomobject]@{
-                            Subject = $_.Subject; Thumbprint = $_.Thumbprint; NotBefore = $_.NotBefore; NotAfter = $_.NotAfter
-                            FriendlyName = $_.FriendlyName; HasPrivateKey = $_.HasPrivateKey; EKU = ($eku -join '; ')
+                            'Wolumin'          = $v.MountPoint
+                            'Typ'              = [string]$v.VolumeType
+                            'Ochrona'          = [string]$v.ProtectionStatus
+                            'Stan'             = [string]$v.VolumeStatus
+                            'Zaszyfrowano (%)' = $v.EncryptionPercentage
+                            'Metoda'           = [string]$v.EncryptionMethod
+                            'Blokada'          = [string]$v.LockStatus
+                            'Zabezpieczenia'   = (@($v.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType }) -join ', ')
                         }
                     }
-                    if ($flt) { $list = $list | Where-Object { $_.Subject -like "*$flt*" -or $_.Thumbprint -like "*$flt*" } }
-                    $list
+                    return
                 }
-                $out = Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ store = $store; flt = $flt }
-                $grid.DataSource = @($out | Sort-Object Subject)
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-
-    $btnExport.Add_Click({
-            try {
-                $selectedHost = $cmbHost.Text; if (-not $selectedHost) { Show-Error "Wybierz komputer."; return }
-                if (-not $grid.SelectedRows) { Show-Error "Zaznacz certyfikat."; return }
-                $store = $cmbStore.Text
-                $thumb = $grid.SelectedRows[0].Cells['Thumbprint'].Value
-                $dlg = New-Object System.Windows.Forms.SaveFileDialog
-                $dlg.Filter = 'CER (*.cer)|*.cer'; $dlg.FileName = "$selectedHost-$($thumb).cer"
-                if ($dlg.ShowDialog() -ne 'OK') { return }
-                Write-Log "[$selectedHost] eksportuję $thumb z LocalMachine\\$store do $($dlg.FileName) ..."
-                # zapis na hoście i pobranie pliku
-                $remoteTmp = "C:\Windows\Temp\DomainOps\$($thumb).cer"
-                $sb = {
-                    param($store, $thumb, $outFile)
-                    if (-not (Test-Path (Split-Path -Path $outFile -Parent))) { New-Item -ItemType Directory -Force -Path (Split-Path -Path $outFile -Parent) | Out-Null }
-                    $cert = Get-ChildItem -Path ("Cert:\LocalMachine\$store\$thumb")
-                    Export-Certificate -Cert $cert -FilePath $outFile -Force | Out-Null
-                    'OK'
-                }
-                Invoke-Remote -ComputerName $selectedHost -ScriptBlock $sb -Arg @{ store = $store; thumb = $thumb; outFile = $remoteTmp } | Out-Null
-                $sess = if ($State.UseCurrentCreds -or -not $State.Cred) { New-PSSession -ComputerName $selectedHost } else { New-PSSession -ComputerName $selectedHost -Credential $State.Cred }
-                Copy-Item -FromSession $sess -Path $remoteTmp -Destination $dlg.FileName -Force
-                Remove-PSSession $sess
-                Write-Log "[$selectedHost] eksport zakończony."
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
-        })
-}
-
-# 23) Diagnostyka łączności — Ping / WSMan(5985) / WinRM HTTPS(5986) / SMB(445) / RDP(3389) / WMI(135)
-Register-ModuleTab -Name 'Diagnostyka łączności' -Builder {
-    param($tab, $getTargets)
-
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = 'Testuj łączność dla zaznaczonych'
-    $btn.Left = 12; $btn.Top = 12; $btn.Width = 260
-    $tab.Controls.Add($btn)
-
-    $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Left = 12; $grid.Top = 52; $grid.Width = 1110; $grid.Height = 618
-    $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false
-    $tab.Controls.Add($grid)
-
-    $btn.Add_Click({
-            try {
-                $targets = & $getTargets
-                $rows = @()
-                foreach ($t in $targets) {
-                    Write-Log "[$t] test łączności..."
-                    $ping = Test-Connection -ComputerName $t -Count 1 -Quiet -ErrorAction SilentlyContinue
-                    $wsman = $false; try { Test-WSMan -ComputerName $t -ErrorAction Stop | Out-Null; $wsman = $true } catch {}
-                    $t5986 = (Test-NetConnection -ComputerName $t -Port 5986 -WarningAction SilentlyContinue).TcpTestSucceeded
-                    $smb = (Test-NetConnection -ComputerName $t -Port 445  -WarningAction SilentlyContinue).TcpTestSucceeded
-                    $rdp = (Test-NetConnection -ComputerName $t -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
-                    $wmi = (Test-NetConnection -ComputerName $t -Port 135  -WarningAction SilentlyContinue).TcpTestSucceeded
-                    $rows += [pscustomobject]@{
-                        Komputer = $t; Ping = $ping; WSMan5985 = $wsman; WinRM5986 = $t5986; SMB445 = $smb; RDP3389 = $rdp; WMI135 = $wmi
+                # Starsze systemy / brak modułu: klasa WMI (niezależna od języka systemu)
+                $conversion = @{ 0 = 'Odszyfrowany'; 1 = 'Zaszyfrowany'; 2 = 'Szyfrowanie w toku'; 3 = 'Odszyfrowywanie w toku'; 4 = 'Szyfrowanie wstrzymane'; 5 = 'Odszyfrowywanie wstrzymane' }
+                $protection = @{ 0 = 'Off'; 1 = 'On'; 2 = 'Unknown' }
+                $volumes = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -ErrorAction Stop)
+                foreach ($v in $volumes) {
+                    $status = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus -ErrorAction SilentlyContinue
+                    [pscustomobject]@{
+                        'Wolumin'          = $v.DriveLetter
+                        'Ochrona'          = $protection[[int]$v.ProtectionStatus]
+                        'Stan'             = $(if ($status) { $conversion[[int]$status.ConversionStatus] } else { '' })
+                        'Zaszyfrowano (%)' = $(if ($status) { $status.EncryptionPercentage } else { $null })
                     }
                 }
-                $grid.DataSource = $rows
-            } catch { Write-Log $_.Exception.Message 'ERROR' }
+            }
+        })
+    [void](Add-Button $row 'Kopia kluczy do AD' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            if (-not (Confirm-Action "Zapisać w AD klucze odzyskiwania BitLocker (wszystkie woluminy) z $($targets.Count) komputer(ów)?" $targets)) { return }
+            Start-HostOperation -Module $m -Name 'BitLocker – kopia do AD' -Targets $targets -Output Log -ScriptBlock {
+                param($P)
+                if (Get-Command Backup-BitLockerKeyProtector -ErrorAction SilentlyContinue) {
+                    $found = $false
+                    foreach ($v in @(Get-BitLockerVolume -ErrorAction Stop)) {
+                        foreach ($kp in @($v.KeyProtector | Where-Object { [string]$_.KeyProtectorType -eq 'RecoveryPassword' })) {
+                            $found = $true
+                            try {
+                                Backup-BitLockerKeyProtector -MountPoint $v.MountPoint -KeyProtectorId $kp.KeyProtectorId -ErrorAction Stop | Out-Null
+                                [pscustomobject]@{ 'Wolumin' = $v.MountPoint; 'Klucz' = $kp.KeyProtectorId; 'Wynik' = 'Zapisano w AD' }
+                            }
+                            catch { [pscustomobject]@{ 'Wolumin' = $v.MountPoint; 'Klucz' = $kp.KeyProtectorId; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
+                        }
+                    }
+                    if (-not $found) { 'Brak zabezpieczeń typu hasło odzyskiwania (RecoveryPassword) – nie ma czego zapisać.' }
+                    return
+                }
+                $bde = Join-Path $env:SystemRoot 'System32\manage-bde.exe'
+                if (-not (Test-Path -LiteralPath $bde)) { throw 'Brak Get-BitLockerVolume i manage-bde.exe na hoście.' }
+                $volumes = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -ErrorAction Stop | Where-Object { $_.DriveLetter })
+                foreach ($v in $volumes) {
+                    $text = (& $bde -protectors -get $v.DriveLetter -Type RecoveryPassword 2>&1) -join "`n"
+                    $ids = @([regex]::Matches($text, '\{[0-9A-Fa-f-]{36}\}') | ForEach-Object { $_.Value } | Select-Object -Unique)
+                    foreach ($id in $ids) {
+                        $out = & $bde -protectors -adbackup $v.DriveLetter -id $id 2>&1
+                        $res = if ($LASTEXITCODE -eq 0) { 'Zapisano w AD' } else { "Błąd – $(($out | Out-String).Trim())" }
+                        [pscustomobject]@{ 'Wolumin' = $v.DriveLetter; 'Klucz' = $id; 'Wynik' = $res }
+                    }
+                }
+            }
+        })
+    [void](Add-Button $row 'Klucze odzyskiwania z AD' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'BitLocker – klucze w AD' -Targets $targets -Local -ScriptBlock {
+                param($Target, $P, $Ctx)
+                Import-Module ActiveDirectory -ErrorAction Stop
+                $ad = @{}
+                if ($Ctx.Server) { $ad.Server = $Ctx.Server }
+                if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+                $computer = Get-ADComputer -Identity ($Target -split '\.')[0] @ad -ErrorAction Stop
+                $keys = @(Get-ADObject -SearchBase $computer.DistinguishedName -LDAPFilter '(objectClass=msFVE-RecoveryInformation)' -Properties 'msFVE-RecoveryPassword', 'whenCreated' @ad -ErrorAction Stop)
+                if ($keys.Count -eq 0) { return [pscustomobject]@{ 'Identyfikator klucza' = '(brak kluczy w AD albo brak uprawnień do ich odczytu)' } }
+                $keys | Sort-Object whenCreated -Descending | ForEach-Object {
+                    $id = if ($_.Name -match '\{([0-9A-Fa-f-]{36})\}') { $Matches[1] } else { $_.Name }
+                    [pscustomobject]@{
+                        'Utworzono'            = $_.whenCreated
+                        'Identyfikator klucza' = $id
+                        'Hasło odzyskiwania'   = $_.'msFVE-RecoveryPassword'
+                    }
+                }
+            }
+        })
+    [void](Add-Button $row 'Kopiuj hasło odzyskiwania' $m {
+            param($m)
+            $row = @(Get-SelectedResultRows -Module $m) | Select-Object -First 1
+            $secret = [string](Get-ObjectValue $row 'Hasło odzyskiwania')
+            if (-not $secret) { Show-Warning 'Zaznacz wiersz z hasłem odzyskiwania (przycisk «Klucze odzyskiwania z AD»).'; return }
+            Set-ClipboardSecret -Text $secret -Seconds 60
+            Write-Log ("Skopiowano hasło odzyskiwania BitLocker ({0}, klucz {1}); schowek zostanie wyczyszczony po 60 s." -f (Get-ObjectValue $row 'Komputer'), (Get-ObjectValue $row 'Identyfikator klucza')) 'OK'
         })
 }
 
-# ======= START UI =======
-# Zmienne aktywnej zakladki musza byc widoczne dla jej handlerow (patrz Register-ModuleTab)
-$tabs.add_Selecting({ param($sender, $e) if ($e.TabPage) { Restore-ModuleScope $e.TabPage } })
-$tabs.add_SelectedIndexChanged({ Restore-ModuleScope $tabs.SelectedTab })
-if ($tabs.TabPages.Count -gt 0) { Restore-ModuleScope $tabs.TabPages[0] }
-$form.Add_Shown({ $chkUseCurrent.Checked = $true })
-[void]$form.ShowDialog()
+Register-Module -Key 'Firewall' -Category 'Bezpieczeństwo' -Title 'Zapora Windows' -Description 'Stan profili zapory, reguły (z portami i programami), włączanie/wyłączanie/usuwanie zaznaczonych reguł oraz tworzenie nowych.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $params = @{ Direction = @('Inbound', 'Outbound')[$m.Direction.SelectedIndex]; EnabledOnly = $m.EnabledOnly.Checked; Filter = $m.Filter.Text.Trim() }
+        Start-HostOperation -Module $m -Name 'Reguły zapory' -Targets $targets -Parameters $params -ScriptBlock {
+            param($P)
+            $rules = @(Get-NetFirewallRule -Direction $P.Direction -ErrorAction Stop)
+            if ($P.EnabledOnly) { $rules = @($rules | Where-Object { [string]$_.Enabled -eq 'True' }) }
+            if ($P.Filter) {
+                $f = "*$($P.Filter)*"
+                $rules = @($rules | Where-Object { $_.DisplayName -like $f -or $_.Name -like $f -or $_.DisplayGroup -like $f })
+            }
+            if ($rules.Count -eq 0) { return }
+            # Filtry pobierane hurtowo i łączone po InstanceID - zapytanie per reguła trwałoby minutami
+            $ports = @{}
+            foreach ($pf in @(Get-NetFirewallPortFilter -ErrorAction SilentlyContinue)) { $ports[$pf.InstanceID] = $pf }
+            $apps = @{}
+            foreach ($af in @(Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue)) { $apps[$af.InstanceID] = $af }
+            $addresses = @{}
+            foreach ($ad in @(Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue)) { $addresses[$ad.InstanceID] = $ad }
+            foreach ($r in $rules) {
+                $pf = $ports[$r.InstanceID]
+                $af = $apps[$r.InstanceID]
+                $adf = $addresses[$r.InstanceID]
+                [pscustomobject]@{
+                    'Nazwa wyświetlana' = $r.DisplayName
+                    'Włączona'          = ([string]$r.Enabled -eq 'True')
+                    'Akcja'             = [string]$r.Action
+                    'Profil'            = [string]$r.Profile
+                    'Protokół'          = $(if ($pf) { [string]$pf.Protocol } else { '' })
+                    'Port lokalny'      = $(if ($pf) { @($pf.LocalPort) -join ',' } else { '' })
+                    'Port zdalny'       = $(if ($pf) { @($pf.RemotePort) -join ',' } else { '' })
+                    'Adres zdalny'      = $(if ($adf) { @($adf.RemoteAddress) -join ',' } else { '' })
+                    'Program'           = $(if ($af) { $af.Program } else { '' })
+                    'Grupa'             = $r.DisplayGroup
+                    'ID reguły'         = $r.Name
+                }
+            }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Profile zapory' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Profile zapory' -Targets $targets -ScriptBlock {
+                param($P)
+                Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {
+                    [pscustomobject]@{
+                        'Profil'               = $_.Name
+                        'Włączony'             = ([string]$_.Enabled -eq 'True')
+                        'Ruch przychodzący'    = [string]$_.DefaultInboundAction
+                        'Ruch wychodzący'      = [string]$_.DefaultOutboundAction
+                        'Rejestrowanie blokad' = [string]$_.LogBlocked
+                    }
+                }
+            }
+        })
+    [void](Add-Label $row '  Reguły:')
+    $m.Direction = Add-ComboBox $row @('Przychodzące', 'Wychodzące') 120 0
+    $m.EnabledOnly = Add-CheckBox $row 'Tylko włączone' $true
+    [void](Add-Label $row 'Filtr:')
+    $m.Filter = Add-TextBox $row 150
+    [void](Add-Button $row 'Pokaż reguły' $m -Primary $m.Actions.List)
+
+    $ruleAction = {
+        param($m, $s)
+        $op = [string]$s.Tag['Op']
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('ID reguły', 'Nazwa wyświetlana')
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli reguły zapory (widok «Pokaż reguły»).'; return }
+        $label = @{ Enable = 'Włączyć'; Disable = 'Wyłączyć'; Delete = 'USUNĄĆ' }[$op]
+        $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1}' -f $h, $i['Nazwa wyświetlana'] } }
+        if (-not (Confirm-Action "$label wybrane reguły zapory?" @($items))) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $op; Names = @($byHost[$h] | ForEach-Object { [string]$_['ID reguły'] }) } }
+        Start-HostOperation -Module $m -Name "Zapora – $op" -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+            param($P)
+            foreach ($name in $P.Names) {
+                try {
+                    switch ($P.Op) {
+                        'Enable' { Enable-NetFirewallRule -Name $name -ErrorAction Stop }
+                        'Disable' { Disable-NetFirewallRule -Name $name -ErrorAction Stop }
+                        'Delete' { Remove-NetFirewallRule -Name $name -ErrorAction Stop }
+                    }
+                    [pscustomobject]@{ 'Reguła' = $name; 'Operacja' = $P.Op; 'Wynik' = 'OK' }
+                }
+                catch { [pscustomobject]@{ 'Reguła' = $name; 'Operacja' = $P.Op; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
+            }
+        }
+    }
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Zaznaczone reguły:')
+    $b = Add-Button $row2 'Włącz' $m $ruleAction
+    $b.Tag['Op'] = 'Enable'
+    $b = Add-Button $row2 'Wyłącz' $m $ruleAction
+    $b.Tag['Op'] = 'Disable'
+    $b = Add-Button $row2 'Usuń' $m -Danger $ruleAction
+    $b.Tag['Op'] = 'Delete'
+
+    $row3 = Add-ToolbarRow $m
+    [void](Add-Label $row3 'Nowa reguła:' -Bold)
+    $m.NewName = Add-TextBox $row3 170 'Domain Ops – nowa reguła'
+    $m.NewDirection = Add-ComboBox $row3 @('Przychodząca', 'Wychodząca') 110 0
+    $m.NewAction = Add-ComboBox $row3 @('Zezwalaj', 'Blokuj') 90 0
+    $m.NewProtocol = Add-ComboBox $row3 @('TCP', 'UDP') 60 0
+    [void](Add-Label $row3 'Porty:')
+    $m.NewPorts = Add-TextBox $row3 110 '5985'
+    [void](Add-Label $row3 'Profil:')
+    $m.NewProfile = Add-ComboBox $row3 @('Wszystkie', 'Domena', 'Prywatny', 'Publiczny') 100 0
+    [void](Add-Label $row3 'Adres zdalny:')
+    $m.NewRemote = Add-TextBox $row3 110 'Any'
+    [void](Add-Button $row3 'Utwórz na zaznaczonych' $m {
+            param($m)
+            $name = $m.NewName.Text.Trim()
+            $ports = @(Split-ListText $m.NewPorts.Text)
+            if (-not $name) { Show-Warning 'Podaj nazwę reguły.'; return }
+            if ($ports.Count -eq 0 -or @($ports | Where-Object { $_ -notmatch '^\d{1,5}(-\d{1,5})?$' }).Count -gt 0) { Show-Warning 'Podaj porty jako liczby lub zakresy, np. 80, 443, 8000-8010.'; return }
+            $remote = @(Split-ListText $m.NewRemote.Text)
+            if ($remote.Count -eq 0) { $remote = @('Any') }
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $params = @{
+                DisplayName   = $name
+                Direction     = @('Inbound', 'Outbound')[$m.NewDirection.SelectedIndex]
+                Action        = @('Allow', 'Block')[$m.NewAction.SelectedIndex]
+                Protocol      = $m.NewProtocol.Text
+                Ports         = $ports
+                Profile       = @('Any', 'Domain', 'Private', 'Public')[$m.NewProfile.SelectedIndex]
+                RemoteAddress = $remote
+            }
+            if (-not (Confirm-Action ("Utworzyć regułę «{0}» ({1} {2} {3}/{4}) na {5} komputer(ach)?" -f $name, $m.NewDirection.Text, $m.NewAction.Text, $params.Protocol, ($ports -join ','), $targets.Count) $targets)) { return }
+            Start-HostOperation -Module $m -Name 'Nowa reguła zapory' -Targets $targets -Output Log -Parameters $params -ScriptBlock {
+                param($P)
+                $rp = @{
+                    DisplayName   = $P.DisplayName
+                    Group         = 'Domain Ops'
+                    Direction     = $P.Direction
+                    Action        = $P.Action
+                    Protocol      = $P.Protocol
+                    LocalPort     = [string[]]@($P.Ports)
+                    RemoteAddress = [string[]]@($P.RemoteAddress)
+                    Profile       = $P.Profile
+                    Enabled       = 'True'
+                    ErrorAction   = 'Stop'
+                }
+                $rule = New-NetFirewallRule @rp
+                [pscustomobject]@{ 'Reguła' = $P.DisplayName; 'ID reguły' = $rule.Name; 'Wynik' = 'Utworzono (grupa «Domain Ops»)' }
+            }
+        })
+}
+
+Register-Module -Key 'Certificates' -Category 'Bezpieczeństwo' -Title 'Certyfikaty komputera' -Description 'Certyfikaty z magazynów LocalMachine, wyszukiwanie wygasających oraz eksport zaznaczonych do plików .cer.' -Build {
+    param($m)
+    $row = Add-ToolbarRow $m
+    [void](Add-Label $row 'Magazyn:')
+    $m.Store = Add-ComboBox $row @('My', 'Root', 'CA', 'TrustedPublisher', 'TrustedPeople', 'WebHosting', 'Remote Desktop') 140 0
+    [void](Add-Label $row 'Filtr:')
+    $m.Filter = Add-TextBox $row 150
+    $m.OnlyExpiring = Add-CheckBox $row 'Tylko wygasające w ciągu (dni):' $false
+    $m.Days = Add-Numeric $row 1 3650 30 60
+    [void](Add-Button $row 'Pokaż certyfikaty' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $params = @{ Store = $m.Store.Text; Filter = $m.Filter.Text.Trim(); ExpiringDays = $(if ($m.OnlyExpiring.Checked) { [int]$m.Days.Value } else { 0 }) }
+            Start-HostOperation -Module $m -Name 'Certyfikaty' -Targets $targets -Parameters $params -ScriptBlock {
+                param($P)
+                $now = Get-Date
+                foreach ($c in @(Get-ChildItem -Path ('Cert:\LocalMachine\' + $P.Store) -ErrorAction Stop)) {
+                    if ($P.Filter) {
+                        $f = "*$($P.Filter)*"
+                        if ($c.Subject -notlike $f -and $c.Thumbprint -notlike $f -and $c.FriendlyName -notlike $f -and $c.Issuer -notlike $f) { continue }
+                    }
+                    $days = [int][Math]::Floor(($c.NotAfter - $now).TotalDays)
+                    if ($P.ExpiringDays -gt 0 -and $days -gt $P.ExpiringDays) { continue }
+                    [pscustomobject]@{
+                        'Podmiot'            = $c.Subject
+                        'Wystawca'           = $c.Issuer
+                        'Ważny od'           = $c.NotBefore
+                        'Ważny do'           = $c.NotAfter
+                        'Dni do wygaśnięcia' = $days
+                        'Klucz prywatny'     = $c.HasPrivateKey
+                        'Przeznaczenie'      = (@($c.EnhancedKeyUsageList | ForEach-Object { $_.FriendlyName } | Where-Object { $_ }) -join ', ')
+                        'Nazwa przyjazna'    = $c.FriendlyName
+                        'Odcisk palca'       = $c.Thumbprint
+                        'Magazyn'            = $P.Store
+                    }
+                }
+            }
+        })
+    [void](Add-Button $row 'Eksportuj zaznaczone (.cer)…' $m {
+            param($m)
+            $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Odcisk palca', 'Magazyn')
+            if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli certyfikaty do eksportu.'; return }
+            $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+            $dlg.Description = 'Folder docelowy dla plików .cer'
+            if ($dlg.ShowDialog($script:UI.Form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+            $m.ExportFolder = $dlg.SelectedPath
+            $per = @{}
+            foreach ($h in $byHost.Keys) {
+                $per[$h] = @{ Items = @($byHost[$h] | ForEach-Object { @{ Thumbprint = [string]$_['Odcisk palca']; Store = [string]$_['Magazyn'] } }) }
+            }
+            Start-HostOperation -Module $m -Name 'Eksport certyfikatów' -Targets @($byHost.Keys) -PerTarget $per -Output None -ScriptBlock {
+                param($P)
+                foreach ($i in $P.Items) {
+                    $cert = Get-Item -Path ('Cert:\LocalMachine\{0}\{1}' -f $i.Store, $i.Thumbprint) -ErrorAction Stop
+                    [pscustomobject]@{ Thumbprint = $cert.Thumbprint; Base64 = [Convert]::ToBase64String($cert.RawData) }
+                }
+            } -OnResult {
+                param($m, $r)
+                foreach ($d in @($r.Data)) {
+                    $thumb = [string](Get-ObjectValue $d 'Thumbprint')
+                    $b64 = [string](Get-ObjectValue $d 'Base64')
+                    if (-not $thumb -or -not $b64) { continue }
+                    $file = Join-Path $m.ExportFolder ('{0}_{1}.cer' -f $r.Target, $thumb)
+                    [System.IO.File]::WriteAllBytes($file, [Convert]::FromBase64String($b64))
+                    Write-Log ("[{0}] zapisano {1}" -f $r.Target, $file) 'OK'
+                }
+            }
+        })
+}
+
+Register-Module -Key 'LocalAdmins' -Category 'Bezpieczeństwo' -Title 'Lokalni administratorzy' -Description 'Członkowie lokalnej grupy Administratorzy (wyznaczanej po SID S-1-5-32-544, więc działa w każdym języku systemu): podgląd, dodawanie i usuwanie.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Lokalni administratorzy' -Targets $targets -ScriptBlock {
+            param($P)
+            $groupName = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+            $rows = @()
+            try {
+                $rows = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object {
+                        [pscustomobject]@{ 'Członek' = $_.Name; 'Typ' = [string]$_.ObjectClass; 'Źródło' = [string]$_.PrincipalSource; 'SID' = [string]$_.SID }
+                    })
+            }
+            catch {
+                # Get-LocalGroupMember zawodzi np. przy osieroconych SID-ach - odczyt przez ADSI
+                $group = [ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME, $groupName)
+                foreach ($member in @($group.Invoke('Members'))) {
+                    $type = $member.GetType()
+                    $path = [string]$type.InvokeMember('ADsPath', 'GetProperty', $null, $member, $null)
+                    $class = [string]$type.InvokeMember('Class', 'GetProperty', $null, $member, $null)
+                    $sid = ''
+                    try { $sid = (New-Object System.Security.Principal.SecurityIdentifier($type.InvokeMember('objectSid', 'GetProperty', $null, $member, $null), 0)).Value } catch { }
+                    $parts = @($path -replace '^WinNT://', '' -split '/')
+                    $name = if ($parts.Count -ge 2) { $parts[-2] + '\' + $parts[-1] } else { $parts[-1] }
+                    $rows += [pscustomobject]@{ 'Członek' = $name; 'Typ' = $class; 'Źródło' = '(ADSI)'; 'SID' = $sid }
+                }
+            }
+            $rows | ForEach-Object { $_ | Add-Member -NotePropertyName 'Grupa' -NotePropertyValue $groupName -PassThru }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Pokaż członków' $m -Primary $m.Actions.List)
+    [void](Add-Button $row 'Usuń zaznaczonych' $m -Danger {
+            param($m)
+            $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Członek')
+            if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli członków grupy do usunięcia.'; return }
+            $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1}' -f $h, $i['Członek'] } }
+            if (-not (Confirm-Action 'Usunąć wybrane konta z lokalnej grupy Administratorzy?' @($items))) { return }
+            $per = @{}
+            foreach ($h in $byHost.Keys) {
+                $sids = @{}
+                foreach ($drv in @(Get-SelectedResultRows -Module $m)) {
+                    if ((Get-ObjectValue $drv 'Komputer') -eq $h) { $sids[[string](Get-ObjectValue $drv 'Członek')] = [string](Get-ObjectValue $drv 'SID') }
+                }
+                $per[$h] = @{ Members = @($byHost[$h] | ForEach-Object { @{ Name = [string]$_['Członek']; Sid = $sids[[string]$_['Członek']] } }) }
+            }
+            Start-HostOperation -Module $m -Name 'Usuwanie administratorów' -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+                param($P)
+                $groupName = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+                foreach ($member in $P.Members) {
+                    try {
+                        # Zabezpieczenie przed odcięciem dostępu: wbudowane konto Administrator i Domain Admins
+                        if ($member.Sid -match '-500$' -or $member.Sid -match '^S-1-5-21-.+-512$') { throw 'Pominięto: wbudowane konto Administrator / grupa Domain Admins.' }
+                        $identity = if ($member.Sid) { $member.Sid } else { $member.Name }
+                        if (Get-Command Remove-LocalGroupMember -ErrorAction SilentlyContinue) {
+                            Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member $identity -ErrorAction Stop
+                        }
+                        else {
+                            $group = [ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME, $groupName)
+                            $group.Remove('WinNT://' + ($member.Name -replace '\\', '/'))
+                        }
+                        [pscustomobject]@{ 'Członek' = $member.Name; 'Wynik' = 'Usunięto' }
+                    }
+                    catch { [pscustomobject]@{ 'Członek' = $member.Name; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
+                }
+            }
+        })
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Dodaj konto/grupę (DOMENA\nazwa, kilka – rozdziel przecinkiem):')
+    $m.NewMember = Add-TextBox $row2 280
+    [void](Add-Button $row2 'Dodaj na zaznaczonych komputerach' $m {
+            param($m)
+            $members = @(Split-ListText $m.NewMember.Text)
+            if ($members.Count -eq 0) { Show-Warning 'Podaj konto lub grupę, np. FIRMA\Helpdesk.'; return }
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            if (-not (Confirm-Action ("Dodać {0} do lokalnej grupy Administratorzy na {1} komputer(ach)?" -f ($members -join ', '), $targets.Count) $targets)) { return }
+            Start-HostOperation -Module $m -Name 'Dodawanie administratorów' -Targets $targets -Output Log -Parameters @{ Members = $members } -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+                param($P)
+                $groupName = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+                foreach ($member in $P.Members) {
+                    try {
+                        if (Get-Command Add-LocalGroupMember -ErrorAction SilentlyContinue) {
+                            Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $member -ErrorAction Stop
+                        }
+                        else {
+                            $group = [ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME, $groupName)
+                            $group.Add('WinNT://' + ($member -replace '\\', '/'))
+                        }
+                        [pscustomobject]@{ 'Członek' = $member; 'Wynik' = 'Dodano' }
+                    }
+                    catch {
+                        $msg = $_.Exception.Message
+                        if ($_.FullyQualifiedErrorId -like 'MemberExists*') { $msg = 'już jest członkiem grupy' }
+                        [pscustomobject]@{ 'Członek' = $member; 'Wynik' = "Błąd – $msg" }
+                    }
+                }
+            }
+        })
+}
+
+Register-Module -Key 'LocalUsers' -Category 'Bezpieczeństwo' -Title 'Konta lokalne' -Description 'Lokalne konta użytkowników: stan, ostatnie logowanie, wiek hasła; włączanie, wyłączanie i ustawianie hasła zaznaczonych kont.' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Konta lokalne' -Targets $targets -ScriptBlock {
+            param($P)
+            if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+                Get-LocalUser | ForEach-Object {
+                    [pscustomobject]@{
+                        'Konto'              = $_.Name
+                        'Pełna nazwa'        = $_.FullName
+                        'Włączone'           = $_.Enabled
+                        'Ostatnie logowanie' = $_.LastLogon
+                        'Hasło ustawione'    = $_.PasswordLastSet
+                        'Hasło wygasa'       = $_.PasswordExpires
+                        'Opis'               = $_.Description
+                        'SID'                = [string]$_.SID
+                    }
+                }
+            }
+            else {
+                Get-CimInstance -ClassName Win32_UserAccount -Filter 'LocalAccount = True' | ForEach-Object {
+                    [pscustomobject]@{ 'Konto' = $_.Name; 'Pełna nazwa' = $_.FullName; 'Włączone' = (-not $_.Disabled); 'Opis' = $_.Description; 'SID' = $_.SID }
+                }
+            }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Pokaż konta' $m -Primary $m.Actions.List)
+    $userAction = {
+        param($m, $s)
+        $op = [string]$s.Tag['Op']
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Konto')
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli konta lokalne.'; return }
+        $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1}' -f $h, $i['Konto'] } }
+        $password = $null
+        if ($op -eq 'Password') {
+            $password = Show-PasswordDialog -Message 'Nowe hasło zostanie ustawione dla wszystkich zaznaczonych kont.'
+            if (-not $password) { return }
+        }
+        $question = @{ Enable = 'Włączyć wybrane konta lokalne?'; Disable = 'Wyłączyć wybrane konta lokalne?'; Password = 'Ustawić nowe hasło dla wybranych kont lokalnych?' }[$op]
+        if (-not (Confirm-Action $question @($items))) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $op; Password = $password; Names = @($byHost[$h] | ForEach-Object { [string]$_['Konto'] }) } }
+        Start-HostOperation -Module $m -Name "Konta lokalne – $op" -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+            param($P)
+            foreach ($name in $P.Names) {
+                try {
+                    switch ($P.Op) {
+                        'Enable' { Enable-LocalUser -Name $name -ErrorAction Stop }
+                        'Disable' { Disable-LocalUser -Name $name -ErrorAction Stop }
+                        'Password' { Set-LocalUser -Name $name -Password $P.Password -ErrorAction Stop }
+                    }
+                    [pscustomobject]@{ 'Konto' = $name; 'Operacja' = $P.Op; 'Wynik' = 'OK' }
+                }
+                catch { [pscustomobject]@{ 'Konto' = $name; 'Operacja' = $P.Op; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
+            }
+        }
+    }
+    [void](Add-Label $row '   Zaznaczone konta:')
+    $b = Add-Button $row 'Włącz' $m $userAction
+    $b.Tag['Op'] = 'Enable'
+    $b = Add-Button $row 'Wyłącz' $m -Danger $userAction
+    $b.Tag['Op'] = 'Disable'
+    $b = Add-Button $row 'Ustaw hasło…' $m -Danger $userAction
+    $b.Tag['Op'] = 'Password'
+}
+#endregion
+
+#region Moduły: Udostępnianie
+Register-Module -Key 'Shares' -Category 'Udostępnianie' -Title 'Udziały sieciowe' -Description 'Udziały SMB na zaznaczonych komputerach: podgląd, uprawnienia, tworzenie (z uprawnieniami udziału i opcjonalnie NTFS) oraz usuwanie.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Udziały' -Targets $targets -Parameters @{ ShowSpecial = $m.ShowSpecial.Checked } -ScriptBlock {
+            param($P)
+            if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
+                $shares = @(Get-SmbShare -ErrorAction Stop)
+                if (-not $P.ShowSpecial) { $shares = @($shares | Where-Object { -not $_.Special }) }
+                foreach ($s in $shares) {
+                    [pscustomobject]@{ 'Udział' = $s.Name; 'Ścieżka' = $s.Path; 'Opis' = $s.Description; 'Administracyjny' = [bool]$s.Special; 'Połączenia' = $s.CurrentUsers }
+                }
+            }
+            else {
+                foreach ($s in @(Get-CimInstance -ClassName Win32_Share)) {
+                    $special = ([int64]$s.Type -ge 2147483648)
+                    if ($special -and -not $P.ShowSpecial) { continue }
+                    [pscustomobject]@{ 'Udział' = $s.Name; 'Ścieżka' = $s.Path; 'Opis' = $s.Description; 'Administracyjny' = $special }
+                }
+            }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    $m.ShowSpecial = Add-CheckBox $row 'Pokaż udziały administracyjne (C$, ADMIN$…)' $false
+    [void](Add-Button $row 'Pokaż udziały' $m -Primary $m.Actions.List)
+    [void](Add-Button $row 'Uprawnienia zaznaczonych' $m {
+            param($m)
+            $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Udział')
+            if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli udziały.'; return }
+            $per = @{}
+            foreach ($h in $byHost.Keys) { $per[$h] = @{ Names = @($byHost[$h] | ForEach-Object { [string]$_['Udział'] }) } }
+            $m.PermissionRows = New-Object System.Collections.ArrayList
+            Start-HostOperation -Module $m -Name 'Uprawnienia udziałów' -Targets @($byHost.Keys) -PerTarget $per -Output None -ScriptBlock {
+                param($P)
+                foreach ($name in $P.Names) {
+                    Get-SmbShareAccess -Name $name -ErrorAction Stop | ForEach-Object {
+                        [pscustomobject]@{ 'Udział' = $name; 'Konto' = $_.AccountName; 'Typ' = [string]$_.AccessControlType; 'Uprawnienie' = [string]$_.AccessRight }
+                    }
+                }
+            } -OnResult {
+                param($m, $r)
+                foreach ($d in @($r.Data)) {
+                    [void]$m.PermissionRows.Add([pscustomobject]@{
+                            'Komputer'    = $r.Target
+                            'Udział'      = Get-ObjectValue $d 'Udział'
+                            'Konto'       = Get-ObjectValue $d 'Konto'
+                            'Typ'         = Get-ObjectValue $d 'Typ'
+                            'Uprawnienie' = Get-ObjectValue $d 'Uprawnienie'
+                        })
+                }
+            } -OnComplete {
+                param($m)
+                if ($m.PermissionRows.Count -eq 0) { return }
+                # Okno pokazujemy poza obsługą timera, żeby nie wstrzymywać innych trwających operacji
+                Invoke-Deferred -Module $m -Action { param($m) Show-GridDialog -Title 'Uprawnienia udziałów' -Rows @($m.PermissionRows) }
+            }
+        })
+    [void](Add-Button $row 'Usuń zaznaczone' $m -Danger {
+            param($m)
+            $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Udział')
+            if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli udziały do usunięcia.'; return }
+            $items = foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0}: {1}' -f $h, $i['Udział'] } }
+            if (-not (Confirm-Action 'Usunąć wybrane udziały? Dane w folderach pozostaną nienaruszone.' @($items))) { return }
+            $per = @{}
+            foreach ($h in $byHost.Keys) { $per[$h] = @{ Names = @($byHost[$h] | ForEach-Object { [string]$_['Udział'] }) } }
+            Start-HostOperation -Module $m -Name 'Usuwanie udziałów' -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+                param($P)
+                foreach ($name in $P.Names) {
+                    try {
+                        if (@('ADMIN$', 'IPC$', 'PRINT$') -contains $name.ToUpperInvariant() -or $name -match '^[A-Za-z]\$$') { throw 'Pominięto udział administracyjny.' }
+                        if (Get-Command Remove-SmbShare -ErrorAction SilentlyContinue) { Remove-SmbShare -Name $name -Force -ErrorAction Stop }
+                        else {
+                            $share = Get-CimInstance -ClassName Win32_Share -Filter ("Name = '{0}'" -f $name.Replace("'", "''"))
+                            if (-not $share) { throw 'Nie znaleziono udziału.' }
+                            $r = Invoke-CimMethod -InputObject $share -MethodName Delete
+                            if ($r.ReturnValue -ne 0) { throw "Win32_Share.Delete zwrócił $($r.ReturnValue)." }
+                        }
+                        [pscustomobject]@{ 'Udział' = $name; 'Wynik' = 'Usunięto' }
+                    }
+                    catch { [pscustomobject]@{ 'Udział' = $name; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
+                }
+            }
+        })
+
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Nowy udział:' -Bold)
+    [void](Add-Label $row2 'Nazwa:')
+    $m.NewName = Add-TextBox $row2 120
+    [void](Add-Label $row2 'Ścieżka na hoście:')
+    $m.NewPath = Add-TextBox $row2 200 'D:\Udzial'
+    [void](Add-Label $row2 'Opis:')
+    $m.NewDesc = Add-TextBox $row2 160
+    $row3 = Add-ToolbarRow $m
+    [void](Add-Label $row3 'Pełna kontrola:')
+    $m.NewFull = Add-TextBox $row3 150
+    [void](Add-Label $row3 'Zmiana:')
+    $m.NewChange = Add-TextBox $row3 150
+    [void](Add-Label $row3 'Odczyt:')
+    $m.NewRead = Add-TextBox $row3 150
+    $m.NewNtfs = Add-CheckBox $row3 'Nadaj też NTFS' $false
+    $m.NewCreate = Add-CheckBox $row3 'Utwórz folder' $true
+    [void](Add-Button $row3 'Utwórz na zaznaczonych' $m {
+            param($m)
+            $name = $m.NewName.Text.Trim()
+            $path = $m.NewPath.Text.Trim()
+            if (-not $name -or -not $path) { Show-Warning 'Podaj nazwę udziału i ścieżkę folderu na hoście.'; return }
+            if ($path -notmatch '^[A-Za-z]:\\') { Show-Warning 'Ścieżka musi być lokalną ścieżką na hoście, np. D:\Dane\Projekty.'; return }
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $params = @{
+                Name = $name; Path = $path; Description = $m.NewDesc.Text.Trim()
+                Full = @(Split-ListText $m.NewFull.Text); Change = @(Split-ListText $m.NewChange.Text); Read = @(Split-ListText $m.NewRead.Text)
+                Ntfs = $m.NewNtfs.Checked; CreateFolder = $m.NewCreate.Checked
+            }
+            if (-not (Confirm-Action ("Utworzyć udział {0} -> {1} na {2} komputer(ach)?" -f $name, $path, $targets.Count) $targets)) { return }
+            Start-HostOperation -Module $m -Name 'Tworzenie udziału' -Targets $targets -Output Log -Parameters $params -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+                param($P)
+                if (-not (Test-Path -LiteralPath $P.Path)) {
+                    if ($P.CreateFolder) { New-Item -ItemType Directory -Path $P.Path -Force | Out-Null }
+                    else { throw "Folder $($P.Path) nie istnieje." }
+                }
+                $full = @($P.Full | Where-Object { $_ })
+                $change = @($P.Change | Where-Object { $_ })
+                $read = @($P.Read | Where-Object { $_ })
+                if (Get-Command New-SmbShare -ErrorAction SilentlyContinue) {
+                    $sp = @{ Name = $P.Name; Path = $P.Path; ErrorAction = 'Stop' }
+                    if ($P.Description) { $sp.Description = $P.Description }
+                    if ($full.Count) { $sp.FullAccess = [string[]]$full }
+                    if ($change.Count) { $sp.ChangeAccess = [string[]]$change }
+                    if ($read.Count) { $sp.ReadAccess = [string[]]$read }
+                    New-SmbShare @sp | Out-Null
+                }
+                else {
+                    $r = Invoke-CimMethod -ClassName Win32_Share -MethodName Create -Arguments @{ Path = $P.Path; Name = $P.Name; Type = [uint32]0; Description = [string]$P.Description }
+                    if ($r.ReturnValue -ne 0) { throw "Win32_Share.Create zwrócił $($r.ReturnValue)." }
+                }
+                $ntfs = ''
+                if ($P.Ntfs) {
+                    $grants = @()
+                    foreach ($a in $full) { $grants += "${a}:(OI)(CI)F" }
+                    foreach ($a in $change) { $grants += "${a}:(OI)(CI)M" }
+                    foreach ($a in $read) { $grants += "${a}:(OI)(CI)RX" }
+                    foreach ($g in $grants) {
+                        $out = & icacls.exe $P.Path /grant $g 2>&1
+                        if ($LASTEXITCODE -ne 0) { throw "icacls $g : $(($out | Out-String).Trim())" }
+                    }
+                    if ($grants.Count) { $ntfs = ' + NTFS' }
+                }
+                [pscustomobject]@{ 'Udział' = $P.Name; 'Ścieżka' = $P.Path; 'Wynik' = "Utworzono$ntfs" }
+            }
+        })
+}
+#endregion
+
+#region Moduły: Active Directory
+Register-Module -Key 'ComputerAccount' -Category 'Active Directory' -Title 'Konto komputera' -Description 'Informacje o obiekcie komputera w AD, test i naprawa kanału zaufania, reset konta, włączanie/wyłączanie i przenoszenie do innej jednostki OU.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Konto komputera – informacje' -Targets $targets -Local -ScriptBlock {
+            param($Target, $P, $Ctx)
+            Import-Module ActiveDirectory -ErrorAction Stop
+            $ad = @{}
+            if ($Ctx.Server) { $ad.Server = $Ctx.Server }
+            if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+            $props = @('Enabled', 'LastLogonDate', 'PasswordLastSet', 'OperatingSystem', 'OperatingSystemVersion', 'whenCreated', 'Description', 'IPv4Address', 'ManagedBy', 'Location')
+            $c = Get-ADComputer -Identity ($Target -split '\.')[0] -Properties $props @ad -ErrorAction Stop
+            [pscustomobject]@{
+                'Włączone'               = $c.Enabled
+                'Ostatnie logowanie'     = $c.LastLogonDate
+                'Hasło konta zmienione'  = $c.PasswordLastSet
+                'Dni od zmiany hasła'    = $(if ($c.PasswordLastSet) { [int]((Get-Date) - $c.PasswordLastSet).TotalDays } else { $null })
+                'System'                 = $c.OperatingSystem
+                'Wersja'                 = $c.OperatingSystemVersion
+                'IPv4'                   = $c.IPv4Address
+                'Utworzono'              = $c.whenCreated
+                'Opis'                   = $c.Description
+                'Lokalizacja'            = $c.Location
+                'Jednostka OU'           = ($c.DistinguishedName -replace '^CN=(?:\\.|[^,])+,', '')
+            }
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Informacje z AD' $m -Primary $m.Actions.List)
+    [void](Add-Button $row 'Test kanału zaufania' $m {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Start-HostOperation -Module $m -Name 'Test kanału zaufania' -Targets $targets -Parameters @{ Server = [string]$script:Settings.DomainController } -ScriptBlock {
+                param($P)
+                $tp = @{ ErrorAction = 'Stop' }
+                if ($P.Server) { $tp.Server = $P.Server }
+                $ok = Test-ComputerSecureChannel @tp
+                $domain = (Get-CimInstance -ClassName Win32_ComputerSystem).Domain
+                $dc = ''
+                try {
+                    $text = (& nltest.exe "/sc_query:$domain" 2>&1) -join "`n"
+                    if ($text -match '\\\\([^\s\\]+)') { $dc = $Matches[1] }
+                }
+                catch { }
+                [pscustomobject]@{
+                    'Kanał zaufania'   = $(if ($ok) { 'Poprawny' } else { 'Błąd – kanał uszkodzony' })
+                    'Domena'           = $domain
+                    'Kontroler domeny' = $dc
+                }
+            }
+        })
+    [void](Add-Button $row 'Napraw kanał zaufania' $m -Danger {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            $cred = Get-EffectiveCredential
+            if (-not $cred) {
+                $cred = Show-CredentialDialog -Message 'Naprawa kanału zaufania wymaga poświadczeń domenowych z prawem resetu konta komputera (nie przechodzą przez WinRM automatycznie).'
+                if (-not $cred) { return }
+            }
+            if (-not (Confirm-Action "Naprawić kanał zaufania (Test-ComputerSecureChannel -Repair) na $($targets.Count) komputer(ach)?" $targets)) { return }
+            Start-HostOperation -Module $m -Name 'Naprawa kanału zaufania' -Targets $targets -Output Log -Parameters @{ Credential = $cred; Server = [string]$script:Settings.DomainController } -ScriptBlock {
+                param($P)
+                $tp = @{ Repair = $true; Credential = $P.Credential; ErrorAction = 'Stop' }
+                if ($P.Server) { $tp.Server = $P.Server }
+                if (Test-ComputerSecureChannel @tp) { 'Kanał zaufania naprawiony.' } else { 'Błąd – naprawa nie powiodła się.' }
+            }
+        })
+    $adAction = {
+        param($m, $s)
+        $op = [string]$s.Tag['Op']
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $params = @{ Op = $op; TargetOU = '' }
+        switch ($op) {
+            'Reset' { $question = 'Zresetować konta komputerów w AD? Komputery stracą relację zaufania i trzeba będzie ponownie dołączyć je do domeny lub naprawić kanał.' }
+            'Enable' { $question = 'Włączyć konta komputerów w AD?' }
+            'Disable' { $question = 'Wyłączyć konta komputerów w AD? Użytkownicy nie zalogują się kontem domenowym na tych komputerach.' }
+            'Move' {
+                $ou = Select-OrganizationalUnit -Title 'Docelowa jednostka organizacyjna'
+                if (-not $ou) { return }
+                $params.TargetOU = $ou
+                $question = "Przenieść konta komputerów do:`r`n$ou ?"
+            }
+        }
+        if (-not (Confirm-Action $question $targets)) { return }
+        Start-HostOperation -Module $m -Name "Konto komputera – $op" -Targets $targets -Local -Output Log -Parameters $params -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+            param($Target, $P, $Ctx)
+            Import-Module ActiveDirectory -ErrorAction Stop
+            $ad = @{}
+            if ($Ctx.Server) { $ad.Server = $Ctx.Server }
+            if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+            $c = Get-ADComputer -Identity ($Target -split '\.')[0] @ad -ErrorAction Stop
+            switch ($P.Op) {
+                'Reset' {
+                    # Odpowiednik "Resetuj konto" z konsoli ADUC: hasło domyślne = nazwa komputera małymi literami (bez $, maks. 14 znaków)
+                    $plain = $c.SamAccountName.TrimEnd('$').ToLowerInvariant()
+                    if ($plain.Length -gt 14) { $plain = $plain.Substring(0, 14) }
+                    Set-ADAccountPassword -Identity $c -Reset -NewPassword (ConvertTo-SecureString $plain -AsPlainText -Force) @ad -ErrorAction Stop
+                    'Konto zresetowane – dołącz komputer ponownie do domeny lub napraw kanał zaufania.'
+                }
+                'Enable' { Enable-ADAccount -Identity $c @ad -ErrorAction Stop; 'Konto włączone.' }
+                'Disable' { Disable-ADAccount -Identity $c @ad -ErrorAction Stop; 'Konto wyłączone.' }
+                'Move' { Move-ADObject -Identity $c.DistinguishedName -TargetPath $P.TargetOU @ad -ErrorAction Stop; "Przeniesiono do $($P.TargetOU)." }
+            }
+        }
+    }
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Label $row2 'Operacje w AD:')
+    foreach ($a in @(@('Włącz konto', 'Enable', $false), @('Wyłącz konto', 'Disable', $true), @('Przenieś do OU…', 'Move', $false), @('Resetuj konto', 'Reset', $true))) {
+        $b = Add-Button $row2 $a[0] $m -Danger:$a[2] $adAction
+        $b.Tag['Op'] = $a[1]
+    }
+}
+
+Register-Module -Key 'Laps' -Category 'Active Directory' -Title 'LAPS' -Description 'Hasła lokalnego administratora z AD (Windows LAPS, także szyfrowane, oraz LAPS legacy), wymuszanie zmiany hasła i bezpieczne kopiowanie do schowka (czyszczonego po 60 s).' -Build {
+    param($m)
+    $m.SecretColumns = @('Hasło')
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'LAPS – odczyt' -Targets $targets -Local -ScriptBlock {
+            param($Target, $P, $Ctx)
+            Import-Module ActiveDirectory -ErrorAction Stop
+            $ad = @{}
+            if ($Ctx.Server) { $ad.Server = $Ctx.Server }
+            if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+            function ConvertFrom-FileTimeValue($Value) {
+                if ($null -eq $Value -or [string]$Value -eq '' -or [string]$Value -eq '0') { return $null }
+                try { return [DateTime]::FromFileTimeUtc([int64][string]$Value).ToLocalTime() } catch { return $null }
+            }
+            $name = ($Target -split '\.')[0]
+            $c = Get-ADComputer -Identity $name -Properties * @ad -ErrorAction Stop
+            $row = $null
+            $lapsError = ''
+            if (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue) {
+                try {
+                    $lp = @{ Identity = $name; AsPlainText = $true; ErrorAction = 'Stop' }
+                    if ($Ctx.Server) { $lp.DomainController = $Ctx.Server }
+                    if ($Ctx.Credential) { $lp.Credential = $Ctx.Credential }
+                    $info = Get-LapsADPassword @lp
+                    if ($info -and $info.Password) {
+                        $row = [pscustomobject]@{
+                            'Rozwiązanie' = 'Windows LAPS'
+                            'Konto'       = $info.Account
+                            'Hasło'       = [string]$info.Password
+                            'Zmienione'   = $info.PasswordUpdateTime
+                            'Wygasa'      = $info.ExpirationTimestamp
+                            'Źródło'      = [string]$info.Source
+                            'Uwagi'       = ''
+                        }
+                    }
+                    elseif ($info) { $lapsError = "Status odszyfrowania: $($info.DecryptionStatus)" }
+                }
+                catch { $lapsError = $_.Exception.Message }
+            }
+            if (-not $row -and $c.'msLAPS-Password') {
+                try {
+                    $json = [string]$c.'msLAPS-Password' | ConvertFrom-Json
+                    $row = [pscustomobject]@{
+                        'Rozwiązanie' = 'Windows LAPS'
+                        'Konto'       = $json.n
+                        'Hasło'       = [string]$json.p
+                        'Zmienione'   = $null
+                        'Wygasa'      = ConvertFrom-FileTimeValue $c.'msLAPS-PasswordExpirationTime'
+                        'Źródło'      = 'msLAPS-Password'
+                        'Uwagi'       = ''
+                    }
+                }
+                catch { }
+            }
+            if (-not $row -and $c.'ms-Mcs-AdmPwd') {
+                $row = [pscustomobject]@{
+                    'Rozwiązanie' = 'LAPS (legacy)'
+                    'Konto'       = '(wg zasad GPO)'
+                    'Hasło'       = [string]$c.'ms-Mcs-AdmPwd'
+                    'Zmienione'   = $null
+                    'Wygasa'      = ConvertFrom-FileTimeValue $c.'ms-Mcs-AdmPwdExpirationTime'
+                    'Źródło'      = 'ms-Mcs-AdmPwd'
+                    'Uwagi'       = ''
+                }
+            }
+            if (-not $row) {
+                $note = 'Brak hasła LAPS albo brak uprawnień do odczytu.'
+                if ($c.'msLAPS-EncryptedPassword') { $note = 'Hasło jest zaszyfrowane – brak uprawnień do odszyfrowania lub brak modułu LAPS (RSAT).' }
+                if ($lapsError) { $note += " ($lapsError)" }
+                $row = [pscustomobject]@{ 'Rozwiązanie' = 'brak'; 'Konto' = ''; 'Hasło' = ''; 'Zmienione' = $null; 'Wygasa' = $null; 'Źródło' = ''; 'Uwagi' = $note }
+            }
+            $row
+        }
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Pokaż hasła LAPS' $m -Primary $m.Actions.List)
+    [void](Add-Button $row 'Kopiuj hasło zaznaczonego' $m {
+            param($m)
+            $selected = @(Get-SelectedResultRows -Module $m) | Select-Object -First 1
+            $secret = [string](Get-ObjectValue $selected 'Hasło')
+            if (-not $secret) { Show-Warning 'Zaznacz wiersz z hasłem.'; return }
+            Set-ClipboardSecret -Text $secret -Seconds 60
+            Write-Log ("Skopiowano hasło LAPS komputera {0}; schowek zostanie wyczyszczony po 60 s." -f (Get-ObjectValue $selected 'Komputer')) 'OK'
+        })
+    $m.ProcessNow = Add-CheckBox $row 'Od razu przetwórz zasady na hoście' $true
+    [void](Add-Button $row 'Wymuś zmianę hasła' $m -Danger {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            if (-not (Confirm-Action "Wymusić zmianę hasła LAPS (ustawienie wygaśnięcia na teraz) dla $($targets.Count) komputer(ów)?" $targets)) { return }
+            Start-HostOperation -Module $m -Name 'LAPS – wymuszenie zmiany' -Targets $targets -Local -Output Log -Parameters @{ ProcessNow = $m.ProcessNow.Checked } -ScriptBlock {
+                param($Target, $P, $Ctx)
+                Import-Module ActiveDirectory -ErrorAction Stop
+                $ad = @{}
+                if ($Ctx.Server) { $ad.Server = $Ctx.Server }
+                if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+                $name = ($Target -split '\.')[0]
+                $c = Get-ADComputer -Identity $name -Properties * @ad -ErrorAction Stop
+                $done = @()
+                if ($c.'msLAPS-PasswordExpirationTime' -or $c.'msLAPS-EncryptedPassword' -or $c.'msLAPS-Password') {
+                    if (Get-Command Set-LapsADPasswordExpirationTime -ErrorAction SilentlyContinue) {
+                        $sp = @{ Identity = $name; WhenEffective = (Get-Date); ErrorAction = 'Stop' }
+                        if ($Ctx.Server) { $sp.DomainController = $Ctx.Server }
+                        if ($Ctx.Credential) { $sp.Credential = $Ctx.Credential }
+                        Set-LapsADPasswordExpirationTime @sp | Out-Null
+                    }
+                    else {
+                        Set-ADComputer -Identity $c -Replace @{ 'msLAPS-PasswordExpirationTime' = 0 } @ad -ErrorAction Stop
+                    }
+                    $done += 'Windows LAPS'
+                }
+                if ($c.'ms-Mcs-AdmPwdExpirationTime' -or $c.'ms-Mcs-AdmPwd') {
+                    Set-ADComputer -Identity $c -Replace @{ 'ms-Mcs-AdmPwdExpirationTime' = 0 } @ad -ErrorAction Stop
+                    $done += 'LAPS legacy'
+                }
+                if ($done.Count -eq 0) { throw 'Komputer nie ma atrybutów LAPS w AD (albo brak uprawnień do ich odczytu).' }
+                $msg = 'Ustawiono natychmiastowe wygaśnięcie hasła (' + ($done -join ', ') + ')'
+                if ($P.ProcessNow) {
+                    $ic = @{
+                        ComputerName = $Target
+                        ErrorAction  = 'Stop'
+                        ScriptBlock  = {
+                            if (Get-Command Invoke-LapsPolicyProcessing -ErrorAction SilentlyContinue) { Invoke-LapsPolicyProcessing; 'Invoke-LapsPolicyProcessing' }
+                            else { & gpupdate.exe /target:computer /force | Out-Null; 'gpupdate' }
+                        }
+                    }
+                    if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
+                    if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
+                    try { $msg += '; na hoście uruchomiono ' + (Invoke-Command @ic) }
+                    catch { $msg += '; nie udało się wymusić przetwarzania na hoście: ' + $_.Exception.Message }
+                }
+                $msg + '.'
+            }
+        })
+}
+
+Register-Module -Key 'Rename' -Category 'Active Directory' -Title 'Zmiana nazwy komputerów' -Description 'Wsadowa zmiana nazw z autonumeracją i walidacją (NetBIOS: maks. 15 znaków). Kolumnę «Nowa nazwa» można edytować bezpośrednio w tabeli.' -Build {
+    param($m)
+    $m.Validate = {
+        param($m)
+        [void]$m.Grid.EndEdit()
+        $names = @{}
+        foreach ($r in $m.Table.Rows) {
+            $new = ([string]$r['Nowa nazwa']).Trim()
+            if ($new) { $names[$new] = 1 + [int]$names[$new] }
+        }
+        $valid = 0
+        foreach ($r in $m.Table.Rows) {
+            $old = [string]$r['Komputer']
+            $new = ([string]$r['Nowa nazwa']).Trim()
+            $problem = Test-NetBiosName -Name $new
+            if (-not $problem -and $new -eq ($old -split '\.')[0]) { $problem = 'Nazwa bez zmian' }
+            if (-not $problem -and $names[$new] -gt 1) { $problem = 'Nazwa powtarza się na liście' }
+            if (-not $problem -and $script:UI.HostTable.Rows.Find($new)) { $problem = 'Taki komputer jest już na liście' }
+            if ($problem) { $r['Walidacja'] = $problem } else { $r['Walidacja'] = 'OK'; $valid++ }
+        }
+        return $valid
+    }
+    $row = Add-ToolbarRow $m
+    [void](Add-Button $row 'Wczytaj zaznaczone komputery' $m -Primary {
+            param($m)
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+            Reset-ResultTable -Module $m
+            foreach ($t in $targets) { Add-ResultRows -Module $m -Computer $t -Objects @([pscustomobject]@{ 'Nowa nazwa' = ''; 'Walidacja' = ''; 'Wynik' = '' }) }
+            $m.Grid.ReadOnly = $false
+            foreach ($c in $m.Grid.Columns) { $c.ReadOnly = ($c.DataPropertyName -ne 'Nowa nazwa') }
+            Resize-ResultColumns -Module $m
+        })
+    [void](Add-Label $row '   Prefiks:')
+    $m.Prefix = Add-TextBox $row 90 'PC-'
+    [void](Add-Label $row 'Start:')
+    $m.Start = Add-Numeric $row 0 99999 1 70
+    [void](Add-Label $row 'Cyfr:')
+    $m.Pad = Add-Numeric $row 1 8 3 50
+    [void](Add-Label $row 'Sufiks:')
+    $m.Suffix = Add-TextBox $row 70
+    [void](Add-Button $row 'Autonumeracja' $m {
+            param($m)
+            if ($m.Table.Rows.Count -eq 0) { Show-Warning 'Najpierw wczytaj zaznaczone komputery.'; return }
+            $n = [int]$m.Start.Value
+            $format = 'D' + [int]$m.Pad.Value
+            # Numeracja w kolejności widocznej w tabeli (z uwzględnieniem sortowania i filtra)
+            foreach ($drv in @($m.View | ForEach-Object { $_ })) {
+                $drv.Row['Nowa nazwa'] = ($m.Prefix.Text.Trim() + $n.ToString($format) + $m.Suffix.Text.Trim()).ToUpperInvariant()
+                $n++
+            }
+            [void](& $m.Validate $m)
+        })
+    $row2 = Add-ToolbarRow $m
+    [void](Add-Button $row2 'Sprawdź nazwy' $m {
+            param($m)
+            if ($m.Table.Rows.Count -eq 0) { Show-Warning 'Najpierw wczytaj zaznaczone komputery.'; return }
+            $valid = & $m.Validate $m
+            Write-Log "Poprawnych nowych nazw: $valid z $($m.Table.Rows.Count)."
+        })
+    $m.Restart = Add-CheckBox $row2 'Restart po zmianie (za 30 s)' $true
+    [void](Add-Button $row2 'Zmień nazwy' $m -Danger {
+            param($m)
+            if ($m.Table.Rows.Count -eq 0) { Show-Warning 'Najpierw wczytaj zaznaczone komputery.'; return }
+            $valid = & $m.Validate $m
+            if ($valid -eq 0) { Show-Warning 'Brak poprawnych nowych nazw – sprawdź kolumnę «Walidacja».'; return }
+            $per = @{}
+            $items = @()
+            foreach ($r in $m.Table.Rows) {
+                if ([string]$r['Walidacja'] -ne 'OK') { continue }
+                $old = [string]$r['Komputer']
+                $new = ([string]$r['Nowa nazwa']).Trim()
+                $per[$old] = @{ NewName = $new; Restart = $m.Restart.Checked; Credential = $null }
+                $items += "$old → $new"
+            }
+            $cred = Get-EffectiveCredential
+            if (-not $cred) {
+                $cred = Show-CredentialDialog -Message 'Zmiana nazwy komputera w domenie wymaga poświadczeń domenowych z prawem zmiany obiektu komputera (nie przechodzą przez WinRM automatycznie).'
+                if (-not $cred) { return }
+            }
+            foreach ($k in @($per.Keys)) { $per[$k].Credential = $cred }
+            $skipped = $m.Table.Rows.Count - $per.Count
+            $question = 'Zmienić nazwy komputerów?'
+            if ($skipped -gt 0) { $question += " (pominięte z powodu walidacji: $skipped)" }
+            if (-not (Confirm-Action $question $items)) { return }
+            Start-HostOperation -Module $m -Name 'Zmiana nazw' -Targets @($per.Keys) -PerTarget $per -Output Log -ScriptBlock {
+                param($P)
+                $rp = @{ NewName = $P.NewName; DomainCredential = $P.Credential; Force = $true; ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
+                Rename-Computer @rp
+                if ($P.Restart) {
+                    & (Join-Path $env:SystemRoot 'System32\shutdown.exe') /r /t 30 /d p:4:2 /c ('Zmiana nazwy komputera na ' + $P.NewName) | Out-Null
+                    "Zmieniono nazwę na $($P.NewName) – restart za 30 s."
+                }
+                else { "Zmieniono nazwę na $($P.NewName) – zmiana zadziała po restarcie." }
+            } -OnResult {
+                param($m, $r)
+                $row = $null
+                foreach ($x in $m.Table.Rows) { if ([string]$x['Komputer'] -eq $r.Target) { $row = $x; break } }
+                if (-not $row) { return }
+                if ($r.Ok) {
+                    $row['Wynik'] = 'Zmieniono'
+                    Rename-HostRow -OldName $r.Target -NewName ([string]$row['Nowa nazwa']).Trim()
+                }
+                else { $row['Wynik'] = 'Błąd – ' + ((@($r.Errors)) -join ' | ') }
+            }
+        })
+    [void](Add-Label $row2 'Komputery muszą być włączone; po zmianie nazwy lista po lewej jest aktualizowana.' -Hint)
+}
+#endregion
+
+#region Okno główne
+function Update-CredentialLabel {
+    $label = $script:UI.CredLabel
+    if ($script:State.UseCurrent -or -not $script:State.Credential) {
+        $label.Text = "Działam jako: $env:USERDOMAIN\$env:USERNAME"
+        $label.ForeColor = [System.Drawing.Color]::FromArgb(40, 40, 40)
+    }
+    else {
+        $label.Text = "Działam jako: $($script:State.Credential.UserName) (poświadczenia alternatywne)"
+        $label.ForeColor = [System.Drawing.Color]::DarkRed
+    }
+}
+
+function New-TopBar {
+    $hm = $script:UI.Modules['Hosts']
+    $bar = New-FlowRow
+    $bar.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 4)
+    $bar.BackColor = [System.Drawing.Color]::FromArgb(236, 241, 248)
+
+    $chk = Add-CheckBox -Parent $bar -Text 'Bieżący użytkownik' -Checked $true
+    $script:UI.CredCurrent = $chk
+    $btnCred = New-PlainButton -Parent $bar -Text 'Inne poświadczenia…'
+    $lbl = Add-Label -Parent $bar -Text ''
+    $lbl.Margin = New-Object System.Windows.Forms.Padding(6, 7, 24, 3)
+    $script:UI.CredLabel = $lbl
+
+    Register-ControlHandler -Control $btnCred -EventName 'Click' -Module $hm -Action {
+        $cred = Show-CredentialDialog -UserName $(if ($script:State.Credential) { $script:State.Credential.UserName } else { '' })
+        if (-not $cred) { return }
+        $script:State.Credential = $cred
+        $script:State.UseCurrent = $false
+        $script:UI.CredCurrent.Checked = $false
+        Update-CredentialLabel
+        Write-Log "Ustawiono poświadczenia alternatywne: $($cred.UserName)" -Module ''
+    }
+    Register-ControlHandler -Control $chk -EventName 'CheckedChanged' -Module $hm -Action {
+        param($m, $s)
+        if (-not $s.Checked -and -not $script:State.Credential) {
+            $cred = Show-CredentialDialog
+            if (-not $cred) { $s.Checked = $true; return }
+            $script:State.Credential = $cred
+            Write-Log "Ustawiono poświadczenia alternatywne: $($cred.UserName)" -Module ''
+        }
+        $script:State.UseCurrent = $s.Checked
+        Update-CredentialLabel
+    }
+
+    [void](Add-Label -Parent $bar -Text 'Równolegle:')
+    $numThrottle = Add-Numeric -Parent $bar -Minimum 1 -Maximum 64 -Value ([int]$script:Settings.ThrottleLimit) -Width 55
+    $numThrottle.add_ValueChanged({ param($s, $e) try { Set-EngineThrottle -Limit ([int]$s.Value) } catch { } })
+    [void](Add-Label -Parent $bar -Text 'Limit połączenia (s):')
+    $numTimeout = Add-Numeric -Parent $bar -Minimum 5 -Maximum 300 -Value ([int]$script:Settings.TimeoutSec) -Width 55
+    $numTimeout.add_ValueChanged({ param($s, $e) $script:Settings.TimeoutSec = [int]$s.Value })
+    [void](Add-Label -Parent $bar -Text 'Kontroler domeny:')
+    $txtDc = Add-TextBox -Parent $bar -Width 150 -Text ([string]$script:Settings.DomainController)
+    $txtDc.add_TextChanged({ param($s, $e) $script:Settings.DomainController = $s.Text.Trim() })
+    $tip = New-Object System.Windows.Forms.ToolTip
+    $tip.SetToolTip($txtDc, 'Opcjonalnie: kontroler domeny dla operacji AD (puste = wybór automatyczny).')
+    $tip.SetToolTip($numThrottle, 'Liczba hostów obsługiwanych jednocześnie.')
+    $tip.SetToolTip($numTimeout, 'Czas oczekiwania na nawiązanie połączenia WinRM z hostem.')
+    $script:UI.ToolTip = $tip
+    Update-CredentialLabel
+    return $bar
+}
+
+function New-LogPanel {
+    $panel = New-Object System.Windows.Forms.Panel
+    $head = New-FlowRow
+    [void](Add-Label -Parent $head -Text 'Dziennik operacji' -Bold)
+    $btnClear = New-PlainButton -Parent $head -Text 'Wyczyść'
+    $btnClear.add_Click({ try { $script:UI.LogBox.Clear() } catch { } })
+    $btnOpen = New-PlainButton -Parent $head -Text 'Otwórz plik dziennika'
+    $btnOpen.add_Click({
+            try {
+                if (Test-Path -LiteralPath $script:App.LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:App.LogFile) }
+                else { Show-Warning 'Plik dziennika jeszcze nie istnieje.' }
+            }
+            catch { Show-Error 'Nie można otworzyć pliku dziennika.' $_ }
+        })
+    [void](Add-Label -Parent $head -Text $script:App.LogFile -Hint)
+    $box = New-Object System.Windows.Forms.RichTextBox
+    $box.ReadOnly = $true
+    $box.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 252)
+    $box.Font = $script:UI.FontMono
+    $box.WordWrap = $false
+    $box.DetectUrls = $false
+    $box.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $script:UI.LogBox = $box
+    Add-DockStack -Parent $panel -Top @($head) -Fill $box
+    return $panel
+}
+
+function New-StatusStrip {
+    $strip = New-Object System.Windows.Forms.StatusStrip
+    $label = New-Object System.Windows.Forms.ToolStripStatusLabel
+    $label.Spring = $true
+    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $label.Text = 'Gotowe'
+    $progress = New-Object System.Windows.Forms.ToolStripProgressBar
+    $progress.Size = New-Object System.Drawing.Size(220, 16)
+    $progress.Visible = $false
+    $cancel = New-Object System.Windows.Forms.ToolStripButton
+    $cancel.Text = 'Anuluj operacje'
+    $cancel.ForeColor = [System.Drawing.Color]::DarkRed
+    $cancel.Enabled = $false
+    $cancel.add_Click({ try { Stop-AllOperations } catch { } })
+    [void]$strip.Items.Add($label)
+    [void]$strip.Items.Add($progress)
+    [void]$strip.Items.Add($cancel)
+    $script:UI.StatusLabel = $label
+    $script:UI.StatusProgress = $progress
+    $script:UI.StatusCancel = $cancel
+    return $strip
+}
+
+function New-ModuleTree {
+    $tree = New-Object System.Windows.Forms.TreeView
+    $tree.HideSelection = $false
+    $tree.FullRowSelect = $true
+    $tree.ShowLines = $false
+    $tree.ShowNodeToolTips = $true
+    $tree.ItemHeight = 24
+    $tree.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $tree.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 251)
+    # Czcionka drzewa pogrubiona (kategorie), moduły zwykłą - inaczej pogrubione etykiety byłyby przycinane
+    $tree.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
+    $regular = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    foreach ($category in $script:UI.Categories) {
+        $defs = @($script:UI.ModuleDefs | Where-Object { $_.Category -eq $category })
+        if ($defs.Count -eq 0) { continue }
+        $catNode = $tree.Nodes.Add($category)
+        $catNode.ForeColor = [System.Drawing.Color]::FromArgb(30, 60, 110)
+        foreach ($d in $defs) {
+            $node = $catNode.Nodes.Add($d.Title)
+            $node.Tag = $d.Key
+            $node.NodeFont = $regular
+            $node.ToolTipText = $d.Description
+        }
+    }
+    $tree.ExpandAll()
+    $tree.add_AfterSelect({
+            param($s, $e)
+            try {
+                if ($e.Node.Tag) { Show-Module -Key ([string]$e.Node.Tag) }
+                elseif ($e.Node.Nodes.Count -gt 0) { $s.SelectedNode = $e.Node.Nodes[0] }
+            }
+            catch {
+                Write-Log "Nie udało się otworzyć modułu: $($_.Exception.Message)" 'ERROR' -Module ''
+                Show-Error 'Nie udało się otworzyć modułu.' $_
+            }
+        })
+    $script:UI.Tree = $tree
+    return $tree
+}
+
+function Select-ModuleNode([string]$Key) {
+    foreach ($cat in $script:UI.Tree.Nodes) {
+        foreach ($node in $cat.Nodes) {
+            if ([string]$node.Tag -eq $Key) { $script:UI.Tree.SelectedNode = $node; return $true }
+        }
+    }
+    return $false
+}
+
+function New-MainForm {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Domain Ops $($script:AppVersion) – zdalna administracja komputerami w domenie"
+    $form.Font = $script:UI.Font
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.MinimumSize = New-Object System.Drawing.Size(1100, 650)
+    $form.Size = New-Object System.Drawing.Size([Math]::Max(1100, [int]$script:Settings.WindowWidth), [Math]::Max(650, [int]$script:Settings.WindowHeight))
+    if ($script:Settings.WindowMaximized) { $form.WindowState = [System.Windows.Forms.FormWindowState]::Maximized }
+    try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $env:SystemRoot 'System32\mmc.exe')) } catch { }
+    $script:UI.Form = $form
+
+    $hostPanel = New-HostPanel
+    $topBar = New-TopBar
+    $status = New-StatusStrip
+    $logPanel = New-LogPanel
+    $tree = New-ModuleTree
+
+    $content = New-Object System.Windows.Forms.Panel
+    $content.BackColor = [System.Drawing.SystemColors]::Window
+    $script:UI.ContentHost = $content
+
+    $splitNav = New-Object System.Windows.Forms.SplitContainer
+    $splitNav.Orientation = [System.Windows.Forms.Orientation]::Vertical
+    $splitNav.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel1
+    $splitNav.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $tree.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $splitNav.Panel1.Controls.Add($tree)
+    $content.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $splitNav.Panel2.Controls.Add($content)
+
+    $splitMain = New-Object System.Windows.Forms.SplitContainer
+    $splitMain.Orientation = [System.Windows.Forms.Orientation]::Vertical
+    $splitMain.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel1
+    $splitMain.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $hostPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $splitMain.Panel1.Controls.Add($hostPanel)
+    $splitMain.Panel2.Controls.Add($splitNav)
+
+    $splitLog = New-Object System.Windows.Forms.SplitContainer
+    $splitLog.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+    $splitLog.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel2
+    $splitLog.Panel1.Controls.Add($splitMain)
+    $logPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $splitLog.Panel2.Controls.Add($logPanel)
+
+    Add-DockStack -Parent $form -Top @($topBar) -Fill $splitLog -Bottom @($status)
+
+    $script:UI.SplitMain = $splitMain
+    $script:UI.SplitNav = $splitNav
+    $script:UI.SplitLog = $splitLog
+
+    # Timery: odbiór wyników operacji w tle i czyszczenie schowka z haseł
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 200
+    $timer.add_Tick({ try { Update-Operations } catch { } })
+    $script:Engine.Timer = $timer
+    $clipTimer = New-Object System.Windows.Forms.Timer
+    $clipTimer.add_Tick({ try { $script:Clipboard.Timer.Stop(); Clear-ClipboardSecret } catch { } })
+    $script:Clipboard.Timer = $clipTimer
+
+    $form.add_Shown({
+            param($s, $e)
+            # Rozmiary paneli ustawiane dopiero po pokazaniu okna (wcześniej kontenery mają rozmiar domyślny)
+            try {
+                $script:UI.SplitLog.SplitterDistance = [Math]::Max(200, $script:UI.SplitLog.Height - 190)
+                $script:UI.SplitLog.Panel2MinSize = 80
+            }
+            catch { }
+            try {
+                $script:UI.SplitMain.SplitterDistance = 430
+                $script:UI.SplitMain.Panel1MinSize = 320
+            }
+            catch { }
+            try {
+                $script:UI.SplitNav.SplitterDistance = 220
+                $script:UI.SplitNav.Panel1MinSize = 160
+            }
+            catch { }
+            Write-Log ("Uruchomiono {0} {1} jako {2}\{3} (PowerShell {4})." -f $script:App.Name, $script:AppVersion, $env:USERDOMAIN, $env:USERNAME, $PSVersionTable.PSVersion) -Module ''
+            if (-not (Select-ModuleNode -Key ([string]$script:Settings.LastModule))) { [void](Select-ModuleNode -Key 'Connectivity') }
+            if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+                Write-Log 'Brak modułu ActiveDirectory (RSAT) – listę komputerów dodaj ręcznie lub z pliku; moduły AD będą niedostępne.' 'WARN' -Module ''
+            }
+        })
+
+    $form.add_FormClosing({
+            param($s, $e)
+            try {
+                if (@($script:Engine.Operations).Count -gt 0) {
+                    if (-not (Confirm-Action 'Trwają operacje w tle. Przerwać je i zamknąć program?')) { $e.Cancel = $true; return }
+                    Stop-AllOperations
+                }
+                $script:Settings.WindowMaximized = ($s.WindowState -eq [System.Windows.Forms.FormWindowState]::Maximized)
+                if ($s.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
+                    $script:Settings.WindowWidth = $s.Width
+                    $script:Settings.WindowHeight = $s.Height
+                }
+                $script:Settings.SearchBase = $script:UI.HostSearchBase.Text.Trim()
+                $script:Settings.NameFilter = $script:UI.HostNameFilter.Text.Trim()
+                $script:Settings.OnlyEnabled = $script:UI.HostOnlyEnabled.Checked
+                Export-Settings
+            }
+            catch { }
+        })
+    return $form
+}
+#endregion
+
+#region Uruchomienie
+Import-Settings
+try {
+    if (-not (Test-Path -LiteralPath $script:App.LogDir)) { New-Item -ItemType Directory -Path $script:App.LogDir -Force | Out-Null }
+}
+catch { }
+
+$mainForm = New-MainForm
+try {
+    [void]$mainForm.ShowDialog()
+}
+finally {
+    Close-Engine
+    Clear-ClipboardSecret
+    $mainForm.Dispose()
+}
+#endregion
