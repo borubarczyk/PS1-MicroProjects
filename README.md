@@ -8,7 +8,7 @@ Zbiór mikroprojektów PowerShell wspomagających codzienną administrację Acti
 - RSAT ActiveDirectory (moduł `ActiveDirectory`) dla wszystkich skryptów zaczynających się od `AD-`.
 - Uprawnienia administracyjne odpowiadające operacji (np. tworzenie OU, modyfikacja NTFS, odczyt dziennika Security, zdalne polecenia).
 - Sesja desktopowa w trybie STA dla narzędzi WinForms/WPF: `powershell.exe -STA -File .\NazwaSkryptu.ps1`.
-- Dla zdalnych operacji (`AD-ManagerDiamond.ps1`, `AD-RDP-LoginEvents.ps1`) włączony WinRM/WMI na hostach docelowych.
+- Dla zdalnych operacji (`AD-ManagerDiamond.ps1`, `AD-RDP-LoginEvents.ps1`) włączony WinRM/WMI na hostach docelowych. `AD-ManagerDiamond.ps1` działa w Windows PowerShell 5.1 (uruchomiony z PowerShell 7 sam przełączy się na `powershell.exe`).
 
 ## Jak uruchomić skrypt
 
@@ -46,8 +46,9 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | `%TEMP%\DisabledUsersGroupsBackup.csv` | `AD-RemoveDisabledUsersFromGroups.ps1` | Kopia członkostw w grupach przed usunięciem. |
 | `%TEMP%\PC-CheckHashFoldersIntegrity.log` | `PC-CheckHashFoldersIntegrity.ps1` | Log diagnostyczny porównania. |
 | `%APPDATA%\CyberGenPro\CyberGenConfig.json`, `%TEMP%\CyberGenHistory.json` | `PasswordGenerator.ps1` | Ustawienia generatora oraz historia haseł z ostatnich 24 h (zapisana jawnym tekstem). |
-| `%APPDATA%\AD-ManagerDiamond\settings.json` | `AD-ManagerDiamond.ps1` | Ustawienia: OU i filtr listy komputerów, kontroler domeny, liczba równoległych hostów, limit połączenia, ostatni moduł, rozmiar okna (bez poświadczeń). |
-| `%LOCALAPPDATA%\AD-ManagerDiamond\Logs\DomainOps_RRRRMMDD.log` | `AD-ManagerDiamond.ps1` | Dziennik wszystkich operacji (kto, co, na których hostach, wynik). |
+| `%APPDATA%\AD-ManagerDiamond\settings.json` | `AD-ManagerDiamond.ps1` | Ustawienia: OU i filtry list komputerów i użytkowników, kontroler domeny, liczba równoległych operacji, limit połączenia, próg nieaktywności, ostatnia przestrzeń i moduły, rozmiar okna, panel dziennika i szczegółów (bez poświadczeń). |
+| `AD-ManagerDiamond.Modules\*.ps1` (katalog skryptu) | `AD-ManagerDiamond.ps1` | Opcjonalne własne moduły wczytywane przy starcie. |
+| `%LOCALAPPDATA%\AD-ManagerDiamond\Logs\DomainOps_RRRRMMDD.log` | `AD-ManagerDiamond.ps1` | Dziennik wszystkich operacji (kto, co, na których komputerach/kontach, wynik). |
 | `%SystemRoot%\Temp\DomainOps` na hostach docelowych | `AD-ManagerDiamond.ps1` | Kopiowane instalatory i ich logi, skrypt i log instalacji aktualizacji (`WU.log`); zadanie Harmonogramu `DomainOps-WindowsUpdate`. |
 | `LICENSE` | — | Informacja o licencji zbioru. |
 
@@ -63,7 +64,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | `AD-DeleteNewAccoutsGUI.ps1` | Lista kont utworzonych w ostatnich X minutach; pozwala zaznaczyć i usunąć albo (bezpieczniej) wyłączyć konta. Log trafia na Pulpit. |
 | `AD-DomainGroupTree.ps1` | Funkcja `Get-ADDomainGroupTree` generująca raport HTML z drzewem zagnieżdżeń grup AD (wyszukiwarka, rozwijanie/zwijanie), opcjonalnie z członkami i opisami. Wykrywa rzeczywiste pętle zagnieżdżeń. |
 | `AD-LastActiviti.ps1` | Interfejs WPF z raportem ostatniego logowania użytkowników (filtr nieaktywności 1/3/6/12 miesięcy, wyszukiwanie po nazwie/loginie/mieście, tylko aktywne), wyłączanie zaznaczonego konta i eksport widoku do CSV. |
-| `AD-ManagerDiamond.ps1` | Kompleksowe narzędzie „Domain Ops” do zdalnej administracji komputerami domenowymi: 24 moduły w 7 kategoriach, operacje wykonywane w tle i równolegle na wielu hostach, wyniki w tabeli z filtrem i eksportem CSV — szczegóły poniżej. |
+| `AD-ManagerDiamond.ps1` | Centrum administracji domeną „Domain Ops” (WPF, ciemny motyw): trzy przestrzenie robocze — zarządzanie zdalne komputerami, użytkownicy AD i komputery AD — z 41 modułami, m.in. weryfikacją i czyszczeniem profili użytkowników względem AD, audytem bezpieczeństwa, raportami kont i źródłem blokad. Operacje w tle i równolegle, wyniki z filtrem, eksportem CSV/HTML i akcjami pod prawym przyciskiem; możliwość dodawania własnych modułów — szczegóły poniżej. |
 | `AD-MoveDisabledUsersGUI.ps1` | Wyszukuje wyłączone konta spoza bazowego OU, pozwala je zaznaczyć i przenieść do wybranego OU (z opcją usunięcia z grup niechronionych). Ma przeglądarkę drzewa OU, tryb WhatIf (domyślnie włączony) i zakładkę ustawień z wyjątkami. |
 | `AD-NTFS-AuditGUI.ps1` | Audytor NTFS w WPF: rekursywnie czyta ACL, rozpoznaje typ podmiotu (użytkownik/grupa), wskazuje foldery z uprawnieniami nadanymi bezpośrednio użytkownikom; widok tabeli i drzewa, filtry, eksport CSV/XLSX. |
 | `AD-NTFS-BulkGroupPermissions.ps1` | WinForms do hurtowego nadawania uprawnień NTFS wielu grupom (odczyt … pełna kontrola, zakres dziedziczenia, opcje purge/zablokowania dziedziczenia, WhatIf). Uprawnienia nadawane są po SID grupy. |
@@ -81,53 +82,114 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 
 ## AD-ManagerDiamond — Domain Ops
 
-Uruchomienie: `powershell.exe -STA -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1` (skrypt sam przełączy się w tryb STA, jeśli trzeba; działa też w PowerShell 7 na Windows).
+Uruchomienie: `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1`. Interfejs jest napisany w WPF dla Windows PowerShell 5.1 — skrypt sam uruchomi się ponownie w trybie STA, a z PowerShell 7 przełączy się na `powershell.exe`.
+
+**Przestrzenie robocze** (przełącznik na górnym pasku, skróty `Ctrl+1…3`):
+
+| Przestrzeń | Lista po lewej | Do czego służy |
+| --- | --- | --- |
+| **Zarządzanie zdalne** | komputery | Operacje na komputerach przez PowerShell Remoting (WinRM): diagnostyka, profile i sesje użytkowników, grupy i konta lokalne, usługi, procesy, zdarzenia, oprogramowanie, aktualizacje, bezpieczeństwo, udziały. |
+| **Użytkownicy AD** | konta użytkowników | Konta w Active Directory: szczegóły, hasła i blokady, stan konta, atrybuty, grupy, raporty i źródło blokad. |
+| **Komputery AD** | komputery | Konta komputerów w AD: informacje i kanał zaufania, LAPS, klucze BitLocker, zmiana nazw, grupy, raporty. |
 
 **Układ okna**
 
-- **Lewy panel — komputery docelowe.** Lista z Active Directory (OU wybierane z drzewa, filtr nazwy z `*`, opcja „tylko włączone konta”), dopisywana ręcznie albo wczytywana z pliku TXT/CSV. Szybkie wyszukiwanie, zaznaczanie checkboxami, spacją, kliknięciem nagłówka lub z menu kontekstowego. Operacje dotyczą zaznaczonych komputerów.
-- **Drzewo modułów** pogrupowanych w kategorie; ostatnio używany moduł otwiera się przy starcie.
-- **Tabela wyników** w każdym module: sortowanie po kolumnie, filtr po wszystkich kolumnach, eksport widocznych wierszy do CSV (UTF-8, separator z ustawień regionalnych — otwiera się poprawnie w Excelu), kopiowanie do schowka, podgląd szczegółów wiersza dwuklikiem. Akcje typu „zatrzymaj usługę”, „usuń regułę” działają na wierszach zaznaczonych w tabeli — każdy na właściwym hoście.
-- **Pasek górny:** bieżący użytkownik albo poświadczenia alternatywne (używane także w poleceniach AD), liczba hostów obsługiwanych równolegle, limit czasu połączenia WinRM, opcjonalny kontroler domeny.
-- **Dziennik operacji** na dole (kolorowany, równolegle zapisywany do pliku) i **pasek stanu** z postępem oraz przyciskiem anulowania.
+- **Lewy panel — obiekty docelowe.** Komputery: z AD (OU z drzewa, filtr nazwy z `*`, tylko włączone), wpisane ręcznie albo z pliku TXT/CSV. Użytkownicy: wyszukiwanie w AD (login, nazwisko, e-mail, gwiazdka), stan konta (aktywne / wyłączone / zablokowane), OU, loginy wpisane ręcznie lub z pliku. Zaznaczanie polami wyboru (także kilku wierszy naraz i spacją), szybkie wyszukiwanie, kolorowa kropka stanu (np. wynik testu łączności, konto zablokowane), menu kontekstowe (pulpit zdalny, konsola zarządzania, usługi, podgląd zdarzeń, `C$`, kopiowanie nazw / adresów e-mail).
+- **Nawigacja modułów** pogrupowanych w kategorie — każda przestrzeń pamięta ostatnio otwarty moduł; kropka przy module oznacza trwającą operację.
+- **Moduł:** nagłówek z opisem, panel parametrów (zwijany), kafelki z podsumowaniem (np. kandydaci do usunięcia, średni wynik audytu), tabela wyników z sortowaniem, filtrem po wszystkich kolumnach (`Ctrl+F`, słowo z minusem wyklucza wiersze), kolorowymi „pigułkami” stanu, panelem szczegółów wiersza, menu pod prawym przyciskiem myszy (akcje modułu, kopiowanie komórki/wierszy) oraz eksportem do **CSV** lub **raportu HTML**. `F5` uruchamia główną akcję modułu.
+- **Górny pasek:** konto używane do operacji (bieżące albo alternatywne — także dla poleceń AD) i ustawienia (kontroler domeny, liczba równoległych operacji, limit połączenia WinRM, domyślny próg nieaktywności, foldery dziennika, ustawień i modułów).
+- **Dziennik operacji** (`Ctrl+L`, z licznikiem nowych ostrzeżeń), **pasek stanu** z postępem i przyciskiem „Przerwij” oraz **powiadomienia** w rogu okna.
 
-Wszystkie operacje wykonywane są w tle (pula wątków PowerShell), równolegle dla wielu hostów — okno nie zawiesza się, a wyniki pojawiają się na bieżąco. Host niedostępny lub zwracający błąd pojawia się w tabeli jako wiersz ze statusem „Błąd” i opisem przyczyny. Operacje zmieniające stan wymagają potwierdzenia z listą hostów/obiektów.
+Wszystkie operacje wykonywane są w tle (pula wątków PowerShell), równolegle dla wielu komputerów/kont — okno nie zawiesza się, a wyniki pojawiają się na bieżąco. Niedostępny komputer lub błąd pojawia się w tabeli jako wiersz „Błąd” z przyczyną. Operacje zmieniające stan wymagają potwierdzenia z listą obiektów (przy niszczących domyślnym przyciskiem jest „Anuluj”).
 
-**Moduły**
+**Profile użytkowników — co można usunąć.** Moduł *Profile użytkowników* zbiera profile z zaznaczonych komputerów (ostatnie użycie z `ProfileList`, opcjonalnie rozmiar) i sprawdza każde konto w AD przez ADSI (bez RSAT). Kandydaci do usunięcia: konta **usunięte z AD**, **wyłączone**, **wygasłe**, usunięte konta lokalne, profile **tymczasowe/uszkodzone** oraz — opcjonalnie — profile nieużywane dłużej niż N dni. Profile załadowane (użytkownik zalogowany) i systemowe nigdy nie są kandydatami. Przycisk *Zaznacz kandydatów* → *Usuń zaznaczone profile* usuwa profile przez `Win32_UserProfile` (folder i wpis w rejestrze), z potwierdzeniem pokazującym ścieżki, rozmiary i ostrzeżeniem, jeśli zaznaczono profil, który nie jest kandydatem.
+
+**Moduły — Zarządzanie zdalne**
 
 | Kategoria | Moduł | Możliwości |
 | --- | --- | --- |
-| Diagnostyka | Łączność | DNS, ping (czas), porty TCP (lista do edycji), test sesji PowerShell Remoting — wykonywane lokalnie. |
-| | Inwentaryzacja | Producent, model, numer seryjny, BIOS, system i kompilacja, procesor, RAM, dysk systemowy, zalogowany użytkownik, IP/MAC, data instalacji i ostatniego startu. |
-| | Zasilanie i uptime | Czas pracy, oczekujący restart (CBS, Windows Update, operacje na plikach, zmiana nazwy, SCCM); restart/wyłączenie z opóźnieniem i komunikatem, anulowanie zaplanowanego. |
-| Zdalne wykonanie | Polecenia | PowerShell lub cmd.exe (polskie znaki w wyniku cmd), szablony typowych poleceń, pełny wynik w podglądzie wiersza. |
-| | Instalacja oprogramowania | MSI/MSP/MSU/EXE: kopiowanie (udział ADMIN$ albo WinRM), cicha instalacja, kod wyjścia z opisem (np. 3010 = wymagany restart), log MSI, opcjonalne usunięcie instalatora. |
-| | Aktualizacja zasad grupy | `gpupdate` dla komputera i/lub użytkownika, z `/force` lub bez. |
-| System | Usługi | Filtr nazwy i stanu (m.in. „automatyczne, ale zatrzymane”), start/stop/restart, zmiana typu uruchamiania. |
-| | Procesy | Pamięć, właściciel, wiersz poleceń; kończenie zaznaczonych procesów. |
-| | Dyski | Zajętość; czyszczenie Windows\Temp, TEMP profili i Kosza (pliki starsze niż N dni) z raportem odzyskanego miejsca. |
-| | Dziennik zdarzeń | Dzienniki System/Application/Security, poziomy, ID zdarzeń, zakres godzin, limit na host. |
-| | Harmonogram zadań | Podgląd (opcjonalnie bez zadań \Microsoft\), uruchom/zatrzymaj/włącz/wyłącz/usuń, tworzenie prostych zadań SYSTEM (logowanie, start, codziennie, jednorazowo, na żądanie). |
-| | Sterowniki i urządzenia | Sterowniki PnP z filtrem oraz urządzenia zgłaszające problem w Menedżerze urządzeń. |
-| Oprogramowanie | Zainstalowane programy | Rejestr 64/32-bit i profili zalogowanych użytkowników, opcjonalnie aktualizacje i składniki systemowe; ciche odinstalowanie (MSI lub `QuietUninstallString`). |
-| | Windows Update | Wyszukiwanie dostępnych aktualizacji i historia (API Windows Update), instalacja przez zadanie SYSTEM z opcjonalnym restartem, podgląd postępu z logu — bez modułu PSWindowsUpdate. |
-| Bezpieczeństwo | Microsoft Defender | Stan ochrony i sygnatur, wykryte zagrożenia, aktualizacja sygnatur, szybki i pełny skan. |
-| | BitLocker | Stan woluminów (także na systemach bez modułu BitLocker), kopia kluczy odzyskiwania do AD, odczyt kluczy zapisanych w AD i kopiowanie hasła odzyskiwania. |
-| | Zapora Windows | Stan profili, reguły z portami/programami/adresami, włączanie/wyłączanie/usuwanie zaznaczonych, tworzenie reguł (grupa „Domain Ops”). |
-| | Certyfikaty komputera | Magazyny LocalMachine, filtr, wygasające w ciągu N dni, eksport zaznaczonych do `.cer`. |
-| | Lokalni administratorzy | Członkowie grupy wyznaczanej po SID (działa w każdym języku systemu, także z osieroconymi SID-ami), dodawanie i usuwanie; wbudowane konto Administrator i Domain Admins są chronione przed usunięciem. |
+| Diagnostyka | Łączność | DNS, ping, porty TCP, test sesji PowerShell — lokalnie; koloruje kropki na liście, przycisk „zaznacz tylko dostępne”. |
+| | Inwentaryzacja | Producent, model, numer seryjny, BIOS, system i kompilacja, procesor, RAM, dysk systemowy, TPM, Secure Boot, zalogowany użytkownik, IP/MAC, daty instalacji i startu. |
+| | Wydajność | Obciążenie procesora i pamięci, wolne miejsce, kolejka dysku, procesy zużywające najwięcej CPU i pamięci, ocena. |
+| | Zasilanie i uptime | Czas pracy, oczekujący restart (CBS, Windows Update, pliki, zmiana nazwy, SCCM); restart/wyłączenie z opóźnieniem i komunikatem, anulowanie. |
+| Użytkownicy i dostęp | Profile użytkowników | Weryfikacja profili względem AD, kandydaci do usunięcia, rozmiar, usuwanie (opis wyżej). |
+| | Sesje użytkowników | Zalogowani użytkownicy (konsola/RDP), bezczynność; wiadomość, rozłączenie, wylogowanie, podgląd sesji (shadow). |
+| | Grupy lokalne | Administratorzy, Użytkownicy pulpitu zdalnego, zarządzania zdalnego (WinRM), dziennika zdarzeń, kopii zapasowych — po SID (każdy język systemu); dodawanie (także wybór grup z AD) i usuwanie; wbudowany Administrator i Domain Admins chronione. |
 | | Konta lokalne | Stan, ostatnie logowanie, wiek hasła; włączanie, wyłączanie, ustawianie hasła. |
-| Udostępnianie | Udziały sieciowe | Podgląd (opcjonalnie z administracyjnymi), uprawnienia udziałów, tworzenie z uprawnieniami udziału i opcjonalnie NTFS, usuwanie (bez udziałów administracyjnych). |
-| Active Directory | Konto komputera | Informacje z AD, test i naprawa kanału zaufania, włączanie/wyłączanie, przenoszenie do OU, reset konta. |
-| | LAPS | Windows LAPS (także hasła szyfrowane) i LAPS legacy, wymuszenie zmiany hasła z opcjonalnym przetworzeniem zasad na hoście. |
-| | Zmiana nazwy komputerów | Wczytanie zaznaczonych, autonumeracja (prefiks, numer, liczba cyfr, sufiks), walidacja nazw NetBIOS i duplikatów, edycja w tabeli, opcjonalny restart. |
+| | Pulpit zdalny | Stan RDP, NLA, port, reguły zapory, członkowie grupy RDP; włączanie/wyłączanie RDP razem z zaporą, NLA. |
+| Zdalne wykonanie | Polecenia | PowerShell lub cmd.exe (polskie znaki), szablony typowych poleceń (DNS, Kerberos, gpresult, kanał zaufania, czas, DISM/SFC). |
+| | Instalacja oprogramowania | MSI/MSP/MSU/EXE: kopiowanie (ADMIN$ albo WinRM), cicha instalacja, kod wyjścia z opisem, log MSI. |
+| | Aktualizacja zasad grupy | `gpupdate` dla komputera i/lub użytkownika, opcjonalnie `/force`. |
+| System | Usługi | Filtr nazwy i stanu, start/stop/restart, typ uruchamiania (także z menu wiersza). |
+| | Procesy | Pamięć, właściciel, sesja, wiersz poleceń; kończenie procesów. |
+| | Dyski | Zajętość z oceną; czyszczenie Temp, TEMP profili, Kosza i pobranych aktualizacji z raportem odzyskanego miejsca. |
+| | Dziennik zdarzeń | Gotowe zestawy (nieoczekiwane wyłączenia, błędy dysków, awarie aplikacji, nieudane logowania, blokady, GPO, Windows Update) albo własne dzienniki/poziomy/ID. |
+| | Harmonogram zadań | Podgląd, uruchom/zatrzymaj/włącz/wyłącz/usuń, tworzenie prostych zadań SYSTEM. |
+| | Autostart | Klucze Run/RunOnce (komputer i zalogowani użytkownicy) i foldery Autostart; usuwanie wpisów. |
+| | Drukarki | Drukarki, sterowniki, porty, zadania w kolejce; czyszczenie kolejek, usuwanie, restart bufora wydruku. |
+| | Sterowniki i urządzenia | Sterowniki PnP z filtrem i urządzenia z problemami. |
+| Oprogramowanie | Zainstalowane programy | Rejestr 64/32-bit i profili zalogowanych; ciche odinstalowanie; „pokaż ten program na wszystkich komputerach”. |
+| | Windows Update | Dostępne aktualizacje, historia, **sprawdzenie obecności poprawek KB**, instalacja przez zadanie SYSTEM z opcjonalnym restartem, postęp z logu. |
+| Bezpieczeństwo | Szybki audyt bezpieczeństwa | Zapora, antywirus i sygnatury, BitLocker, SMBv1, NLA, UAC, LAPS, świeżość aktualizacji, oczekujący restart, Secure Boot, TPM, WDigest, ochrona LSA, LLMNR, konto Gość — wynik procentowy i lista problemów. |
+| | Microsoft Defender | Stan ochrony i sygnatur, zagrożenia, aktualizacja sygnatur, szybki i pełny skan. |
+| | BitLocker | Stan woluminów, kopia kluczy odzyskiwania do AD. |
+| | Zapora Windows | Profile, reguły z portami/programami/adresami, włączanie/wyłączanie/usuwanie, nowe reguły. |
+| | Certyfikaty komputera | Magazyny LocalMachine, ważność z oceną, wygasające w ciągu N dni, eksport `.cer`. |
+| Udostępnianie | Udziały sieciowe | Podgląd, uprawnienia, tworzenie (z uprawnieniami udziału i opcjonalnie NTFS), usuwanie. |
+
+**Moduły — Użytkownicy AD**
+
+| Kategoria | Moduł | Możliwości |
+| --- | --- | --- |
+| Konta | Szczegóły konta | Stan, kontakt, przełożony, logowania, hasło, wygaśnięcie, profil, OU, SID. |
+| | Hasło i blokada | Stan haseł i blokad; odblokowanie; reset hasła — **losowe, inne dla każdego konta** (widoczne jako wartości poufne, kopiowanie z czyszczeniem schowka) albo wpisane; wymuszenie zmiany przy logowaniu; „hasło nigdy nie wygasa”. |
+| | Stan konta | Włączanie i wyłączanie (z dopiskiem daty/autora/powodu w opisie i przeniesieniem do OU), data wygaśnięcia, przenoszenie do OU. |
+| | Edycja atrybutów | Odczyt i masowa zmiana atrybutów (stanowisko, dział, firma, biuro, telefony, e-mail, przełożony, extensionAttribute1–15…) z polami `{login}`, `{imie}`, `{nazwisko}`, `{nazwa}`. |
+| Grupy | Członkostwo w grupach | Grupy bezpośrednie i zagnieżdżone, dodawanie (wyszukiwarka grup), usuwanie, kopiowanie członkostwa z konta wzorcowego. |
+| Raporty | Raporty kont | Zablokowane, wyłączone, nieaktywne, nigdy nie logowane, hasło wygasa / wygasło / nigdy nie wygasa, konta wygasające, nowe, uprzywilejowane (`adminCount`); wyniki można zaznaczyć na liście kont i od razu wykonać na nich operacje. |
+| | Źródło blokady konta | Zdarzenia 4740 z emulatora PDC (lub wszystkich DC) — komputer, z którego przyszły błędne hasła; opcjonalnie 4771/4776 z adresem IP/stacją. |
+
+**Moduły — Komputery AD**
+
+| Kategoria | Moduł | Możliwości |
+| --- | --- | --- |
+| Konta komputerów | Konto komputera | Informacje, test i naprawa kanału zaufania, włączanie/wyłączanie, opis, przenoszenie do OU, reset, usuwanie, tworzenie nowych kont (pre-staging). |
+| | Zmiana nazwy komputerów | Autonumeracja, mapowanie z listy (np. z Excela), edycja w tabeli, walidacja NetBIOS i duplikatów, opcjonalny restart. |
+| | Członkostwo w grupach | Jak dla użytkowników — dla kont komputerów. |
+| Hasła i klucze | LAPS | Windows LAPS (także szyfrowane) i LAPS legacy, kopiowanie hasła (dwuklik), wymuszenie zmiany z przetworzeniem zasad. |
+| | Klucze BitLocker (AD) | Klucze zaznaczonych komputerów oraz **wyszukiwanie komputera po identyfikatorze klucza** z ekranu odzyskiwania. |
+| Raporty | Raporty komputerów | Nieaktywne, wyłączone, nowe, podsumowanie systemów, nieobsługiwane systemy, bez LAPS, bez klucza BitLocker w AD, serwery; zaznaczanie na liście, wyłączanie, przenoszenie, usuwanie. |
+
+**Rozbudowa — własne moduły.** Pliki `*.ps1` z folderu `AD-ManagerDiamond.Modules` (obok skryptu) są wczytywane przy starcie i mogą dodawać przestrzenie robocze oraz moduły bez zmiany głównego pliku (folder otworzysz z okna Ustawienia). Przykład:
+
+```powershell
+# AD-ManagerDiamond.Modules\Czas.ps1
+Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'TimeSync' -Title 'Synchronizacja czasu' -Icon 'E916' `
+    -Description 'Źródło czasu i przesunięcie zegara (w32tm).' -Build {
+    param($m)
+    $row = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row -Text 'Sprawdź' -Icon 'E72C' -Module $m -Primary -OnClick {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-HostOperation -Module $m -Name 'Czas' -Targets $targets -ScriptBlock {
+            param($P)
+            [pscustomobject]@{ 'Źródło' = (w32tm /query /source).Trim(); 'Czas' = Get-Date }
+        }
+    } | Out-Null
+}
+```
+
+`Register-Workspace -Key -Title -Icon -Target Computer|User|None` dodaje nową przestrzeń; `Start-HostOperation` (zdalnie lub `-Local`) i `Start-AdOperation` (moduł ActiveDirectory z gotową hashtablą `$ad`) uruchamiają operacje w tle.
 
 ## Uwagi bezpieczeństwa
 
 - Przed pierwszym użyciem na produkcji korzystaj z trybów podglądu (WhatIf / tryb testowy), które mają m.in. `AD-BulkUserCreator`, `AD-BulkOUGroupCreator`, `AD-BulkAddUsersToGroups`, `AD-NTFS-BulkGroupPermissions`, `AD-MoveDisabledUsersGUI`, `AD-SwapLogin` i `AD-UpdateUserTitleDepartment`.
 - `AD-DeleteNewAccoutsGUI` usuwa konta nieodwracalnie (poza przywróceniem z Kosza AD) — jeśli nie masz pewności, użyj przycisku wyłączenia konta.
 - „Resetuj konto” w module *Konto komputera* `AD-ManagerDiamond` działa jak polecenie z konsoli ADUC: ustawia hasło konta komputera na domyślne (nazwa komputera małymi literami, bez `$`); komputer trzeba potem ponownie dołączyć do domeny lub naprawić kanał zaufania.
-- `AD-ManagerDiamond` maskuje hasła LAPS i klucze odzyskiwania BitLocker w tabeli, eksporcie i kopiowaniu (do czasu zaznaczenia „Pokaż wartości poufne”), a hasło skopiowane przyciskiem „Kopiuj hasło…” usuwa ze schowka po 60 s. Zmiana nazwy komputera i naprawa kanału zaufania wymagają poświadczeń domenowych — program poprosi o nie, jeśli nie ustawiono poświadczeń alternatywnych.
+- `AD-ManagerDiamond` maskuje hasła LAPS, klucze odzyskiwania BitLocker i nowo wygenerowane hasła użytkowników w tabeli, panelu szczegółów, eksporcie CSV/HTML i kopiowaniu (do czasu zaznaczenia „Pokaż poufne”); nie są też przeszukiwane filtrem. Hasło skopiowane akcją „Kopiuj hasło…” jest usuwane ze schowka po 60 s. Zmiana nazwy komputera i naprawa kanału zaufania wymagają poświadczeń domenowych — program poprosi o nie, jeśli nie ustawiono poświadczeń alternatywnych.
+- Usuwanie profili w `AD-ManagerDiamond` jest nieodwracalne (folder profilu i wpis w rejestrze). Przed usunięciem sprawdź kolumnę „Ocena” — profile oznaczone jako kandydaci to m.in. konta usunięte/wyłączone/wygasłe w AD; nieużywane profile aktywnych kont są kandydatami tylko przy włączonej opcji. Profile zalogowanych użytkowników są zawsze pomijane.
+- Moduły z folderu `AD-ManagerDiamond.Modules` są wykonywane z uprawnieniami użytkownika programu — trzymaj tam tylko zaufane pliki.
 - `PasswordGenerator` i `AD-BulkUserCreator` przechowują wygenerowane hasła jawnym tekstem (historia w `%TEMP%`, kolumna w siatce/schowek) — czyść historię i schowek po pracy.
 
 ## Kontakt
