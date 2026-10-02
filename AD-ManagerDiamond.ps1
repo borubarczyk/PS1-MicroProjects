@@ -95,6 +95,7 @@ $script:Settings = [ordered]@{
     UserFilter       = 0
     DomainController = ''
     ThrottleLimit    = 16
+    AdThrottleLimit  = 4
     TimeoutSec       = 20
     InactiveDays     = 90
     LastWorkspace    = 'Remote'
@@ -144,6 +145,7 @@ $script:UI = @{
 # Silnik operacji w tle
 $script:Engine = @{
     Pool       = $null
+    AdPool     = $null
     Operations = New-Object System.Collections.ArrayList
     Timer      = $null
     NextId     = 1
@@ -436,6 +438,7 @@ function Import-Settings {
     # Wartości spoza zakresu (np. ręcznie edytowany plik) sprowadzamy do bezpiecznych granic
     $s = $script:Settings
     try { $s.ThrottleLimit = [Math]::Min(64, [Math]::Max(1, [int]$s.ThrottleLimit)) } catch { $s.ThrottleLimit = 16 }
+    try { $s.AdThrottleLimit = [Math]::Min(16, [Math]::Max(1, [int]$s.AdThrottleLimit)) } catch { $s.AdThrottleLimit = 4 }
     try { $s.TimeoutSec = [Math]::Min(300, [Math]::Max(5, [int]$s.TimeoutSec)) } catch { $s.TimeoutSec = 20 }
     try { $s.InactiveDays = [Math]::Min(3650, [Math]::Max(1, [int]$s.InactiveDays)) } catch { $s.InactiveDays = 90 }
     try { $s.UserFilter = [Math]::Min(3, [Math]::Max(0, [int]$s.UserFilter)) } catch { $s.UserFilter = 0 }
@@ -2813,24 +2816,31 @@ function Show-SettingsDialog {
       <ColumnDefinition Width="*"/>
       <ColumnDefinition Width="14"/>
       <ColumnDefinition Width="*"/>
-      <ColumnDefinition Width="14"/>
-      <ColumnDefinition Width="*"/>
     </Grid.ColumnDefinitions>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="12"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
     <StackPanel>
       <TextBlock Text="Równoległe operacje" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
       <TextBox x:Name="stThrottle" HorizontalContentAlignment="Right"/>
     </StackPanel>
     <StackPanel Grid.Column="2">
+      <TextBlock Text="Równoległe zapytania AD" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+      <TextBox x:Name="stAdThrottle" HorizontalContentAlignment="Right"/>
+    </StackPanel>
+    <StackPanel Grid.Row="2">
       <TextBlock Text="Limit połączenia (s)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
       <TextBox x:Name="stTimeout" HorizontalContentAlignment="Right"/>
     </StackPanel>
-    <StackPanel Grid.Column="4">
+    <StackPanel Grid.Row="2" Grid.Column="2">
       <TextBlock Text="Nieaktywność (dni)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
       <TextBox x:Name="stDays" HorizontalContentAlignment="Right"/>
     </StackPanel>
   </Grid>
   <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"
-             Text="Równoległe operacje: 1–64. Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili."/>
+             Text="Równoległe operacje na komputerach: 1–64. Zapytania AD: 1–16 – usługa ADWS na kontrolerze domeny odrzuca zbyt wiele żądań naraz («A connection to the directory … was unavailable»), więc przy takich błędach zmniejsz tę wartość (przejściowe błędy są i tak ponawiane). Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili."/>
   <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
   <WrapPanel>
     <Button x:Name="stLogs" Margin="0,0,8,6"/>
@@ -2842,7 +2852,7 @@ function Show-SettingsDialog {
 '@
     $w = New-Dialog -Title 'Ustawienia' -Subtitle 'Połączenia, wydajność i pliki programu.' -Body $body -Icon 'E713' -OkText 'Zapisz' -Width 560 -Validate {
         param($w)
-        foreach ($pair in @(@('stThrottle', 1, 64, 'Równoległe operacje'), @('stTimeout', 5, 300, 'Limit połączenia'), @('stDays', 1, 3650, 'Nieaktywność'))) {
+        foreach ($pair in @(@('stThrottle', 1, 64, 'Równoległe operacje'), @('stAdThrottle', 1, 16, 'Równoległe zapytania AD'), @('stTimeout', 5, 300, 'Limit połączenia'), @('stDays', 1, 3650, 'Nieaktywność'))) {
             $v = 0
             if (-not [int]::TryParse($w.FindName($pair[0]).Text.Trim(), [ref]$v) -or $v -lt $pair[1] -or $v -gt $pair[2]) {
                 Show-Warning ('{0}: podaj liczbę z zakresu {1}–{2}.' -f $pair[3], $pair[1], $pair[2])
@@ -2853,6 +2863,7 @@ function Show-SettingsDialog {
     }
     $w.FindName('stDc').Text = [string]$script:Settings.DomainController
     $w.FindName('stThrottle').Text = [string]$script:Settings.ThrottleLimit
+    $w.FindName('stAdThrottle').Text = [string]$script:Settings.AdThrottleLimit
     $w.FindName('stTimeout').Text = [string]$script:Settings.TimeoutSec
     $w.FindName('stDays').Text = [string]$script:Settings.InactiveDays
     $w.FindName('stLogs').Content = New-IconContent -Text 'Folder dziennika' -Icon 'E838'
@@ -2866,7 +2877,7 @@ function Show-SettingsDialog {
     $script:Settings.DomainController = $w.FindName('stDc').Text.Trim()
     $script:Settings.TimeoutSec = [int]$w.FindName('stTimeout').Text.Trim()
     $script:Settings.InactiveDays = [int]$w.FindName('stDays').Text.Trim()
-    Set-EngineThrottle ([int]$w.FindName('stThrottle').Text.Trim())
+    Set-EngineThrottle ([int]$w.FindName('stThrottle').Text.Trim()) ([int]$w.FindName('stAdThrottle').Text.Trim())
     Export-Settings
     return $true
 }
@@ -4265,7 +4276,7 @@ function Initialize-ColumnFilterUi {
     $popup.StaysOpen = $false
     $popup.AllowsTransparency = $true
     $popup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
-    $popup.PopupAnimation = [System.Windows.Controls.Primitives.PopupAnimation]::Fade
+    $popup.PopupAnimation = [System.Windows.Controls.Primitives.PopupAnimation]::None
     $ui.Popup = $popup
     $script:ColumnFilterUi = $ui
     $ui.fList.AddHandler([System.Windows.Controls.Primitives.ToggleButton]::CheckedEvent, [System.Windows.RoutedEventHandler]$script:ColumnFilterEvents.ItemToggled)
@@ -4501,17 +4512,25 @@ if ($result.Errors.Count -gt 0 -and $result.Data.Count -eq 0) { $result.Ok = $fa
 [pscustomobject]$result
 '@
 
-function Initialize-Engine {
-    if ($script:Engine.Pool) { return }
+function New-EnginePool([int]$Max) {
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     # Zasady wykonywania dotyczą tylko Windows (na innych platformach Open() rzuciłby wyjątek)
     if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
         try { $iss.ExecutionPolicy = [Microsoft.PowerShell.ExecutionPolicy]::Bypass } catch { }
     }
-    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, [int]$script:Settings.ThrottleLimit, $iss, $Host)
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $Max, $iss, $Host)
     $pool.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
     $pool.Open()
-    $script:Engine.Pool = $pool
+    return $pool
+}
+
+function Initialize-Engine {
+    # Dwie pule wątków: ogólna (zdalne operacje na komputerach, pliki) i mniejsza dla zapytań do AD.
+    # Usługa ADWS na kontrolerze domeny ogranicza równoległe żądania - przy kilkunastu naraz odrzuca je
+    # błędami «A connection to the directory ... was unavailable» / «invalid enumeration context».
+    param([switch]$Ad)
+    if (-not $script:Engine.Pool) { $script:Engine.Pool = New-EnginePool ([int]$script:Settings.ThrottleLimit) }
+    if ($Ad -and -not $script:Engine.AdPool) { $script:Engine.AdPool = New-EnginePool ([int]$script:Settings.AdThrottleLimit) }
 }
 
 function Initialize-EngineTimer {
@@ -4522,10 +4541,16 @@ function Initialize-EngineTimer {
     $script:Engine.Timer = $timer
 }
 
-function Set-EngineThrottle([int]$Limit) {
+function Set-EngineThrottle([int]$Limit, [int]$AdLimit = 0) {
     $script:Settings.ThrottleLimit = [Math]::Min(64, [Math]::Max(1, $Limit))
     if ($script:Engine.Pool) {
         try { [void]$script:Engine.Pool.SetMaxRunspaces($script:Settings.ThrottleLimit) } catch { }
+    }
+    if ($AdLimit -gt 0) {
+        $script:Settings.AdThrottleLimit = [Math]::Min(16, [Math]::Max(1, $AdLimit))
+        if ($script:Engine.AdPool) {
+            try { [void]$script:Engine.AdPool.SetMaxRunspaces($script:Settings.AdThrottleLimit) } catch { }
+        }
     }
 }
 
@@ -4571,7 +4596,8 @@ function Start-HostOperation {
         [string]$TargetColumn = 'Komputer',
         [switch]$Append,
         [scriptblock]$OnResult,
-        [scriptblock]$OnComplete
+        [scriptblock]$OnComplete,
+        [ValidateSet('Default', 'AD')][string]$Pool = 'Default'
     )
     if ($Module.Busy) {
         Show-Warning "Poprzednia operacja w module «$($Module.Title)» jeszcze trwa. Poczekaj na jej zakończenie lub przerwij ją na pasku stanu."
@@ -4580,8 +4606,9 @@ function Start-HostOperation {
     $items = @($Targets | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
     if ($items.Count -eq 0) { return }
 
-    Initialize-Engine
+    Initialize-Engine -Ad:($Pool -eq 'AD')
     Initialize-EngineTimer
+    $runspacePool = if ($Pool -eq 'AD') { $script:Engine.AdPool } else { $script:Engine.Pool }
     if ($Output -eq 'Grid' -and -not $Append -and $Module.Grid) { Reset-ResultTable -Module $Module }
 
     $ctx = @{
@@ -4613,7 +4640,7 @@ function Start-HostOperation {
         $p = $Parameters
         if ($PerTarget.ContainsKey($t)) { $p = $PerTarget[$t] }
         $ps = [System.Management.Automation.PowerShell]::Create()
-        $ps.RunspacePool = $script:Engine.Pool
+        $ps.RunspacePool = $runspacePool
         [void]$ps.AddScript($script:WorkerScript)
         [void]$ps.AddArgument($t).AddArgument($mode).AddArgument($scriptText).AddArgument($p).AddArgument($ctx)
         $handle = $ps.BeginInvoke()
@@ -4786,9 +4813,11 @@ function Close-Engine {
         }
     }
     foreach ($h in $handles) { try { [void]$h.AsyncWaitHandle.WaitOne(3000) } catch { } }
-    if ($script:Engine.Pool) {
-        try { $script:Engine.Pool.Close(); $script:Engine.Pool.Dispose() } catch { }
-        $script:Engine.Pool = $null
+    foreach ($key in 'Pool', 'AdPool') {
+        if ($script:Engine[$key]) {
+            try { $script:Engine[$key].Close(); $script:Engine[$key].Dispose() } catch { }
+            $script:Engine[$key] = $null
+        }
     }
 }
 
@@ -5459,7 +5488,7 @@ function Start-AdComputerLoad {
         LdapFilter = New-ComputerLdapFilter -NamePattern $script:Settings.NameFilter -OnlyEnabled $script:Settings.OnlyEnabled
         SearchBase = $script:Settings.SearchBase
     }
-    Start-HostOperation -Module $Module -Name 'Wczytywanie komputerów z AD' -Targets @('Active Directory') -Local -Output None -Parameters $params -ScriptBlock {
+    Start-AdOperation -Module $Module -Name 'Wczytywanie komputerów z AD' -Targets @('Active Directory') -Output None -Parameters $params -ScriptBlock {
         param($Target, $P, $Ctx)
         Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
         $q = @{
@@ -5709,7 +5738,7 @@ function Start-AdUserLoad {
     $Module.Data.Check = [bool]$Check
     $Module.Data.Replace = ($Logins.Count -eq 0)
     $title = if ($Logins.Count -gt 0) { 'Uzupełnianie danych kont z AD' } else { 'Wyszukiwanie kont w AD' }
-    Start-HostOperation -Module $Module -Name $title -Targets @('Active Directory') -Local -Output None -Parameters $params -ScriptBlock $script:UserLoadScript -OnResult {
+    Start-AdOperation -Module $Module -Name $title -Targets @('Active Directory') -Output None -Parameters $params -ScriptBlock $script:UserLoadScript -OnResult {
         param($m, $r)
         if (-not $r.Ok) {
             $m.Data.LastError = (@($r.Errors)) -join "`r`n"
@@ -5936,7 +5965,7 @@ function Start-AdGroupLoad {
     $Module.Data.Replace = ($Names.Count -eq 0)
     $Module.Data.Source = $Source
     $title = if ($Names.Count -gt 0) { 'Pobieranie grup z AD' } else { 'Wyszukiwanie grup w AD' }
-    Start-HostOperation -Module $Module -Name $title -Targets @('Active Directory') -Local -Output None -Parameters $params -ScriptBlock $script:GroupLoadScript -OnResult {
+    Start-AdOperation -Module $Module -Name $title -Targets @('Active Directory') -Output None -Parameters $params -ScriptBlock $script:GroupLoadScript -OnResult {
         param($m, $r)
         if (-not $r.Ok) {
             $m.Data.LastError = (@($r.Errors)) -join "`r`n"
@@ -9591,6 +9620,30 @@ Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
 $ad = @{ ErrorAction = 'Stop' }
 if ($Ctx.Server) { $ad.Server = $Ctx.Server }
 if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+# Odczyty z AD ponawiane przy przejściowych błędach usługi ADWS (przeciążony kontroler, wygasły kontekst wyliczania).
+# Polecenia Get-AD* są tu zastępowane funkcjami o tej samej nazwie; zmiany (Set/New/Add/Remove) nie są ponawiane.
+$__adTransient = 'connection to the directory on which to process the request was unavailable|invalid enumeration context|enumeration context is (not valid|invalid)|Unable to contact the server|server is busy|timeout limit was exceeded'
+function Invoke-AdRead {
+    param([string]$Command, [object[]]$Arguments, [object[]]$Pipe, [bool]$HasPipe)
+    $delays = @(500, 1500, 3000, 6000)
+    for ($i = 0; ; $i++) {
+        try {
+            if ($HasPipe) { return @($Pipe | & $Command @Arguments) }
+            return @(& $Command @Arguments)
+        }
+        catch {
+            if ($i -ge $delays.Count -or $_.Exception.Message -notmatch $__adTransient) { throw }
+            Start-Sleep -Milliseconds ($delays[$i] + (Get-Random -Maximum 500))
+        }
+    }
+}
+$__exported = (Get-Module -Name ActiveDirectory).ExportedCommands
+foreach ($__c in 'Get-ADUser', 'Get-ADComputer', 'Get-ADGroup', 'Get-ADObject', 'Get-ADOrganizationalUnit', 'Get-ADGroupMember', 'Get-ADPrincipalGroupMembership',
+    'Get-ADDomain', 'Get-ADForest', 'Get-ADRootDSE', 'Get-ADDomainController', 'Search-ADAccount', 'Get-ADDefaultDomainPasswordPolicy', 'Get-ADFineGrainedPasswordPolicy',
+    'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata') {
+    if (-not $__exported.ContainsKey($__c)) { continue }
+    Set-Item -Path "function:$__c" -Value ([scriptblock]::Create("if (`$MyInvocation.ExpectingInput) { Invoke-AdRead 'ActiveDirectory\$__c' `$args @(`$input) `$true } else { Invoke-AdRead 'ActiveDirectory\$__c' `$args `$null `$false }"))
+}
 '@
 
 function Get-FriendlyAdError {
@@ -9642,6 +9695,7 @@ function Start-AdOperation {
         Output       = $Output
         TargetColumn = $TargetColumn
         Append       = $Append
+        Pool         = 'AD'
     }
     if ($OnResult) { $sp.OnResult = $OnResult }
     if ($OnComplete) { $sp.OnComplete = $OnComplete }
@@ -13062,7 +13116,7 @@ Register-Module -Workspace 'AdGroups' -Category 'Raporty' -Key 'GroupNesting' -T
         if ($roots.Count -eq 0) {
             if ($up) { Show-Warning 'Dla kierunku «w górę» zaznacz grupy na liście po lewej.'; return }
             $scope = if ($m.Ou.Text.Trim()) { $m.Ou.Text.Trim() } else { 'całej domeny' }
-            if (-not (Confirm-Action -Text "Na liście nie zaznaczono grup. Zbudować drzewo wszystkich grup najwyższego poziomu z $scope? Przy dużej domenie może to potrwać." -ConfirmText 'Buduj drzewo')) { return }
+            if (-not (Confirm-Action -Text "Na liście nie zaznaczono grup. Zbudować drzewo wszystkich grup najwyższego poziomu z ${scope}? Przy dużej domenie może to potrwać." -ConfirmText 'Buduj drzewo')) { return }
         }
         $params = @{ Roots = $roots; Up = $up; ShowMembers = ((Test-Checked $m.ShowMembers) -and -not $up); ShowDescription = (Test-Checked $m.ShowDesc); MaxDepth = (Get-Num $m.Depth); SearchBase = $m.Ou.Text.Trim() }
         Start-AdOperation -Module $m -Name 'Drzewo grup' -Targets @('AD') -Parameters $params -ScriptBlock $script:GroupTreeScript -OnComplete {
