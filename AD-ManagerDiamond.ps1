@@ -75,7 +75,7 @@ $env:ADPS_LoadDefaultDrive = '0'
 #endregion
 
 #region Konfiguracja i stan
-$script:AppVersion = '4.4'
+$script:AppVersion = '4.5'
 
 $script:App = @{
     Name       = 'Domain Ops'
@@ -6851,6 +6851,9 @@ Register-Workspace -Key 'AdComputers' -Title 'Komputery AD' -Icon 'E977' -Target
 Register-Workspace -Key 'Files' -Title 'Pliki i uprawnienia' -Icon 'E8B7' -Target None `
     -Description 'Uprawnienia NTFS: nadawanie, odbieranie, uprawnienia efektywne, raporty, ryzyka, naprawa i kopie uprawnień; udziały oraz sumy kontrolne plików' `
     -Categories @('Uprawnienia NTFS', 'Kontrola i naprawa', 'Pliki')
+Register-Workspace -Key 'Domain' -Title 'Domena' -Icon 'E774' -Target None `
+    -Description 'Cała domena: audyt bezpieczeństwa AD, delegacje uprawnień, stan kontrolerów i replikacji, zasady grupy oraz raporty cykliczne' `
+    -Categories @('Bezpieczeństwo', 'Stan domeny', 'Zasady grupy', 'Automatyzacja')
 #endregion
 
 #region Zarządzanie zdalne: Diagnostyka
@@ -11444,11 +11447,14 @@ function Invoke-AdRead {
 $__exported = (Get-Module -Name ActiveDirectory).ExportedCommands
 foreach ($__c in 'Get-ADUser', 'Get-ADComputer', 'Get-ADGroup', 'Get-ADObject', 'Get-ADOrganizationalUnit', 'Get-ADGroupMember', 'Get-ADPrincipalGroupMembership',
     'Get-ADDomain', 'Get-ADForest', 'Get-ADRootDSE', 'Get-ADDomainController', 'Search-ADAccount', 'Get-ADDefaultDomainPasswordPolicy', 'Get-ADFineGrainedPasswordPolicy',
-    'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata') {
+    'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata', 'Get-ADOptionalFeature') {
     if (-not $__exported.ContainsKey($__c)) { continue }
     Set-Item -Path "function:$__c" -Value ([scriptblock]::Create("if (`$MyInvocation.ExpectingInput) { Invoke-AdRead 'ActiveDirectory\$__c' `$args @(`$input) `$true } else { Invoke-AdRead 'ActiveDirectory\$__c' `$args `$null `$false }"))
 }
 '@
+
+# Systemy bez wsparcia producenta (stan na 2026 r.): Windows 10 poza LTSC, Windows 7/8.x, Server 2003-2012 R2
+$script:UnsupportedOsPattern = 'Windows (XP|Vista|7|8|8\.1)( |$)|Windows 10 (?!.*LTSC)|Windows Server (2003|2008|2012)'
 
 function Get-FriendlyAdError {
     # Typowe komunikaty błędów AD (po angielsku) -> wskazówka po polsku; nieznane bez zmian
@@ -12820,7 +12826,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Raporty' -Key 'ComputerRepor
     Add-Button -Parent $row2 -Text 'Generuj raport' -Icon 'E9F9' -Module $m -Primary -OnClick {
         param($m)
         $report = $script:ComputerReports[$m.Report.SelectedIndex]
-        $params = @{ Report = $report.Key; Days = (Get-Num $m.Days); OnlyEnabled = (Test-Checked $m.OnlyEnabled); SearchBase = $m.Ou.Text.Trim() }
+        $params = @{ Report = $report.Key; Days = (Get-Num $m.Days); OnlyEnabled = (Test-Checked $m.OnlyEnabled); SearchBase = $m.Ou.Text.Trim(); UnsupportedOs = $script:UnsupportedOsPattern }
         Reset-StatTiles $m
         Start-AdOperation -Module $m -Name $report.Name -Targets @('AD') -Parameters $params -ScriptBlock {
             $now = Get-Date
@@ -12861,8 +12867,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Raporty' -Key 'ComputerRepor
                 if ($P.SearchBase) { $kq.SearchBase = $P.SearchBase }
                 foreach ($k in @(Get-ADObject @kq @ad)) { [void]$withKey.Add(($k.DistinguishedName -replace '^CN=(?:\\.|[^,])+,', '')) }
             }
-            # Systemy bez wsparcia producenta (stan na 2026 r.): Windows 10 poza LTSC, Windows 7/8.x, Server 2003-2012 R2
-            $unsupported = 'Windows (XP|Vista|7|8|8\.1)( |$)|Windows 10 (?!.*LTSC)|Windows Server (2003|2008|2012)'
+            $unsupported = [string]$P.UnsupportedOs
             foreach ($c in $computers) {
                 $include = switch ($P.Report) {
                     'Unsupported' { [string]$c.OperatingSystem -match $unsupported }
@@ -19776,6 +19781,572 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsShar
     Add-StatTile -Module $m -Key 'shares' -Label 'Udziały' -Icon 'E8CE' | Out-Null
     Add-StatTile -Module $m -Key 'risk' -Label 'Zapis dla szerokich grup' -Icon 'EA39' | Out-Null
     $m.EmptyHint = 'Podaj serwer plików i kliknij «Pokaż udziały» (F5). Dostęp przez sieć to mniejsze z uprawnień udziału i NTFS – dla konkretnej osoby z jej grupami użyj «Uprawnienia efektywne».'
+}
+#endregion
+
+#region Domena: audyt bezpieczeństwa Active Directory
+# Kontrole wykonywane zapytaniami LDAP w pięciu grupach (osobne zadania puli AD, równolegle). Wątek zwraca płaskie rekordy:
+# check (Key, Severity, Count, Summary, Error) i obj (obiekty, których dotyczy kontrola). Opisy i zalecenia są tutaj.
+
+$script:AdAuditCategories = @('Konta uprzywilejowane', 'Kerberos i delegowanie', 'Hasła', 'Konta i komputery', 'Domena')
+$script:AdAuditChecks = [ordered]@{
+    PrivAccounts       = @{ Cat = 'Konta uprzywilejowane'; Title = 'Konta w grupach uprzywilejowanych'; Rec = 'Ogranicz liczbę kont uprzywilejowanych. Administratorzy powinni mieć osobne konta do zadań administracyjnych i nie używać ich do poczty ani przeglądania internetu.' }
+    PrivSpn            = @{ Cat = 'Konta uprzywilejowane'; Title = 'Konta uprzywilejowane z SPN (kerberoasting)'; Rec = 'Usuń SPN z kont administratorów albo przenieś usługę na konto gMSA – bilet usługi z SPN można złamać offline i przejąć hasło administratora.' }
+    PrivPwdNever       = @{ Cat = 'Konta uprzywilejowane'; Title = 'Konta uprzywilejowane z hasłem bez wygasania'; Rec = 'Wyłącz «Hasło nigdy nie wygasa» albo chroń konta długimi hasłami i logowaniem kartą / MFA.' }
+    PrivPwdOld         = @{ Cat = 'Konta uprzywilejowane'; Title = 'Stare hasła kont uprzywilejowanych'; Rec = 'Zmień hasła kont uprzywilejowanych – stare hasło mogło zostać ujawnione.' }
+    PrivInactive       = @{ Cat = 'Konta uprzywilejowane'; Title = 'Nieużywane konta uprzywilejowane'; Rec = 'Wyłącz nieużywane konta uprzywilejowane albo usuń je z grup.' }
+    PrivDisabled       = @{ Cat = 'Konta uprzywilejowane'; Title = 'Wyłączone konta w grupach uprzywilejowanych'; Rec = 'Usuń wyłączone konta z grup uprzywilejowanych – ponowne włączenie konta przywróciłoby uprawnienia.' }
+    PrivDelegable      = @{ Cat = 'Konta uprzywilejowane'; Title = 'Konta uprzywilejowane bez ochrony przed delegowaniem'; Rec = 'Zaznacz «Konto jest poufne i nie może być delegowane» albo dodaj konta do grupy Protected Users.' }
+    SchemaEnterprise   = @{ Cat = 'Konta uprzywilejowane'; Title = 'Członkowie Schema Admins i Enterprise Admins'; Rec = 'Grupy powinny być puste poza czasem zmian w schemacie lub konfiguracji lasu.' }
+    BuiltinAdmin       = @{ Cat = 'Konta uprzywilejowane'; Title = 'Wbudowane konto Administrator'; Rec = 'Nie używaj wbudowanego konta na co dzień – zostaw je jako konto awaryjne z długim hasłem przechowywanym w bezpiecznym miejscu.' }
+    AdminCountOrphan   = @{ Cat = 'Konta uprzywilejowane'; Title = 'Pozostałości adminCount = 1'; Rec = 'Konta usunięte z grup chronionych mają nadal wyłączone dziedziczenie uprawnień w AD – wyczyść adminCount i włącz dziedziczenie na obiekcie.' }
+    UserSpn            = @{ Cat = 'Kerberos i delegowanie'; Title = 'Konta użytkowników z SPN (kerberoasting)'; Rec = 'Dla usług używaj kont gMSA albo haseł dłuższych niż 25 znaków i zmieniaj je regularnie.' }
+    NoPreauth          = @{ Cat = 'Kerberos i delegowanie'; Title = 'Konta bez wstępnego uwierzytelnienia Kerberos (AS-REP roasting)'; Rec = 'Wyłącz opcję «Nie wymagaj wstępnego uwierzytelnienia Kerberos» – każdy może pobrać materiał do złamania hasła.' }
+    Unconstrained      = @{ Cat = 'Kerberos i delegowanie'; Title = 'Nieograniczone delegowanie'; Rec = 'Zamień na delegowanie ograniczone lub oparte na zasobach. Serwer z nieograniczonym delegowaniem przechowuje bilety TGT logujących się użytkowników – także administratorów.' }
+    ProtocolTransition = @{ Cat = 'Kerberos i delegowanie'; Title = 'Delegowanie ograniczone z dowolnym protokołem'; Rec = 'Sprawdź, czy przejście protokołów jest potrzebne – konto może podszywać się pod dowolnego użytkownika wobec wskazanych usług.' }
+    Constrained        = @{ Cat = 'Kerberos i delegowanie'; Title = 'Delegowanie ograniczone (tylko Kerberos)'; Rec = 'Przejrzyj usługi, do których konta mogą delegować uprawnienia użytkowników.' }
+    Rbcd               = @{ Cat = 'Kerberos i delegowanie'; Title = 'Delegowanie oparte na zasobach (RBCD)'; Rec = 'Sprawdź, czy wpisy są zamierzone – nieoczekiwane RBCD to częsty ślad eskalacji uprawnień.' }
+    Krbtgt             = @{ Cat = 'Kerberos i delegowanie'; Title = 'Wiek hasła konta krbtgt'; Rec = 'Zmień hasło krbtgt dwukrotnie, z przerwą na pełną replikację (np. skryptem New-KrbtgtKeys.ps1 Microsoftu).' }
+    DesOnly            = @{ Cat = 'Kerberos i delegowanie'; Title = 'Konta z szyfrowaniem tylko DES'; Rec = 'Wyłącz opcję «Używaj tylko szyfrowania DES» – DES jest przestarzały i łatwy do złamania.' }
+    PwdNotRequired     = @{ Cat = 'Hasła'; Title = 'Konta, dla których hasło nie jest wymagane'; Rec = 'Usuń flagę PASSWD_NOTREQD (Set-ADUser -PasswordNotRequired $false) – takie konto może mieć puste hasło.' }
+    Reversible         = @{ Cat = 'Hasła'; Title = 'Hasła zapisywane z szyfrowaniem odwracalnym'; Rec = 'Wyłącz «Przechowuj hasło przy użyciu szyfrowania odwracalnego» i zmień hasła tych kont.' }
+    PwdNeverExpires    = @{ Cat = 'Hasła'; Title = 'Hasła bez wygasania'; Rec = 'Zostaw tę opcję tylko kontom usług (lepiej: gMSA) – konta osób powinny podlegać zasadom haseł.' }
+    PwdPolicy          = @{ Cat = 'Hasła'; Title = 'Zasady haseł domeny'; Rec = 'Minimalna długość co najmniej 12–14 znaków, złożoność albo długie frazy, blokada po kilku nieudanych próbach, historia haseł.' }
+    InactiveUsers      = @{ Cat = 'Konta i komputery'; Title = 'Nieaktywne konta użytkowników'; Rec = 'Wyłącz konta nieużywane dłużej niż próg (Użytkownicy AD → Raporty kont).' }
+    InactiveComputers  = @{ Cat = 'Konta i komputery'; Title = 'Nieaktywne konta komputerów'; Rec = 'Wyłącz lub usuń konta komputerów, które nie logowały się dłużej niż próg (Komputery AD → Raporty komputerów).' }
+    GuestEnabled       = @{ Cat = 'Konta i komputery'; Title = 'Konto Gość'; Rec = 'Wyłącz wbudowane konto Gość.' }
+    OldOs              = @{ Cat = 'Konta i komputery'; Title = 'Nieobsługiwane systemy operacyjne'; Rec = 'Zaktualizuj albo odizoluj komputery z systemami bez poprawek bezpieczeństwa.' }
+    Laps               = @{ Cat = 'Konta i komputery'; Title = 'Komputery bez LAPS'; Rec = 'Wdróż Windows LAPS – każdy komputer dostaje unikalne, automatycznie zmieniane hasło lokalnego administratora.' }
+    SidHistory         = @{ Cat = 'Konta i komputery'; Title = 'Konta z SID History'; Rec = 'Po zakończonej migracji wyczyść atrybut sIDHistory – może dawać ukryte uprawnienia z innej domeny.' }
+    MachineQuota       = @{ Cat = 'Domena'; Title = 'Dołączanie komputerów przez zwykłych użytkowników'; Rec = 'Ustaw ms-DS-MachineAccountQuota = 0 i deleguj dołączanie komputerów do domeny wybranej grupie.' }
+    RecycleBin         = @{ Cat = 'Domena'; Title = 'Kosz Active Directory'; Rec = 'Włącz kosz AD (Enable-ADOptionalFeature "Recycle Bin Feature"), aby przywracać usunięte obiekty razem z atrybutami i członkostwami.' }
+    FunctionalLevel    = @{ Cat = 'Domena'; Title = 'Poziom funkcjonalny domeny'; Rec = 'Podnieś poziom funkcjonalny po wycofaniu starszych kontrolerów domeny – nowsze poziomy włączają dodatkowe zabezpieczenia.' }
+    ProtectedUsers     = @{ Cat = 'Domena'; Title = 'Grupa Protected Users'; Rec = 'Dodaj konta administratorów do Protected Users (po sprawdzeniu, że nie korzystają z NTLM, delegowania ani DES/RC4).' }
+    PreWin2000         = @{ Cat = 'Domena'; Title = 'Grupa «Pre-Windows 2000 Compatible Access»'; Rec = 'Usuń z grupy Wszystkich i Logowanie anonimowe – pozwalają anonimowo odczytywać katalog.' }
+    Trusts             = @{ Cat = 'Domena'; Title = 'Relacje zaufania'; Rec = 'Włącz filtrowanie SID (kwarantannę) dla zaufań zewnętrznych i usuń nieużywane zaufania.' }
+}
+$script:AdAuditSeverity = [ordered]@{
+    'Wysokie' = @{ Rank = 0; Tone = 'crit'; Weight = 10 }
+    'Średnie' = @{ Rank = 1; Tone = 'warn'; Weight = 5 }
+    'Niskie'  = @{ Rank = 2; Tone = 'info'; Weight = 2 }
+    'Błąd'    = @{ Rank = 3; Tone = 'crit'; Weight = 0 }
+    'Info'    = @{ Rank = 4; Tone = ''; Weight = 0 }
+    'OK'      = @{ Rank = 5; Tone = 'ok'; Weight = 0 }
+}
+
+$script:AdAuditScript = {
+    # $Target: nazwa grupy kontroli; $P: InactiveDays, AdminPwdDays, KrbtgtDays, AdminLimit, UnsupportedOs
+    $now = Get-Date
+    $domain = Get-ADDomain @ad
+    $dsid = [string]$domain.DomainSID.Value
+    $domainDn = [string]$domain.DistinguishedName
+    $en = '(!(userAccountControl:1.2.840.113556.1.4.803:=2))'
+    $usersOnly = '(objectCategory=person)(objectClass=user)'
+    $props = @('sAMAccountName', 'userAccountControl', 'pwdLastSet', 'lastLogonTimestamp', 'servicePrincipalName', 'adminCount', 'whenCreated', 'operatingSystem', 'msDS-AllowedToDelegateTo', 'description')
+    function Find-Ad([string]$Filter, [string[]]$Extra = @(), [string]$Base = '') {
+        $q = @{ LDAPFilter = $Filter; Properties = (@($props) + @($Extra)) }
+        if ($Base) { $q.SearchBase = $Base }
+        return @(Get-ADObject @q @ad)
+    }
+    function Get-Age($FileTime) {
+        if ($null -eq $FileTime -or "$FileTime" -eq '' -or [int64]$FileTime -le 0 -or [int64]$FileTime -ge [int64]::MaxValue) { return $null }
+        return [int]($now - [datetime]::FromFileTime([int64]$FileTime)).TotalDays
+    }
+    function Get-N([int]$N, [string]$One, [string]$Few, [string]$Many) {
+        # Liczba z rzeczownikiem w poprawnej formie: 1 konto, 2 konta, 5 kont, 22 konta, 12 kont
+        $form = if ($N -eq 1) { $One } elseif ($N % 10 -ge 2 -and $N % 10 -le 4 -and ($N % 100 -lt 12 -or $N % 100 -gt 14)) { $Few } else { $Many }
+        return "$N $form"
+    }
+    function Get-AgeText($FileTime, [string]$Never = 'nigdy') { $a = Get-Age $FileTime; if ($null -eq $a) { return $Never } return ((Get-N $a 'dzień' 'dni' 'dni') + ' temu') }
+    function Get-Rid($o) { return ([string]$o.objectSid -replace '^.*-', '') }
+    function New-AuditObject($o, [string]$Details) {
+        $cls = [string]$o.ObjectClass
+        $uac = [int64]$o.userAccountControl
+        $isAccount = @('user', 'computer', 'inetOrgPerson', 'msDS-GroupManagedServiceAccount', 'msDS-ManagedServiceAccount') -contains $cls
+        $name = [string]$o.Name
+        if ($cls -eq 'computer') { $name = ([string]$o.sAMAccountName).TrimEnd('$'); if (-not $name) { $name = [string]$o.Name } }
+        [pscustomobject][ordered]@{
+            '__rec'     = 'obj'
+            '__check'   = ''
+            'Nazwa'     = $name
+            'Login'     = [string]$o.sAMAccountName
+            'Typ'       = (Get-ObjectKind $cls)
+            'Włączone'  = $(if (-not $isAccount) { '' } elseif ($uac -band 2) { 'Nie' } else { 'Tak' })
+            'Szczegóły' = $Details
+            'DN'        = [string]$o.DistinguishedName
+        }
+    }
+    function Out-Check([string]$Key, [string]$Severity, [int]$Count, [string]$Summary, [object[]]$Objects = @()) {
+        [pscustomobject]@{ '__rec' = 'check'; Key = $Key; Severity = $Severity; Count = $Count; Summary = $Summary; Error = '' }
+        foreach ($x in $Objects) { $x.'__check' = $Key; $x }
+    }
+    function Invoke-Check([string]$Key, [scriptblock]$Body) {
+        # Błąd jednej kontroli (np. brak atrybutu w schemacie, brak uprawnień) nie przerywa pozostałych
+        try { & $Body }
+        catch { [pscustomobject]@{ '__rec' = 'check'; Key = $Key; Severity = 'Błąd'; Count = 0; Summary = ''; Error = $_.Exception.Message } }
+    }
+    function Get-ListText($Values, [int]$Max = 3) {
+        $v = @($Values | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        if ($v.Count -le $Max) { return ($v -join ', ') }
+        return ((@($v | Select-Object -First $Max)) -join ', ') + " (+$($v.Count - $Max))"
+    }
+
+    [pscustomobject]@{ '__rec' = 'domain'; Name = [string]$domain.DNSRoot }
+    switch ($Target) {
+        'Konta uprzywilejowane' {
+            # Grupy uprzywilejowane po SID (niezależnie od języka); Enterprise/Schema Admins są w domenie głównej lasu
+            $groupSids = [ordered]@{ "$dsid-512" = 'Domain Admins'; "$dsid-519" = 'Enterprise Admins'; "$dsid-518" = 'Schema Admins'; 'S-1-5-32-544' = 'Administrators'; 'S-1-5-32-548' = 'Account Operators'
+                'S-1-5-32-549' = 'Server Operators'; 'S-1-5-32-550' = 'Print Operators'; 'S-1-5-32-551' = 'Backup Operators'; "$dsid-520" = 'Group Policy Creator Owners'; "$dsid-526" = 'Key Admins'; "$dsid-527" = 'Enterprise Key Admins' }
+            $groups = New-Object System.Collections.ArrayList
+            foreach ($s in $groupSids.Keys) { $g = @(Get-ADObject -LDAPFilter "(objectSid=$s)" -Properties sAMAccountName, member, objectSid @ad); if ($g.Count) { [void]$groups.Add($g[0]) } }
+            foreach ($g in @(Get-ADObject -LDAPFilter '(&(objectClass=group)(sAMAccountName=DnsAdmins))' -Properties sAMAccountName, member, objectSid @ad)) { [void]$groups.Add($g) }
+            $priv = [ordered]@{}
+            foreach ($g in $groups) {
+                foreach ($o in (Find-Ad ('(memberOf:1.2.840.113556.1.4.1941:={0})' -f (ConvertTo-LdapValue ([string]$g.DistinguishedName))) @('objectSid'))) {
+                    $k = ([string]$o.DistinguishedName).ToLowerInvariant()
+                    if (-not $priv.Contains($k)) { $priv[$k] = @{ Obj = $o; Groups = New-Object System.Collections.ArrayList } }
+                    if (-not $priv[$k].Groups.Contains([string]$g.sAMAccountName)) { [void]$priv[$k].Groups.Add([string]$g.sAMAccountName) }
+                }
+            }
+            $privUsers = @($priv.Values | Where-Object { @('user', 'inetOrgPerson') -contains [string]$_.Obj.ObjectClass })
+            $enabled = @($privUsers | Where-Object { -not ([int64]$_.Obj.userAccountControl -band 2) })
+            $gt = { param($e) 'grupy: ' + ((@($e.Groups)) -join ', ') }
+            Invoke-Check 'PrivAccounts' {
+                $sev = if ($enabled.Count -gt [int]$P.AdminLimit) { 'Niskie' } else { 'Info' }
+                Out-Check 'PrivAccounts' $sev $enabled.Count ('{0} w grupach uprzywilejowanych (sprawdzone grupy: {1}, próg {2})' -f (Get-N $enabled.Count 'włączone konto' 'włączone konta' 'włączonych kont'), $groups.Count, $P.AdminLimit) @($enabled | ForEach-Object { New-AuditObject $_.Obj (& $gt $_) })
+            }
+            Invoke-Check 'PrivSpn' {
+                $l = @($enabled | Where-Object { @($_.Obj.servicePrincipalName | Where-Object { $_ }).Count -gt 0 })
+                Out-Check 'PrivSpn' $(if ($l.Count) { 'Wysokie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'konto uprzywilejowane ma' 'konta uprzywilejowane mają' 'kont uprzywilejowanych ma') + ' SPN' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_.Obj ('SPN: {0}; {1}' -f (Get-ListText $_.Obj.servicePrincipalName 2), (& $gt $_)) })
+            }
+            Invoke-Check 'PrivPwdNever' {
+                $l = @($enabled | Where-Object { [int64]$_.Obj.userAccountControl -band 0x10000 })
+                Out-Check 'PrivPwdNever' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'konto' 'konta' 'kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_.Obj ('hasło ustawione {0}; {1}' -f (Get-AgeText $_.Obj.pwdLastSet), (& $gt $_)) })
+            }
+            Invoke-Check 'PrivPwdOld' {
+                $l = @($enabled | Where-Object { $a = Get-Age $_.Obj.pwdLastSet; $null -eq $a -or $a -gt [int]$P.AdminPwdDays })
+                Out-Check 'PrivPwdOld' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'konto' 'konta' 'kont') + " z hasłem starszym niż $($P.AdminPwdDays) dni" } else { "wszystkie hasła młodsze niż $($P.AdminPwdDays) dni" }) @($l | ForEach-Object { New-AuditObject $_.Obj ('hasło ustawione {0}; {1}' -f (Get-AgeText $_.Obj.pwdLastSet), (& $gt $_)) })
+            }
+            Invoke-Check 'PrivInactive' {
+                $l = @($enabled | Where-Object { $a = Get-Age $_.Obj.lastLogonTimestamp; $null -eq $a -or $a -gt [int]$P.InactiveDays })
+                Out-Check 'PrivInactive' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'konto' 'konta' 'kont') + " bez logowania od ponad $($P.InactiveDays) dni" } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_.Obj ('ostatnie logowanie {0}; {1}' -f (Get-AgeText $_.Obj.lastLogonTimestamp), (& $gt $_)) })
+            }
+            Invoke-Check 'PrivDisabled' {
+                $l = @($privUsers | Where-Object { [int64]$_.Obj.userAccountControl -band 2 })
+                Out-Check 'PrivDisabled' $(if ($l.Count) { 'Niskie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'wyłączone konto' 'wyłączone konta' 'wyłączonych kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_.Obj (& $gt $_) })
+            }
+            Invoke-Check 'PrivDelegable' {
+                $pu = @(Get-ADObject -LDAPFilter "(objectSid=$dsid-525)" @ad)
+                $inPu = @{}
+                if ($pu.Count) { foreach ($o in (Find-Ad ('(memberOf:1.2.840.113556.1.4.1941:={0})' -f (ConvertTo-LdapValue ([string]$pu[0].DistinguishedName))))) { $inPu[([string]$o.DistinguishedName).ToLowerInvariant()] = $true } }
+                $l = @($enabled | Where-Object { -not ([int64]$_.Obj.userAccountControl -band 0x100000) -and -not $inPu.ContainsKey(([string]$_.Obj.DistinguishedName).ToLowerInvariant()) })
+                Out-Check 'PrivDelegable' $(if ($l.Count) { 'Niskie' } else { 'OK' }) $l.Count $(if ($l.Count) { "bez ochrony: $($l.Count) z $($enabled.Count)" } else { 'wszystkie chronione' }) @($l | ForEach-Object { New-AuditObject $_.Obj (& $gt $_) })
+            }
+            Invoke-Check 'SchemaEnterprise' {
+                $l = @($priv.Values | Where-Object { $_.Groups -contains 'Schema Admins' -or $_.Groups -contains 'Enterprise Admins' })
+                $found = @($groups | Where-Object { @("$dsid-518", "$dsid-519") -contains [string]$_.objectSid })
+                $sum = if ($found.Count -eq 0) { 'grupy są w domenie głównej lasu – nie sprawdzono' } elseif ($l.Count) { "członkowie: $($l.Count)" } else { 'grupy są puste' }
+                Out-Check 'SchemaEnterprise' $(if ($l.Count) { 'Średnie' } elseif ($found.Count -eq 0) { 'Info' } else { 'OK' }) $l.Count $sum @($l | ForEach-Object { New-AuditObject $_.Obj (& $gt $_) })
+            }
+            Invoke-Check 'BuiltinAdmin' {
+                $a = @(Find-Ad "(objectSid=$dsid-500)" @('objectSid'))
+                if ($a.Count -eq 0) { Out-Check 'BuiltinAdmin' 'Info' 0 'nie znaleziono konta (RID 500)'; return }
+                $o = $a[0]
+                $last = Get-Age $o.lastLogonTimestamp
+                $on = -not ([int64]$o.userAccountControl -band 2)
+                $used = $on -and $null -ne $last -and $last -le 30
+                $sum = 'konto {0} ({1}), ostatnie logowanie {2}, hasło ustawione {3}' -f [string]$o.sAMAccountName, $(if ($on) { 'włączone' } else { 'wyłączone' }), (Get-AgeText $o.lastLogonTimestamp), (Get-AgeText $o.pwdLastSet)
+                Out-Check 'BuiltinAdmin' $(if ($used) { 'Niskie' } else { 'OK' }) $(if ($used) { 1 } else { 0 }) $sum @(New-AuditObject $o $sum)
+            }
+            Invoke-Check 'AdminCountOrphan' {
+                # Chronione przez AdminSDHolder: grupy uprzywilejowane, kontrolery domeny, Replicator i ich członkowie (także zagnieżdżeni)
+                $prot = @{}
+                foreach ($k in $priv.Keys) { $prot[$k] = $true }
+                foreach ($g in $groups) { $prot[([string]$g.DistinguishedName).ToLowerInvariant()] = $true }
+                foreach ($s in @("$dsid-516", "$dsid-521", "$dsid-498", 'S-1-5-32-552')) {
+                    foreach ($g in @(Get-ADObject -LDAPFilter "(objectSid=$s)" @ad)) {
+                        $prot[([string]$g.DistinguishedName).ToLowerInvariant()] = $true
+                        foreach ($o in (Find-Ad ('(memberOf:1.2.840.113556.1.4.1941:={0})' -f (ConvertTo-LdapValue ([string]$g.DistinguishedName))))) { $prot[([string]$o.DistinguishedName).ToLowerInvariant()] = $true }
+                    }
+                }
+                $l = @(Find-Ad '(adminCount=1)' @('objectSid') | Where-Object { -not $prot.ContainsKey(([string]$_.DistinguishedName).ToLowerInvariant()) -and @('500', '502') -notcontains (Get-Rid $_) })
+                Out-Check 'AdminCountOrphan' $(if ($l.Count) { 'Niskie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'obiekt' 'obiekty' 'obiektów') + ' poza grupami chronionymi' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ 'adminCount = 1, obiekt nie należy już do grup chronionych' })
+            }
+        }
+        'Kerberos i delegowanie' {
+            Invoke-Check 'UserSpn' {
+                $l = @(Find-Ad "(&$usersOnly(servicePrincipalName=*)$en(!(sAMAccountName=krbtgt)))")
+                $old = @($l | Where-Object { $a = Get-Age $_.pwdLastSet; $null -eq $a -or $a -gt 365 })
+                $sev = if ($old.Count) { 'Średnie' } elseif ($l.Count) { 'Niskie' } else { 'OK' }
+                Out-Check 'UserSpn' $sev $l.Count $(if ($l.Count) { (Get-N $l.Count 'konto' 'konta' 'kont') + " z SPN, w tym z hasłem starszym niż rok: $($old.Count)" } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('SPN: {0}; hasło ustawione {1}' -f (Get-ListText $_.servicePrincipalName 2), (Get-AgeText $_.pwdLastSet)) })
+            }
+            Invoke-Check 'NoPreauth' {
+                $l = @(Find-Ad "(&(userAccountControl:1.2.840.113556.1.4.803:=4194304)$en)")
+                Out-Check 'NoPreauth' $(if ($l.Count) { 'Wysokie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'konto' 'konta' 'kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('hasło ustawione ' + (Get-AgeText $_.pwdLastSet)) })
+            }
+            Invoke-Check 'Unconstrained' {
+                # Kontrolery domeny (SERVER_TRUST_ACCOUNT) mają nieograniczone delegowanie z założenia
+                $l = @(Find-Ad "(&(userAccountControl:1.2.840.113556.1.4.803:=524288)(!(userAccountControl:1.2.840.113556.1.4.803:=8192))$en)")
+                Out-Check 'Unconstrained' $(if ($l.Count) { 'Wysokie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'konto' 'konta' 'kont') + ' (poza kontrolerami domeny)' } else { 'tylko kontrolery domeny' }) @($l | ForEach-Object { New-AuditObject $_ $(if ($_.operatingSystem) { [string]$_.operatingSystem } else { '' }) })
+            }
+            Invoke-Check 'ProtocolTransition' {
+                $l = @(Find-Ad "(&(userAccountControl:1.2.840.113556.1.4.803:=16777216)$en)")
+                Out-Check 'ProtocolTransition' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'konto' 'konta' 'kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('może delegować do: ' + (Get-ListText $_.'msDS-AllowedToDelegateTo' 4)) })
+            }
+            Invoke-Check 'Constrained' {
+                $l = @(Find-Ad "(&(msDS-AllowedToDelegateTo=*)(!(userAccountControl:1.2.840.113556.1.4.803:=16777216))$en)")
+                Out-Check 'Constrained' $(if ($l.Count) { 'Info' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'konto' 'konta' 'kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('może delegować do: ' + (Get-ListText $_.'msDS-AllowedToDelegateTo' 4)) })
+            }
+            Invoke-Check 'Rbcd' {
+                $l = @(Find-Ad '(msDS-AllowedToActOnBehalfOfOtherIdentity=*)')
+                Out-Check 'Rbcd' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'obiekt pozwala' 'obiekty pozwalają' 'obiektów pozwala') + ' innym kontom działać w imieniu użytkowników' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ 'ustawiony msDS-AllowedToActOnBehalfOfOtherIdentity' })
+            }
+            Invoke-Check 'Krbtgt' {
+                $k = @(Find-Ad "(objectSid=$dsid-502)" @('objectSid'))
+                if ($k.Count -eq 0) { Out-Check 'Krbtgt' 'Info' 0 'nie znaleziono konta krbtgt'; return }
+                $age = Get-Age $k[0].pwdLastSet
+                $limit = [int]$P.KrbtgtDays
+                $sev = if ($null -eq $age -or $age -gt 2 * $limit) { 'Wysokie' } elseif ($age -gt $limit) { 'Średnie' } else { 'OK' }
+                $sum = 'hasło zmienione {0} (próg {1} dni)' -f (Get-AgeText $k[0].pwdLastSet), $limit
+                Out-Check 'Krbtgt' $sev $(if ($sev -eq 'OK') { 0 } else { 1 }) $sum @(New-AuditObject $k[0] $sum)
+            }
+            Invoke-Check 'DesOnly' {
+                $l = @(Find-Ad "(&(userAccountControl:1.2.840.113556.1.4.803:=2097152)$en)")
+                Out-Check 'DesOnly' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'konto' 'konta' 'kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ 'USE_DES_KEY_ONLY' })
+            }
+        }
+        'Hasła' {
+            Invoke-Check 'PwdNotRequired' {
+                # Bez kont zaufania między domenami (INTERDOMAIN_TRUST_ACCOUNT)
+                $l = @(Find-Ad "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=32)(!(userAccountControl:1.2.840.113556.1.4.803:=2048))$en)")
+                Out-Check 'PwdNotRequired' $(if ($l.Count) { 'Wysokie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'konto' 'konta' 'kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('hasło ustawione ' + (Get-AgeText $_.pwdLastSet)) })
+            }
+            Invoke-Check 'Reversible' {
+                $l = @(Find-Ad "(&(userAccountControl:1.2.840.113556.1.4.803:=128)$en)")
+                Out-Check 'Reversible' $(if ($l.Count) { 'Wysokie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'konto' 'konta' 'kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ 'ENCRYPTED_TEXT_PWD_ALLOWED' })
+            }
+            Invoke-Check 'PwdNeverExpires' {
+                $l = @(Find-Ad "(&$usersOnly(userAccountControl:1.2.840.113556.1.4.803:=65536)$en)")
+                Out-Check 'PwdNeverExpires' $(if ($l.Count) { 'Niskie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'włączone konto' 'włączone konta' 'włączonych kont' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('hasło ustawione ' + (Get-AgeText $_.pwdLastSet)) })
+            }
+            Invoke-Check 'PwdPolicy' {
+                $pol = Get-ADDefaultDomainPasswordPolicy @ad
+                $issues = New-Object System.Collections.ArrayList
+                $row = { param($name, $value, $sev, $note) [pscustomobject][ordered]@{ '__rec' = 'obj'; '__check' = ''; 'Nazwa' = $name; 'Login' = ''; 'Typ' = 'Ustawienie'; 'Włączone' = ''; 'Szczegóły' = $(if ($note) { "$value – $note" } else { [string]$value }); 'DN' = ''; '__sev' = $sev } }
+                $len = [int]$pol.MinPasswordLength
+                [void]$issues.Add((& $row 'Minimalna długość hasła' $len $(if ($len -lt 8) { 'Wysokie' } elseif ($len -lt 12) { 'Niskie' } else { '' }) $(if ($len -lt 8) { 'za krótkie' } elseif ($len -lt 12) { 'zalecane co najmniej 12' } else { '' })))
+                [void]$issues.Add((& $row 'Wymagania złożoności' $(if ($pol.ComplexityEnabled) { 'włączone' } else { 'wyłączone' }) $(if (-not $pol.ComplexityEnabled -and $len -lt 14) { 'Średnie' } else { '' }) $(if (-not $pol.ComplexityEnabled -and $len -lt 14) { 'krótkie hasła bez złożoności' } else { '' })))
+                $lock = [int]$pol.LockoutThreshold
+                [void]$issues.Add((& $row 'Próg blokady konta' $(if ($lock -eq 0) { 'brak blokady' } else { Get-N $lock 'nieudana próba' 'nieudane próby' 'nieudanych prób' }) $(if ($lock -eq 0) { 'Średnie' } else { '' }) $(if ($lock -eq 0) { 'można bez końca zgadywać hasła' } else { '' })))
+                [void]$issues.Add((& $row 'Szyfrowanie odwracalne' $(if ($pol.ReversibleEncryptionEnabled) { 'włączone' } else { 'wyłączone' }) $(if ($pol.ReversibleEncryptionEnabled) { 'Wysokie' } else { '' }) ''))
+                $hist = [int]$pol.PasswordHistoryCount
+                [void]$issues.Add((& $row 'Historia haseł' $hist $(if ($hist -lt 10) { 'Niskie' } else { '' }) $(if ($hist -lt 10) { 'zalecane co najmniej 10' } else { '' })))
+                $max = [timespan]$pol.MaxPasswordAge
+                [void]$issues.Add((& $row 'Maksymalny wiek hasła' $(if ($max.TotalDays -le 0 -or $max.TotalDays -gt 36500) { 'bez wygasania' } else { Get-N ([int]$max.TotalDays) 'dzień' 'dni' 'dni' }) '' ''))
+                try { $fg = @(Get-ADFineGrainedPasswordPolicy -Filter * @ad); foreach ($f in $fg) { [void]$issues.Add((& $row ('Szczegółowe zasady: ' + [string]$f.Name) ('min. długość {0}, priorytet {1}' -f $f.MinPasswordLength, $f.Precedence) '' '')) } } catch { }
+                $sevs = @($issues | ForEach-Object { $_.'__sev' } | Where-Object { $_ })
+                $sev = if ($sevs -contains 'Wysokie') { 'Wysokie' } elseif ($sevs -contains 'Średnie') { 'Średnie' } elseif ($sevs -contains 'Niskie') { 'Niskie' } else { 'OK' }
+                $sum = 'min. długość {0}, złożoność {1}, blokada {2}' -f $len, $(if ($pol.ComplexityEnabled) { 'tak' } else { 'nie' }), $(if ($lock -eq 0) { 'brak' } else { 'po ' + (Get-N $lock 'próbie' 'próbach' 'próbach') })
+                Out-Check 'PwdPolicy' $sev $sevs.Count $sum @($issues | ForEach-Object { $_.PSObject.Properties.Remove('__sev'); $_ })
+            }
+        }
+        'Konta i komputery' {
+            $cut = $now.AddDays(-[int]$P.InactiveDays)
+            $ft = $cut.ToFileTimeUtc()
+            $gen = $cut.ToUniversalTime().ToString('yyyyMMddHHmmss.0Z')
+            $idle = "(|(lastLogonTimestamp<=$ft)(&(!(lastLogonTimestamp=*))(whenCreated<=$gen)))"
+            Invoke-Check 'InactiveUsers' {
+                $l = @(Find-Ad "(&$usersOnly$en$idle)")
+                Out-Check 'InactiveUsers' $(if ($l.Count) { 'Niskie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'włączone konto' 'włączone konta' 'włączonych kont') + " bez logowania od $($P.InactiveDays) dni" } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('ostatnie logowanie ' + (Get-AgeText $_.lastLogonTimestamp)) })
+            }
+            Invoke-Check 'InactiveComputers' {
+                $l = @(Find-Ad "(&(objectCategory=computer)$en$idle)")
+                Out-Check 'InactiveComputers' $(if ($l.Count) { 'Niskie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'włączone konto komputera' 'włączone konta komputerów' 'włączonych kont komputerów') + " bez logowania od $($P.InactiveDays) dni" } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ('ostatnie logowanie {0}; {1}' -f (Get-AgeText $_.lastLogonTimestamp), [string]$_.operatingSystem) })
+            }
+            Invoke-Check 'GuestEnabled' {
+                $g = @(Find-Ad "(objectSid=$dsid-501)" @('objectSid'))
+                $on = @($g | Where-Object { -not ([int64]$_.userAccountControl -band 2) })
+                Out-Check 'GuestEnabled' $(if ($on.Count) { 'Wysokie' } else { 'OK' }) $on.Count $(if ($g.Count -eq 0) { 'nie znaleziono konta' } elseif ($on.Count) { 'konto Gość jest włączone' } else { 'wyłączone' }) @($on | ForEach-Object { New-AuditObject $_ 'konto włączone' })
+            }
+            Invoke-Check 'OldOs' {
+                $l = @(Find-Ad "(&(objectCategory=computer)$en(operatingSystem=*))" | Where-Object { [string]$_.operatingSystem -match $P.UnsupportedOs })
+                Out-Check 'OldOs' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { (Get-N $l.Count 'włączony komputer' 'włączone komputery' 'włączonych komputerów') + ': ' + (Get-ListText @($l | Group-Object operatingSystem | Sort-Object Count -Descending | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Count }) 3) } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ ([string]$_.operatingSystem) })
+            }
+            Invoke-Check 'Laps' {
+                # Atrybuty LAPS istnieją tylko po rozszerzeniu schematu - zapytanie o nieznany atrybut kończy się błędem
+                $schema = [string](Get-ADRootDSE @ad).schemaNamingContext
+                $attrs = @(foreach ($a in 'ms-Mcs-AdmPwdExpirationTime', 'msLAPS-PasswordExpirationTime') { if (@(Get-ADObject -SearchBase $schema -LDAPFilter "(lDAPDisplayName=$a)" @ad).Count) { $a } })
+                if ($attrs.Count -eq 0) { Out-Check 'Laps' 'Średnie' 1 'LAPS nie jest wdrożony (brak atrybutów LAPS w schemacie)'; return }
+                $filter = '(&(objectCategory=computer)' + $en + '(!(userAccountControl:1.2.840.113556.1.4.803:=8192))' + ((@($attrs | ForEach-Object { "(!($_=*))" })) -join '') + ')'
+                $l = @(Find-Ad $filter)
+                $all = @(Find-Ad "(&(objectCategory=computer)$en(!(userAccountControl:1.2.840.113556.1.4.803:=8192)))").Count
+                Out-Check 'Laps' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { 'bez hasła LAPS: {0} z {1} ({2})' -f $l.Count, $all, ($attrs -join ', ') } else { "hasło LAPS mają wszystkie komputery ($all)" }) @($l | ForEach-Object { New-AuditObject $_ ([string]$_.operatingSystem) })
+            }
+            Invoke-Check 'SidHistory' {
+                $l = @(Find-Ad '(sIDHistory=*)')
+                Out-Check 'SidHistory' $(if ($l.Count) { 'Średnie' } else { 'OK' }) $l.Count $(if ($l.Count) { Get-N $l.Count 'obiekt' 'obiekty' 'obiektów' } else { 'brak' }) @($l | ForEach-Object { New-AuditObject $_ 'ustawiony sIDHistory' })
+            }
+        }
+        'Domena' {
+            Invoke-Check 'MachineQuota' {
+                $d = Get-ADObject -Identity $domainDn -Properties 'ms-DS-MachineAccountQuota' @ad
+                $q = [int]$d.'ms-DS-MachineAccountQuota'
+                Out-Check 'MachineQuota' $(if ($q -gt 0) { 'Średnie' } else { 'OK' }) $(if ($q -gt 0) { 1 } else { 0 }) $(if ($q -gt 0) { 'każdy użytkownik może dołączyć do domeny {0} (ms-DS-MachineAccountQuota = {1})' -f (Get-N $q 'komputer' 'komputery' 'komputerów'), $q } else { 'ms-DS-MachineAccountQuota = 0' })
+            }
+            Invoke-Check 'RecycleBin' {
+                $f = @(Get-ADOptionalFeature -Filter "name -like 'Recycle Bin Feature'" @ad)
+                $on = $f.Count -gt 0 -and @($f[0].EnabledScopes | Where-Object { $_ }).Count -gt 0
+                Out-Check 'RecycleBin' $(if ($on) { 'OK' } else { 'Niskie' }) $(if ($on) { 0 } else { 1 }) $(if ($on) { 'włączony' } else { 'wyłączony' })
+            }
+            Invoke-Check 'FunctionalLevel' {
+                $mode = [string]$domain.DomainMode
+                $year = [regex]::Match($mode, '\d{4}').Value
+                $sev = if (-not $year) { 'Info' } elseif ([int]$year -le 2008) { 'Średnie' } elseif ([int]$year -le 2012) { 'Niskie' } else { 'OK' }
+                Out-Check 'FunctionalLevel' $sev $(if (@('Średnie', 'Niskie') -contains $sev) { 1 } else { 0 }) $mode
+            }
+            Invoke-Check 'ProtectedUsers' {
+                $g = @(Get-ADObject -LDAPFilter "(objectSid=$dsid-525)" @ad)
+                if ($g.Count -eq 0) { Out-Check 'ProtectedUsers' 'Info' 0 'brak grupy (poziom funkcjonalny niższy niż 2012 R2)'; return }
+                $mem = @(Find-Ad ('(memberOf:1.2.840.113556.1.4.1941:={0})' -f (ConvertTo-LdapValue ([string]$g[0].DistinguishedName))))
+                Out-Check 'ProtectedUsers' $(if ($mem.Count) { 'OK' } else { 'Niskie' }) $mem.Count $(if ($mem.Count) { "członkowie: $($mem.Count)" } else { 'grupa jest pusta' }) @($mem | ForEach-Object { New-AuditObject $_ 'członek Protected Users' })
+            }
+            Invoke-Check 'PreWin2000' {
+                $g = @(Get-ADObject -LDAPFilter '(objectSid=S-1-5-32-554)' -Properties member @ad)
+                if ($g.Count -eq 0) { Out-Check 'PreWin2000' 'Info' 0 'nie znaleziono grupy'; return }
+                $bad = @(@($g[0].member) | Where-Object { [string]$_ -match '^CN=(S-1-5-7|S-1-1-0),' })
+                $names = @($bad | ForEach-Object { if ([string]$_ -match '^CN=S-1-5-7,') { 'Logowanie anonimowe' } else { 'Wszyscy' } })
+                $objs = @($bad | ForEach-Object { [pscustomobject][ordered]@{ '__rec' = 'obj'; '__check' = ''; 'Nazwa' = $(if ([string]$_ -match '^CN=S-1-5-7,') { 'Logowanie anonimowe (S-1-5-7)' } else { 'Wszyscy (S-1-1-0)' }); 'Login' = ''; 'Typ' = 'Obcy podmiot'; 'Włączone' = ''; 'Szczegóły' = 'członek grupy'; 'DN' = [string]$_ } })
+                Out-Check 'PreWin2000' $(if ($bad.Count) { 'Średnie' } else { 'OK' }) $bad.Count $(if ($bad.Count) { 'w grupie: ' + ($names -join ', ') } else { "członkowie: $(@($g[0].member).Count), bez Wszystkich i anonimowych" }) $objs
+            }
+            Invoke-Check 'Trusts' {
+                $t = @(Get-ADObject -SearchBase "CN=System,$domainDn" -LDAPFilter '(objectClass=trustedDomain)' -Properties trustPartner, trustDirection, trustAttributes, trustType @ad)
+                $objs = New-Object System.Collections.ArrayList
+                $risky = 0
+                foreach ($x in $t) {
+                    $attr = [int64]$x.trustAttributes
+                    $dir = [int]$x.trustDirection
+                    $forest = [bool]($attr -band 0x8)
+                    $within = [bool]($attr -band 0x20)
+                    $filtered = [bool]($attr -band 0x4)
+                    $kind = if ($within) { 'w obrębie lasu' } elseif ($forest) { 'lasu' } else { 'zewnętrzne' }
+                    $dirText = switch ($dir) { 1 { 'przychodzące' } 2 { 'wychodzące' } 3 { 'dwukierunkowe' } default { 'wyłączone' } }
+                    $bad = (-not $within -and -not $forest -and ($dir -band 2) -and -not $filtered)
+                    if ($bad) { $risky++ }
+                    [void]$objs.Add([pscustomobject][ordered]@{ '__rec' = 'obj'; '__check' = ''; 'Nazwa' = [string]$x.trustPartner; 'Login' = ''; 'Typ' = "Zaufanie $kind"; 'Włączone' = ''
+                            'Szczegóły' = ('{0}; filtrowanie SID: {1}' -f $dirText, $(if ($within) { 'nie dotyczy' } elseif ($filtered -or $forest) { 'tak' } else { 'NIE' })); 'DN' = [string]$x.DistinguishedName })
+                }
+                Out-Check 'Trusts' $(if ($risky) { 'Średnie' } elseif ($t.Count) { 'Info' } else { 'OK' }) $risky $(if ($t.Count) { "relacje zaufania: $($t.Count), bez filtrowania SID: $risky" } else { 'brak zaufań' }) @($objs)
+            }
+        }
+    }
+}
+
+function Get-AdAuditScore([object[]]$Rows) {
+    # 100 minus wagi niespełnionych kontroli (wysokie 10, średnie 5, niskie 2)
+    $sum = 0
+    foreach ($r in $Rows) { $s = $script:AdAuditSeverity[[string](Get-ObjectValue $r 'Ocena')]; if ($s) { $sum += $s.Weight } }
+    $score = [Math]::Max(0, 100 - $sum)
+    $grade = if ($score -ge 90) { 'dobry' } elseif ($score -ge 70) { 'do poprawy' } elseif ($score -ge 50) { 'słaby' } else { 'krytyczny' }
+    $tone = if ($score -ge 90) { 'ok' } elseif ($score -ge 70) { 'warn' } else { 'crit' }
+    return @{ Score = $score; Grade = $grade; Tone = $tone }
+}
+
+function Show-AdAuditResults {
+    param([hashtable]$Module)
+    $m = $Module
+    $a = $m.Data.Audit
+    Reset-ResultTable -Module $m
+    $catOrder = @{}
+    for ($i = 0; $i -lt $script:AdAuditCategories.Count; $i++) { $catOrder[$script:AdAuditCategories[$i]] = $i }
+    $keyOrder = @{}
+    $i = 0
+    foreach ($k in $script:AdAuditChecks.Keys) { $keyOrder[$k] = $i++ }
+    $rows = foreach ($c in $a.Checks.Values) {
+        $def = $script:AdAuditChecks[[string]$c.Key]
+        if (-not $def) { continue }
+        $objs = @(if ($a.Objects.ContainsKey([string]$c.Key)) { $a.Objects[[string]$c.Key] })
+        [pscustomobject][ordered]@{
+            'Ocena'     = [string]$c.Severity
+            'Kategoria' = $def.Cat
+            'Kontrola'  = $def.Title
+            'Wynik'     = $(if ($c.Error) { 'Nie sprawdzono: ' + [string]$c.Error } else { [string]$c.Summary })
+            'Obiekty'   = $objs.Count
+            'Przykłady' = ((@($objs | Select-Object -First 5 | ForEach-Object { $_.'Nazwa' })) -join ', ')
+            'Zalecenie' = $(if (@('OK') -contains [string]$c.Severity) { '' } else { $def.Rec })
+            '__key'     = [string]$c.Key
+            '__tone'    = $script:AdAuditSeverity[[string]$c.Severity].Tone
+            '__sort'    = '{0}{1:00}{2:00}' -f $script:AdAuditSeverity[[string]$c.Severity].Rank, $catOrder[$def.Cat], $keyOrder[[string]$c.Key]
+        }
+    }
+    foreach ($err in $a.Errors) {
+        $rows = @($rows) + [pscustomobject][ordered]@{ 'Ocena' = 'Błąd'; 'Kategoria' = $err.Category; 'Kontrola' = '(cała grupa kontroli)'; 'Wynik' = 'Nie sprawdzono: ' + $err.Message; 'Obiekty' = 0; 'Przykłady' = ''; 'Zalecenie' = 'Sprawdź połączenie z kontrolerem domeny i uprawnienia konta.'; '__key' = ''; '__tone' = 'crit'; '__sort' = ('{0}{1:00}' -f 3, $catOrder[$err.Category]) }
+    }
+    $rows = @($rows | Sort-Object '__sort')
+    if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+    $sc = Get-AdAuditScore $rows
+    $a.Score = $sc
+    Set-StatTile -Module $m -Key 'score' -Value ('{0}/100' -f $sc.Score) -Tone $sc.Tone
+    foreach ($k in 'Wysokie', 'Średnie', 'Niskie') {
+        $n = @($rows | Where-Object { $_.'Ocena' -eq $k }).Count
+        Set-StatTile -Module $m -Key $k -Value ([string]$n) -Tone $(if ($n) { $script:AdAuditSeverity[$k].Tone } else { '' })
+    }
+    Set-StatTile -Module $m -Key 'ok' -Value ([string]@($rows | Where-Object { $_.'Ocena' -eq 'OK' }).Count) -Tone 'ok'
+    $unchecked = @($rows | Where-Object { $_.'Ocena' -eq 'Błąd' }).Count
+    $m.ResultHint = 'Ocena: {0}/100 ({1}){4} • domena {2} • {3:yyyy-MM-dd HH:mm} • prawy przycisk na kontroli: obiekty, zaznaczenie na liście' -f $sc.Score, $sc.Grade, $a.Domain, $a.At, $(if ($unchecked) { " – nie sprawdzono: $unchecked" } else { '' })
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+}
+
+function Get-AdAuditRowObjects([hashtable]$Module, $Rows) {
+    $out = New-Object System.Collections.ArrayList
+    foreach ($r in @($Rows)) {
+        $key = [string](Get-ObjectValue $r '__key')
+        if ($key -and $Module.Data.Audit.Objects.ContainsKey($key)) { foreach ($o in $Module.Data.Audit.Objects[$key]) { [void]$out.Add($o) } }
+    }
+    return $out.ToArray()
+}
+
+function Save-AdAuditReport {
+    # Raport HTML audytu: ocena, zestawienie kontroli i karta każdej niespełnionej kontroli z listą obiektów
+    param([hashtable]$Module, [string]$Path)
+    $a = $Module.Data.Audit
+    $rows = @(Get-ResultRowsAll -Module $Module)
+    $enc = { param($t) ConvertTo-HtmlText $t }
+    $sc = $a.Score
+    $sb = New-Object System.Text.StringBuilder
+    $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2}\{3} • domena {4} • progi: nieaktywność {5} dni, hasło administratora {6} dni, krbtgt {7} dni, konta uprzywilejowane {8}' -f $script:AppVersion, $a.At, $env:USERDOMAIN, $env:USERNAME, $a.Domain, $a.Params.InactiveDays, $a.Params.AdminPwdDays, $a.Params.KrbtgtDays, $a.Params.AdminLimit
+    [void]$sb.Append((Get-ReportHead -Title ('Audyt bezpieczeństwa Active Directory – ' + $a.Domain) -Meta $meta))
+    [void]$sb.Append('<div class="tiles"><div class="tile ').Append($sc.Tone).Append('"><b>').Append($sc.Score).Append('/100</b><span>Ocena: ').Append((& $enc $sc.Grade)).Append('</span></div>')
+    foreach ($k in 'Wysokie', 'Średnie', 'Niskie', 'OK') {
+        $n = @($rows | Where-Object { [string]$_['Ocena'] -eq $k }).Count
+        [void]$sb.Append('<div class="tile ').Append($(if ($k -eq 'OK') { 'ok' } else { $script:AdAuditSeverity[$k].Tone })).Append('"><b>').Append($n).Append('</b><span>').Append($(if ($k -eq 'OK') { 'Kontrole bez uwag' } else { "Ryzyko $($k.ToLowerInvariant())" })).Append('</span></div>')
+    }
+    [void]$sb.Append('</div>')
+    [void]$sb.Append((Get-ReportBar -Mode 'cards' -Placeholder 'Szukaj (kontrola, konto, komputer…)' -Buttons @('expand', 'collapse', 'print')))
+    [void]$sb.Append('<div class="box toc"><table class="dt" data-filters="no"><thead><tr><th>Ocena</th><th>Kategoria</th><th>Kontrola</th><th>Wynik</th><th>Obiekty</th></tr></thead><tbody>')
+    $n = 0
+    foreach ($r in $rows) {
+        $n++
+        $tone = $script:AdAuditSeverity[[string]$r['Ocena']].Tone
+        $title = & $enc ([string]$r['Kontrola'])
+        if ([string]$r['Ocena'] -ne 'OK') { $title = '<a href="#c' + $n + '">' + $title + '</a>' }
+        [void]$sb.Append('<tr><td><span class="pill ').Append($(if ($tone) { $tone } else { 'mute' })).Append('">').Append((& $enc ([string]$r['Ocena']))).Append('</span></td><td>').Append((& $enc ([string]$r['Kategoria']))).Append('</td><td>').Append($title)
+        [void]$sb.Append('</td><td>').Append((& $enc ([string]$r['Wynik']))).Append('</td><td>').Append([string]$r['Obiekty']).Append('</td></tr>')
+    }
+    [void]$sb.Append('</tbody></table></div>')
+    $n = 0
+    foreach ($r in $rows) {
+        $n++
+        if ([string]$r['Ocena'] -eq 'OK') { continue }
+        $tone = $script:AdAuditSeverity[[string]$r['Ocena']].Tone
+        [void]$sb.Append('<section class="card" id="c').Append($n).Append('"><div class="head"><div><h2>').Append((& $enc ([string]$r['Kontrola']))).Append('</h2><div class="sub">').Append((& $enc ([string]$r['Kategoria']))).Append('</div></div>')
+        [void]$sb.Append('<div style="text-align:right"><span class="pill ').Append($(if ($tone) { $tone } else { 'mute' })).Append('">').Append((& $enc ([string]$r['Ocena']))).Append('</span><div class="cacts"><button data-act="copy-card" title="Kopiuj kartę jako tekst">⧉ Kopiuj</button><button data-act="open-card" title="Otwórz kartę w osobnym oknie">↗ Okno</button></div><div class="top"><a href="#">↑ do góry</a></div></div></div>')
+        [void]$sb.Append('<div class="grid"><div class="sec"><h3>Wynik</h3><dl><dt>Wynik</dt><dd>').Append((& $enc ([string]$r['Wynik']))).Append('</dd><dt>Obiekty</dt><dd>').Append([string]$r['Obiekty']).Append('</dd></dl></div>')
+        if ([string]$r['Zalecenie']) { [void]$sb.Append('<div class="sec"><h3>Zalecenie</h3><div>').Append((& $enc ([string]$r['Zalecenie']))).Append('</div></div>') }
+        [void]$sb.Append('</div>')
+        $objs = @(Get-AdAuditRowObjects -Module $Module -Rows @($r))
+        if ($objs.Count) {
+            $shown = @($objs | Select-Object -First 1000)
+            [void]$sb.Append($(if ($shown.Count -le 50) { '<details open>' } else { '<details>' })).Append('<summary>Obiekty<span class="n">').Append($objs.Count).Append('</span></summary>')
+            [void]$sb.Append('<table class="dt"').Append($(if ($shown.Count -le 15) { ' data-filters="no"' } else { '' })).Append('><thead><tr><th>Nazwa</th><th>Login</th><th>Typ</th><th>Włączone</th><th>Szczegóły</th><th>DN</th></tr></thead><tbody>')
+            foreach ($o in $shown) {
+                [void]$sb.Append('<tr>')
+                foreach ($c in 'Nazwa', 'Login', 'Typ', 'Włączone', 'Szczegóły', 'DN') { [void]$sb.Append('<td>').Append((& $enc ([string]$o.$c))).Append('</td>') }
+                [void]$sb.Append('</tr>')
+            }
+            [void]$sb.Append('</tbody></table>')
+            if ($objs.Count -gt $shown.Count) { [void]$sb.Append('<div class="note">Pokazano ').Append($shown.Count).Append(' z ').Append($objs.Count).Append(' – pełną listę daje moduł w programie.</div>') }
+            [void]$sb.Append('</details>')
+        }
+        [void]$sb.Append('</section>')
+    }
+    [void]$sb.Append((Get-ReportTail))
+    [System.IO.File]::WriteAllText($Path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Log "Zapisano raport audytu AD: $Path" 'OK' -Module $Module.Title
+}
+
+Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdAudit' -Title 'Audyt bezpieczeństwa AD' -Icon 'EA18' -Badge 'nowe' `
+    -Description 'Ponad 30 kontroli bezpieczeństwa domeny z oceną punktową: konta uprzywilejowane (SPN, stare hasła, brak ochrony przed delegowaniem, pozostałości adminCount), Kerberos (konta bez wstępnego uwierzytelnienia, nieograniczone delegowanie, wiek hasła krbtgt), hasła i ich zasady, nieaktywne konta, LAPS, stare systemy, ustawienia domeny i zaufania. Każda kontrola z listą obiektów i zaleceniem.' -Build {
+    param($m)
+    $m.PillColumns = @('Ocena')
+    $row = Add-ToolbarRow -Module $m -Title 'Progi'
+    Add-Label -Parent $row -Text 'Nieaktywność (dni)' | Out-Null
+    $m.InactiveDays = Add-Numeric -Parent $row -Value ([int](Get-ModuleSetting -Module $m -Name 'InactiveDays' -Default ([int]$script:Settings.InactiveDays))) -Minimum 7 -Maximum 3650 -Width 70
+    Add-Label -Parent $row -Text '   Hasło administratora (dni)' | Out-Null
+    $m.AdminPwdDays = Add-Numeric -Parent $row -Value ([int](Get-ModuleSetting -Module $m -Name 'AdminPwdDays' -Default 365)) -Minimum 30 -Maximum 3650 -Width 70
+    Add-Label -Parent $row -Text '   Hasło krbtgt (dni)' | Out-Null
+    $m.KrbtgtDays = Add-Numeric -Parent $row -Value ([int](Get-ModuleSetting -Module $m -Name 'KrbtgtDays' -Default 180)) -Minimum 30 -Maximum 3650 -Width 70
+    Add-Label -Parent $row -Text '   Konta uprzywilejowane (próg)' | Out-Null
+    $m.AdminLimit = Add-Numeric -Parent $row -Value ([int](Get-ModuleSetting -Module $m -Name 'AdminLimit' -Default 10)) -Minimum 1 -Maximum 1000 -Width 70
+    $m.Actions.Run = {
+        param($m)
+        if (-not (Test-AdAvailable)) { return }
+        $params = @{ InactiveDays = (Get-Num $m.InactiveDays); AdminPwdDays = (Get-Num $m.AdminPwdDays); KrbtgtDays = (Get-Num $m.KrbtgtDays); AdminLimit = (Get-Num $m.AdminLimit); UnsupportedOs = $script:UnsupportedOsPattern }
+        foreach ($k in 'InactiveDays', 'AdminPwdDays', 'KrbtgtDays', 'AdminLimit') { Set-ModuleSetting -Module $m -Name $k -Value $params[$k] }
+        Reset-ResultTable -Module $m
+        $m.Data.Audit = @{ Checks = [ordered]@{}; Objects = @{}; Errors = New-Object System.Collections.ArrayList; Params = $params; At = (Get-Date); Domain = ''; Score = $null }
+        Start-AdOperation -Module $m -Name 'Audyt bezpieczeństwa AD' -Targets $script:AdAuditCategories -Output None -Parameters $params -ScriptBlock $script:AdAuditScript -OnResult {
+            param($m, $r)
+            $a = $m.Data.Audit
+            if (-not $r.Ok) { [void]$a.Errors.Add(@{ Category = [string]$r.Target; Message = ((@($r.Errors)) -join ' ') }); return }
+            foreach ($d in @($r.Data)) {
+                if ($null -eq $d) { continue }
+                switch ([string](Get-ObjectValue $d '__rec')) {
+                    'domain' { $a.Domain = [string]$d.Name }
+                    'check' { $a.Checks[[string]$d.Key] = $d }
+                    'obj' {
+                        $k = [string]$d.'__check'
+                        if (-not $a.Objects.ContainsKey($k)) { $a.Objects[$k] = New-Object System.Collections.ArrayList }
+                        [void]$a.Objects[$k].Add(([pscustomobject][ordered]@{ 'Nazwa' = $d.'Nazwa'; 'Login' = $d.'Login'; 'Typ' = $d.'Typ'; 'Włączone' = $d.'Włączone'; 'Szczegóły' = $d.'Szczegóły'; 'DN' = $d.'DN' }))
+                    }
+                }
+            }
+        } -OnComplete {
+            param($m)
+            if (-not $m.Data.Audit.Domain) { $m.Data.Audit.Domain = [string]$env:USERDNSDOMAIN }
+            Show-AdAuditResults -Module $m
+            $sc = $m.Data.Audit.Score
+            Write-Log ("Audyt bezpieczeństwa AD: ocena {0}/100 ({1})" -f $sc.Score, $sc.Grade) $(if ($sc.Tone -eq 'ok') { 'OK' } else { 'WARN' }) -Module $m.Title
+        }
+    }
+    $row2 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row2 -Text 'Uruchom audyt' -Icon 'EA18' -Module $m -Primary -OnClick $m.Actions.Run | Out-Null
+    Add-Button -Parent $row2 -Text 'Raport HTML…' -Icon 'E8A5' -Module $m -OnClick {
+        param($m)
+        if (-not $m.Data['Audit'] -or -not $m.Data.Audit['Score']) { Show-Warning 'Najpierw uruchom audyt.'; return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'Raport HTML (*.html)|*.html'
+        $dlg.FileName = 'Audyt_AD_{0}_{1:yyyyMMdd_HHmm}.html' -f (Get-SafeFileName $m.Data.Audit.Domain), (Get-Date)
+        $answer = if ($script:UI.Window) { $dlg.ShowDialog($script:UI.Window) } else { $dlg.ShowDialog() }
+        if ($answer -ne $true) { return }
+        Save-AdAuditReport -Module $m -Path $dlg.FileName
+        Show-Toast "Zapisano raport: $([System.IO.Path]::GetFileName($dlg.FileName))" 'ok'
+        try { Start-Process -FilePath $dlg.FileName } catch { }
+    } | Out-Null
+    Add-Label -Parent $row2 -Text 'Tylko odczyt – audyt niczego nie zmienia. Wynik zależy od uprawnień konta (część atrybutów czytają tylko administratorzy).' -Hint -MaxWidth 560 | Out-Null
+    Add-RowAction -Module $m -Text 'Pokaż obiekty' -Icon 'E8A1' -Action {
+        param($m, $rows)
+        $objs = @(Get-AdAuditRowObjects -Module $m -Rows $rows)
+        if ($objs.Count -eq 0) { Show-Message -Text 'Ta kontrola nie wskazała obiektów.' -Title 'Brak obiektów'; return }
+        Show-GridDialog -Title ('Audyt: ' + [string](Get-ObjectValue $rows[0] 'Kontrola')) -Subtitle ([string](Get-ObjectValue $rows[0] 'Zalecenie')) -Rows $objs
+    }
+    Add-RowAction -Module $m -Text 'Zaznacz konta na liście użytkowników' -Icon 'E8B3' -Separator -Action {
+        param($m, $rows)
+        $objs = @(Get-AdAuditRowObjects -Module $m -Rows $rows | Where-Object { $_.'Typ' -eq 'Użytkownik' -and $_.'Login' })
+        if ($objs.Count -eq 0) { Show-Warning 'Wybrane kontrole nie wskazały kont użytkowników.'; return }
+        Add-ResultsToTargets -Module $m -Kind User -Column 'Login' -Rows $objs
+    }
+    Add-RowAction -Module $m -Text 'Zaznacz komputery na liście komputerów' -Icon 'E977' -Action {
+        param($m, $rows)
+        $objs = @(Get-AdAuditRowObjects -Module $m -Rows $rows | Where-Object { $_.'Typ' -eq 'Komputer' })
+        if ($objs.Count -eq 0) { Show-Warning 'Wybrane kontrole nie wskazały komputerów.'; return }
+        Add-ResultsToTargets -Module $m -Kind Computer -Column 'Nazwa' -Rows $objs
+    }
+    Add-StatTile -Module $m -Key 'score' -Label 'Ocena bezpieczeństwa' -Icon 'EA18' | Out-Null
+    Add-StatTile -Module $m -Key 'Wysokie' -Label 'Ryzyko wysokie' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'Średnie' -Label 'Ryzyko średnie' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'Niskie' -Label 'Ryzyko niskie' -Icon 'E946' | Out-Null
+    Add-StatTile -Module $m -Key 'ok' -Label 'Bez uwag' -Icon 'E73E' | Out-Null
+    $m.EmptyHint = 'Kliknij «Uruchom audyt» (F5). Kontrole działają równolegle w pięciu grupach; każdą można rozwinąć prawym przyciskiem – lista obiektów, zaznaczenie kont lub komputerów na liście do dalszych operacji.'
 }
 #endregion
 

@@ -47,7 +47,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | --- | --- |
 | `AD-BulkAccountStatusChecker.ps1` | WinForms do wklejania listy loginów: sprawdza, czy konta istnieją i są włączone, filtruje/sortuje wyniki i eksportuje je do CSV. Duplikaty loginów (bez względu na wielkość liter) są pomijane. |
 | `AD-LastActiviti.ps1` | Interfejs WPF z raportem ostatniego logowania użytkowników (filtr nieaktywności 1/3/6/12 miesięcy, wyszukiwanie po nazwie/loginie/mieście, tylko aktywne), wyłączanie zaznaczonego konta i eksport widoku do CSV. |
-| `AD-ManagerDiamond.ps1` | Centrum administracji domeną „Domain Ops” (WPF, ciemny motyw): pięć przestrzeni roboczych — zarządzanie zdalne komputerami, użytkownicy AD, grupy i OU, komputery AD oraz pliki i uprawnienia — z 66 modułami, m.in. weryfikacją i czyszczeniem profili użytkowników względem AD, hurtowym tworzeniem kont i grup, duplikowaniem grup, budowaniem i klonowaniem drzew OU, uprawnieniami NTFS (nadawanie, odbieranie, uprawnienia efektywne z grupami zagnieżdżonymi i udziałem, raport ryzyk, porównanie ze wzorcem, naprawa z kopią uprawnień) i audytem bezpieczeństwa. Zastępuje dawne osobne skrypty (lista poniżej). Operacje w tle i równolegle, wyniki z filtrem, eksportem CSV/HTML i akcjami pod prawym przyciskiem; możliwość dodawania własnych modułów — szczegóły poniżej. |
+| `AD-ManagerDiamond.ps1` | Centrum administracji domeną „Domain Ops” (WPF, ciemny motyw): sześć przestrzeni roboczych — zarządzanie zdalne komputerami, użytkownicy AD, grupy i OU, komputery AD, pliki i uprawnienia oraz domena — z 67 modułami, m.in. weryfikacją i czyszczeniem profili użytkowników względem AD, hurtowym tworzeniem kont i grup, duplikowaniem grup, budowaniem i klonowaniem drzew OU, uprawnieniami NTFS (nadawanie, odbieranie, uprawnienia efektywne z grupami zagnieżdżonymi i udziałem, raport ryzyk, porównanie ze wzorcem, naprawa z kopią uprawnień) oraz audytem bezpieczeństwa komputerów i domeny AD. Zastępuje dawne osobne skrypty (lista poniżej). Operacje w tle i równolegle, wyniki z filtrem, eksportem CSV/HTML i akcjami pod prawym przyciskiem; możliwość dodawania własnych modułów — szczegóły poniżej. |
 | `AD-NTFS-AuditGUI.ps1` | Audytor NTFS w WPF: rekursywnie czyta ACL, rozpoznaje typ podmiotu (użytkownik/grupa), wskazuje foldery z uprawnieniami nadanymi bezpośrednio użytkownikom; widok tabeli i drzewa, filtry, eksport CSV/XLSX. |
 | `AD-PremissionAudit.ps1` | Prosty panel GUI: po wybraniu folderu uruchamia zadanie w tle, które przeszukuje drzewo katalogów i wypisuje miejsca, gdzie uprawnienia ma pojedynczy użytkownik zamiast grupy. |
 | `AD-RDP-LoginEvents.ps1` | GUI do pobierania zdarzeń z dziennika Security (domyślnie 4624/4634) z ostatnich N dni z wybranych komputerów lub wszystkich kontrolerów domeny. Działa w tle, zapisuje raport CSV do wskazanego folderu; konfigurację można zapisać/wczytać z JSON. |
@@ -61,7 +61,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 
 Uruchomienie: `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1`. Interfejs jest napisany w WPF dla Windows PowerShell 5.1 — skrypt sam uruchomi się ponownie w trybie STA, a z PowerShell 7 przełączy się na `powershell.exe`.
 
-**Przestrzenie robocze** (przełącznik na górnym pasku, skróty `Ctrl+1…5`):
+**Przestrzenie robocze** (przełącznik na górnym pasku, skróty `Ctrl+1…6`):
 
 | Przestrzeń | Lista po lewej | Do czego służy |
 | --- | --- | --- |
@@ -70,6 +70,7 @@ Uruchomienie: `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.
 | **Grupy i OU** | grupy | Grupy i jednostki organizacyjne: szczegóły i członkowie grup, członkostwo hurtowe, tworzenie i duplikowanie grup, drzewa OU, klonowanie OU, lokalizacje i role, drzewo zagnieżdżeń, raporty grup. |
 | **Komputery AD** | komputery | Konta komputerów w AD: informacje i kanał zaufania, LAPS, klucze BitLocker, zmiana nazw, grupy, raporty. |
 | **Pliki i uprawnienia** | — | Uprawnienia NTFS: nadawanie wielu grupom naraz, uprawnienia efektywne osoby, „gdzie ma dostęp”, odbieranie dostępu, grupy dostępu do folderów, raport uprawnień; kontrola i naprawa: raport ryzyk, udziały i NTFS, porównanie ze wzorcem, naprawa dziedziczenia i własności, kopie uprawnień z przywracaniem; sumy kontrolne plików. |
+| **Domena** | — | Cała domena naraz: audyt bezpieczeństwa Active Directory z oceną punktową. |
 
 **Układ okna**
 
@@ -190,6 +191,12 @@ Wszystkie raporty HTML programu (eksport tabeli, karty obiektów, drzewo zagnie�
 | Hasła i klucze | LAPS | Windows LAPS (także szyfrowane) i LAPS legacy, kopiowanie hasła (dwuklik), wymuszenie zmiany z przetworzeniem zasad. |
 | | Klucze BitLocker (AD) | Klucze zaznaczonych komputerów oraz **wyszukiwanie komputera po identyfikatorze klucza** z ekranu odzyskiwania. |
 | Raporty | Raporty komputerów | Nieaktywne, wyłączone, nowe, podsumowanie systemów, nieobsługiwane systemy, bez LAPS, bez klucza BitLocker w AD, serwery; zaznaczanie na liście, wyłączanie, przenoszenie, usuwanie. |
+
+**Moduły — Domena**
+
+| Kategoria | Moduł | Możliwości |
+| --- | --- | --- |
+| Bezpieczeństwo | Audyt bezpieczeństwa AD | 34 kontrole w pięciu grupach (uruchamiane równolegle), każda z oceną *wysokie / średnie / niskie / bez uwag*, listą obiektów i zaleceniem; ocena punktowa domeny (100 minus wagi niespełnionych kontroli). **Konta uprzywilejowane** (członkowie grup chronionych po SID, także zagnieżdżeni): SPN na kontach administratorów, hasła bez wygasania i stare hasła, nieużywane i wyłączone konta w grupach, brak ochrony przed delegowaniem (flaga „konto poufne” / Protected Users), członkowie Schema i Enterprise Admins, używanie wbudowanego konta Administrator, pozostałości `adminCount = 1`. **Kerberos i delegowanie:** konta z SPN (kerberoasting), bez wstępnego uwierzytelnienia (AS-REP roasting), nieograniczone delegowanie poza kontrolerami domeny, delegowanie z dowolnym protokołem, RBCD, wiek hasła `krbtgt`, DES. **Hasła:** brak wymaganego hasła, szyfrowanie odwracalne, hasła bez wygasania, zasady haseł domeny (długość, złożoność, blokada, historia) i zasady szczegółowe. **Konta i komputery:** nieaktywne konta i komputery, konto Gość, nieobsługiwane systemy, komputery bez LAPS (według schematu: Windows LAPS i LAPS legacy), SID History. **Domena:** `ms-DS-MachineAccountQuota`, kosz AD, poziom funkcjonalny, grupa Protected Users, „Pre-Windows 2000 Compatible Access” z dostępem anonimowym, zaufania bez filtrowania SID. Progi do ustawienia (nieaktywność, wiek hasła administratora i `krbtgt`, liczba kont uprzywilejowanych). Z wiersza: lista obiektów, **zaznaczenie kont lub komputerów na listach** do dalszych operacji; **raport HTML** z oceną, zestawieniem i kartą każdej kontroli. Tylko odczyt. |
 
 **Zastąpione skrypty.** Dawne osobne narzędzia zostały przeniesione do `AD-ManagerDiamond.ps1` (z podglądem przed zmianami, pracą w tle i wspólnym dziennikiem) i usunięte z repozytorium — w razie potrzeby są dostępne w historii git.
 
