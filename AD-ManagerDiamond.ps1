@@ -1,20 +1,28 @@
 ﻿<#
 .SYNOPSIS
     Domain Ops (AD-ManagerDiamond) - centrum administracji domeną: zdalne zarządzanie komputerami,
-    użytkownicy i komputery w Active Directory. Interfejs WPF.
+    użytkownicy, grupy, jednostki organizacyjne i komputery w Active Directory, uprawnienia NTFS
+    i sumy kontrolne plików. Interfejs WPF.
 
 .DESCRIPTION
-    Program jest podzielony na przestrzenie robocze (przełącznik na górze okna):
+    Program jest podzielony na przestrzenie robocze (przełącznik na górze okna, Ctrl+1..5):
       - Zarządzanie zdalne  - operacje na zaznaczonych komputerach przez PowerShell Remoting (WinRM):
                               diagnostyka, sesje i profile użytkowników, usługi, procesy, dyski, zdarzenia,
                               oprogramowanie i aktualizacje, bezpieczeństwo, udziały, polecenia, instalacje,
       - Użytkownicy AD      - konta użytkowników: szczegóły, hasła i blokady, stan konta, grupy, atrybuty,
-                              raporty (zablokowane, nieaktywne, wygasające hasła...) i źródło blokad,
+                              hurtowe tworzenie kont (profile), import atrybutów z CSV z cofaniem zmian,
+                              ostatnio utworzone obiekty, porządki z wyłączonymi kontami, raporty i blokady,
+      - Grupy i OU          - grupy: szczegóły, członkowie, członkostwo hurtowe, tworzenie z tabeli,
+                              duplikowanie, drzewo zagnieżdżeń i raporty; drzewa OU, klonowanie OU,
+                              lokalizacje i role (OU + grupy z szablonu, grupy zbiorcze ALL),
       - Komputery AD        - konta komputerów: informacje, kanał zaufania, LAPS, klucze BitLocker,
-                              zmiana nazwy, grupy i raporty (nieaktywne, systemy, bez LAPS...).
-    Każda przestrzeń ma listę obiektów docelowych (komputery albo użytkownicy) z zaznaczaniem, a moduły
-    pogrupowane w kategorie. Wyniki trafiają do tabel z filtrem, sortowaniem, podglądem wiersza,
-    kopiowaniem i eksportem CSV. Operacje wykonują się w tle i równolegle - okno nie zawiesza się.
+                              zmiana nazwy, grupy i raporty (nieaktywne, systemy, bez LAPS...),
+      - Pliki i uprawnienia - nadawanie uprawnień NTFS wielu grupom, raport uprawnień folderów,
+                              sumy kontrolne (MD5/SHA1/SHA256/SHA384/SHA512) z porównaniem.
+    Przestrzenie AD mają listę obiektów docelowych (komputery, użytkownicy albo grupy) z zaznaczaniem,
+    a moduły pogrupowane są w kategorie. Wyniki trafiają do tabel z filtrem, sortowaniem, podglądem
+    wiersza, kopiowaniem i eksportem CSV/HTML; zmiany hurtowe mają podgląd z edycją komórek przed
+    wykonaniem. Operacje wykonują się w tle i równolegle - okno nie zawiesza się.
 
     Rozbudowa: każda przestrzeń to Register-Workspace, każdy moduł to Register-Module. Własne moduły
     można dodawać bez zmiany tego pliku: pliki *.ps1 z folderu AD-ManagerDiamond.Modules (obok skryptu)
@@ -25,7 +33,8 @@
       - Windows PowerShell 5.1 (WPF, tryb STA - skrypt sam uruchomi się ponownie w odpowiednim trybie),
       - RSAT: moduł ActiveDirectory (przestrzenie AD i wczytywanie komputerów), opcjonalnie moduł LAPS,
       - WinRM na komputerach docelowych i uprawnienia administratora lokalnego.
-    Ustawienia: %APPDATA%\AD-ManagerDiamond\settings.json
+    Ustawienia: %APPDATA%\AD-ManagerDiamond\settings.json (także profile tworzenia kont)
+    Kopie członkostw i pliki cofania: %APPDATA%\AD-ManagerDiamond\Backup, ...\Rollback
     Dziennik:   %LOCALAPPDATA%\AD-ManagerDiamond\Logs\DomainOps_RRRRMMDD.log
     Pliki robocze na komputerach: %SystemRoot%\Temp\DomainOps
     Plik musi pozostać zapisany jako UTF-8 z BOM (polskie znaki w Windows PowerShell 5.1).
@@ -64,7 +73,7 @@ $env:ADPS_LoadDefaultDrive = '0'
 #endregion
 
 #region Konfiguracja i stan
-$script:AppVersion = '4.0'
+$script:AppVersion = '4.1'
 
 $script:App = @{
     Name       = 'Domain Ops'
@@ -94,6 +103,21 @@ $script:Settings = [ordered]@{
     LogVisible       = $false
     LogHeight        = 190
     DetailVisible    = $true
+    GroupSearchBase  = ''
+    GroupFilter      = 0
+    DisabledBaseOU   = ''
+    AadSyncServer    = ''
+    UserProfiles     = @()
+    ModuleValues     = @{}
+    ProfilesImported = $false
+    # Porządkowanie wyłączonych kont: konta pomijane i grupy, z których nigdy nie usuwamy członków
+    ExceptionUsers   = @('Guest', 'krbtgt', 'Gość', 'Admin2', 'Konto domyślne', 'any connect')
+    ProtectedGroups  = @('Domain Users', 'Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Protected Users',
+        'DnsAdmins', 'Backup Operators', 'Account Operators', 'Server Operators', 'Print Operators', 'Read-only Domain Controllers')
+    # Raport uprawnień NTFS: tożsamości systemowe ukrywane opcją «Ukryj konta systemowe» (dopasowanie końcówki nazwy)
+    NtfsHiddenIdentities = @('NT AUTHORITY\SYSTEM', 'CREATOR OWNER', 'BUILTIN\Administrators', 'NT SERVICE\TrustedInstaller',
+        'APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES', 'APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES',
+        'NT VIRTUAL MACHINE\Virtual Machines', 'NT AUTHORITY\LOCAL SERVICE', 'NT AUTHORITY\NETWORK SERVICE', 'Domain Admins')
 }
 
 # Poświadczenia bieżącej sesji (nie są zapisywane na dysku)
@@ -406,19 +430,228 @@ function Import-Settings {
     try { $s.TimeoutSec = [Math]::Min(300, [Math]::Max(5, [int]$s.TimeoutSec)) } catch { $s.TimeoutSec = 20 }
     try { $s.InactiveDays = [Math]::Min(3650, [Math]::Max(1, [int]$s.InactiveDays)) } catch { $s.InactiveDays = 90 }
     try { $s.UserFilter = [Math]::Min(3, [Math]::Max(0, [int]$s.UserFilter)) } catch { $s.UserFilter = 0 }
+    try { $s.GroupFilter = [Math]::Min(4, [Math]::Max(0, [int]$s.GroupFilter)) } catch { $s.GroupFilter = 0 }
     try { $s.LogHeight = [Math]::Min(600, [Math]::Max(90, [int]$s.LogHeight)) } catch { $s.LogHeight = 190 }
     try { $s.WindowWidth = [Math]::Max(1100, [int]$s.WindowWidth); $s.WindowHeight = [Math]::Max(680, [int]$s.WindowHeight) } catch { }
-    foreach ($b in 'OnlyEnabled', 'WindowMaximized', 'LogVisible', 'DetailVisible') { $s[$b] = [bool]$s[$b] }
-    foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace') { $s[$t] = [string]$s[$t] }
+    foreach ($b in 'OnlyEnabled', 'WindowMaximized', 'LogVisible', 'DetailVisible', 'ProfilesImported') { $s[$b] = [bool]$s[$b] }
+    foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace', 'GroupSearchBase', 'DisabledBaseOU', 'AadSyncServer') { $s[$t] = [string]$s[$t] }
+    foreach ($l in 'ExceptionUsers', 'ProtectedGroups', 'NtfsHiddenIdentities') { $s[$l] = @($s[$l] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
     $s.LastModules = ConvertTo-Hashtable $s.LastModules
+    $mv = ConvertTo-Hashtable $s.ModuleValues
+    foreach ($k in @($mv.Keys)) { $mv[$k] = ConvertTo-Hashtable $mv[$k] }
+    $s.ModuleValues = $mv
+    $s.UserProfiles = @(foreach ($pr in @($s.UserProfiles)) {
+            if ($null -eq $pr) { continue }
+            $h = ConvertTo-Hashtable $pr
+            if (-not [string]$h['Name']) { continue }
+            $h['Groups'] = @($h['Groups'] | ForEach-Object { [string]$_ } | Where-Object { $_ })
+            $h
+        })
 }
 
 function Export-Settings {
     try {
         if (-not (Test-Path -LiteralPath $script:App.DataDir)) { New-Item -ItemType Directory -Path $script:App.DataDir -Force | Out-Null }
-        $script:Settings | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:App.SettingsFile -Encoding UTF8
+        $script:Settings | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:App.SettingsFile -Encoding UTF8
     }
     catch { }
+}
+#endregion
+
+#region Tekst: nazwy, loginy, transliteracja, dane wklejane z Excela
+function ConvertTo-AsciiText {
+    # Usuwa znaki diakrytyczne (ą -> a, Ł -> L ...) - podstawa loginów i sAMAccountName
+    param([AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $normalized = $Text.Normalize([System.Text.NormalizationForm]::FormD)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $normalized.ToCharArray()) {
+        if ([System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark) { [void]$sb.Append($ch) }
+    }
+    # Ł/ł nie rozkłada się w normalizacji Unicode
+    return $sb.ToString().Normalize([System.Text.NormalizationForm]::FormC).Replace([string][char]0x0142, 'l').Replace([string][char]0x0141, 'L')
+}
+
+function ConvertTo-SamName {
+    # Nazwa -> sAMAccountName: ASCII, niedozwolone znaki i spacje zamienione na '-', bez powtórzeń '-'
+    param([AllowEmptyString()][string]$Text, [int]$MaxLength = 0)
+    $t = (ConvertTo-AsciiText $Text).Trim()
+    $t = $t -replace '[^A-Za-z0-9\-_.]', '-'
+    $t = ($t -replace '-{2,}', '-').Trim('-', '.')
+    if ($MaxLength -gt 0 -and $t.Length -gt $MaxLength) { $t = $t.Substring(0, $MaxLength).TrimEnd('-', '.') }
+    return $t
+}
+
+function ConvertTo-RdnValue {
+    # Wartość RDN do budowy DN (RFC 4514): znaki specjalne poprzedzone ukośnikiem
+    param([AllowEmptyString()][string]$Text)
+    $t = $Text -replace '([,+"\\<>;=])', '\$1'
+    if ($t.StartsWith(' ') -or $t.StartsWith('#')) { $t = '\' + $t }
+    if ($t.EndsWith(' ') -and -not $t.EndsWith('\ ')) { $t = $t.Substring(0, $t.Length - 1) + '\ ' }
+    return $t
+}
+
+function Test-SamName {
+    # Zwraca opis problemu albo pusty tekst. -User: limit 20 znaków (logowanie sprzed Windows 2000)
+    param([AllowEmptyString()][string]$Name, [switch]$User)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return 'brak sAMAccountName' }
+    if ($Name -match '["/\\\[\]:;|=,+*?<>@]') { return 'niedozwolone znaki w sAMAccountName' }
+    if ($Name.EndsWith('.')) { return 'sAMAccountName nie może kończyć się kropką' }
+    if ($User -and $Name.Length -gt 20) { return 'login dłuższy niż 20 znaków' }
+    if ($Name.Length -gt 256) { return 'sAMAccountName dłuższy niż 256 znaków' }
+    return ''
+}
+
+function ConvertTo-ProperName {
+    # "JAN KOWALSKI-NOWAK" -> "Jan Kowalski-Nowak" (polska kultura, części z myślnikiem osobno)
+    param([AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $pl = [System.Globalization.CultureInfo]::GetCultureInfo('pl-PL')
+    $words = foreach ($w in (($Text.Trim() -replace '\s+', ' ') -split ' ')) {
+        $parts = foreach ($p in ($w -split '-')) { if ($p) { $pl.TextInfo.ToTitleCase($p.ToLower($pl)) } }
+        @($parts) -join '-'
+    }
+    return (@($words) -join ' ')
+}
+
+function Test-PersonName {
+    # Imię/nazwisko: tylko litery, spacja i myślnik. Zwraca opis problemu albo pusty tekst.
+    param([AllowEmptyString()][string]$Text, [string]$Field = 'Imię')
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return "brak pola $Field" }
+    if ($t -match '\d') { return "$Field zawiera cyfry" }
+    if ($t -match "[^\p{L} \-']") { return "$Field zawiera niedozwolone znaki" }
+    return ''
+}
+
+$script:LoginFormats = @('i.nazwisko', 'inazwisko', 'imie.nazwisko', 'nazwisko.imie', 'imienazwisko', 'nazwisko.i', 'numer')
+
+function Get-LoginFromName {
+    # Login z imienia i nazwiska wg formatu (ASCII, małe litery, bez spacji, myślników i apostrofów)
+    param([string]$First, [string]$Last, [string]$Format = 'i.nazwisko', [string]$Number = '')
+    if ($Format -eq 'numer') { return ([string]$Number).Trim() }
+    $i = ((ConvertTo-AsciiText $First).ToLowerInvariant() -replace "[\s\-'.]", '')
+    $n = ((ConvertTo-AsciiText $Last).ToLowerInvariant() -replace "[\s\-'.]", '')
+    $i = $i -replace '[^a-z0-9]', ''
+    $n = $n -replace '[^a-z0-9]', ''
+    if (-not $i -or -not $n) { return '' }
+    switch ($Format) {
+        'inazwisko' { return $i.Substring(0, 1) + $n }
+        'imie.nazwisko' { return "$i.$n" }
+        'nazwisko.imie' { return "$n.$i" }
+        'imienazwisko' { return $i + $n }
+        'nazwisko.i' { return "$n." + $i.Substring(0, 1) }
+        default { return $i.Substring(0, 1) + ".$n" }
+    }
+}
+
+function Expand-Template {
+    # Podstawia pola {Nazwa} w szablonie (wielkość liter w nazwach pól bez znaczenia)
+    param([AllowEmptyString()][string]$Template, [hashtable]$Values)
+    if (-not $Template) { return '' }
+    $result = [regex]::Replace($Template, '\{([^{}]+)\}', {
+            param($match)
+            $key = $match.Groups[1].Value
+            foreach ($k in $Values.Keys) { if ([string]$k -ieq $key) { return [string]$Values[$k] } }
+            return $match.Value
+        })
+    return (($result -replace '\s{2,}', ' ') -replace '\(\s*\)', '').Trim()
+}
+
+function ConvertTo-GroupScope {
+    # Zakres grupy z tekstu (angielski, polski, skrót) -> Global / DomainLocal / Universal albo ''
+    param([AllowEmptyString()][string]$Text)
+    switch -Regex ((ConvertTo-AsciiText ([string]$Text)).Trim().ToLowerInvariant()) {
+        '^(global|globalna|g|gg)$' { return 'Global' }
+        '^(domainlocal|domain local|lokalna|lokalna domeny|dl|l|domenowa lokalna)$' { return 'DomainLocal' }
+        '^(universal|uniwersalna|u|ug)$' { return 'Universal' }
+    }
+    return ''
+}
+
+function ConvertTo-GroupCategory {
+    param([AllowEmptyString()][string]$Text)
+    switch -Regex ((ConvertTo-AsciiText ([string]$Text)).Trim().ToLowerInvariant()) {
+        '^(security|zabezpieczen|zabezpieczenia|s|z|sec)$' { return 'Security' }
+        '^(distribution|dystrybucyjna|dystrybucja|d|dist)$' { return 'Distribution' }
+    }
+    return ''
+}
+
+$script:GroupScopeLabels = @{ Global = 'Globalna'; DomainLocal = 'Lokalna domeny'; Universal = 'Uniwersalna' }
+$script:GroupCategoryLabels = @{ Security = 'Zabezpieczeń'; Distribution = 'Dystrybucyjna' }
+
+function Get-GroupScopeLabel([string]$Scope) {
+    $v = $script:GroupScopeLabels[[string]$Scope]
+    if ($v) { return $v }
+    return [string]$Scope
+}
+
+function Get-GroupCategoryLabel([string]$Category) {
+    $v = $script:GroupCategoryLabels[[string]$Category]
+    if ($v) { return $v }
+    return [string]$Category
+}
+
+function ConvertFrom-PastedTable {
+    <#
+        Tekst wklejony z Excela / CSV -> wiersze (tablice pól). Separator: tabulator, a gdy go brak - średnik.
+        -Headers @{ Klucz = @('alias1','alias2') } rozpoznaje wiersz nagłówka; zwraca @{ Rows; Map; HasHeader },
+        gdzie Map: Klucz -> indeks kolumny (bez nagłówka: kolejność kluczy z -Order).
+    #>
+    param([AllowEmptyString()][string]$Text, [System.Collections.IDictionary]$Headers = @{}, [string[]]$Order = @())
+    $lines = @(([string]$Text) -split "\r?\n" | Where-Object { $_.Trim() })
+    $result = @{ Rows = @(); Map = @{}; HasHeader = $false }
+    if ($lines.Count -eq 0) { return $result }
+    $sep = if ($lines[0].Contains("`t")) { "`t" } elseif ($lines[0].Contains(';')) { ';' } else { "`t" }
+    # Lista zamiast tablicy: wiersze (tablice pól) nie mogą zostać spłaszczone
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($l in $lines) { $rows.Add([object[]]@($l.Split($sep) | ForEach-Object { $_.Trim().Trim('"').Trim() })) }
+    $first = $rows[0]
+    $map = @{}
+    $matched = 0
+    for ($c = 0; $c -lt $first.Count; $c++) {
+        $cell = (ConvertTo-AsciiText $first[$c]).ToLowerInvariant() -replace '[\s_\-]', ''
+        foreach ($k in $Headers.Keys) {
+            foreach ($alias in @($Headers[$k])) {
+                if ($cell -eq ((ConvertTo-AsciiText $alias).ToLowerInvariant() -replace '[\s_\-]', '')) {
+                    if (-not $map.ContainsKey($k)) { $map[$k] = $c; $matched++ }
+                }
+            }
+        }
+    }
+    if ($matched -gt 0) {
+        $result.HasHeader = $true
+        $result.Map = $map
+        $result.Rows = @($rows | Select-Object -Skip 1)
+    }
+    else {
+        for ($i = 0; $i -lt $Order.Count; $i++) { $result.Map[$Order[$i]] = $i }
+        $result.Rows = $rows.ToArray()
+    }
+    return $result
+}
+
+function Get-PastedValue {
+    # Pole wiersza wg mapy kolumn z ConvertFrom-PastedTable ('' gdy brak)
+    param([object[]]$Row, [hashtable]$Map, [string]$Key)
+    if (-not $Map.ContainsKey($Key)) { return '' }
+    $i = [int]$Map[$Key]
+    if ($i -ge $Row.Count) { return '' }
+    return [string]$Row[$i]
+}
+
+function Get-ClipboardText {
+    try { if ([System.Windows.Clipboard]::ContainsText()) { return [System.Windows.Clipboard]::GetText() } } catch { }
+    return ''
+}
+
+function Get-DataFolder {
+    # Podfolder danych programu (kopie zapasowe członkostw, pliki cofania zmian)
+    param([Parameter(Mandatory)][string]$Name)
+    $path = Join-Path $script:App.DataDir $Name
+    if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+    return $path
 }
 #endregion
 
@@ -618,6 +851,27 @@ $script:ThemeXaml = @'
     <Setter Property="HorizontalScrollBarVisibility" Value="Disabled"/>
     <Setter Property="Background" Value="Transparent"/>
     <Setter Property="BorderThickness" Value="0"/>
+  </Style>
+
+  <Style x:Key="GridEditText" TargetType="TextBox">
+    <Setter Property="Background" Value="#202A3B"/>
+    <Setter Property="Foreground" Value="White"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="Padding" Value="0"/>
+    <Setter Property="Margin" Value="-6,-3"/>
+    <Setter Property="MinHeight" Value="0"/>
+    <Setter Property="CaretBrush" Value="#E4E8EF"/>
+    <Setter Property="SelectionBrush" Value="#3E6FE0"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="TextBox">
+          <Border Background="{TemplateBinding Background}" BorderBrush="#4C7DF0" BorderThickness="1" CornerRadius="4" Padding="5,2">
+            <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="Center"/>
+          </Border>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
   </Style>
 
   <Style TargetType="PasswordBox">
@@ -1190,6 +1444,8 @@ function Invoke-UiAction {
     $previous = $script:LogContext
     $script:LogContext = if ($Module) { $Module.Title } else { $null }
     try {
+        # Akcje czytają tabelę - niezatwierdzona edycja komórki musi trafić do wiersza
+        if ($Module -and $Module['EditableColumns'] -and $Module.Grid) { Complete-GridEdit -Module $Module }
         $null = & $Action $Module $Source
     }
     catch {
@@ -1497,6 +1753,175 @@ function Set-StatTile {
 function Reset-StatTiles([hashtable]$Module) {
     foreach ($k in @($Module.Stats.Keys)) { Set-StatTile -Module $Module -Key $k -Value '–' }
 }
+
+function Add-TextColumns {
+    <#
+        Kilka wieloliniowych pól obok siebie (np. «Lokalizacje» i «Role», «Obiekty» i «Grupy»).
+        -Columns: @(@{ Caption = '...'; Placeholder = '...'; Text = '' }, ...). Zwraca tablicę pól TextBox.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Module, [string]$Title = '', [Parameter(Mandatory)][object[]]$Columns, [double]$Height = 150)
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = '0,0,8,6'
+    $boxes = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $Columns.Count; $i++) {
+        $cd = New-Object System.Windows.Controls.ColumnDefinition
+        $cd.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+        [void]$grid.ColumnDefinitions.Add($cd)
+        $def = $Columns[$i]
+        $sp = New-Object System.Windows.Controls.DockPanel
+        $sp.Margin = $(if ($i -lt $Columns.Count - 1) { '0,0,10,0' } else { '0' })
+        $cap = New-Object System.Windows.Controls.TextBlock
+        $cap.Text = [string]$def['Caption']
+        $cap.Foreground = Get-Brush '#8791A5'
+        $cap.FontSize = 11.5
+        $cap.Margin = '1,0,0,4'
+        $cap.TextTrimming = 'CharacterEllipsis'
+        [System.Windows.Controls.DockPanel]::SetDock($cap, 'Top')
+        [void]$sp.Children.Add($cap)
+        $tb = New-Object System.Windows.Controls.TextBox
+        $tb.Style = Get-ThemeResource 'MultiText'
+        $tb.Height = $Height
+        $tb.Text = [string]$def['Text']
+        if ($def['Placeholder']) { $tb.Tag = [string]$def['Placeholder'] }
+        if ($def['ToolTip']) { $tb.ToolTip = [string]$def['ToolTip'] }
+        [void]$sp.Children.Add($tb)
+        [System.Windows.Controls.Grid]::SetColumn($sp, $i)
+        [void]$grid.Children.Add($sp)
+        [void]$boxes.Add($tb)
+    }
+    [void](Add-ParamRow -Module $Module -Title $Title -Content $grid)
+    return , $boxes.ToArray()
+}
+
+function Get-TextLines {
+    # Niepuste wiersze pola tekstowego albo tekstu (przycięte)
+    param($TextBox)
+    $text = if ($TextBox -is [string]) { $TextBox } elseif ($null -ne $TextBox) { [string]$TextBox.Text } else { '' }
+    return @($text -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Add-MenuButton {
+    <#
+        Przycisk z rozwijanym menu, np. «Ustaw zakres ▾». -Items: @(@{ Text; Icon; Action = { param($m, $value) }; Value }, '-')
+    #>
+    param([Parameter(Mandatory)]$Parent, [Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][object[]]$Items, [string]$Icon = '', [string]$ToolTip = '')
+    $b = New-PlainButton -Text $Text -Icon $Icon -ToolTip $ToolTip
+    $content = $b.Content
+    if (-not ($content -is [System.Windows.Controls.Panel])) {
+        $sp = New-Object System.Windows.Controls.StackPanel
+        $sp.Orientation = 'Horizontal'
+        $t = New-Object System.Windows.Controls.TextBlock
+        $t.Text = $Text
+        [void]$sp.Children.Add($t)
+        $content = $sp
+        $b.Content = $sp
+    }
+    $chev = New-GlyphBlock -Code 'E70D' -Size 9 -Color '#8791A5'
+    $chev.Margin = '8,1,0,0'
+    [void]$content.Children.Add($chev)
+    $b.Margin = '0,0,8,6'
+    $menu = New-Object System.Windows.Controls.ContextMenu
+    foreach ($it in $Items) {
+        if ($it -is [string]) { [void]$menu.Items.Add((New-MenuSeparator)); continue }
+        $mi = New-MenuItem -Text $it.Text -Icon ([string]$it['Icon']) -Module $Module -Danger:([bool]$it['Danger']) -Action {
+            param($m, $s)
+            $entry = $script:MenuButtonItems[$s]
+            $null = & $entry.Action $m $entry.Value
+        }
+        $script:MenuButtonItems[$mi] = @{ Action = $it.Action; Value = $it['Value'] }
+        [void]$menu.Items.Add($mi)
+    }
+    $b.ContextMenu = $menu
+    $menu.PlacementTarget = $b
+    $menu.Placement = 'Bottom'
+    $b.add_Click({ param($s, $e) $s.ContextMenu.IsOpen = $true })
+    [void]$Module.Buttons.Add($b)
+    [void]$Parent.Children.Add($b)
+    return $b
+}
+$script:MenuButtonItems = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
+
+$script:DropTargets = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
+$script:DropEvents = @{
+    DragOver = {
+        param($s, $e)
+        try {
+            $ok = $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)
+            $e.Effects = if ($ok) { [System.Windows.DragDropEffects]::Copy } else { [System.Windows.DragDropEffects]::None }
+            $e.Handled = $true
+        }
+        catch { }
+    }
+    Drop     = {
+        param($s, $e)
+        try {
+            if (-not $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { return }
+            $e.Handled = $true
+            $paths = [string[]]$e.Data.GetData([System.Windows.DataFormats]::FileDrop)
+            $entry = $script:DropTargets[$s]
+            if ($entry -and $paths) {
+                $script:LastDrop = @{ Entry = $entry; Paths = $paths }
+                Invoke-UiAction -Module $entry.Module -Action { param($m) $null = & $script:LastDrop.Entry.Action $m $script:LastDrop.Paths }
+            }
+        }
+        catch { Write-Log "Błąd upuszczania plików: $($_.Exception.Message)" 'ERROR' }
+    }
+}
+
+function Register-DropTarget {
+    # Upuszczanie plików i folderów z Eksploratora na element (np. cały widok modułu): -Action { param($m, [string[]]$paths) }
+    param([Parameter(Mandatory)]$Control, [Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][scriptblock]$Action)
+    $Control.AllowDrop = $true
+    $script:DropTargets[$Control] = @{ Module = $Module; Action = $Action }
+    # Zdarzenia tunelowe: pola tekstowe same obsługują przeciąganie (tekstu) i blokowałyby pliki
+    $Control.add_PreviewDragOver($script:DropEvents.DragOver)
+    $Control.add_PreviewDrop($script:DropEvents.Drop)
+}
+
+function Get-ModuleSetting {
+    # Wartość zapamiętana dla modułu (np. ostatnio użyta OU) - przetrwa ponowne uruchomienie programu
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Name, $Default = '')
+    $bag = $script:Settings.ModuleValues[$Module.Key]
+    if ($bag -is [System.Collections.IDictionary] -and $bag.Contains($Name) -and $null -ne $bag[$Name]) { return $bag[$Name] }
+    return $Default
+}
+
+function Set-ModuleSetting {
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Name, $Value)
+    $all = $script:Settings.ModuleValues
+    if (-not ($all[$Module.Key] -is [System.Collections.IDictionary])) { $all[$Module.Key] = @{} }
+    $all[$Module.Key][$Name] = $Value
+}
+
+function Add-OuField {
+    <#
+        Pole z DN jednostki organizacyjnej i przycisk wyboru z drzewa domeny. -Remember: zapamiętuje wartość
+        w ustawieniach modułu pod tą nazwą. -AllowDomainRoot: puste pole = cała domena / korzeń domeny.
+    #>
+    param([Parameter(Mandatory)]$Parent, [Parameter(Mandatory)][hashtable]$Module, [double]$Width = 420, [string]$Placeholder = 'Cała domena',
+        [string]$DialogTitle = 'Wybierz jednostkę organizacyjną', [switch]$AllowDomainRoot, [string]$Remember = '')
+    $tb = Add-TextBox -Parent $Parent -Width $Width -Placeholder $Placeholder
+    if ($Remember) { $tb.Text = [string](Get-ModuleSetting -Module $Module -Name $Remember -Default '') }
+    $b = Add-Button -Parent $Parent -Text '' -Icon 'E8B7' -Module $Module -AlwaysEnabled -ToolTip $DialogTitle -OnClick {
+        param($m, $s)
+        $entry = $script:OuFields[$s]
+        $dn = Select-OrganizationalUnit -Title $entry.Title -Selected $entry.Box.Text.Trim() -AllowDomainRoot:$entry.Root
+        if ($null -ne $dn) {
+            $entry.Box.Text = $dn
+            if ($entry.Remember) { Set-ModuleSetting -Module $m -Name $entry.Remember -Value $dn }
+        }
+    }
+    $script:OuFields[$b] = @{ Box = $tb; Title = $DialogTitle; Root = [bool]$AllowDomainRoot; Remember = $Remember }
+    if ($Remember) {
+        $script:OuFields[$tb] = @{ Remember = $Remember }
+        Register-ControlHandler -Control $tb -EventName 'TextChanged' -Module $Module -Action {
+            param($m, $s)
+            Set-ModuleSetting -Module $m -Name $script:OuFields[$s].Remember -Value $s.Text.Trim()
+        }
+    }
+    return $tb
+}
+$script:OuFields = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
 
 function Add-RowAction {
     # Pozycja menu kontekstowego tabeli wyników; akcja dostaje ($m, $rows) - zaznaczone wiersze (DataRowView)
@@ -1925,6 +2350,117 @@ function Read-NewPassword {
     $secure = $w.FindName('np1').SecurePassword.Copy()
     $secure.MakeReadOnly()
     return $secure
+}
+
+function Show-FormDialog {
+    <#
+        Formularz w oknie. -Fields: @(@{ Key; Label; Type = 'Text' | 'Multi' | 'Combo' | 'Check' | 'Ou'; Value; Items; Placeholder; Hint })
+        Zwraca hashtablę Key -> wartość (Text/Multi/Ou: tekst, Combo: wybrany tekst, Check: bool) albo $null (anulowano).
+        -Validate { param($values) } zwraca opis błędu albo pusty tekst.
+    #>
+    param([Parameter(Mandatory)][string]$Title, [string]$Subtitle = '', [Parameter(Mandatory)][object[]]$Fields, [string]$OkText = 'OK',
+        [string]$Icon = 'E70F', [scriptblock]$Validate, [double]$Width = 540, [switch]$Danger)
+    $w = New-Dialog -Title $Title -Subtitle $Subtitle -Body '<ScrollViewer MaxHeight="560" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="fmHost" Margin="0,0,6,0"/></ScrollViewer>' `
+        -Icon $Icon -OkText $OkText -Width $Width -Danger:$Danger -Validate {
+        param($w)
+        $values = Get-FormValues -Controls $w.Tag.Controls
+        if ($w.Tag.Check) {
+            $problem = [string](& $w.Tag.Check $values)
+            if ($problem) { Show-Warning $problem; return $false }
+        }
+        return $true
+    }
+    $stack = $w.FindName('fmHost')
+    $controls = [ordered]@{}
+    $first = $true
+    foreach ($f in $Fields) {
+        $type = if ($f['Type']) { [string]$f['Type'] } else { 'Text' }
+        if ($type -ne 'Check') {
+            $lbl = New-DialogText -Text ([string]$f['Label']) -Color '#8791A5' -Size 12
+            $lbl.Margin = $(if ($first) { '0,0,0,5' } else { '0,12,0,5' })
+            [void]$stack.Children.Add($lbl)
+        }
+        $ctl = $null
+        switch ($type) {
+            'Combo' {
+                $ctl = New-Object System.Windows.Controls.ComboBox
+                foreach ($i in @($f['Items'])) { [void]$ctl.Items.Add([string]$i) }
+                $sel = [string]$f['Value']
+                $ctl.SelectedIndex = [Math]::Max(0, $ctl.Items.IndexOf($sel))
+                [void]$stack.Children.Add($ctl)
+            }
+            'Check' {
+                $ctl = New-Object System.Windows.Controls.CheckBox
+                $ctl.Content = [string]$f['Label']
+                $ctl.IsChecked = [bool]$f['Value']
+                $ctl.Margin = $(if ($first) { '0,0,0,0' } else { '0,12,0,0' })
+                [void]$stack.Children.Add($ctl)
+            }
+            'Multi' {
+                $ctl = New-Object System.Windows.Controls.TextBox
+                $ctl.Style = Get-ThemeResource 'MultiText'
+                $ctl.Height = 130
+                $ctl.Text = [string]$f['Value']
+                [void]$stack.Children.Add($ctl)
+            }
+            default {
+                $ctl = New-Object System.Windows.Controls.TextBox
+                $ctl.Text = [string]$f['Value']
+                if ($type -eq 'Ou') {
+                    $dock = New-Object System.Windows.Controls.DockPanel
+                    $btn = New-PlainButton -Icon 'E8B7' -ToolTip 'Wybierz jednostkę organizacyjną'
+                    $btn.Padding = '9,6'
+                    $btn.Margin = '6,0,0,0'
+                    [System.Windows.Controls.DockPanel]::SetDock($btn, 'Right')
+                    [void]$dock.Children.Add($btn)
+                    [void]$dock.Children.Add($ctl)
+                    $script:FormOuButtons[$btn] = $ctl
+                    $btn.add_Click({
+                            param($s, $e)
+                            $box = $script:FormOuButtons[$s]
+                            $dn = $null
+                            try { $dn = Select-OrganizationalUnit -Selected $box.Text.Trim() -AllowDomainRoot } catch { Show-Error 'Nie można wczytać jednostek organizacyjnych.' $_ }
+                            if ($null -ne $dn) { $box.Text = $dn }
+                        })
+                    [void]$stack.Children.Add($dock)
+                }
+                else { [void]$stack.Children.Add($ctl) }
+            }
+        }
+        if ($f['Placeholder'] -and $ctl -is [System.Windows.Controls.TextBox]) { $ctl.Tag = [string]$f['Placeholder'] }
+        if ($f['Hint']) {
+            $h = New-DialogText -Text ([string]$f['Hint']) -Color '#6B7487' -Size 11.5
+            $h.Margin = '1,5,0,0'
+            [void]$stack.Children.Add($h)
+        }
+        $controls[[string]$f['Key']] = @{ Type = $type; Control = $ctl }
+        $first = $false
+    }
+    $w.Tag.Controls = $controls
+    $w.Tag.Check = $Validate
+    $w.add_ContentRendered({
+            param($s, $e)
+            foreach ($c in $s.Tag.Controls.Values) { if ($c.Control -is [System.Windows.Controls.TextBox]) { [void]$c.Control.Focus(); $c.Control.SelectAll(); break } }
+        })
+    if (@($Fields | Where-Object { $_['Type'] -eq 'Multi' }).Count -gt 0) { $w.FindName('btnOk').IsDefault = $false }
+    if (-not (Invoke-Dialog $w)) { return $null }
+    return (Get-FormValues -Controls $controls)
+}
+$script:FormOuButtons = New-Object 'System.Collections.Generic.Dictionary[object,object]'
+
+function Get-FormValues {
+    param([System.Collections.IDictionary]$Controls)
+    $values = @{}
+    foreach ($k in $Controls.Keys) {
+        $c = $Controls[$k]
+        $values[$k] = switch ($c.Type) {
+            'Combo' { [string]$c.Control.SelectedItem }
+            'Check' { ($c.Control.IsChecked -eq $true) }
+            'Multi' { [string]$c.Control.Text }
+            default { ([string]$c.Control.Text).Trim() }
+        }
+    }
+    return $values
 }
 
 function Show-TextDialog {
@@ -2540,6 +3076,8 @@ $script:GridEvents = @{
             $dep = $e.OriginalSource
             while ($dep -and -not ($dep -is [System.Windows.Controls.DataGridRow])) {
                 if ($dep -is [System.Windows.Controls.Primitives.DataGridColumnHeader] -or $dep -is [System.Windows.Controls.Primitives.ScrollBar]) { return }
+                # Dwuklik w edytowalnej komórce rozpoczyna edycję - bez okna szczegółów
+                if ($dep -is [System.Windows.Controls.DataGridCell] -and $dep.Column -and -not $dep.Column.IsReadOnly) { return }
                 if ($dep -is [System.Windows.Media.Visual] -or $dep -is [System.Windows.Media.Media3D.Visual3D]) { $dep = [System.Windows.Media.VisualTreeHelper]::GetParent($dep) }
                 else { $dep = $null }
             }
@@ -2632,12 +3170,25 @@ function Update-ParamsCollapse {
     $v.btnCollapse.Content = New-IconContent -Text $(if ($collapsed) { 'Parametry' } else { '' }) -Icon $(if ($collapsed) { 'E70D' } else { 'E70E' }) -IconSize 12
 }
 
+function Request-ResultSpace {
+    # Po przygotowaniu podglądu: gdy tabela wyników jest za niska, zwija panel parametrów (przycisk «Parametry» go rozwinie)
+    param([hashtable]$Module, [double]$MinHeight = 240)
+    if ($Module.ParamsCollapsed -or -not $Module.Grid -or -not $Module.Root.IsVisible) { return }
+    try { $Module.Root.UpdateLayout() } catch { }
+    if ($Module.Grid.ActualHeight -gt 0 -and $Module.Grid.ActualHeight -lt $MinHeight) {
+        $Module.ParamsCollapsed = $true
+        Update-ParamsCollapse -Module $Module
+        Show-Toast 'Zwinięto panel parametrów, aby zmieścić wyniki – przycisk «Parametry» u góry go rozwinie.' 'info' 5
+    }
+}
+
 function Complete-ModuleView {
     # Po zbudowaniu modułu: elementy zależne od ustawień nadanych w Build
     param([Parameter(Mandatory)][hashtable]$Module)
     $v = $Module.View_
     if ($Module.ParamsStack.Children.Count -gt 0) { $v.btnCollapse.Visibility = 'Visible' }
     if ($Module.SecretColumns.Count -gt 0) { $v.chkReveal.Visibility = 'Visible' }
+    if ($Module.EditableColumns.Count -gt 0) { $Module.Grid.IsReadOnly = $false }
     $v.emptyIcon.Text = Get-Glyph $(if ($Module.EmptyIcon) { $Module.EmptyIcon } else { $Module.Icon })
     if (-not $Module.EmptyHint -and $Module.PrimaryButton) {
         $label = $Module.PrimaryButton.Content
@@ -2645,10 +3196,12 @@ function Complete-ModuleView {
         $Module.EmptyHint = switch ($Module.Target) {
             'Computer' { "Zaznacz komputery na liście po lewej i kliknij «$label» (F5)." }
             'User' { "Zaznacz konta na liście po lewej i kliknij «$label» (F5)." }
+            'Group' { "Zaznacz grupy na liście po lewej i kliknij «$label» (F5)." }
             default { "Kliknij «$label» (F5), aby pobrać dane." }
         }
     }
     if ($Module.ResultHint) { $v.resultHint.Text = $Module.ResultHint }
+    elseif ($Module.EditableColumns.Count -gt 0) { $v.resultHint.Text = 'Kolumny z ołówkiem można edytować (dwuklik lub F2) • prawy przycisk – akcje' }
     elseif ($Module.RowActions.Count -gt 0) { $v.resultHint.Text = 'Prawy przycisk myszy na wierszach – akcje' }
     else { $v.resultHint.Text = 'Dwuklik na wierszu – szczegóły' }
     Update-ResultCount -Module $Module
@@ -2659,6 +3212,11 @@ function Reset-ResultTable {
     $table = New-Object System.Data.DataTable 'Wyniki'
     foreach ($c in '__search', '__flag', '__tone') { [void]$table.Columns.Add($c, [string]) }
     $view = [System.Data.DataView]::new($table)
+    if ($Module.Table) { [void]$script:TableModules.Remove($Module.Table) }
+    if ($Module.EditableColumns.Count -gt 0) {
+        $script:TableModules[$table] = $Module
+        $table.add_ColumnChanged($script:TableEvents.ColumnChanged)
+    }
     $Module.Table = $table
     $Module.View = $view
     $Module.ColumnIndex = @{}
@@ -2678,6 +3236,7 @@ function Add-GridColumn {
     $Module.ColumnIndex[$Name] = $true
     if ($Name.StartsWith('__') -or $Module.HiddenColumns -contains $Name) { return }
     $path = '[' + $Name + ']'
+    $editable = $Module.EditableColumns -contains $Name
     if ($Module.PillColumns -contains $Name) {
         $xaml = @"
 <DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
@@ -2697,14 +3256,32 @@ function Add-GridColumn {
     }
     else {
         $col = New-Object System.Windows.Controls.DataGridTextColumn
-        $col.Binding = New-Object System.Windows.Data.Binding $path
+        $binding = New-Object System.Windows.Data.Binding $path
+        if ($editable) {
+            $binding.Mode = [System.Windows.Data.BindingMode]::TwoWay
+            $col.EditingElementStyle = Get-ThemeResource 'GridEditText'
+        }
+        $col.Binding = $binding
         $style = New-Object System.Windows.Style ([System.Windows.Controls.TextBlock])
         $style.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.TextBlock]::TextTrimmingProperty, [System.Windows.TextTrimming]::CharacterEllipsis)))
         $col.ElementStyle = $style
         if ($Module.GoodWhenNo -contains $Name) { $col.CellStyle = Get-ThemeResource 'BoolCellInv' }
         elseif ($Module.ColorBools) { $col.CellStyle = Get-ThemeResource 'BoolCell' }
     }
-    $col.Header = $Name
+    $col.IsReadOnly = -not $editable
+    if ($editable) {
+        # Nagłówek kolumny edytowalnej: nazwa + ołówek
+        $hp = New-Object System.Windows.Controls.StackPanel
+        $hp.Orientation = 'Horizontal'
+        $ht = New-Object System.Windows.Controls.TextBlock
+        $ht.Text = $Name
+        [void]$hp.Children.Add($ht)
+        $hg = New-GlyphBlock -Code 'E70F' -Size 10 -Color '#6F8FD8'
+        $hg.Margin = '6,1,0,0'
+        [void]$hp.Children.Add($hg)
+        $col.Header = $hp
+    }
+    else { $col.Header = $Name }
     $col.SortMemberPath = $Name
     $col.MaxWidth = 520
     $col.MinWidth = 54
@@ -2717,6 +3294,7 @@ function Add-ResultRows {
     param([hashtable]$Module, [string]$Computer = '', [object[]]$Objects, [string]$TargetColumn = 'Komputer')
     $table = $Module.Table
     if ($null -eq $table) { return }
+    $Module.Loading = $true
     $table.BeginLoadData()
     try {
         foreach ($obj in $Objects) {
@@ -2768,6 +3346,7 @@ function Add-ResultRows {
     }
     finally {
         $table.EndLoadData()
+        $Module.Loading = $false
     }
     Update-ResultCount -Module $Module
 }
@@ -2781,15 +3360,93 @@ function Set-ResultValue {
         [void]$table.Columns.Add($Column, [object])
         Add-GridColumn -Module $Module -Name $Column
     }
-    $Row[$Column] = ConvertTo-CellValue $Value
+    $wasLoading = $Module.Loading
+    $Module.Loading = $true
+    try {
+        if ($Module.SecretColumns -contains $Column) {
+            if (-not $table.Columns.Contains("__secret_$Column")) { [void]$table.Columns.Add("__secret_$Column", [object]) }
+            $real = ConvertTo-CellValue $Value
+            $Row["__secret_$Column"] = $real
+            $Row[$Column] = if ($Module.RevealSecrets -or $real -is [System.DBNull] -or [string]$real -eq '') { $real } else { '••••••••••' }
+        }
+        else { $Row[$Column] = ConvertTo-CellValue $Value }
+        Update-RowSearch -Module $Module -Row $Row
+    }
+    finally { $Module.Loading = $wasLoading }
+}
+
+function Update-RowSearch {
+    # Tekst do filtrowania wiersza (po zmianie wartości w kodzie albo edycji komórki)
+    param([hashtable]$Module, $Row)
+    if ($Row -is [System.Data.DataRowView]) { $Row = $Row.Row }
     $search = New-Object System.Text.StringBuilder
-    foreach ($c in $table.Columns) {
+    foreach ($c in $Row.Table.Columns) {
         $n = $c.ColumnName
         if ($n.StartsWith('__') -or $Module.SecretColumns -contains $n) { continue }
         $v = $Row[$n]
         if ($v -isnot [System.DBNull]) { [void]$search.Append([string]$v).Append(' ') }
     }
     $Row['__search'] = $search.ToString().ToLowerInvariant()
+}
+
+function Complete-GridEdit {
+    # Zatwierdza trwającą edycję komórki/wiersza (przed odczytem tabeli przez akcję modułu)
+    param([hashtable]$Module)
+    $g = $Module.Grid
+    if (-not $g -or $g.IsReadOnly) { return }
+    try { [void]$g.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Row, $true) } catch { }
+}
+
+$script:TableModules = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
+$script:TableEvents = @{
+    ColumnChanged = {
+        param($s, $e)
+        try {
+            $m = $null
+            if (-not $script:TableModules.TryGetValue($s, [ref]$m)) { return }
+            if ($m.Loading -or $m.InCellEdit) { return }
+            $name = $e.Column.ColumnName
+            if ($name.StartsWith('__') -or $m.EditableColumns -notcontains $name) { return }
+            $row = $e.Row
+            if ($row.RowState -eq [System.Data.DataRowState]::Detached) { return }
+            $m.InCellEdit = $true
+            $previous = $script:LogContext
+            $script:LogContext = $m.Title
+            try {
+                if ($m.OnCellEdit) { $null = & $m.OnCellEdit $m $row $name }
+                Update-RowSearch -Module $m -Row $row
+            }
+            finally {
+                $m.InCellEdit = $false
+                $script:LogContext = $previous
+            }
+        }
+        catch { Write-Log "Błąd edycji komórki: $($_.Exception.Message)" 'ERROR' }
+    }
+}
+
+function Find-ResultRow {
+    # Wiersze tabeli wyników z wartością w kolumnie (np. ukryty identyfikator __id)
+    param([hashtable]$Module, [string]$Column, [string]$Value)
+    $table = $Module.Table
+    if (-not $table -or -not $table.Columns.Contains($Column)) { return @() }
+    $expr = "[{0}] = '{1}'" -f $Column.Replace(']', '\]'), $Value.Replace("'", "''")
+    return @($table.Select($expr))
+}
+
+function Set-RowState {
+    # Kolumny Stan (+ kolor pigułki) i Uwagi wiersza planu / podglądu
+    param([hashtable]$Module, $Row, [string]$State, [ValidateSet('', 'ok', 'warn', 'crit', 'info')][string]$Tone = '', $Note = $null, [string]$StateColumn = 'Stan')
+    Set-ResultValue -Module $Module -Row $Row -Column $StateColumn -Value $State
+    Set-ResultValue -Module $Module -Row $Row -Column '__tone' -Value $Tone
+    if ($null -ne $Note) { Set-ResultValue -Module $Module -Row $Row -Column 'Uwagi' -Value ([string]$Note) }
+}
+
+function Get-ResultRowsAll {
+    # Wszystkie wiersze tabeli (DataRow) w kolejności dodania
+    param([hashtable]$Module)
+    if (-not $Module.Table) { return @() }
+    return @($Module.Table.Rows | Where-Object { $_.RowState -ne [System.Data.DataRowState]::Deleted })
 }
 
 function Remove-ResultRows {
@@ -3337,7 +3994,11 @@ function Complete-OperationItem {
             $Operation.Failed++
             Write-Log ("[{0}] {1}" -f $Result.Target, $errorText) 'ERROR'
             if ($Operation.Output -eq 'Grid') {
-                Add-ResultRows -Module $m -Computer $Result.Target -TargetColumn $Operation.TargetColumn -Objects @([pscustomobject]@{ 'Status' = 'Błąd'; 'Szczegóły' = $errorText })
+                # Bez kolumny obiektu docelowego wiersz błędu sam mówi, czego dotyczy
+                $errRow = [ordered]@{ 'Status' = 'Błąd' }
+                if (-not $Operation.TargetColumn) { $errRow['Obiekt'] = $Result.Target }
+                $errRow['Szczegóły'] = $errorText
+                Add-ResultRows -Module $m -Computer $Result.Target -TargetColumn $Operation.TargetColumn -Objects @([pscustomobject]$errRow)
             }
         }
         else {
@@ -3459,14 +4120,16 @@ function Update-StatusBar {
 function Register-Workspace {
     <#
         Przestrzeń robocza = przycisk na górnym pasku + własna nawigacja modułów.
-        -Target: 'Computer' (lista komputerów po lewej), 'User' (lista kont) albo 'None' (bez listy).
+        -Target: 'Computer' (lista komputerów po lewej), 'User' (lista kont), 'Group' (lista grup) albo 'None' (bez listy).
+        -Categories: kolejność kategorii w nawigacji (pozostałe kategorie - w kolejności rejestracji modułów).
     #>
     param(
         [Parameter(Mandatory)][string]$Key,
         [Parameter(Mandatory)][string]$Title,
         [string]$Icon = 'E80F',
-        [ValidateSet('Computer', 'User', 'None')][string]$Target = 'None',
-        [string]$Description = ''
+        [ValidateSet('Computer', 'User', 'Group', 'None')][string]$Target = 'None',
+        [string]$Description = '',
+        [string[]]$Categories = @()
     )
     $script:UI.Workspaces[$Key] = @{
         Key         = $Key
@@ -3474,6 +4137,7 @@ function Register-Workspace {
         Icon        = $Icon
         Target      = $Target
         Description = $Description
+        Categories  = @($Categories)
         NavHost     = $null
         Tab         = $null
         NavItems    = @{}
@@ -3526,6 +4190,10 @@ function New-ModuleContext {
         PillColumns    = @()
         GoodWhenNo     = @()
         HiddenColumns  = @()
+        EditableColumns = @()
+        OnCellEdit     = $null
+        Loading        = $false
+        InCellEdit     = $false
         ColorBools     = $false
         RevealSecrets  = $false
         Stats          = @{}
@@ -3603,6 +4271,7 @@ function Show-Workspace {
     $c = $script:UI.Controls
     $c.panelComputers.Visibility = if ($ws.Target -eq 'Computer') { 'Visible' } else { 'Collapsed' }
     $c.panelUsers.Visibility = if ($ws.Target -eq 'User') { 'Visible' } else { 'Collapsed' }
+    $c.panelGroups.Visibility = if ($ws.Target -eq 'Group') { 'Visible' } else { 'Collapsed' }
     $c.targetColumn.Width = if ($ws.Target -eq 'None') { New-Object System.Windows.GridLength 0 } else { New-Object System.Windows.GridLength 300 }
     $c.txtSubtitle.Text = $ws.Description
     if (-not $ModuleKey) { $ModuleKey = [string]$script:Settings.LastModules[$Key] }
@@ -3632,6 +4301,15 @@ function Get-TargetComputers {
     $rows = @($script:UI.HostTable.Select('Sel = true', 'Name ASC'))
     $names = @($rows | ForEach-Object { [string]$_['Name'] } | Where-Object { $_ } | Select-Object -Unique)
     if ($names.Count -eq 0 -and -not $Quiet) { Show-Warning 'Zaznacz komputery na liście po lewej stronie.' }
+    return $names
+}
+
+function Get-TargetGroups {
+    # Grupy zaznaczone na liście grup (sAMAccountName)
+    param([switch]$Quiet)
+    $rows = @($script:UI.GroupTable.Select('Sel = true', 'Sam ASC'))
+    $names = @($rows | ForEach-Object { [string]$_['Sam'] } | Where-Object { $_ } | Select-Object -Unique)
+    if ($names.Count -eq 0 -and -not $Quiet) { Show-Warning 'Zaznacz grupy na liście po lewej stronie.' }
     return $names
 }
 
@@ -4382,6 +5060,217 @@ function Update-UserRow {
 }
 #endregion
 
+#region Panel grup
+function New-GroupLdapFilter {
+    param([string]$Query, [int]$Kind)
+    $parts = @('(objectCategory=group)')
+    $q = ([string]$Query).Trim()
+    if ($q) {
+        if ($q -match '\*') {
+            $v = $q -replace '\\', '\5c' -replace '\(', '\28' -replace '\)', '\29'
+            $parts += "(|(name=$v)(sAMAccountName=$v)(description=$v))"
+        }
+        else {
+            $v = ConvertTo-LdapFilterValue $q
+            $parts += "(|(name=*$v*)(sAMAccountName=*$v*)(description=*$v*)(mail=$v*))"
+        }
+    }
+    switch ($Kind) {
+        1 { $parts += '(groupType:1.2.840.113556.1.4.803:=2147483648)' }
+        2 { $parts += '(!(groupType:1.2.840.113556.1.4.803:=2147483648))' }
+        3 { $parts += '(!(member=*))' }
+        4 { $parts += '(adminCount=1)' }
+    }
+    return '(&' + ($parts -join '') + ')'
+}
+
+function Initialize-GroupPanel {
+    $p = New-TargetPanel -Kind 'Groups' -Title 'GRUPY' -Placeholder 'Szukaj na liście…' -EmptyIcon 'E902' `
+        -EmptyText "Lista jest pusta.`nWyszukaj grupy w Active Directory albo dodaj nazwy ręcznie." `
+        -Columns @('Sam', 'Name', 'Scope', 'Category', 'Description', 'Mail', 'DN') -KeyColumn 'Sam'
+    $p.SearchColumns = @('Sam', 'Name', 'Scope', 'Category', 'Description', 'Mail', 'Source', 'DN')
+    $p.Describe = {
+        param($row)
+        $name = [string]$row['Name']
+        $row['Title'] = if ($name) { $name } else { $row['Sam'] }
+        $parts = @()
+        if ($name -and $name -ne [string]$row['Sam']) { $parts += [string]$row['Sam'] }
+        if ([string]$row['Scope']) { $parts += [string]$row['Scope'] }
+        if ([string]$row['Category'] -eq 'Dystrybucyjna') { $parts += 'dystrybucyjna' }
+        if ([string]$row['Description']) { $parts += [string]$row['Description'] }
+        if ([string]$row['Source'] -ne 'AD') { $parts += [string]$row['Source'] }
+        $row['Sub'] = $parts -join ' • '
+        $row['Dot'] = switch ([string]$row['Category']) { 'Zabezpieczeń' { '#8CB0FF' } 'Dystrybucyjna' { '#C792EA' } default { $script:DotColors.unknown } }
+    }
+    $script:UI.GroupPanel = $p
+    $script:UI.GroupTable = $p.Table
+
+    $query = New-Object System.Windows.Controls.TextBox
+    $query.Tag = 'Nazwa, fragment nazwy lub opisu'
+    $query.ToolTip = 'Puste pole = wszystkie grupy z wybranej jednostki. Można używać gwiazdki, np. GG_*'
+    [void]$p.pSource.Children.Add((New-SourceRow -Stretch $query -Caption 'Wyszukaj grupy'))
+    $ou = New-Object System.Windows.Controls.TextBox
+    $ou.Tag = 'Cała domena'
+    $ou.Text = [string]$script:Settings.GroupSearchBase
+    $btnOu = New-PlainButton -Icon 'E8B7' -ToolTip 'Wybierz jednostkę organizacyjną'
+    $btnOu.Padding = '9,6'
+    [void]$p.pSource.Children.Add((New-SourceRow -Stretch $ou -After @($btnOu) -Caption 'Jednostka organizacyjna'))
+    $kind = New-Object System.Windows.Controls.ComboBox
+    foreach ($i in 'Wszystkie grupy', 'Grupy zabezpieczeń', 'Grupy dystrybucyjne', 'Grupy bez członków', 'Grupy uprzywilejowane (adminCount)') { [void]$kind.Items.Add($i) }
+    $kind.SelectedIndex = [int]$script:Settings.GroupFilter
+    [void]$p.pSource.Children.Add((New-SourceRow -Stretch $kind -Caption 'Rodzaj'))
+    $find = New-PlainButton -Text 'Szukaj w AD' -Icon 'E721' -Primary
+    $add = New-PlainButton -Icon 'E710' -ToolTip 'Dodaj grupy ręcznie (nazwy lub sAMAccountName)'
+    $file = New-PlainButton -Icon 'E8E5' -ToolTip 'Wczytaj nazwy grup z pliku TXT/CSV'
+    foreach ($b in $add, $file) { $b.Padding = '9,6' }
+    [void]$p.pSource.Children.Add((New-SourceRow -Stretch $find -After @($file, $add)))
+    $p.Query = $query
+    $p.Ou = $ou
+    $p.KindBox = $kind
+
+    $tm = New-ModuleContext -Definition @{ Key = '__groups'; Title = 'Lista grup'; Category = ''; Icon = 'E902'; Workspace = '' }
+    $script:UI.Modules['__groups'] = $tm
+    [void]$tm.Buttons.Add($find)
+    Register-ControlHandler -Control $btnOu -EventName 'Click' -Module $tm -Action {
+        $dn = Select-OrganizationalUnit -Title 'Grupy z jednostki organizacyjnej' -Selected $script:UI.GroupPanel.Ou.Text.Trim() -AllowDomainRoot
+        if ($null -ne $dn) { $script:UI.GroupPanel.Ou.Text = $dn }
+    }
+    Register-ControlHandler -Control $find -EventName 'Click' -Module $tm -Action { param($m) Start-AdGroupLoad -Module $m }
+    Register-ControlHandler -Control $add -EventName 'Click' -Module $tm -Action {
+        param($m)
+        $text = Show-InputDialog -Title 'Dodaj grupy' -Prompt 'Wpisz lub wklej nazwy grup albo sAMAccountName – po jednej w wierszu (nazwy ze spacjami muszą być w osobnych wierszach).' -Multiline -Icon 'E902'
+        if ($null -eq $text) { return }
+        Add-GroupNames -Module $m -Names @(Get-TextLines $text | ForEach-Object { $_.Trim('"') }) -Source 'ręcznie'
+    }
+    Register-ControlHandler -Control $file -EventName 'Click' -Module $tm -Action {
+        param($m)
+        $names = Read-NameFile -HeaderPattern '^(name|nazwa|grupa|group|samaccountname)$'
+        if ($null -eq $names) { return }
+        if ($names.Count -eq 0) { Show-Warning 'Plik nie zawiera nazw grup.'; return }
+        Add-GroupNames -Module $m -Names $names -Source 'plik'
+    }
+    $query.add_KeyDown({ param($s, $e) if ($e.Key -eq [System.Windows.Input.Key]::Return) { Invoke-UiAction -Module $script:UI.Modules['__groups'] -Action { param($m) Start-AdGroupLoad -Module $m } } })
+
+    Add-PanelMenu -Panel $p -Items @(
+        @{ Text = 'Zaznacz wybrane'; Icon = 'E73A'; Action = { param($panel) Set-TargetCheck -Panel $panel -Mode CheckSelected } }
+        @{ Text = 'Odznacz wybrane'; Icon = 'E739'; Action = { param($panel) Set-TargetCheck -Panel $panel -Mode UncheckSelected } }
+        '-'
+        @{ Text = 'Kopiuj nazwy'; Icon = 'E8C8'; Action = { param($panel, $names) Set-ClipboardText ($names -join [Environment]::NewLine); Show-Toast "Skopiowano nazw: $($names.Count)" 'ok' } }
+        @{ Text = 'Kopiuj DN'; Icon = 'E8C8'; Action = {
+                param($panel, $names)
+                $dns = @(foreach ($n in $names) { $r = $panel.Table.Rows.Find($n); if ($r -and [string]$r['DN']) { [string]$r['DN'] } })
+                if ($dns.Count -eq 0) { Show-Warning 'Wybrane pozycje nie mają DN – wyszukaj je w AD.'; return }
+                Set-ClipboardText ($dns -join [Environment]::NewLine)
+                Show-Toast "Skopiowano DN: $($dns.Count)" 'ok'
+            }
+        }
+        @{ Text = 'Usuń z listy'; Icon = 'E74D'; Danger = $true; Action = { param($panel) Remove-TargetRows -Panel $panel } }
+    )
+    return $p
+}
+
+$script:GroupLoadScript = {
+    # Wyszukiwanie grup (LdapFilter) albo pobranie podanych nazw (Names: sAMAccountName, nazwa, DN)
+    param($Target, $P, $Ctx)
+    Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
+    $ad = @{ ErrorAction = 'Stop' }
+    if ($Ctx.Server) { $ad.Server = $Ctx.Server }
+    if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+    $props = @('Description', 'mail')
+    $groups = @()
+    if ($P.Names) {
+        $groups = foreach ($n in $P.Names) {
+            $g = $null
+            try { $g = Get-ADGroup -Identity $n -Properties $props @ad } catch { }
+            if ($g) { $g; continue }
+            $v = ($n -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29')
+            $found = @(Get-ADGroup -LDAPFilter "(|(name=$v)(displayName=$v))" -Properties $props @ad)
+            if ($found.Count -eq 1) { $found[0] }
+            elseif ($found.Count -gt 1) { Write-Error "Nazwa «$n» pasuje do $($found.Count) grup – podaj sAMAccountName." }
+            else { Write-Error "Nie znaleziono grupy «$n»." }
+        }
+    }
+    else {
+        $q = @{ LDAPFilter = $P.LdapFilter; Properties = $props; ResultSetSize = 20000 }
+        if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+        $groups = @(Get-ADGroup @q @ad)
+    }
+    $scopes = @{ Global = 'Globalna'; DomainLocal = 'Lokalna domeny'; Universal = 'Uniwersalna' }
+    $cats = @{ Security = 'Zabezpieczeń'; Distribution = 'Dystrybucyjna' }
+    foreach ($g in $groups) {
+        if (-not $g) { continue }
+        [pscustomobject]@{
+            Sam         = $g.SamAccountName
+            Name        = $g.Name
+            Scope       = $scopes[[string]$g.GroupScope]
+            Category    = $cats[[string]$g.GroupCategory]
+            Description = $g.Description
+            Mail        = $g.mail
+            DN          = $g.DistinguishedName
+        }
+    }
+}
+
+function Start-AdGroupLoad {
+    param([hashtable]$Module, [string[]]$Names = @(), [string]$Source = 'AD')
+    if (-not (Test-AdAvailable)) { return }
+    $p = $script:UI.GroupPanel
+    $params = @{ Names = @($Names) }
+    if ($Names.Count -eq 0) {
+        $kind = [int]$p.KindBox.SelectedIndex
+        $script:Settings.GroupFilter = $kind
+        $script:Settings.GroupSearchBase = $p.Ou.Text.Trim()
+        $params.LdapFilter = New-GroupLdapFilter -Query $p.Query.Text -Kind $kind
+        $params.SearchBase = $script:Settings.GroupSearchBase
+    }
+    $Module.Data.Replace = ($Names.Count -eq 0)
+    $Module.Data.Source = $Source
+    $title = if ($Names.Count -gt 0) { 'Pobieranie grup z AD' } else { 'Wyszukiwanie grup w AD' }
+    Start-HostOperation -Module $Module -Name $title -Targets @('Active Directory') -Local -Output None -Parameters $params -ScriptBlock $script:GroupLoadScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) {
+            $m.Data.LastError = (@($r.Errors)) -join "`r`n"
+            Invoke-Deferred -Module $m -Action { param($m) Show-Error 'Nie udało się pobrać grup z Active Directory.' $m.Data.LastError }
+            return
+        }
+        $items = @($r.Data)
+        $panel = $script:UI.GroupPanel
+        if ($m.Data.Replace) { $added = Import-TargetRows -Panel $panel -Items $items -Source 'AD' -ReplaceSource }
+        else { $added = Import-TargetRows -Panel $panel -Items $items -Source 'AD' -Check }
+        if ($items.Count -ge 20000) { Write-Log 'Wyświetlono pierwsze 20000 grup – zawęź wyszukiwanie.' 'WARN' }
+        Write-Log ("Znaleziono w AD {0} grup (nowych na liście: {1})." -f $items.Count, $added) 'OK'
+    }
+}
+
+function Add-GroupNames {
+    # Grupy wpisane ręcznie lub z pliku: z modułem AD - pobranie i zaznaczenie, bez niego - dopisanie nazw
+    param([hashtable]$Module, [string[]]$Names, [string]$Source)
+    $list = @($Names | Where-Object { $_ } | Select-Object -Unique)
+    if ($list.Count -eq 0) { return }
+    if (Get-Module -ListAvailable -Name ActiveDirectory) {
+        Write-Log ("Pobieranie {0} grup z AD ({1})…" -f $list.Count, $Source) 'INFO' -Module 'Grupy'
+        Start-AdGroupLoad -Module $Module -Names $list -Source $Source
+        return
+    }
+    [void](Import-TargetRows -Panel $script:UI.GroupPanel -Items @($list | ForEach-Object { [pscustomobject]@{ Sam = $_ } }) -Source $Source -Check)
+}
+
+function Update-GroupRow {
+    # Aktualizacja pozycji listy grup po zmianie w AD (np. nowy opis, nowa nazwa)
+    param([string]$Sam, [hashtable]$Values)
+    $p = $script:UI.GroupPanel
+    if (-not $p) { return }
+    $row = $p.Table.Rows.Find($Sam)
+    if (-not $row) { return }
+    foreach ($k in $Values.Keys) {
+        if (-not $p.Table.Columns.Contains($k)) { continue }
+        $row[$k] = ConvertTo-DbValue $Values[$k]
+    }
+    & $p.Describe $row
+    $p.Table.AcceptChanges()
+}
+#endregion
+
 #region Okno główne
 $script:MainXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -4607,6 +5496,7 @@ function New-MainWindow {
     $w.add_PreviewKeyDown($script:ShellEvents.PreviewKeyDown)
     $w.add_Closing($script:ShellEvents.Closing)
     $w.add_SourceInitialized({ param($s, $e) Set-DarkTitleBar $s })
+    $w.add_SizeChanged({ param($s, $e) try { Update-HeaderLayout } catch { } })
 
     Update-CredentialLabel
     Update-StatusBar
@@ -4667,6 +5557,21 @@ $script:ShellEvents = @{
         }
         catch { }
     }
+}
+
+function Update-HeaderLayout {
+    # Wąskie okno: przyciski przestrzeni roboczych tylko z ikoną (pełna nazwa w podpowiedzi), bez opisu przestrzeni
+    $w = $script:UI.Window
+    if (-not $w -or $w.ActualWidth -le 0) { return }
+    $compact = $w.ActualWidth -lt 1280
+    foreach ($ws in $script:UI.Workspaces.Values) {
+        $content = if ($ws.Tab) { $ws.Tab.Content } else { $null }
+        if ($content -is [System.Windows.Controls.Panel] -and $content.Children.Count -gt 1) {
+            $content.Children[1].Visibility = if ($compact) { 'Collapsed' } else { 'Visible' }
+            $content.Children[0].Margin = if ($compact) { '2,0,2,0' } else { '0,0,8,0' }
+        }
+    }
+    $script:UI.Controls.txtSubtitle.Visibility = if ($w.ActualWidth -lt 1440) { 'Collapsed' } else { 'Visible' }
 }
 
 function Set-LogVisible {
@@ -4770,7 +5675,7 @@ function Initialize-Navigation {
         $tab.GroupName = 'workspaces'
         $tab.Content = New-IconContent -Text $ws.Title -Icon $ws.Icon
         $tab.Tag = $ws.Key
-        $tab.ToolTip = "$($ws.Description) (Ctrl+$i)"
+        $tab.ToolTip = "$($ws.Title): $($ws.Description) (Ctrl+$i)"
         $tab.add_Click($script:NavEvents.WorkspaceClick)
         [void]$c.wsSwitcher.Children.Add($tab)
         $ws.Tab = $tab
@@ -4782,6 +5687,7 @@ function Initialize-Navigation {
         [void]$c.navHost.Children.Add($panel)
         $defs = @($script:UI.ModuleDefs | Where-Object { $_.Workspace -eq $ws.Key })
         $categories = New-Object System.Collections.ArrayList
+        foreach ($order in @($ws['Categories'])) { if ($order -and @($defs | Where-Object { $_.Category -eq $order }).Count -gt 0) { [void]$categories.Add($order) } }
         foreach ($d in $defs) { if (-not $categories.Contains($d.Category)) { [void]$categories.Add($d.Category) } }
         foreach ($cat in $categories) {
             $header = New-Object System.Windows.Controls.TextBlock
@@ -4872,9 +5778,15 @@ $script:NavEvents = @{
 Register-Workspace -Key 'Remote' -Title 'Zarządzanie zdalne' -Icon 'E7F4' -Target Computer `
     -Description 'Operacje na zaznaczonych komputerach przez PowerShell Remoting (WinRM)'
 Register-Workspace -Key 'AdUsers' -Title 'Użytkownicy AD' -Icon 'E716' -Target User `
-    -Description 'Konta użytkowników w Active Directory: hasła, blokady, grupy, atrybuty i raporty'
+    -Description 'Konta użytkowników w Active Directory: tworzenie, hasła, blokady, grupy, atrybuty, porządki i raporty' `
+    -Categories @('Konta', 'Tworzenie i import', 'Grupy', 'Porządki', 'Raporty')
+Register-Workspace -Key 'AdGroups' -Title 'Grupy i OU' -Icon 'E902' -Target Group `
+    -Description 'Grupy i jednostki organizacyjne: członkowie, tworzenie, duplikowanie, zagnieżdżenia, drzewa OU i raporty' `
+    -Categories @('Grupy', 'Tworzenie', 'Struktura OU', 'Raporty')
 Register-Workspace -Key 'AdComputers' -Title 'Komputery AD' -Icon 'E977' -Target Computer `
     -Description 'Konta komputerów w Active Directory: LAPS, BitLocker, nazwy, grupy i raporty'
+Register-Workspace -Key 'Files' -Title 'Pliki i uprawnienia' -Icon 'E8B7' -Target None `
+    -Description 'Uprawnienia NTFS do folderów (nadawanie i raporty) oraz sumy kontrolne plików'
 #endregion
 
 #region Zarządzanie zdalne: Diagnostyka
@@ -7889,12 +8801,102 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
 #region Active Directory: wspólne
 # Operacje AD wykonywane są lokalnie w puli wątków modułem ActiveDirectory. Blok modułu dostaje gotową
 # hashtablę $ad (Server, Credential, ErrorAction = Stop) do rozwinięcia w poleceniach: Get-ADUser ... @ad
+# oraz funkcje pomocnicze z $script:AdHelpers (rozpoznawanie obiektów, nazwy z DN, filtry LDAP).
+$script:AdHelpers = @'
+function Get-DnName([string]$Dn) { return (([regex]::Match($Dn, '^(?:\\.|[^,])+').Value -replace '^[^=]+=', '') -replace '\\(.)', '$1') }
+function Get-DnParent([string]$Dn) { return ($Dn -replace '^(?:\\.|[^,])+,', '') }
+function ConvertTo-LdapValue([string]$Text) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Text.ToCharArray()) {
+        switch ($ch) {
+            '\' { [void]$sb.Append('\5c') }
+            '*' { [void]$sb.Append('\2a') }
+            '(' { [void]$sb.Append('\28') }
+            ')' { [void]$sb.Append('\29') }
+            ([char]0) { [void]$sb.Append('\00') }
+            default { [void]$sb.Append($ch) }
+        }
+    }
+    return $sb.ToString()
+}
+function Get-ScopeLabel($Scope) { switch ([string]$Scope) { 'Global' { 'Globalna' } 'DomainLocal' { 'Lokalna domeny' } 'Universal' { 'Uniwersalna' } default { [string]$Scope } } }
+function Get-CategoryLabel($Category) { switch ([string]$Category) { 'Security' { 'Zabezpieczeń' } 'Distribution' { 'Dystrybucyjna' } default { [string]$Category } } }
+function Get-ObjectKind([string]$Class) {
+    switch ($Class) {
+        'user' { 'Użytkownik' } 'computer' { 'Komputer' } 'group' { 'Grupa' } 'contact' { 'Kontakt' }
+        'foreignSecurityPrincipal' { 'Obcy podmiot' } 'organizationalUnit' { 'OU' } 'inetOrgPerson' { 'Użytkownik' }
+        'msDS-GroupManagedServiceAccount' { 'Konto usługi (gMSA)' } 'msDS-ManagedServiceAccount' { 'Konto usługi (MSA)' }
+        default { $Class }
+    }
+}
+function Resolve-AdPrincipal {
+    # Użytkownik, komputer lub grupa po: sAMAccountName, nazwie komputera, UPN, e-mail, DN, SID, nazwie albo DOMENA\login.
+    # Zwraca obiekt Get-ADObject; brak lub niejednoznaczność - wyjątek z opisem po polsku.
+    param([string]$Id, [string[]]$Classes = @('user', 'group', 'computer'), [string[]]$Properties = @())
+    $id = ([string]$Id).Trim().Trim('"')
+    if (-not $id) { throw 'Pusty identyfikator.' }
+    $props = @('sAMAccountName', 'objectSid', 'userAccountControl', 'groupType', 'displayName') + @($Properties)
+    $classFilter = '(|' + ((@($Classes) | ForEach-Object { "(objectClass=$_)" }) -join '') + ')'
+    if ($id -match '^(CN|OU)=.+,DC=') { return (Get-ADObject -Identity $id -Properties $props @ad) }
+    if ($id -match '^S-1-\d+(-\d+)+$') {
+        $found = @(Get-ADObject -LDAPFilter "(&$classFilter(objectSid=$id))" -Properties $props @ad)
+        if ($found.Count -ge 1) { return $found[0] }
+        throw "Nie znaleziono obiektu o SID $id."
+    }
+    if ($id -match '^[^\\]+\\(.+)$') { $id = $Matches[1] }
+    $v = ConvertTo-LdapValue $id
+    $filter = if ($id.Contains('@')) { "(&$classFilter(|(userPrincipalName=$v)(mail=$v)))" }
+    else { "(&$classFilter(|(sAMAccountName=$v)(sAMAccountName=$v`$)(name=$v)(displayName=$v)))" }
+    $found = @(Get-ADObject -LDAPFilter $filter -Properties $props @ad)
+    if ($found.Count -eq 1) { return $found[0] }
+    if ($found.Count -eq 0) { throw "Nie znaleziono «$id»." }
+    foreach ($pref in @($id, "$id`$")) {
+        $exact = @($found | Where-Object { [string]$_.sAMAccountName -ieq $pref })
+        if ($exact.Count -eq 1) { return $exact[0] }
+    }
+    throw ("«$id» jest niejednoznaczne ({0} obiektów) – podaj sAMAccountName lub DN." -f $found.Count)
+}
+function Get-GroupMemberObjects {
+    # Członkowie grupy zapytaniem po memberOf (bez limitu 5000 Get-ADGroupMember). -Recursive: także zagnieżdżeni.
+    # -PrimaryRid: dołącza konta, dla których grupa jest podstawowa (np. Domain Users).
+    param([string]$GroupDn, [switch]$Recursive, [string[]]$Properties = @(), [int]$PrimaryRid = 0)
+    $v = ConvertTo-LdapValue $GroupDn
+    $rule = if ($Recursive) { 'memberOf:1.2.840.113556.1.4.1941:' } else { 'memberOf' }
+    $props = @('sAMAccountName', 'objectSid', 'userAccountControl', 'displayName', 'groupType') + @($Properties)
+    $list = @(Get-ADObject -LDAPFilter "($rule=$v)" -Properties $props @ad)
+    if ($PrimaryRid -gt 0) { $list += @(Get-ADObject -LDAPFilter "(primaryGroupID=$PrimaryRid)" -Properties $props @ad) }
+    return $list
+}
+'@
+
+# Funkcje tekstowe programu (transliteracja, sAMAccountName) dostępne także w wątkach operacji AD
+foreach ($fn in 'ConvertTo-AsciiText', 'ConvertTo-SamName', 'Expand-Template', 'ConvertTo-RdnValue') {
+    $script:AdHelpers += "`nfunction $fn {`n" + (Get-Item "function:$fn").ScriptBlock.ToString() + "`n}"
+}
+
+# Początek każdego bloku operacji AD (funkcje pomocnicze z $script:AdHelpers dołączane w chwili uruchomienia,
+# więc kolejne regiony mogą je rozszerzać)
 $script:AdPrelude = @'
 Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
 $ad = @{ ErrorAction = 'Stop' }
 if ($Ctx.Server) { $ad.Server = $Ctx.Server }
 if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
 '@
+
+function Get-FriendlyAdError {
+    # Typowe komunikaty błędów AD (po angielsku) -> wskazówka po polsku; nieznane bez zmian
+    param([string]$Message)
+    $m = ([string]$Message).ToLowerInvariant()
+    if ($m -match 'already.*(exist|in use|member)|name that is already in use|not unique') { return "Obiekt już istnieje (login, UPN lub nazwa w OU są zajęte). ($Message)" }
+    if ($m -match 'access is denied|insufficient access') { return "Brak uprawnień w tej jednostce organizacyjnej. ($Message)" }
+    if ($m -match 'password does not meet|password.*requirement|complexity') { return "Hasło nie spełnia zasad domeny (długość, złożoność, historia). ($Message)" }
+    if ($m -match 'unwilling to process') { return "Kontroler domeny odrzucił żądanie – sprawdź hasło, wymagane atrybuty i UPN. ($Message)" }
+    if ($m -match 'directory object not found|no such object|cannot find an object') { return "Nie znaleziono obiektu lub jednostki organizacyjnej. ($Message)" }
+    if ($m -match 'naming violation|invalid dn syntax|bad name') { return "Niedozwolona nazwa (CN) – usuń znaki specjalne. ($Message)" }
+    if ($m -match 'group type cannot be changed|cannot be converted|group scope') { return "Nie można zmienić zakresu grupy – koliduje z jej członkami lub przynależnością. ($Message)" }
+    if ($m -match 'unable to contact|server is not operational|cannot contact') { return "Brak połączenia z kontrolerem domeny. ($Message)" }
+    return $Message
+}
 
 function Test-AdAvailable {
     if (Get-Module -ListAvailable -Name ActiveDirectory) { return $true }
@@ -7918,7 +8920,7 @@ function Start-AdOperation {
         [scriptblock]$OnComplete
     )
     if (-not (Test-AdAvailable)) { return }
-    $text = 'param($Target, $P, $Ctx)' + "`n" + $script:AdPrelude + "`n" + '$__body = {' + $ScriptBlock.ToString() + "`n}`n" + '& $__body $Target $P $Ctx'
+    $text = 'param($Target, $P, $Ctx)' + "`n" + $script:AdPrelude + "`n" + $script:AdHelpers + "`n" + '$__body = {' + $ScriptBlock.ToString() + "`n}`n" + '& $__body $Target $P $Ctx'
     $sp = @{
         Module       = $Module
         Name         = $Name
@@ -7938,7 +8940,7 @@ function Start-AdOperation {
 
 function Add-ResultsToTargets {
     # Przenosi obiekty z tabeli wyników na listę po lewej (i zaznacza je) - most między raportami a operacjami
-    param([hashtable]$Module, [ValidateSet('User', 'Computer')][string]$Kind, [string]$Column, $Rows = $null)
+    param([hashtable]$Module, [ValidateSet('User', 'Computer', 'Group')][string]$Kind, [string]$Column, $Rows = $null)
     $source = @(if ($null -ne $Rows) { $Rows } else { Get-SelectedResultRows -Module $Module })
     if ($source.Count -le 1 -and $null -eq $Rows) { $source = @($Module.View | ForEach-Object { $_ }) }
     $names = @($source | ForEach-Object { [string](Get-ObjectValue $_ $Column) } | Where-Object { $_ } | Select-Object -Unique)
@@ -7956,6 +8958,23 @@ function Add-ResultsToTargets {
             }
         }
         $panel = $script:UI.UserPanel
+        Set-TargetCheck -Panel $panel -Mode UncheckAll
+        $added = Import-TargetRows -Panel $panel -Items @($items) -Source 'raport' -Check
+    }
+    elseif ($Kind -eq 'Group') {
+        $items = foreach ($drv in $source) {
+            $sam = [string](Get-ObjectValue $drv $Column)
+            if (-not $sam) { continue }
+            [pscustomobject]@{
+                Sam         = $sam
+                Name        = Get-ObjectValue $drv 'Nazwa'
+                Scope       = Get-ObjectValue $drv 'Zakres'
+                Category    = Get-ObjectValue $drv 'Typ'
+                Description = Get-ObjectValue $drv 'Opis'
+                DN          = $(if ($null -ne (Get-ObjectValue $drv 'DN grupy')) { Get-ObjectValue $drv 'DN grupy' } else { Get-ObjectValue $drv 'DN' })
+            }
+        }
+        $panel = $script:UI.GroupPanel
         Set-TargetCheck -Panel $panel -Mode UncheckAll
         $added = Import-TargetRows -Panel $panel -Items @($items) -Source 'raport' -Check
     }
@@ -7979,18 +8998,22 @@ function Get-LdapDate {
 }
 
 function Register-GroupMembershipModule {
-    # Członkostwo w grupach - wspólny moduł dla użytkowników i komputerów
-    param([string]$Workspace, [ValidateSet('User', 'Computer')][string]$Kind, [string]$Key, [string]$Category)
-    $title = 'Członkostwo w grupach'
-    $desc = if ($Kind -eq 'User') { 'Grupy zaznaczonych kont (bezpośrednie i zagnieżdżone), dodawanie do grup, usuwanie z zaznaczonych grup i kopiowanie członkostwa z konta wzorcowego.' }
-    else { 'Grupy zaznaczonych kont komputerów (bezpośrednie i zagnieżdżone), dodawanie do grup i usuwanie z zaznaczonych grup.' }
+    # Członkostwo w grupach - wspólny moduł dla użytkowników, komputerów i grup (zagnieżdżanie)
+    param([string]$Workspace, [ValidateSet('User', 'Computer', 'Group')][string]$Kind, [string]$Key, [string]$Category, [string]$Title = 'Członkostwo w grupach')
+    $title = $Title
+    $desc = switch ($Kind) {
+        'User' { 'Grupy zaznaczonych kont (bezpośrednie i zagnieżdżone), dodawanie do grup, usuwanie z zaznaczonych grup i kopiowanie członkostwa z konta wzorcowego.' }
+        'Computer' { 'Grupy zaznaczonych kont komputerów (bezpośrednie i zagnieżdżone), dodawanie do grup i usuwanie z zaznaczonych grup.' }
+        default { 'Do jakich grup należą zaznaczone grupy (zagnieżdżanie): bezpośrednio i przez inne grupy. Dodawanie zaznaczonych grup do innych grup i usuwanie z nich.' }
+    }
     $build = {
         param($m)
         $m.PillColumns = @('Członkostwo')
-        $m.Data.Column = if ($m.Target -eq 'User') { 'Login' } else { 'Komputer' }
+        $m.Data.Column = switch ($m.Target) { 'User' { 'Login' } 'Group' { 'Członek' } default { 'Komputer' } }
         $m.Actions.Targets = {
             param($m)
             if ($m.Target -eq 'User') { return @(Get-TargetUsers) }
+            if ($m.Target -eq 'Group') { return @(Get-TargetGroups) }
             return @(Get-TargetComputers | ForEach-Object { ($_ -split '\.')[0] })
         }
         $m.Actions.List = {
@@ -7998,26 +9021,30 @@ function Register-GroupMembershipModule {
             $targets = @(& $m.Actions.Targets $m)
             if (-not $targets) { return }
             Start-AdOperation -Module $m -Name 'Grupy' -Targets $targets -TargetColumn $m.Data.Column -Parameters @{ Nested = (Test-Checked $m.Nested); Kind = $m.Target } -ScriptBlock {
-                $obj = if ($P.Kind -eq 'User') { Get-ADUser -Identity $Target -Properties memberOf, PrimaryGroupID @ad } else { Get-ADComputer -Identity $Target -Properties memberOf, PrimaryGroupID @ad }
+                $obj = switch ($P.Kind) {
+                    'User' { Get-ADUser -Identity $Target -Properties memberOf, PrimaryGroupID @ad }
+                    'Group' { Get-ADGroup -Identity $Target -Properties memberOf @ad }
+                    default { Get-ADComputer -Identity $Target -Properties memberOf, PrimaryGroupID @ad }
+                }
                 $direct = @{}
                 foreach ($dn in @($obj.memberOf)) { $direct[[string]$dn] = $true }
                 $groups = @()
                 if ($P.Nested) { $groups = @(Get-ADGroup -LDAPFilter ("(member:1.2.840.113556.1.4.1941:={0})" -f $obj.DistinguishedName) -Properties Description @ad) }
                 else { $groups = @($obj.memberOf | ForEach-Object { Get-ADGroup -Identity $_ -Properties Description @ad }) }
                 # Grupa podstawowa (Domain Users / Domain Computers) nie występuje w memberOf
-                try {
+                if ($P.Kind -ne 'Group') { try {
                     $domainSid = $obj.SID.AccountDomainSid.Value
                     $primary = Get-ADGroup -Identity ('{0}-{1}' -f $domainSid, $obj.PrimaryGroupID) -Properties Description @ad
                     if ($primary) { $groups += $primary; $direct[$primary.DistinguishedName] = $true }
                 }
-                catch { }
+                catch { } }
                 foreach ($g in ($groups | Sort-Object Name -Unique)) {
                     $isDirect = $direct.ContainsKey([string]$g.DistinguishedName)
                     [pscustomobject]@{
                         'Grupa'       = $g.Name
                         'Członkostwo' = $(if ($g.SID.Value -match '-(513|515)$' -and $isDirect) { 'Podstawowa' } elseif ($isDirect) { 'Bezpośrednie' } else { 'Zagnieżdżone' })
-                        'Zakres'      = [string]$g.GroupScope
-                        'Typ'         = [string]$g.GroupCategory
+                        'Zakres'      = Get-ScopeLabel $g.GroupScope
+                        'Typ'         = Get-CategoryLabel $g.GroupCategory
                         'Opis'        = $g.Description
                         'DN grupy'    = $g.DistinguishedName
                         '__tone'      = $(if ($isDirect) { 'info' } else { '' })
@@ -8036,7 +9063,7 @@ function Register-GroupMembershipModule {
             $names = @($Groups | ForEach-Object { $_.Name })
             if (-not (Confirm-Action -Text ("Dodać {0} obiekt(ów) do grup: {1}?" -f $targets.Count, ($names -join ', ')) -Items $targets -ConfirmText 'Dodaj do grup')) { return }
             Start-AdOperation -Module $m -Name 'Dodawanie do grup' -Targets $targets -TargetColumn $m.Data.Column -Output Log -Parameters @{ Groups = @($Groups | ForEach-Object { $_.DN }); Kind = $m.Target } -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
-                $obj = if ($P.Kind -eq 'User') { Get-ADUser -Identity $Target @ad } else { Get-ADComputer -Identity $Target @ad }
+                $obj = switch ($P.Kind) { 'User' { Get-ADUser -Identity $Target @ad } 'Group' { Get-ADGroup -Identity $Target @ad } default { Get-ADComputer -Identity $Target @ad } }
                 foreach ($g in $P.Groups) {
                     try {
                         Add-ADGroupMember -Identity $g -Members $obj @ad
@@ -8060,7 +9087,7 @@ function Register-GroupMembershipModule {
             if ($per.Count -eq 0) { Show-Warning 'Zaznacz w tabeli grupy z członkostwem bezpośrednim (zagnieżdżonego i podstawowego nie da się usunąć z tego miejsca).'; return }
             if (-not (Confirm-Action -Text 'Usunąć obiekty z wybranych grup?' -Items $items -ConfirmText 'Usuń z grup' -Danger)) { return }
             Start-AdOperation -Module $m -Name 'Usuwanie z grup' -Targets @($per.Keys) -PerTarget $per -TargetColumn $m.Data.Column -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
-                $obj = if ($P.Kind -eq 'User') { Get-ADUser -Identity $Target @ad } else { Get-ADComputer -Identity $Target @ad }
+                $obj = switch ($P.Kind) { 'User' { Get-ADUser -Identity $Target @ad } 'Group' { Get-ADGroup -Identity $Target @ad } default { Get-ADComputer -Identity $Target @ad } }
                 foreach ($g in $P.Groups) {
                     try {
                         Remove-ADGroupMember -Identity $g -Members $obj -Confirm:$false @ad
@@ -8071,7 +9098,7 @@ function Register-GroupMembershipModule {
             }
         }
         $row = Add-ToolbarRow -Module $m -Title 'Lista'
-        $m.Nested = Add-CheckBox -Parent $row -Text 'Uwzględnij grupy zagnieżdżone' -ToolTip 'Pełne członkowanie (także przez inne grupy) – LDAP_MATCHING_RULE_IN_CHAIN'
+        $m.Nested = Add-CheckBox -Parent $row -Text 'Uwzględnij grupy zagnieżdżone' -ToolTip 'Pełne członkostwo (także przez inne grupy) – LDAP_MATCHING_RULE_IN_CHAIN'
         Add-Button -Parent $row -Text 'Pokaż grupy' -Icon 'E902' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
         $row2 = Add-ToolbarRow -Module $m -Title 'Zmiany'
         Add-Button -Parent $row2 -Text 'Dodaj do grup…' -Icon 'E710' -Module $m -OnClick { param($m) & $m.Actions.Add $m $null } | Out-Null
@@ -8090,6 +9117,13 @@ function Register-GroupMembershipModule {
             } | Out-Null
         }
         Add-RowAction -Module $m -Text 'Usuń z grupy' -Icon 'E74D' -Danger -Action { param($m, $rows) & $m.Actions.Remove $m $rows }
+        if ($m.Target -eq 'Group') {
+            Add-RowAction -Module $m -Text 'Zaznacz grupy nadrzędne na liście' -Icon 'E8B3' -Action {
+                param($m, $rows)
+                $dns = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'DN grupy') } | Where-Object { $_ } | Select-Object -Unique)
+                Add-GroupNames -Module $script:UI.Modules['__groups'] -Names $dns -Source 'raport'
+            }
+        }
         Add-RowAction -Module $m -Text 'Kopiuj nazwy grup' -Icon 'E8C8' -Action {
             param($m, $rows)
             $names = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Grupa') } | Select-Object -Unique)
@@ -9341,6 +10375,4052 @@ Register-Module -Workspace 'AdComputers' -Category 'Raporty' -Key 'ComputerRepor
 }
 #endregion
 
+#region Grupy AD: szczegóły, członkowie, członkostwo hurtowe
+function Select-TargetGroups {
+    # Zaznacza na liście grup tylko podane grupy (sAMAccountName) - np. przejście do innego modułu z wybranymi grupami
+    param([string[]]$Sams)
+    $panel = $script:UI.GroupPanel
+    if (-not $panel) { return }
+    Set-TargetCheck -Panel $panel -Mode UncheckAll
+    $missing = @()
+    foreach ($s in $Sams) {
+        $row = $panel.Table.Rows.Find($s)
+        if ($row) { $row['Sel'] = $true } else { $missing += $s }
+    }
+    if ($missing.Count -gt 0) { [void](Import-TargetRows -Panel $panel -Items @($missing | ForEach-Object { [pscustomobject]@{ Sam = $_ } }) -Source 'raport' -Check) }
+    Update-TargetCount $panel
+}
+
+function Get-RowGroups {
+    # Grupy, których dotyczy akcja: zaznaczone wiersze wyników (kolumna -Column) albo zaznaczenie na liście po lewej
+    param([hashtable]$Module, $Rows, [string]$Column = 'Grupa')
+    if ($null -ne $Rows) { return @($Rows | ForEach-Object { [string](Get-ObjectValue $_ $Column) } | Where-Object { $_ } | Select-Object -Unique) }
+    return @(Get-TargetGroups)
+}
+
+$script:GroupChangeScript = {
+    # Zmiany pojedynczej grupy ($Target = sAMAccountName); $P.Op wybiera operację
+    $g = Get-ADGroup -Identity $Target -Properties Description, ProtectedFromAccidentalDeletion, adminCount, isCriticalSystemObject, mail @ad
+    switch ($P.Op) {
+        'Description' {
+            $d = ([string]$P.Value).Replace('{nazwa}', $g.Name).Replace('{sam}', $g.SamAccountName).Replace('{opis}', [string]$g.Description).Trim()
+            if ($d) { Set-ADGroup -Identity $g -Description $d @ad; "Opis: $d" }
+            else { Set-ADGroup -Identity $g -Clear description @ad; 'Usunięto opis.' }
+        }
+        'ManagedBy' {
+            if ($P.Value) {
+                $mgr = Resolve-AdPrincipal -Id $P.Value -Classes @('user', 'group', 'contact')
+                Set-ADGroup -Identity $g -ManagedBy $mgr.DistinguishedName @ad
+                "Zarządca: $($mgr.Name)"
+            }
+            else { Set-ADGroup -Identity $g -Clear managedBy @ad; 'Usunięto zarządcę.' }
+        }
+        'Mail' {
+            if ($P.Value) { Set-ADGroup -Identity $g -Replace @{ mail = [string]$P.Value } @ad; "E-mail: $($P.Value)" }
+            else { Set-ADGroup -Identity $g -Clear mail @ad; 'Usunięto adres e-mail.' }
+        }
+        'Scope' {
+            $notes = @()
+            if ($P.Scope -and [string]$g.GroupScope -ne $P.Scope) {
+                # Globalna <-> lokalna domeny tylko przez uniwersalną
+                if ([string]$g.GroupScope -ne 'Universal' -and $P.Scope -ne 'Universal') { Set-ADGroup -Identity $g -GroupScope Universal @ad }
+                Set-ADGroup -Identity $g -GroupScope $P.Scope @ad
+                $notes += 'zakres: ' + (Get-ScopeLabel $P.Scope)
+            }
+            if ($P.Category -and [string]$g.GroupCategory -ne $P.Category) {
+                Set-ADGroup -Identity $g -GroupCategory $P.Category @ad
+                $notes += 'typ: ' + (Get-CategoryLabel $P.Category)
+            }
+            if ($notes.Count -eq 0) { 'Bez zmian.' } else { 'Zmieniono ' + ($notes -join ', ') + '.' }
+        }
+        'Move' {
+            $wasProtected = [bool]$g.ProtectedFromAccidentalDeletion
+            # Obiektu chronionego przed usunięciem nie da się przenieść - ochrona zdejmowana na czas przeniesienia
+            if ($wasProtected) { Set-ADObject -Identity $g.DistinguishedName -ProtectedFromAccidentalDeletion $false @ad }
+            Move-ADObject -Identity $g.DistinguishedName -TargetPath $P.Value @ad
+            $newDn = '{0},{1}' -f ([regex]::Match($g.DistinguishedName, '^(?:\\.|[^,])+').Value), $P.Value
+            if ($wasProtected) { Set-ADObject -Identity $newDn -ProtectedFromAccidentalDeletion $true @ad }
+            [pscustomobject]@{ Wynik = "Przeniesiono do $($P.Value)."; DN = $newDn }
+        }
+        'Protect' {
+            Set-ADObject -Identity $g.DistinguishedName -ProtectedFromAccidentalDeletion ([bool]$P.Value) @ad
+            if ($P.Value) { 'Ochrona przed usunięciem: włączona.' } else { 'Ochrona przed usunięciem: wyłączona.' }
+        }
+        'Delete' {
+            if ($g.isCriticalSystemObject -or $g.adminCount -eq 1) { throw 'Pominięto – grupa systemowa lub uprzywilejowana (adminCount = 1). Usuń ją ręcznie, jeśli to zamierzone.' }
+            if ($g.ProtectedFromAccidentalDeletion) { throw 'Grupa jest chroniona przed przypadkowym usunięciem – najpierw wyłącz ochronę.' }
+            Remove-ADObject -Identity $g.DistinguishedName -Confirm:$false @ad
+            'Usunięto grupę.'
+        }
+        'Rename' {
+            $notes = @()
+            $dn = $g.DistinguishedName
+            if ($P.Name -and $P.Name -cne $g.Name) {
+                $wasProtected = [bool]$g.ProtectedFromAccidentalDeletion
+                if ($wasProtected) { Set-ADObject -Identity $dn -ProtectedFromAccidentalDeletion $false @ad }
+                Rename-ADObject -Identity $dn -NewName $P.Name @ad
+                $dn = 'CN={0},{1}' -f (ConvertTo-RdnValue $P.Name), (Get-DnParent $dn)
+                if ($wasProtected) { Set-ADObject -Identity $dn -ProtectedFromAccidentalDeletion $true @ad }
+                $notes += "nazwa: $($P.Name)"
+            }
+            if ($P.Sam -and $P.Sam -ne $g.SamAccountName) { Set-ADGroup -Identity $dn -SamAccountName $P.Sam @ad; $notes += "sAMAccountName: $($P.Sam)" }
+            if ($P.ContainsKey('Display')) {
+                if ($P.Display) { Set-ADGroup -Identity $dn -DisplayName $P.Display @ad } else { Set-ADGroup -Identity $dn -Clear displayName @ad }
+            }
+            [pscustomobject]@{ Wynik = $(if ($notes.Count) { 'Zmieniono ' + ($notes -join ', ') + '.' } else { 'Bez zmian.' }); DN = $dn; Sam = $(if ($P.Sam) { $P.Sam } else { $g.SamAccountName }); Name = $(if ($P.Name) { $P.Name } else { $g.Name }) }
+        }
+    }
+}
+
+function Invoke-GroupChange {
+    # Wspólna obsługa zmian grup (moduł szczegółów i akcje wierszy)
+    param([hashtable]$Module, [string]$Op, $Rows = $null)
+    $groups = @(Get-RowGroups -Module $Module -Rows $Rows)
+    if ($groups.Count -eq 0) { return }
+    $params = @{ Op = $Op; Value = $null }
+    $confirmText = ''
+    $danger = $false
+    switch ($Op) {
+        'Description' {
+            $current = ''
+            if ($groups.Count -eq 1) { $r = $script:UI.GroupTable.Rows.Find($groups[0]); if ($r) { $current = [string]$r['Description'] } }
+            $v = Show-InputDialog -Title 'Opis grupy' -Prompt 'Nowy opis. Pola: {nazwa}, {sam}, {opis} (dotychczasowy opis). Puste pole usuwa opis.' -Default $current -Icon 'E70F'
+            if ($null -eq $v) { return }
+            $params.Value = $v
+            $confirmText = $(if ($v.Trim()) { "Ustawić opis «$($v.Trim())»?" } else { 'Usunąć opis grup?' })
+        }
+        'ManagedBy' {
+            $v = Show-InputDialog -Title 'Zarządca grupy' -Prompt 'Login użytkownika, nazwa grupy lub kontaktu (pole managedBy). Puste pole usuwa zarządcę.' -Icon 'E77B'
+            if ($null -eq $v) { return }
+            $params.Value = $v.Trim()
+            $confirmText = $(if ($params.Value) { "Ustawić zarządcę «$($params.Value)»?" } else { 'Usunąć zarządcę grup?' })
+        }
+        'Mail' {
+            $v = Show-InputDialog -Title 'Adres e-mail grupy' -Prompt 'Atrybut mail (np. dla grup dystrybucyjnych). Puste pole usuwa adres.' -Icon 'E715' -Validate { param($t) if (-not $t.Trim() -or $t.Trim() -match '^[^@\s]+@[^@\s]+\.[^@\s]+$') { '' } else { 'Podaj poprawny adres e-mail.' } }
+            if ($null -eq $v) { return }
+            $params.Value = $v.Trim()
+            $confirmText = $(if ($params.Value) { "Ustawić adres e-mail «$($params.Value)»?" } else { 'Usunąć adres e-mail grup?' })
+        }
+        'Scope' {
+            $f = Show-FormDialog -Title 'Zakres i typ grupy' -Subtitle 'Zmiana globalna ↔ lokalna domeny odbywa się przez zakres uniwersalny (dwa kroki). AD odrzuci zmianę, jeśli koliduje z członkostwem grupy.' -Icon 'E8AB' -Fields @(
+                @{ Key = 'Scope'; Label = 'Zakres'; Type = 'Combo'; Items = @('bez zmian', 'Globalna', 'Lokalna domeny', 'Uniwersalna'); Value = 'bez zmian' }
+                @{ Key = 'Category'; Label = 'Typ'; Type = 'Combo'; Items = @('bez zmian', 'Zabezpieczeń', 'Dystrybucyjna'); Value = 'bez zmian' }
+            ) -Validate { param($v) if ($v.Scope -eq 'bez zmian' -and $v.Category -eq 'bez zmian') { 'Wybierz nowy zakres lub typ.' } else { '' } }
+            if (-not $f) { return }
+            $params.Scope = ConvertTo-GroupScope $f.Scope
+            $params.Category = ConvertTo-GroupCategory $f.Category
+            if ($params.Category -eq 'Distribution') { $danger = $true }
+            $confirmText = 'Zmienić ' + ((@($(if ($params.Scope) { "zakres na «$($f.Scope)»" }), $(if ($params.Category) { "typ na «$($f.Category)»" }) | Where-Object { $_ })) -join ' i ') + '?'
+            if ($params.Category -eq 'Distribution') { $confirmText += "`r`nGrupa dystrybucyjna nie nadaje uprawnień – wpisy ACL z tą grupą przestaną działać." }
+        }
+        'Move' {
+            $ou = Select-OrganizationalUnit -Title 'Docelowa jednostka dla grup'
+            if (-not $ou) { return }
+            $params.Value = $ou
+            $confirmText = "Przenieść grupy do:`r`n$ou ?"
+        }
+        'ProtectOn' { $params.Op = 'Protect'; $params.Value = $true; $confirmText = 'Włączyć ochronę przed przypadkowym usunięciem?' }
+        'ProtectOff' { $params.Op = 'Protect'; $params.Value = $false; $confirmText = 'Wyłączyć ochronę przed przypadkowym usunięciem?' }
+        'Delete' {
+            $danger = $true
+            $confirmText = "Usunąć $($groups.Count) grup(ę)? Tej operacji nie można cofnąć – członkostwa i uprawnienia nadane grupie przepadną. Grupy systemowe, uprzywilejowane i chronione zostaną pominięte."
+        }
+    }
+    $label = if ($Op -eq 'Delete') { 'Usuń grupy' } else { 'Wykonaj' }
+    if (-not (Confirm-Action -Text $confirmText -Items $groups -ConfirmText $label -Danger:$danger)) { return }
+    $Module.Data.ChangeOp = $params.Op
+    Start-AdOperation -Module $Module -Name "Grupy – $($params.Op)" -Targets $groups -TargetColumn 'Grupa' -Output Log -Parameters $params -ScriptBlock $script:GroupChangeScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { return }
+        switch ($m.Data.ChangeOp) {
+            'Delete' {
+                $row = $script:UI.GroupTable.Rows.Find($r.Target)
+                if ($row) { $script:UI.GroupTable.Rows.Remove($row); $script:UI.GroupTable.AcceptChanges(); Update-TargetCount $script:UI.GroupPanel }
+                Remove-ResultRows -Module $m -Rows @(Find-ResultRow -Module $m -Column 'Grupa' -Value $r.Target)
+            }
+            'Move' { $d = @($r.Data | Where-Object { $_ -isnot [string] }); if ($d.Count) { Update-GroupRow -Sam $r.Target -Values @{ DN = $d[0].DN } } }
+            'Description' { Update-GroupRow -Sam $r.Target -Values @{ Description = ((@($r.Data) -join '') -replace '^Opis: ', '' -replace '^Usunięto opis\.$', '') } }
+            'Mail' { Update-GroupRow -Sam $r.Target -Values @{ Mail = ((@($r.Data) -join '') -replace '^E-mail: ', '' -replace '^Usunięto adres e-mail\.$', '') } }
+        }
+    } -OnComplete {
+        param($m)
+        if ($m.Data.ChangeOp -eq 'Scope') { Write-Log 'Odśwież listę grup, aby zobaczyć nowe zakresy i typy.' }
+        if ($m.Actions['List'] -and $m.Data.ChangeOp -ne 'Delete' -and $m.Table.Rows.Count -gt 0) { & $m.Actions.List $m }
+    }
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Grupy' -Key 'GroupDetails' -Title 'Szczegóły grup' -Icon 'E946' `
+    -Description 'Zakres, typ, opis, zarządca i liczba członków zaznaczonych grup. Zmiana opisu, zarządcy, adresu e-mail, zakresu i typu, nazwy, przeniesienie do innej OU, ochrona przed usunięciem i usuwanie grup.' -Build {
+    param($m)
+    $m.PillColumns = @('Typ')
+    $m.ColorBools = $true
+    $m.GoodWhenNo = @('Uprzywilejowana')
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetGroups)
+        if (-not $targets) { return }
+        Start-AdOperation -Module $m -Name 'Szczegóły grup' -Targets $targets -TargetColumn 'Grupa' -ScriptBlock {
+            $g = Get-ADGroup -Identity $Target -Properties Description, mail, managedBy, info, memberOf, whenCreated, whenChanged, adminCount, ProtectedFromAccidentalDeletion, displayName @ad
+            $rid = [int](([string]$g.SID.Value) -split '-')[-1]
+            $primary = if (@(513, 515, 516, 521) -contains $rid) { $rid } else { 0 }
+            $members = @(Get-GroupMemberObjects -GroupDn $g.DistinguishedName -PrimaryRid $primary)
+            $kinds = @{}
+            $disabled = 0
+            foreach ($o in $members) {
+                $k = [string]$o.ObjectClass
+                $kinds[$k] = 1 + [int]$kinds[$k]
+                if (($k -eq 'user' -or $k -eq 'computer') -and ([int64]$o.userAccountControl -band 2)) { $disabled++ }
+            }
+            [pscustomobject][ordered]@{
+                'Nazwa'                      = $g.Name
+                'Zakres'                     = Get-ScopeLabel $g.GroupScope
+                'Typ'                        = Get-CategoryLabel $g.GroupCategory
+                'Opis'                       = $g.Description
+                'E-mail'                     = $g.mail
+                'Zarządca'                   = $(if ($g.managedBy) { Get-DnName $g.managedBy } else { '' })
+                'Członkowie'                 = $members.Count
+                'Użytkownicy'                = [int]$kinds['user'] + [int]$kinds['inetOrgPerson']
+                'Komputery'                  = [int]$kinds['computer']
+                'Grupy'                      = [int]$kinds['group']
+                'Wyłączone konta'            = $disabled
+                'Należy do grup'             = @($g.memberOf).Count
+                'Chroniona przed usunięciem' = [bool]$g.ProtectedFromAccidentalDeletion
+                'Uprzywilejowana'            = ($g.adminCount -eq 1)
+                'Utworzono'                  = $g.whenCreated
+                'Zmieniono'                  = $g.whenChanged
+                'Nazwa wyświetlana'          = $g.displayName
+                'Uwagi'                      = $g.info
+                'Jednostka OU'               = Get-DnParent $g.DistinguishedName
+                'SID'                        = [string]$g.SID
+                'DN'                         = $g.DistinguishedName
+                '__tone'                     = $(if ([string]$g.GroupCategory -eq 'Security') { 'info' } else { '' })
+            }
+        } -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Status') -ne 'Błąd' })
+            Set-StatTile -Module $m -Key 'groups' -Value ([string]$rows.Count)
+            $sum = 0; $dis = 0; $empty = 0
+            foreach ($r in $rows) {
+                if ($m.Table.Columns.Contains('Członkowie')) { $sum += [int]$r['Członkowie']; if ([int]$r['Członkowie'] -eq 0) { $empty++ } }
+                if ($m.Table.Columns.Contains('Wyłączone konta')) { $dis += [int]$r['Wyłączone konta'] }
+            }
+            Set-StatTile -Module $m -Key 'members' -Value ([string]$sum)
+            Set-StatTile -Module $m -Key 'empty' -Value ([string]$empty) -Tone $(if ($empty) { 'warn' } else { '' })
+            Set-StatTile -Module $m -Key 'disabled' -Value ([string]$dis) -Tone $(if ($dis) { 'warn' } else { '' })
+        }
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row -Text 'Pokaż szczegóły' -Icon 'E896' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
+    Add-Button -Parent $row -Text 'Pokaż członków' -Icon 'E716' -Module $m -AlwaysEnabled -ToolTip 'Przejdź do modułu «Członkowie grup» dla zaznaczonych grup' -OnClick {
+        param($m)
+        if (-not @(Get-TargetGroups)) { return }
+        Show-Module -Key 'GroupMembers'
+        $gm = $script:UI.Modules['GroupMembers']
+        if ($gm) { Invoke-UiAction -Module $gm -Action $gm.Actions.List }
+    } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Zmiany'
+    Add-Button -Parent $row2 -Text 'Opis…' -Icon 'E70F' -Module $m -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'Description' } | Out-Null
+    Add-Button -Parent $row2 -Text 'Zarządca…' -Icon 'E77B' -Module $m -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'ManagedBy' } | Out-Null
+    Add-Button -Parent $row2 -Text 'E-mail…' -Icon 'E715' -Module $m -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'Mail' } | Out-Null
+    Add-Button -Parent $row2 -Text 'Zakres i typ…' -Icon 'E8AB' -Module $m -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'Scope' } | Out-Null
+    Add-Button -Parent $row2 -Text 'Przenieś do OU…' -Icon 'E8DE' -Module $m -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'Move' } | Out-Null
+    Add-MenuButton -Parent $row2 -Text 'Ochrona' -Icon 'E72E' -Module $m -ToolTip 'Ochrona przed przypadkowym usunięciem' -Items @(
+        @{ Text = 'Włącz ochronę przed usunięciem'; Icon = 'E72E'; Action = { param($m) Invoke-GroupChange -Module $m -Op 'ProtectOn' } }
+        @{ Text = 'Wyłącz ochronę przed usunięciem'; Icon = 'E785'; Action = { param($m) Invoke-GroupChange -Module $m -Op 'ProtectOff' } }
+    ) | Out-Null
+    Add-Button -Parent $row2 -Text 'Usuń grupy' -Icon 'E74D' -Module $m -Danger -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'Delete' } | Out-Null
+
+    Add-RowAction -Module $m -Text 'Zmień nazwę…' -Icon 'E8AC' -Action {
+        param($m, $rows)
+        $sam = [string](Get-ObjectValue $rows[0] 'Grupa')
+        $name = [string](Get-ObjectValue $rows[0] 'Nazwa')
+        $f = Show-FormDialog -Title 'Zmiana nazwy grupy' -Subtitle "Grupa: $name" -Icon 'E8AC' -OkText 'Zmień nazwę' -Fields @(
+            @{ Key = 'Name'; Label = 'Nazwa (CN)'; Value = $name }
+            @{ Key = 'Sam'; Label = 'sAMAccountName (nazwa sprzed Windows 2000)'; Value = $sam; Hint = 'Zmiana sAMAccountName może wymagać aktualizacji skryptów i aplikacji, które odwołują się do grupy po nazwie.' }
+            @{ Key = 'Display'; Label = 'Nazwa wyświetlana (opcjonalnie)'; Value = [string](Get-ObjectValue $rows[0] 'Nazwa wyświetlana') }
+        ) -Validate {
+            param($v)
+            if (-not $v.Name) { return 'Podaj nazwę grupy.' }
+            if ($v.Name.Length -gt 64) { return 'Nazwa (CN) może mieć najwyżej 64 znaki.' }
+            return (Test-SamName $v.Sam)
+        }
+        if (-not $f) { return }
+        Start-AdOperation -Module $m -Name 'Zmiana nazwy grupy' -Targets @($sam) -TargetColumn 'Grupa' -Output Log -Parameters @{ Op = 'Rename'; Name = $f.Name; Sam = $f.Sam; Display = $f.Display } -ScriptBlock $script:GroupChangeScript -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { return }
+            $d = @($r.Data | Where-Object { $_ -isnot [string] })
+            if ($d.Count -eq 0) { return }
+            $row = $script:UI.GroupTable.Rows.Find($r.Target)
+            if ($row) {
+                if ($d[0].Sam -ne $r.Target -and -not $script:UI.GroupTable.Rows.Find($d[0].Sam)) { $row['Sam'] = $d[0].Sam }
+                $row['Name'] = $d[0].Name
+                $row['DN'] = $d[0].DN
+                & $script:UI.GroupPanel.Describe $row
+                $script:UI.GroupTable.AcceptChanges()
+            }
+            Select-TargetGroups -Sams @($d[0].Sam)
+        } -OnComplete { param($m) & $m.Actions.List $m }
+    }
+    Add-RowAction -Module $m -Text 'Zmień opis…' -Icon 'E70F' -Action { param($m, $rows) Invoke-GroupChange -Module $m -Op 'Description' -Rows $rows }
+    Add-RowAction -Module $m -Text 'Przenieś do OU…' -Icon 'E8DE' -Action { param($m, $rows) Invoke-GroupChange -Module $m -Op 'Move' -Rows $rows }
+    Add-RowAction -Module $m -Text 'Kopiuj DN' -Icon 'E8C8' -Action {
+        param($m, $rows)
+        $dns = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'DN') } | Where-Object { $_ })
+        Set-ClipboardText ($dns -join [Environment]::NewLine)
+        Show-Toast "Skopiowano DN: $($dns.Count)" 'ok'
+    }
+    Add-RowAction -Module $m -Text 'Usuń grupę' -Icon 'E74D' -Danger -Separator -Action { param($m, $rows) Invoke-GroupChange -Module $m -Op 'Delete' -Rows $rows }
+    Add-StatTile -Module $m -Key 'groups' -Label 'Grupy' -Icon 'E902' | Out-Null
+    Add-StatTile -Module $m -Key 'members' -Label 'Członkowie (bezpośredni)' -Icon 'E716' | Out-Null
+    Add-StatTile -Module $m -Key 'empty' -Label 'Puste grupy' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'disabled' -Label 'Wyłączone konta w grupach' -Icon 'E8D8' | Out-Null
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Grupy' -Key 'GroupMembers' -Title 'Członkowie grup' -Icon 'E716' `
+    -Description 'Członkowie zaznaczonych grup – bezpośredni i zagnieżdżeni (bez limitu 5000 obiektów), z typem i stanem kont. Dodawanie członków, kopiowanie członków z innej grupy, usuwanie i przenoszenie kont na listę użytkowników.' -Build {
+    param($m)
+    $m.PillColumns = @('Członkostwo')
+    $m.ColorBools = $true
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetGroups)
+        if (-not $targets) { return }
+        Reset-StatTiles $m
+        Start-AdOperation -Module $m -Name 'Członkowie grup' -Targets $targets -TargetColumn 'Grupa' -Parameters @{ Nested = (Test-Checked $m.Nested) } -ScriptBlock {
+            $g = Get-ADGroup -Identity $Target @ad
+            $rid = [int](([string]$g.SID.Value) -split '-')[-1]
+            $primaryRid = if (@(513, 515, 516, 521) -contains $rid) { $rid } else { 0 }
+            $direct = @(Get-GroupMemberObjects -GroupDn $g.DistinguishedName -Properties mail)
+            $directSet = @{}
+            foreach ($o in $direct) { $directSet[[string]$o.DistinguishedName] = $true }
+            $primary = @()
+            if ($primaryRid) { $primary = @(Get-ADObject -LDAPFilter "(primaryGroupID=$primaryRid)" -Properties sAMAccountName, userAccountControl, displayName, mail @ad) }
+            $primarySet = @{}
+            foreach ($o in $primary) { $primarySet[[string]$o.DistinguishedName] = $true }
+            $all = if ($P.Nested) { @(Get-GroupMemberObjects -GroupDn $g.DistinguishedName -Recursive -Properties mail) + $primary } else { $direct + $primary }
+            $seen = @{}
+            foreach ($o in ($all | Sort-Object { [string]$_.Name })) {
+                $dn = [string]$o.DistinguishedName
+                if ($seen.ContainsKey($dn)) { continue }
+                $seen[$dn] = $true
+                $class = [string]$o.ObjectClass
+                $isAccount = ($class -eq 'user' -or $class -eq 'computer' -or $class -eq 'inetOrgPerson')
+                $enabled = if ($isAccount) { -not ([int64]$o.userAccountControl -band 2) } else { $null }
+                $how = if ($directSet.ContainsKey($dn)) { 'Bezpośrednie' } elseif ($primarySet.ContainsKey($dn)) { 'Podstawowa' } else { 'Zagnieżdżone' }
+                [pscustomobject][ordered]@{
+                    'Członek'           = $o.Name
+                    'Login'             = ([string]$o.sAMAccountName) -replace '\$$', ''
+                    'Typ'               = Get-ObjectKind $class
+                    'Włączone'          = $enabled
+                    'Członkostwo'       = $how
+                    'Nazwa wyświetlana' = $o.displayName
+                    'E-mail'            = $o.mail
+                    'DN'                = $dn
+                    '__tone'            = $(switch ($how) { 'Bezpośrednie' { 'info' } 'Podstawowa' { 'ok' } default { '' } })
+                    '__flag'            = $(if ($enabled -eq $false) { 'muted' } else { '' })
+                }
+            }
+        } -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Status') -ne 'Błąd' -and $m.Table.Columns.Contains('DN') })
+            $uniq = @{}
+            foreach ($r in $rows) { $uniq[[string]$r['DN']] = $r }
+            $vals = @($uniq.Values)
+            Set-StatTile -Module $m -Key 'all' -Value ([string]$vals.Count)
+            Set-StatTile -Module $m -Key 'users' -Value ([string]@($vals | Where-Object { [string]$_['Typ'] -eq 'Użytkownik' }).Count)
+            Set-StatTile -Module $m -Key 'computers' -Value ([string]@($vals | Where-Object { [string]$_['Typ'] -eq 'Komputer' }).Count)
+            Set-StatTile -Module $m -Key 'groups' -Value ([string]@($vals | Where-Object { [string]$_['Typ'] -eq 'Grupa' }).Count)
+            $dis = @($vals | Where-Object { [string]$_['Włączone'] -eq 'Nie' }).Count
+            Set-StatTile -Module $m -Key 'disabled' -Value ([string]$dis) -Tone $(if ($dis) { 'warn' } else { '' })
+        }
+    }
+    $m.Actions.Remove = {
+        param($m, $Rows)
+        $source = @(if ($null -ne $Rows) { $Rows } else { Get-SelectedResultRows -Module $m })
+        $per = @{}
+        $items = @()
+        $skipped = 0
+        foreach ($r in $source) {
+            if ([string](Get-ObjectValue $r 'Członkostwo') -ne 'Bezpośrednie') { $skipped++; continue }
+            $grp = [string](Get-ObjectValue $r 'Grupa')
+            if (-not $per.ContainsKey($grp)) { $per[$grp] = @{ Members = New-Object System.Collections.ArrayList } }
+            [void]$per[$grp].Members.Add([string](Get-ObjectValue $r 'DN'))
+            $items += ('{0}  ←  {1}' -f $grp, (Get-ObjectValue $r 'Członek'))
+        }
+        if ($per.Count -eq 0) { Show-Warning 'Zaznacz w tabeli członków bezpośrednich (członkostwa zagnieżdżonego i podstawowego nie usuwa się z tej grupy).'; return }
+        $text = 'Usunąć wybranych członków z grup?'
+        if ($skipped) { $text += "`r`nPominięto $skipped wierszy (członkostwo zagnieżdżone lub podstawowe)." }
+        if (-not (Confirm-Action -Text $text -Items $items -ConfirmText 'Usuń z grup' -Danger)) { return }
+        foreach ($k in @($per.Keys)) { $per[$k] = @{ Members = @($per[$k].Members) } }
+        Start-AdOperation -Module $m -Name 'Usuwanie członków' -Targets @($per.Keys) -PerTarget $per -TargetColumn 'Grupa' -Output Log -ScriptBlock {
+            foreach ($d in $P.Members) {
+                try { Remove-ADGroupMember -Identity $Target -Members $d -Confirm:$false @ad; "Usunięto: $(Get-DnName $d)" }
+                catch { "Błąd – $(Get-DnName $d): $($_.Exception.Message)" }
+            }
+        } -OnComplete { param($m) & $m.Actions.List $m }
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Lista'
+    $m.Nested = Add-CheckBox -Parent $row -Text 'Uwzględnij członków zagnieżdżonych' -ToolTip 'Także obiekty należące do grupy przez inne grupy (LDAP_MATCHING_RULE_IN_CHAIN)'
+    [void](Add-Segmented -Parent $row -Items @('Wszyscy', 'Użytkownicy', 'Komputery', 'Grupy') -Module $m -OnChange {
+            param($m, $s)
+            $m.ExtraFilter = switch ([string]$s.Content) { 'Użytkownicy' { "Typ = 'Użytkownik'" } 'Komputery' { "Typ = 'Komputer'" } 'Grupy' { "Typ = 'Grupa'" } default { '' } }
+            Update-ResultFilter -Module $m
+        })
+    Add-Button -Parent $row -Text 'Pokaż członków' -Icon 'E716' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Zmiany'
+    Add-Button -Parent $row2 -Text 'Dodaj członków…' -Icon 'E8FA' -Module $m -OnClick {
+        param($m)
+        $targets = @(Get-TargetGroups)
+        if (-not $targets) { return }
+        $text = Show-InputDialog -Title 'Dodaj członków' -Prompt "Grupy: $($targets -join ', '). Wpisz konta, komputery lub grupy – po jednym w wierszu (login, UPN, nazwa komputera, nazwa grupy, DN albo SID)." -Multiline -Icon 'E8FA'
+        if ($null -eq $text) { return }
+        $ids = @(Get-TextLines $text)
+        if ($ids.Count -eq 0) { return }
+        if (-not (Confirm-Action -Text "Dodać $($ids.Count) obiekt(ów) do $($targets.Count) grup(y)?" -Items $ids -ConfirmText 'Dodaj')) { return }
+        Start-AdOperation -Module $m -Name 'Dodawanie członków' -Targets $targets -TargetColumn 'Grupa' -Output Log -Parameters @{ Ids = $ids } -ScriptBlock {
+            $g = Get-ADGroup -Identity $Target @ad
+            foreach ($id in $P.Ids) {
+                try {
+                    $o = Resolve-AdPrincipal -Id $id -Classes @('user', 'computer', 'group', 'contact')
+                    Add-ADGroupMember -Identity $g -Members $o.DistinguishedName @ad
+                    "Dodano: $($o.Name)"
+                }
+                catch { "Błąd – ${id}: $($_.Exception.Message)" }
+            }
+        } -OnComplete { param($m) & $m.Actions.List $m }
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Kopiuj członków z grupy…' -Icon 'E8C8' -Module $m -OnClick {
+        param($m)
+        $targets = @(Get-TargetGroups)
+        if (-not $targets) { return }
+        $src = Show-InputDialog -Title 'Grupa źródłowa' -Prompt "Bezpośredni członkowie tej grupy zostaną dodani do: $($targets -join ', ')." -Icon 'E902'
+        if (-not $src) { return }
+        Start-AdOperation -Module $m -Name 'Kopiowanie członków' -Targets $targets -TargetColumn 'Grupa' -Output Log -Parameters @{ Source = $src.Trim() } -ScriptBlock {
+            $from = Resolve-AdPrincipal -Id $P.Source -Classes @('group')
+            $srcMembers = @((Get-ADGroup -Identity $from.DistinguishedName -Properties member @ad).member)
+            $existing = @{}
+            foreach ($d in @((Get-ADGroup -Identity $Target -Properties member @ad).member)) { $existing[[string]$d] = $true }
+            $toAdd = @($srcMembers | Where-Object { -not $existing.ContainsKey([string]$_) })
+            if ($toAdd.Count -eq 0) { "Wszyscy członkowie $($from.Name) już należą do grupy."; return }
+            $added = 0
+            for ($i = 0; $i -lt $toAdd.Count; $i += 200) {
+                $chunk = @($toAdd[$i..([Math]::Min($i + 199, $toAdd.Count - 1))])
+                try { Add-ADGroupMember -Identity $Target -Members $chunk @ad; $added += $chunk.Count }
+                catch {
+                    foreach ($d in $chunk) {
+                        try { Add-ADGroupMember -Identity $Target -Members $d @ad; $added++ }
+                        catch { "Błąd – $(Get-DnName $d): $($_.Exception.Message)" }
+                    }
+                }
+            }
+            "Dodano $added z $($toAdd.Count) członków grupy $($from.Name)."
+        } -OnComplete { param($m) & $m.Actions.List $m }
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Usuń zaznaczonych członków' -Icon 'E74D' -Module $m -Danger -OnClick { param($m) & $m.Actions.Remove $m $null } | Out-Null
+    $row3 = Add-ToolbarRow -Module $m -Title 'Wyniki'
+    Add-Button -Parent $row3 -Text 'Zaznacz konta na liście użytkowników' -Icon 'E8B3' -Module $m -AlwaysEnabled -ToolTip 'Konta użytkowników z zaznaczonych wierszy (albo wszystkich widocznych) trafią na listę w przestrzeni «Użytkownicy AD»' -OnClick {
+        param($m)
+        $rows = @(Get-SelectedResultRows -Module $m)
+        if ($rows.Count -le 1) { $rows = @($m.View | ForEach-Object { $_ }) }
+        $users = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Typ') -eq 'Użytkownik' })
+        if ($users.Count -eq 0) { Show-Warning 'Wśród wybranych wierszy nie ma kont użytkowników.'; return }
+        Add-ResultsToTargets -Module $m -Kind User -Column 'Login' -Rows $users
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Usuń z grupy' -Icon 'E74D' -Danger -Action { param($m, $rows) & $m.Actions.Remove $m $rows }
+    Add-RowAction -Module $m -Text 'Kopiuj loginy' -Icon 'E8C8' -Separator -Action {
+        param($m, $rows)
+        $names = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Login') } | Where-Object { $_ } | Select-Object -Unique)
+        Set-ClipboardText ($names -join [Environment]::NewLine)
+        Show-Toast "Skopiowano loginów: $($names.Count)" 'ok'
+    }
+    Add-RowAction -Module $m -Text 'Kopiuj adresy e-mail' -Icon 'E715' -Action {
+        param($m, $rows)
+        $mails = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'E-mail') } | Where-Object { $_ } | Select-Object -Unique)
+        if ($mails.Count -eq 0) { Show-Warning 'Wybrane obiekty nie mają adresów e-mail.'; return }
+        Set-ClipboardText ($mails -join '; ')
+        Show-Toast "Skopiowano adresów: $($mails.Count)" 'ok'
+    }
+    Add-StatTile -Module $m -Key 'all' -Label 'Członkowie (unikalni)' -Icon 'E716' | Out-Null
+    Add-StatTile -Module $m -Key 'users' -Label 'Użytkownicy' -Icon 'E77B' | Out-Null
+    Add-StatTile -Module $m -Key 'computers' -Label 'Komputery' -Icon 'E7F4' | Out-Null
+    Add-StatTile -Module $m -Key 'groups' -Label 'Grupy' -Icon 'E902' | Out-Null
+    Add-StatTile -Module $m -Key 'disabled' -Label 'Wyłączone konta' -Icon 'E8D8' | Out-Null
+}
+
+Register-GroupMembershipModule -Workspace 'AdGroups' -Kind Group -Key 'GroupMemberOf' -Category 'Grupy' -Title 'Przynależność do grup'
+
+$script:BulkPlanScript = {
+    # Plan członkostwa: rozpoznanie obiektów i grup, sprawdzenie obecnego członkostwa
+    $cacheO = @{}
+    $cacheG = @{}
+    $members = @{}
+    $resolve = {
+        param([string]$Id, [string[]]$Classes, [hashtable]$Cache)
+        if ($Cache.ContainsKey($Id)) { return $Cache[$Id] }
+        $res = @{ Ok = $false; Obj = $null; Error = '' }
+        try { $res.Obj = Resolve-AdPrincipal -Id $Id -Classes $Classes; $res.Ok = $true }
+        catch { $res.Error = $_.Exception.Message }
+        $Cache[$Id] = $res
+        return $res
+    }
+    $pairs = New-Object System.Collections.ArrayList
+    if ($P.Mode -eq 'pair') {
+        $n = [Math]::Max(@($P.Objects).Count, @($P.Groups).Count)
+        for ($i = 0; $i -lt $n; $i++) {
+            $o = if ($i -lt @($P.Objects).Count) { [string]$P.Objects[$i] } else { '' }
+            $gr = if ($i -lt @($P.Groups).Count) { [string]$P.Groups[$i] } else { '' }
+            [void]$pairs.Add(@($o, $gr))
+        }
+    }
+    else { foreach ($gr in $P.Groups) { foreach ($o in $P.Objects) { [void]$pairs.Add(@([string]$o, [string]$gr)) } } }
+    $lp = 0
+    foreach ($pair in $pairs) {
+        $lp++
+        $row = [ordered]@{ 'Lp' = $lp; 'Stan' = ''; 'Obiekt' = $pair[0]; 'Rozpoznany' = ''; 'Typ' = ''; 'Grupa' = $pair[1]; 'Rozpoznana grupa' = ''; 'Uwagi' = ''; '__obj' = ''; '__grp' = ''; '__tone' = 'crit' }
+        if (-not $pair[0] -or -not $pair[1]) { $row['Stan'] = 'Brak pary'; $row['Uwagi'] = 'Listy obiektów i grup mają różną liczbę wierszy.'; [pscustomobject]$row; continue }
+        $ro = & $resolve $pair[0] @('user', 'computer', 'group', 'contact') $cacheO
+        $rg = & $resolve $pair[1] @('group') $cacheG
+        if ($ro.Ok) { $row['Rozpoznany'] = $(if ($ro.Obj.sAMAccountName) { ([string]$ro.Obj.sAMAccountName) -replace '\$$', '' } else { $ro.Obj.Name }); $row['Typ'] = Get-ObjectKind ([string]$ro.Obj.ObjectClass); $row['__obj'] = [string]$ro.Obj.DistinguishedName }
+        if ($rg.Ok) { $row['Rozpoznana grupa'] = [string]$rg.Obj.sAMAccountName; $row['__grp'] = [string]$rg.Obj.sAMAccountName }
+        if (-not $ro.Ok) { $row['Stan'] = 'Nie znaleziono obiektu'; $row['Uwagi'] = $ro.Error; [pscustomobject]$row; continue }
+        if (-not $rg.Ok) { $row['Stan'] = 'Nie znaleziono grupy'; $row['Uwagi'] = $rg.Error; [pscustomobject]$row; continue }
+        $gdn = [string]$rg.Obj.DistinguishedName
+        if ($gdn -eq $row['__obj']) { $row['Stan'] = 'Pominięto'; $row['Uwagi'] = 'Grupa nie może należeć do samej siebie.'; $row['__tone'] = 'warn'; [pscustomobject]$row; continue }
+        if (-not $members.ContainsKey($gdn)) {
+            $set = @{}
+            foreach ($d in @((Get-ADGroup -Identity $gdn -Properties member @ad).member)) { $set[([string]$d).ToLowerInvariant()] = $true }
+            $members[$gdn] = $set
+        }
+        $isMember = $members[$gdn].ContainsKey($row['__obj'].ToLowerInvariant())
+        if ($P.Op -eq 'Remove') {
+            if ($isMember) { $row['Stan'] = 'Do usunięcia'; $row['__tone'] = 'warn' } else { $row['Stan'] = 'Nie jest członkiem'; $row['__tone'] = '' }
+        }
+        else {
+            if ($isMember) { $row['Stan'] = 'Już jest członkiem'; $row['__tone'] = '' } else { $row['Stan'] = 'Do dodania'; $row['__tone'] = 'info' }
+        }
+        [pscustomobject]$row
+    }
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Grupy' -Key 'BulkMembership' -Title 'Członkostwo hurtowe' -Icon 'E8FA' -Badge 'nowe' `
+    -Description 'Dodawanie lub usuwanie wielu obiektów w wielu grupach: każdy do każdej (A×B) albo wiersz do wiersza. Najpierw plan (co zostanie zmienione, co już jest), potem wykonanie z wynikiem dla każdej pary.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.Data.Stale = $true
+    $m.Data.PlanOp = 'Add'
+    $m.Data.ThenExecute = $false
+    $boxes = Add-TextColumns -Module $m -Title 'Dane' -Height 150 -Columns @(
+        @{ Caption = 'Obiekty: konta, komputery, grupy (po jednym w wierszu)'; Placeholder = "jan.kowalski`nanna.nowak@firma.pl`nPC-01`nGG_Helpdesk" }
+        @{ Caption = 'Grupy (po jednej w wierszu)'; Placeholder = "GG_VPN`nCN=GG_Finanse,OU=Grupy,DC=firma,DC=local" }
+    )
+    $m.Objects = $boxes[0]
+    $m.Groups = $boxes[1]
+    foreach ($b in $boxes) { Register-ControlHandler -Control $b -EventName 'TextChanged' -Module $m -Action { param($m) $m.Data.Stale = $true } }
+    $row = Add-ToolbarRow -Module $m -Title 'Wypełnij'
+    Add-Button -Parent $row -Text 'Konta z listy użytkowników' -Icon 'E716' -Module $m -AlwaysEnabled -ToolTip 'Dopisuje konta zaznaczone w przestrzeni «Użytkownicy AD»' -OnClick {
+        param($m)
+        $users = @(Get-TargetUsers -Quiet)
+        if ($users.Count -eq 0) { Show-Warning 'Na liście w przestrzeni «Użytkownicy AD» nie zaznaczono kont.'; return }
+        $current = @(Get-TextLines $m.Objects)
+        $m.Objects.Text = ((@($current) + @($users | Where-Object { $current -notcontains $_ })) -join "`r`n")
+    } | Out-Null
+    Add-Button -Parent $row -Text 'Zaznaczone grupy z listy' -Icon 'E902' -Module $m -AlwaysEnabled -ToolTip 'Dopisuje grupy zaznaczone na liście po lewej' -OnClick {
+        param($m)
+        $groups = @(Get-TargetGroups)
+        if ($groups.Count -eq 0) { return }
+        $current = @(Get-TextLines $m.Groups)
+        $m.Groups.Text = ((@($current) + @($groups | Where-Object { $current -notcontains $_ })) -join "`r`n")
+    } | Out-Null
+    Add-Button -Parent $row -Text 'Wklej pary ze schowka' -Icon 'E77F' -Module $m -AlwaysEnabled -ToolTip 'Dwie kolumny z Excela: obiekt [TAB] grupa – wypełnia oba pola i ustawia tryb «wiersz do wiersza»' -OnClick {
+        param($m)
+        $t = ConvertFrom-PastedTable -Text (Get-ClipboardText) -Headers @{ O = @('obiekt', 'login', 'konto', 'user', 'uzytkownik', 'member', 'czlonek'); G = @('grupa', 'group') } -Order @('O', 'G')
+        $rows = @($t.Rows | Where-Object { (Get-PastedValue $_ $t.Map 'O') -and (Get-PastedValue $_ $t.Map 'G') })
+        if ($rows.Count -eq 0) { Show-Warning 'Schowek nie zawiera dwóch kolumn (obiekt, grupa).'; return }
+        $m.Objects.Text = (@($rows | ForEach-Object { Get-PastedValue $_ $t.Map 'O' }) -join "`r`n")
+        $m.Groups.Text = (@($rows | ForEach-Object { Get-PastedValue $_ $t.Map 'G' }) -join "`r`n")
+        Set-SegmentIndex $m.Mode 1
+        Show-Toast "Wklejono par: $($rows.Count)" 'ok'
+    } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Tryb'
+    $m.Mode = Add-Segmented -Parent $row2 -Items @('Każdy do każdej grupy (A×B)', 'Wiersz do wiersza') -Module $m -OnChange { param($m) $m.Data.Stale = $true }
+    $m.Op = Add-Segmented -Parent $row2 -Items @('Dodaj do grup', 'Usuń z grup') -Module $m -OnChange { param($m) $m.Data.Stale = $true }
+    $m.Actions.Plan = {
+        param($m, [bool]$ThenExecute = $false)
+        $objects = @(Get-TextLines $m.Objects)
+        $groups = @(Get-TextLines $m.Groups)
+        if ($objects.Count -eq 0 -or $groups.Count -eq 0) { Show-Warning 'Wpisz obiekty i grupy (po jednym w wierszu).'; return }
+        $mode = if ((Get-SegmentIndex $m.Mode) -eq 1) { 'pair' } else { 'cross' }
+        $count = if ($mode -eq 'pair') { [Math]::Max($objects.Count, $groups.Count) } else { $objects.Count * $groups.Count }
+        if ($count -gt 20000) { Show-Warning "Plan obejmowałby $count par – podziel dane na mniejsze części."; return }
+        $m.Data.ThenExecute = $ThenExecute
+        $m.Data.PlanOp = if ((Get-SegmentIndex $m.Op) -eq 1) { 'Remove' } else { 'Add' }
+        Start-AdOperation -Module $m -Name 'Plan członkostwa' -Targets @('AD') -Parameters @{ Objects = $objects; Groups = $groups; Mode = $mode; Op = $m.Data.PlanOp } -ScriptBlock $script:BulkPlanScript -OnComplete {
+            param($m)
+            $m.Data.Stale = $false
+            & $m.Actions.Stats $m
+            Request-ResultSpace -Module $m
+            if ($m.Data.ThenExecute) { Invoke-Deferred -Module $m -Action { param($m) & $m.Actions.Execute $m } }
+        }
+    }
+    $m.Actions.Stats = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m)
+        $todo = @($rows | Where-Object { @('Do dodania', 'Do usunięcia') -contains [string](Get-ObjectValue $_ 'Stan') }).Count
+        $done = @($rows | Where-Object { @('Dodano', 'Usunięto') -contains [string](Get-ObjectValue $_ 'Stan') }).Count
+        $noop = @($rows | Where-Object { @('Już jest członkiem', 'Nie jest członkiem', 'Pominięto') -contains [string](Get-ObjectValue $_ 'Stan') }).Count
+        $bad = @($rows | Where-Object { [string](Get-ObjectValue $_ '__tone') -eq 'crit' }).Count
+        Set-StatTile -Module $m -Key 'todo' -Value ([string]$todo) -Tone $(if ($todo) { 'info' } else { '' })
+        Set-StatTile -Module $m -Key 'done' -Value ([string]$done) -Tone $(if ($done) { 'ok' } else { '' })
+        Set-StatTile -Module $m -Key 'noop' -Value ([string]$noop)
+        Set-StatTile -Module $m -Key 'bad' -Value ([string]$bad) -Tone $(if ($bad) { 'crit' } else { '' })
+    }
+    $m.Actions.Execute = {
+        param($m)
+        if ($m.Data.Stale -or -not $m.Table -or $m.Table.Rows.Count -eq 0) { & $m.Actions.Plan $m $true; return }
+        $op = $m.Data.PlanOp
+        $state = if ($op -eq 'Remove') { 'Do usunięcia' } else { 'Do dodania' }
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq $state })
+        if ($rows.Count -eq 0) { Show-Message -Text 'Plan nie zawiera zmian do wykonania – wszystkie pary są już w docelowym stanie albo zawierają błędy.' -Title 'Brak zmian'; return }
+        $per = @{}
+        foreach ($r in $rows) {
+            $g = [string]$r['__grp']
+            if (-not $per.ContainsKey($g)) { $per[$g] = @{ Members = New-Object System.Collections.ArrayList; Op = $op } }
+            [void]$per[$g].Members.Add([string]$r['__obj'])
+        }
+        foreach ($k in @($per.Keys)) { $per[$k] = @{ Members = @($per[$k].Members); Op = $op } }
+        $items = @($rows | ForEach-Object { '{0}  →  {1}' -f $_['Rozpoznany'], $_['Rozpoznana grupa'] })
+        $verb = if ($op -eq 'Remove') { 'Usunąć' } else { 'Dodać' }
+        if (-not (Confirm-Action -Text "$verb członkostwo: $($rows.Count) par(y) w $($per.Count) grup(ach)?" -Items $items -ConfirmText $(if ($op -eq 'Remove') { 'Usuń z grup' } else { 'Dodaj do grup' }) -Danger:($op -eq 'Remove'))) { return }
+        Start-AdOperation -Module $m -Name 'Członkostwo hurtowe' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock {
+            $all = @($P.Members)
+            $ok = $false
+            try {
+                if ($P.Op -eq 'Remove') { Remove-ADGroupMember -Identity $Target -Members $all -Confirm:$false @ad } else { Add-ADGroupMember -Identity $Target -Members $all @ad }
+                $ok = $true
+            }
+            catch { }
+            foreach ($d in $all) {
+                if ($ok) { [pscustomobject]@{ Dn = $d; Ok = $true; Message = '' }; continue }
+                try {
+                    if ($P.Op -eq 'Remove') { Remove-ADGroupMember -Identity $Target -Members $d -Confirm:$false @ad } else { Add-ADGroupMember -Identity $Target -Members $d @ad }
+                    [pscustomobject]@{ Dn = $d; Ok = $true; Message = '' }
+                }
+                catch { [pscustomobject]@{ Dn = $d; Ok = $false; Message = $_.Exception.Message } }
+            }
+        } -OnResult {
+            param($m, $r)
+            $rows = @(Find-ResultRow -Module $m -Column '__grp' -Value $r.Target)
+            if (-not $r.Ok) {
+                foreach ($row in $rows) { if (@('Do dodania', 'Do usunięcia') -contains [string]$row['Stan']) { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note ((@($r.Errors)) -join ' ') } }
+                return
+            }
+            $done = if ($m.Data.PlanOp -eq 'Remove') { 'Usunięto' } else { 'Dodano' }
+            foreach ($d in @($r.Data)) {
+                foreach ($row in @($rows | Where-Object { [string]$_['__obj'] -eq [string]$d.Dn })) {
+                    if ($d.Ok) { Set-RowState -Module $m -Row $row -State $done -Tone 'ok' -Note '' }
+                    else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note $d.Message }
+                }
+            }
+        } -OnComplete { param($m) $m.Data.Stale = $true; & $m.Actions.Stats $m }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Sprawdź plan' -Icon 'E9D5' -Module $m -Primary -OnClick { param($m) & $m.Actions.Plan $m $false } | Out-Null
+    Add-Button -Parent $row3 -Text 'Wykonaj' -Icon 'E768' -Module $m -OnClick { param($m) & $m.Actions.Execute $m } | Out-Null
+    Add-Label -Parent $row3 -Text 'Plan nic nie zmienia w AD – pokazuje, co zostanie zrobione (tryb próbny).' -Hint | Out-Null
+    Add-StatTile -Module $m -Key 'todo' -Label 'Do wykonania' -Icon 'E9D5' | Out-Null
+    Add-StatTile -Module $m -Key 'done' -Label 'Wykonane' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'noop' -Label 'Bez zmian' -Icon 'E73A' | Out-Null
+    Add-StatTile -Module $m -Key 'bad' -Label 'Błędy' -Icon 'E7BA' | Out-Null
+    $m.EmptyHint = 'Wpisz obiekty i grupy, wybierz tryb i kliknij «Sprawdź plan» (F5). «Wykonaj» zmieni tylko pary oznaczone jako «Do dodania» / «Do usunięcia».'
+}
+#endregion
+
+#region Grupy AD: tworzenie i duplikowanie
+$script:GroupPasteHeaders = [ordered]@{
+    Name        = @('nazwa', 'name', 'cn', 'grupa', 'nazwa grupy', 'group')
+    Description = @('opis', 'description', 'desc')
+    Scope       = @('zakres', 'scope', 'groupscope')
+    Category    = @('typ', 'kategoria', 'category', 'groupcategory', 'type')
+    Mail        = @('email', 'e-mail', 'mail', 'adres e-mail')
+    Sam         = @('samaccountname', 'sam', 'nazwa sprzed windows 2000')
+    MemberOf    = @('członek grup', 'memberof', 'należy do', 'grupy nadrzędne', 'nadrzędne')
+    ManagedBy   = @('zarządca', 'managedby', 'właściciel', 'owner')
+    Ou          = @('ou', 'ścieżka', 'path', 'jednostka', 'jednostka organizacyjna')
+}
+
+$script:GroupCheckScript = {
+    # Sprawdzenie planowanych grup w AD: OU, zajętość sAMAccountName i nazwy w OU, grupy nadrzędne, zarządca
+    $ouCache = @{}
+    foreach ($r in $P.Rows) {
+        $issues = @()
+        $exists = $false
+        if (-not $ouCache.ContainsKey($r.Ou)) {
+            $ok = $true
+            try { [void](Get-ADObject -Identity $r.Ou @ad) } catch { $ok = $false }
+            $ouCache[$r.Ou] = $ok
+        }
+        if (-not $ouCache[$r.Ou]) { $issues += "Nie ma jednostki $($r.Ou)" }
+        else {
+            $v = ConvertTo-LdapValue $r.Sam
+            $bySam = @(Get-ADObject -LDAPFilter "(sAMAccountName=$v)" @ad)
+            $byName = @(Get-ADObject -LDAPFilter "(name=$(ConvertTo-LdapValue $r.Name))" -SearchBase $r.Ou -SearchScope OneLevel @ad)
+            if ($bySam.Count -gt 0) {
+                if ([string]$bySam[0].ObjectClass -eq 'group' -and (Get-DnName ([string]$bySam[0].DistinguishedName)) -eq $r.Name) { $exists = $true }
+                else { $issues += "sAMAccountName «$($r.Sam)» jest zajęty przez $(Get-DnName ([string]$bySam[0].DistinguishedName))" }
+            }
+            elseif ($byName.Count -gt 0) { $issues += "W tej OU istnieje już obiekt o nazwie «$($r.Name)»" }
+        }
+        foreach ($p in @($r.MemberOf)) {
+            if (-not $p) { continue }
+            try { [void](Resolve-AdPrincipal -Id $p -Classes @('group')) } catch { $issues += "Grupa nadrzędna: $($_.Exception.Message)" }
+        }
+        if ($r.ManagedBy) { try { [void](Resolve-AdPrincipal -Id $r.ManagedBy -Classes @('user', 'group', 'contact')) } catch { $issues += "Zarządca: $($_.Exception.Message)" } }
+        [pscustomobject]@{ Id = $r.Id; Exists = $exists; Issues = @($issues) }
+    }
+}
+
+$script:GroupCreateScript = {
+    # Tworzenie jednej grupy ($P: Name, Sam, Scope, Category, Ou, Description, Mail, MemberOf, ManagedBy, Protect)
+    $params = @{ Name = $P.Name; SamAccountName = $P.Sam; GroupScope = $P.Scope; GroupCategory = $P.Category; Path = $P.Ou; PassThru = $true }
+    if ($P.Description) { $params.Description = $P.Description }
+    if ($P.Mail) { $params.OtherAttributes = @{ mail = $P.Mail } }
+    if ($P.ManagedBy) { $params.ManagedBy = (Resolve-AdPrincipal -Id $P.ManagedBy -Classes @('user', 'group', 'contact')).DistinguishedName }
+    $g = New-ADGroup @params @ad
+    $notes = @()
+    $warn = $false
+    foreach ($p in @($P.MemberOf)) {
+        if (-not $p) { continue }
+        try {
+            $parent = Resolve-AdPrincipal -Id $p -Classes @('group')
+            Add-ADGroupMember -Identity $parent.DistinguishedName -Members $g.DistinguishedName @ad
+            $notes += "dodano do $($parent.Name)"
+        }
+        catch { $notes += "członkostwo w ${p}: $($_.Exception.Message)"; $warn = $true }
+    }
+    if ($P.Protect) {
+        try { Set-ADObject -Identity $g.DistinguishedName -ProtectedFromAccidentalDeletion $true @ad; $notes += 'chroniona przed usunięciem' }
+        catch { $notes += "ochrona: $($_.Exception.Message)"; $warn = $true }
+    }
+    [pscustomobject]@{ Dn = $g.DistinguishedName; Notes = ($notes -join '; '); Warn = $warn }
+}
+
+function ConvertTo-GroupPlanRow {
+    # Wiersz podglądu tworzenia grupy z pól tekstowych; sprawdza poprawność danych (bez AD)
+    param([hashtable]$Module, [hashtable]$Values)
+    $issues = @()
+    $name = ([string]$Values.Name).Trim()
+    if (-not $name) { $issues += 'brak nazwy' }
+    elseif ($name.Length -gt 64) { $issues += 'nazwa (CN) dłuższa niż 64 znaki' }
+    $scope = ConvertTo-GroupScope $Values.Scope
+    if (-not $scope) { $issues += "nieznany zakres «$($Values.Scope)»" }
+    $cat = ConvertTo-GroupCategory $Values.Category
+    if (-not $cat) { $issues += "nieznany typ «$($Values.Category)»" }
+    $samIssue = Test-SamName $Values.Sam
+    if ($samIssue) { $issues += $samIssue }
+    if (-not ([string]$Values.Ou -match '^(OU|CN|DC)=')) { $issues += 'brak jednostki organizacyjnej (OU)' }
+    if ($Values.Mail -and $Values.Mail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { $issues += 'niepoprawny adres e-mail' }
+    $note = @($issues) -join '; '
+    if (-not $issues -and $cat -eq 'Distribution' -and -not $Values.Mail) { $note = 'Grupa dystrybucyjna bez adresu e-mail' }
+    return [ordered]@{
+        'Stan'            = $(if ($issues) { 'Błąd danych' } else { 'Sprawdzanie…' })
+        'Nazwa'           = $name
+        'sAMAccountName'  = [string]$Values.Sam
+        'Opis'            = [string]$Values.Description
+        'Zakres'          = $(if ($scope) { Get-GroupScopeLabel $scope } else { [string]$Values.Scope })
+        'Typ'             = $(if ($cat) { Get-GroupCategoryLabel $cat } else { [string]$Values.Category })
+        'OU'              = [string]$Values.Ou
+        'E-mail'          = [string]$Values.Mail
+        'Członek grup'    = [string]$Values.MemberOf
+        'Zarządca'        = [string]$Values.ManagedBy
+        'Uwagi'           = $note
+        '__tone'          = $(if ($issues) { 'crit' } else { '' })
+    }
+}
+
+function Start-GroupPlanCheck {
+    # Sprawdzenie wierszy podglądu tworzenia grup w AD (moduł Tworzenie grup); -ThenCreate tworzy po sprawdzeniu
+    param([hashtable]$Module, [switch]$ThenCreate)
+    $m = $Module
+    $rows = @(Get-ResultRowsAll -Module $m)
+    # Ponowna walidacja danych (po edycji komórek) i duplikaty w obrębie listy
+    $seenSam = @{}
+    $seenName = @{}
+    $toCheck = @()
+    foreach ($r in $rows) {
+        $vals = @{
+            Name = [string]$r['Nazwa']; Sam = ([string]$r['sAMAccountName']).Trim(); Description = ([string]$r['Opis']).Trim(); Scope = [string]$r['Zakres']
+            Category = [string]$r['Typ']; Mail = ([string]$r['E-mail']).Trim(); MemberOf = [string]$r['Członek grup']; ManagedBy = ([string]$r['Zarządca']).Trim(); Ou = ([string]$r['OU']).Trim()
+        }
+        $plan = ConvertTo-GroupPlanRow -Module $m -Values $vals
+        foreach ($k in 'Zakres', 'Typ') { if ([string]$r[$k] -cne $plan[$k]) { Set-ResultValue -Module $m -Row $r -Column $k -Value $plan[$k] } }
+        $samKey = $vals.Sam.ToLowerInvariant()
+        $nameKey = ($vals.Name + '|' + $vals.Ou).ToLowerInvariant()
+        if ($plan['Stan'] -ne 'Błąd danych') {
+            if ($seenSam.ContainsKey($samKey)) { $plan['Stan'] = 'Błąd danych'; $plan['Uwagi'] = "sAMAccountName powtarza się w wierszu $($seenSam[$samKey])"; $plan['__tone'] = 'crit' }
+            elseif ($seenName.ContainsKey($nameKey)) { $plan['Stan'] = 'Błąd danych'; $plan['Uwagi'] = "nazwa powtarza się w tej samej OU (wiersz $($seenName[$nameKey]))"; $plan['__tone'] = 'crit' }
+        }
+        $seenSam[$samKey] = $r['Lp']
+        $seenName[$nameKey] = $r['Lp']
+        Set-RowState -Module $m -Row $r -State $plan['Stan'] -Tone $plan['__tone'] -Note $plan['Uwagi']
+        if ($plan['Stan'] -ne 'Błąd danych') {
+            $toCheck += @{ Id = [string]$r['__id']; Name = $vals.Name; Sam = $vals.Sam; Ou = $vals.Ou; MemberOf = @(Split-ListText $vals.MemberOf); ManagedBy = $vals.ManagedBy }
+        }
+    }
+    $m.Data.Stale = $false
+    if ($toCheck.Count -eq 0) { & $m.Actions.Stats $m; Show-Warning 'Wszystkie wiersze zawierają błędy danych – popraw je w tabeli (kolumny z ołówkiem).'; return }
+    $m.Data.ThenCreate = [bool]$ThenCreate
+    Start-AdOperation -Module $m -Name 'Sprawdzanie grup' -Targets @('AD') -Output None -Parameters @{ Rows = $toCheck } -ScriptBlock $script:GroupCheckScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) {
+            foreach ($row in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Sprawdzanie…' })) { Set-RowState -Module $m -Row $row -State 'Nie sprawdzono' -Tone 'warn' -Note ((@($r.Errors)) -join ' ') }
+            return
+        }
+        foreach ($res in @($r.Data)) {
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value ([string]$res.Id))) {
+                $note = [string]$row['Uwagi']
+                if (@($res.Issues).Count -gt 0) { Set-RowState -Module $m -Row $row -State 'Konflikt' -Tone 'crit' -Note ((@($res.Issues)) -join '; ') }
+                elseif ($res.Exists) { Set-RowState -Module $m -Row $row -State 'Istnieje' -Tone 'warn' -Note 'Grupa o tej nazwie i sAMAccountName już istnieje – zostanie pominięta.' }
+                else { Set-RowState -Module $m -Row $row -State 'Gotowe do utworzenia' -Tone 'info' -Note $note }
+            }
+        }
+    } -OnComplete {
+        param($m)
+        & $m.Actions.Stats $m
+        if ($m.Data.ThenCreate) { Invoke-Deferred -Module $m -Action { param($m) & $m.Actions.Create $m } }
+    }
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Tworzenie' -Key 'GroupCreate' -Title 'Tworzenie grup' -Icon 'E710' -Badge 'nowe' `
+    -Description 'Wiele grup naraz z tabeli wklejonej z Excela (nazwa, opis, zakres, typ, e-mail, sAMAccountName, grupy nadrzędne, zarządca, OU). Podgląd z edycją komórek i sprawdzeniem w AD, potem utworzenie z wynikiem dla każdej grupy.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.EditableColumns = @('Nazwa', 'sAMAccountName', 'Opis', 'Zakres', 'Typ', 'E-mail', 'Członek grup', 'Zarządca', 'OU')
+    $m.Data.Stale = $true
+    $m.Data.ThenCreate = $false
+    $m.OnCellEdit = {
+        param($m, $row, $column)
+        if ($column -eq 'Nazwa' -and [string]$row['__auto'] -eq '1') {
+            Set-ResultValue -Module $m -Row $row -Column 'sAMAccountName' -Value (ConvertTo-SamName ([string]$row['Nazwa']))
+        }
+        if ($column -eq 'sAMAccountName') { Set-ResultValue -Module $m -Row $row -Column '__auto' -Value '' }
+        if (@('Utworzono', 'Istnieje') -notcontains [string]$row['Stan']) { Set-RowState -Module $m -Row $row -State 'Zmieniono – sprawdź' -Tone 'warn' }
+        $m.Data.Stale = $true
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Miejsce'
+    $m.Ou = Add-OuField -Parent $row -Module $m -Width 460 -Placeholder 'OU, w której powstaną grupy (gdy tabela nie podaje innej)' -DialogTitle 'Jednostka dla nowych grup' -Remember 'Ou'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Domyślnie'
+    Add-Label -Parent $row2 -Text 'Zakres' | Out-Null
+    $m.Scope = Add-ComboBox -Parent $row2 -Items @('Globalna', 'Lokalna domeny', 'Uniwersalna') -Width 150
+    Add-Label -Parent $row2 -Text 'Typ' | Out-Null
+    $m.Category = Add-ComboBox -Parent $row2 -Items @('Zabezpieczeń', 'Dystrybucyjna') -Width 150
+    $m.AutoSam = Add-CheckBox -Parent $row2 -Text 'sAMAccountName z nazwy (bez polskich znaków)' -Checked $true -ToolTip 'Gdy tabela nie podaje sAMAccountName: nazwa bez znaków diakrytycznych, spacje i znaki specjalne zamienione na «-»'
+    $m.Protect = Add-CheckBox -Parent $row2 -Text 'Chroń przed usunięciem'
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Dane' -Multiline -Height 130 -Placeholder "Nazwa [TAB] Opis [TAB] Zakres [TAB] Typ [TAB] E-mail [TAB] sAMAccountName [TAB] Członek grup [TAB] Zarządca [TAB] OU`r`nWklej z Excela (z nagłówkiem lub bez) albo wpisz nazwy grup – po jednej w wierszu."
+    $m.Actions.Stats = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m)
+        Set-StatTile -Module $m -Key 'ready' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Gotowe do utworzenia' }).Count) -Tone 'info'
+        Set-StatTile -Module $m -Key 'done' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Utworzono' }).Count) -Tone 'ok'
+        Set-StatTile -Module $m -Key 'exists' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Istnieje' }).Count)
+        $bad = @($rows | Where-Object { [string](Get-ObjectValue $_ '__tone') -eq 'crit' }).Count
+        Set-StatTile -Module $m -Key 'bad' -Value ([string]$bad) -Tone $(if ($bad) { 'crit' } else { '' })
+    }
+    $m.Actions.Preview = {
+        param($m)
+        $text = $m.Input.Text
+        if (-not $text.Trim()) { Show-Warning 'Wklej lub wpisz dane grup w polu «Dane».'; return }
+        $defOu = $m.Ou.Text.Trim()
+        $t = ConvertFrom-PastedTable -Text $text -Headers $script:GroupPasteHeaders -Order @('Name', 'Description', 'Scope', 'Category', 'Mail', 'Sam', 'MemberOf', 'ManagedBy', 'Ou')
+        Reset-ResultTable -Module $m
+        $lp = 0
+        $objects = foreach ($r in $t.Rows) {
+            $name = Get-PastedValue $r $t.Map 'Name'
+            if (-not $name) { continue }
+            $lp++
+            $sam = Get-PastedValue $r $t.Map 'Sam'
+            $auto = ''
+            if (-not $sam) { $sam = if (Test-Checked $m.AutoSam) { ConvertTo-SamName $name } else { $name }; $auto = '1' }
+            $vals = @{
+                Name = $name; Sam = $sam; Description = (Get-PastedValue $r $t.Map 'Description')
+                Scope = $(if (Get-PastedValue $r $t.Map 'Scope') { Get-PastedValue $r $t.Map 'Scope' } else { [string]$m.Scope.SelectedItem })
+                Category = $(if (Get-PastedValue $r $t.Map 'Category') { Get-PastedValue $r $t.Map 'Category' } else { [string]$m.Category.SelectedItem })
+                Mail = (Get-PastedValue $r $t.Map 'Mail'); MemberOf = (Get-PastedValue $r $t.Map 'MemberOf'); ManagedBy = (Get-PastedValue $r $t.Map 'ManagedBy')
+                Ou = $(if (Get-PastedValue $r $t.Map 'Ou') { Get-PastedValue $r $t.Map 'Ou' } else { $defOu })
+            }
+            $o = [ordered]@{ 'Lp' = $lp }
+            $plan = ConvertTo-GroupPlanRow -Module $m -Values $vals
+            foreach ($k in $plan.Keys) { $o[$k] = $plan[$k] }
+            $o['__id'] = [guid]::NewGuid().ToString('N')
+            $o['__auto'] = $auto
+            [pscustomobject]$o
+        }
+        $objects = @($objects)
+        if ($objects.Count -eq 0) { Show-Warning 'Nie rozpoznano żadnej grupy w danych.'; return }
+        Add-ResultRows -Module $m -Objects $objects
+        Request-ResultSpace -Module $m
+        Write-Log ("Podgląd: {0} grup{1}." -f $objects.Count, $(if ($t.HasHeader) { ' (rozpoznano nagłówek)' } else { '' }))
+        Start-GroupPlanCheck -Module $m
+    }
+    $m.Actions.Create = {
+        param($m)
+        if (-not $m.Table -or $m.Table.Rows.Count -eq 0) { & $m.Actions.Preview $m; return }
+        if ($m.Data.Stale) { Start-GroupPlanCheck -Module $m -ThenCreate; return }
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Gotowe do utworzenia' })
+        if ($rows.Count -eq 0) { Show-Message -Text 'Brak grup gotowych do utworzenia. Popraw wiersze z błędami lub konfliktami i sprawdź ponownie.' -Title 'Brak zmian'; return }
+        $per = @{}
+        foreach ($r in $rows) {
+            $per[[string]$r['__id']] = @{
+                Name = [string]$r['Nazwa']; Sam = ([string]$r['sAMAccountName']).Trim(); Scope = (ConvertTo-GroupScope ([string]$r['Zakres'])); Category = (ConvertTo-GroupCategory ([string]$r['Typ']))
+                Ou = ([string]$r['OU']).Trim(); Description = ([string]$r['Opis']).Trim(); Mail = ([string]$r['E-mail']).Trim(); MemberOf = @(Split-ListText ([string]$r['Członek grup']))
+                ManagedBy = ([string]$r['Zarządca']).Trim(); Protect = (Test-Checked $m.Protect)
+            }
+        }
+        $items = @($rows | ForEach-Object { '{0}  ({1}, {2})' -f $_['Nazwa'], $_['Zakres'], (Get-RdnValue ([string]$_['OU'])) })
+        if (-not (Confirm-Action -Text "Utworzyć $($rows.Count) grup(y)?" -Items $items -ConfirmText 'Utwórz grupy')) { return }
+        foreach ($r in $rows) { Set-RowState -Module $m -Row $r -State 'Tworzenie…' -Tone '' }
+        Start-AdOperation -Module $m -Name 'Tworzenie grup' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:GroupCreateScript -OnResult {
+            param($m, $r)
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value $r.Target)) {
+                if ($r.Ok) {
+                    $d = @($r.Data)[0]
+                    Set-RowState -Module $m -Row $row -State 'Utworzono' -Tone $(if ($d.Warn) { 'warn' } else { 'ok' }) -Note $d.Notes
+                    Set-ResultValue -Module $m -Row $row -Column 'DN' -Value $d.Dn
+                }
+                else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')) }
+            }
+        } -OnComplete {
+            param($m)
+            & $m.Actions.Stats $m
+            $created = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Utworzono' } | ForEach-Object { [string]$_['sAMAccountName'] })
+            if ($created.Count -gt 0) {
+                Set-TargetCheck -Panel $script:UI.GroupPanel -Mode UncheckAll
+                Add-GroupNames -Module $script:UI.Modules['__groups'] -Names $created -Source 'utworzone'
+                Write-Log "Utworzone grupy ($($created.Count)) zostaną zaznaczone na liście grup." 'OK'
+            }
+        }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Wklej ze schowka' -Icon 'E77F' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $clip = Get-ClipboardText
+        if (-not $clip.Trim()) { Show-Warning 'Schowek nie zawiera tekstu.'; return }
+        $m.Input.Text = $clip
+        & $m.Actions.Preview $m
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Podgląd i sprawdzenie' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row3 -Text 'Sprawdź ponownie' -Icon 'E72C' -Module $m -ToolTip 'Sprawdza wiersze tabeli po edycji (bez ponownego wczytywania pola «Dane»)' -OnClick {
+        param($m)
+        if (-not $m.Table -or $m.Table.Rows.Count -eq 0) { & $m.Actions.Preview $m; return }
+        Start-GroupPlanCheck -Module $m
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Utwórz grupy' -Icon 'E710' -Module $m -OnClick $m.Actions.Create | Out-Null
+    Add-MenuButton -Parent $row3 -Text 'Ustaw w zaznaczonych' -Icon 'E70F' -Module $m -ToolTip 'Zmienia kolumnę w zaznaczonych wierszach (albo we wszystkich, gdy nic nie zaznaczono)' -Items @(
+        @{ Text = 'Zakres: globalna'; Value = @('Zakres', 'Globalna'); Action = { param($m, $v) Set-GridColumnValue -Module $m -Column $v[0] -Value $v[1] } }
+        @{ Text = 'Zakres: lokalna domeny'; Value = @('Zakres', 'Lokalna domeny'); Action = { param($m, $v) Set-GridColumnValue -Module $m -Column $v[0] -Value $v[1] } }
+        @{ Text = 'Zakres: uniwersalna'; Value = @('Zakres', 'Uniwersalna'); Action = { param($m, $v) Set-GridColumnValue -Module $m -Column $v[0] -Value $v[1] } }
+        '-'
+        @{ Text = 'Typ: zabezpieczeń'; Value = @('Typ', 'Zabezpieczeń'); Action = { param($m, $v) Set-GridColumnValue -Module $m -Column $v[0] -Value $v[1] } }
+        @{ Text = 'Typ: dystrybucyjna'; Value = @('Typ', 'Dystrybucyjna'); Action = { param($m, $v) Set-GridColumnValue -Module $m -Column $v[0] -Value $v[1] } }
+        '-'
+        @{ Text = 'OU: wartość z pola «Miejsce»'; Value = @('OU', ''); Action = { param($m, $v) Set-GridColumnValue -Module $m -Column 'OU' -Value $m.Ou.Text.Trim() } }
+        @{ Text = 'Opis…'; Value = @('Opis', ''); Action = {
+                param($m)
+                $d = Show-InputDialog -Title 'Opis' -Prompt 'Opis dla wybranych wierszy. Pole {nazwa} zostanie zastąpione nazwą grupy.' -Icon 'E70F'
+                if ($null -ne $d) { Set-GridColumnValue -Module $m -Column 'Opis' -Value $d -Template }
+            }
+        }
+    ) | Out-Null
+    Add-RowAction -Module $m -Text 'Usuń wiersze z podglądu' -Icon 'E74D' -Action { param($m, $rows) Remove-ResultRows -Module $m -Rows $rows; & $m.Actions.Stats $m }
+    Add-StatTile -Module $m -Key 'ready' -Label 'Gotowe do utworzenia' -Icon 'E9D5' | Out-Null
+    Add-StatTile -Module $m -Key 'done' -Label 'Utworzone' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'exists' -Label 'Już istnieją' -Icon 'E73A' | Out-Null
+    Add-StatTile -Module $m -Key 'bad' -Label 'Błędy i konflikty' -Icon 'E7BA' | Out-Null
+    $m.EmptyHint = 'Wklej tabelę z Excela (Wklej ze schowka) albo wpisz nazwy grup w polu «Dane» i kliknij «Podgląd i sprawdzenie» (F5). Komórki z ołówkiem można poprawić przed utworzeniem.'
+}
+
+function Set-GridColumnValue {
+    # Ustawia wartość kolumny w zaznaczonych wierszach podglądu (albo we wszystkich, gdy nic nie zaznaczono)
+    param([hashtable]$Module, [string]$Column, [string]$Value, [switch]$Template)
+    Complete-GridEdit -Module $Module
+    $rows = @(Get-SelectedResultRows -Module $Module | ForEach-Object { $_.Row })
+    if ($rows.Count -le 1) { $rows = @($Module.View | ForEach-Object { $_.Row }) }
+    $Module.Loading = $true
+    try {
+        foreach ($r in $rows) {
+            if (@('Utworzono', 'Istnieje') -contains [string]$r['Stan']) { continue }
+            $v = if ($Template) { $Value.Replace('{nazwa}', [string]$r['Nazwa']) } else { $Value }
+            Set-ResultValue -Module $Module -Row $r -Column $Column -Value $v
+            Set-RowState -Module $Module -Row $r -State 'Zmieniono – sprawdź' -Tone 'warn'
+        }
+    }
+    finally { $Module.Loading = $false }
+    $Module.Data.Stale = $true
+    Show-Toast ("Zmieniono kolumnę «{0}» w {1} wierszach – sprawdź ponownie przed utworzeniem." -f $Column, $rows.Count) 'info'
+}
+
+$script:GroupDuplicatePlanScript = {
+    # Podgląd kopii grupy źródłowej ($Target): nowa nazwa wg reguł, sprawdzenie zajętości
+    $src = Get-ADGroup -Identity $Target -Properties Description, member, memberOf, managedBy @ad
+    $values = @($P.Replace)
+    if ($values.Count -eq 0) { $values = @('') }
+    foreach ($repl in $values) {
+        $conv = {
+            param([string]$Text)
+            $t = $Text
+            if ($P.Find) { $t = [regex]::Replace($t, [regex]::Escape($P.Find), $repl.Replace('$', '$$'), 'IgnoreCase') }
+            return ($P.Prefix + $t + $P.Suffix)
+        }
+        $name = & $conv $src.Name
+        $sam = ConvertTo-SamName (& $conv $src.SamAccountName)
+        $desc = [string]$src.Description
+        if ($P.ReplaceInDescription) { $desc = & $conv $desc; if (-not $src.Description) { $desc = '' } }
+        $ou = if ($P.Ou) { $P.Ou } else { Get-DnParent $src.DistinguishedName }
+        $issues = @()
+        if ($sam -ieq $src.SamAccountName) { $issues += 'sAMAccountName kopii jest taki sam jak oryginału – ustaw zamianę tekstu, przedrostek lub przyrostek albo popraw w tabeli' }
+        elseif (@(Get-ADObject -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapValue $sam))" @ad).Count -gt 0) { $issues += "sAMAccountName «$sam» jest zajęty" }
+        try {
+            if (@(Get-ADObject -LDAPFilter "(name=$(ConvertTo-LdapValue $name))" -SearchBase $ou -SearchScope OneLevel @ad).Count -gt 0) { $issues += "w OU istnieje już obiekt «$name»" }
+        }
+        catch { $issues += "nie ma jednostki $ou" }
+        [pscustomobject][ordered]@{
+            'Stan'                = $(if ($issues) { 'Konflikt' } else { 'Do utworzenia' })
+            'Nowa nazwa'          = $name
+            'Nowy sAMAccountName' = $sam
+            'Opis'                = $desc
+            'OU'                  = $ou
+            'Zakres'              = Get-ScopeLabel $src.GroupScope
+            'Typ'                 = Get-CategoryLabel $src.GroupCategory
+            'Członkowie'          = @($src.member).Count
+            'Należy do'           = @($src.memberOf).Count
+            'Uwagi'               = ($issues -join '; ')
+            '__tone'              = $(if ($issues) { 'crit' } else { 'info' })
+            '__id'                = [guid]::NewGuid().ToString('N')
+            '__src'               = $src.DistinguishedName
+        }
+    }
+}
+
+$script:GroupDuplicateScript = {
+    # Utworzenie kopii grupy ($P: SrcDn, Name, Sam, Description, Ou, Copy*)
+    $src = Get-ADGroup -Identity $P.SrcDn -Properties Description, member, memberOf, managedBy, info, mail, ProtectedFromAccidentalDeletion, displayName @ad
+    $params = @{ Name = $P.Name; SamAccountName = $P.Sam; GroupScope = $src.GroupScope; GroupCategory = $src.GroupCategory; Path = $P.Ou; PassThru = $true }
+    if ($P.Description) { $params.Description = $P.Description }
+    $other = @{}
+    if ($P.CopyInfo -and $src.info) { $other.info = [string]$src.info }
+    if ($P.CopyMail -and $src.mail) { $other.mail = [string]$src.mail }
+    if ($other.Count) { $params.OtherAttributes = $other }
+    if ($P.CopyManager -and $src.managedBy) { $params.ManagedBy = [string]$src.managedBy }
+    $new = New-ADGroup @params @ad
+    $notes = @()
+    $warn = $false
+    if ($P.CopyMembers) {
+        $members = @($src.member)
+        $added = 0
+        for ($i = 0; $i -lt $members.Count; $i += 200) {
+            $chunk = @($members[$i..([Math]::Min($i + 199, $members.Count - 1))])
+            try { Add-ADGroupMember -Identity $new.DistinguishedName -Members $chunk @ad; $added += $chunk.Count }
+            catch {
+                foreach ($d in $chunk) {
+                    try { Add-ADGroupMember -Identity $new.DistinguishedName -Members $d @ad; $added++ }
+                    catch { $notes += "członek $(Get-DnName $d): $($_.Exception.Message)"; $warn = $true }
+                }
+            }
+        }
+        $notes += "członkowie: $added z $($members.Count)"
+    }
+    if ($P.CopyMemberOf) {
+        $ok = 0
+        foreach ($parent in @($src.memberOf)) {
+            try { Add-ADGroupMember -Identity $parent -Members $new.DistinguishedName @ad; $ok++ }
+            catch { $notes += "przynależność do $(Get-DnName $parent): $($_.Exception.Message)"; $warn = $true }
+        }
+        $notes += "przynależność: $ok z $(@($src.memberOf).Count)"
+    }
+    if ($P.CopyProtect -and $src.ProtectedFromAccidentalDeletion) { Set-ADObject -Identity $new.DistinguishedName -ProtectedFromAccidentalDeletion $true @ad; $notes += 'chroniona' }
+    [pscustomobject]@{ Dn = $new.DistinguishedName; Notes = ($notes -join '; '); Warn = $warn }
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Tworzenie' -Key 'GroupDuplicate' -Title 'Duplikowanie grup' -Icon 'E8C8' -Badge 'nowe' `
+    -Description 'Kopie zaznaczonych grup z nową nazwą (zamiana tekstu, przedrostek, przyrostek – także wiele kopii naraz, np. WAW → KRK; GDA) i opcjonalnie z członkami, przynależnością do grup, zarządcą i ochroną. Podgląd z edycją przed utworzeniem.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.EditableColumns = @('Nowa nazwa', 'Nowy sAMAccountName', 'Opis', 'OU')
+    $m.Data.Stale = $false
+    $m.Data.SameInput = ''
+    $m.OnCellEdit = {
+        param($m, $row, $column)
+        if ([string]$row['Stan'] -ne 'Utworzono') { Set-RowState -Module $m -Row $row -State 'Zmieniono – sprawdź' -Tone 'warn' -Note 'Kliknij «Podgląd», aby sprawdzić zmienione wartości w AD (bez zmiany reguł nazwy poprawki w tabeli zostaną zachowane).' }
+        $m.Data.Stale = $true
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Nowa nazwa'
+    Add-Label -Parent $row -Text 'Zamień' | Out-Null
+    $m.Find = Add-TextBox -Parent $row -Width 140 -Placeholder 'np. WAW'
+    Add-Label -Parent $row -Text 'na' | Out-Null
+    $m.Replace = Add-TextBox -Parent $row -Width 220 -Placeholder 'np. KRK; GDA (kilka kopii)'
+    Add-Label -Parent $row -Text 'Przedrostek' | Out-Null
+    $m.Prefix = Add-TextBox -Parent $row -Width 100
+    Add-Label -Parent $row -Text 'Przyrostek' | Out-Null
+    $m.Suffix = Add-TextBox -Parent $row -Width 100 -Placeholder 'np. _kopia'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Miejsce'
+    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 460 -Placeholder 'Ta sama OU co grupa źródłowa' -DialogTitle 'Jednostka dla kopii grup'
+    $row3 = Add-ToolbarRow -Module $m -Title 'Kopiuj'
+    $m.CopyMembers = Add-CheckBox -Parent $row3 -Text 'Członków' -Checked $true
+    $m.CopyMemberOf = Add-CheckBox -Parent $row3 -Text 'Przynależność do grup' -Checked $true -ToolTip 'Kopia zostanie dodana do tych samych grup nadrzędnych co oryginał'
+    $m.CopyManager = Add-CheckBox -Parent $row3 -Text 'Zarządcę' -Checked $true
+    $m.CopyInfo = Add-CheckBox -Parent $row3 -Text 'Uwagi (info)' -Checked $true
+    $m.CopyMail = Add-CheckBox -Parent $row3 -Text 'Adres e-mail' -ToolTip 'Zwykle niewskazane – adres e-mail grupy powinien być unikalny'
+    $m.CopyProtect = Add-CheckBox -Parent $row3 -Text 'Ochronę przed usunięciem' -Checked $true
+    $m.ReplaceDesc = Add-CheckBox -Parent $row3 -Text 'Zamieniaj tekst także w opisie' -Checked $true
+    $m.Actions.Preview = {
+        param($m)
+        $targets = @(Get-TargetGroups)
+        if (-not $targets) { return }
+        $replace = @(([string]$m.Replace.Text) -split ';' | ForEach-Object { $_.Trim() })
+        if (-not $m.Find.Text.Trim()) { $replace = @('') }
+        elseif (@($replace | Where-Object { $_ }).Count -eq 0) { $replace = @('') } else { $replace = @($replace | Where-Object { $_ }) }
+        $params = @{ Find = $m.Find.Text.Trim(); Replace = $replace; Prefix = $m.Prefix.Text; Suffix = $m.Suffix.Text; Ou = $m.Ou.Text.Trim(); ReplaceInDescription = (Test-Checked $m.ReplaceDesc) }
+        # Wiersze zmienione ręcznie w tabeli zostają - sprawdzane są ponownie z nowymi wartościami
+        $edited = @{}
+        foreach ($r in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Zmieniono – sprawdź' })) {
+            $edited[[string]$r['__src'] + '|' + [string]$r['__id']] = $r
+        }
+        if ($edited.Count -gt 0 -and $m.Data.SameInput -eq ($params | ConvertTo-Json -Compress)) {
+            & $m.Actions.Recheck $m
+            return
+        }
+        $m.Data.SameInput = ($params | ConvertTo-Json -Compress)
+        Start-AdOperation -Module $m -Name 'Podgląd kopii' -Targets $targets -TargetColumn 'Źródło' -Parameters $params -ScriptBlock $script:GroupDuplicatePlanScript -OnComplete { param($m) $m.Data.Stale = $false }
+    }
+    $m.Actions.Recheck = {
+        param($m)
+        # Sprawdzenie wierszy edytowanych w tabeli (nazwa, sAMAccountName, OU) bez ponownego generowania nazw
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Zmieniono – sprawdź' })
+        $check = @($rows | ForEach-Object { @{ Id = [string]$_['__id']; Name = ([string]$_['Nowa nazwa']).Trim(); Sam = ([string]$_['Nowy sAMAccountName']).Trim(); Ou = ([string]$_['OU']).Trim(); MemberOf = @(); ManagedBy = '' } })
+        Start-AdOperation -Module $m -Name 'Sprawdzanie kopii' -Targets @('AD') -Output None -Parameters @{ Rows = $check } -ScriptBlock $script:GroupCheckScript -OnResult {
+            param($m, $r)
+            foreach ($res in @($r.Data)) {
+                foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value ([string]$res.Id))) {
+                    $samIssue = Test-SamName ([string]$row['Nowy sAMAccountName'])
+                    if ($samIssue) { Set-RowState -Module $m -Row $row -State 'Konflikt' -Tone 'crit' -Note $samIssue }
+                    elseif (@($res.Issues).Count -gt 0) { Set-RowState -Module $m -Row $row -State 'Konflikt' -Tone 'crit' -Note ((@($res.Issues)) -join '; ') }
+                    elseif ($res.Exists) { Set-RowState -Module $m -Row $row -State 'Konflikt' -Tone 'crit' -Note 'Grupa o tej nazwie już istnieje.' }
+                    else { Set-RowState -Module $m -Row $row -State 'Do utworzenia' -Tone 'info' -Note '' }
+                }
+            }
+        } -OnComplete { param($m) $m.Data.Stale = $false }
+    }
+    $m.Actions.Create = {
+        param($m)
+        if ($m.Data.Stale -and @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Zmieniono – sprawdź' }).Count -gt 0) {
+            Show-Warning 'Część wierszy zmieniono w tabeli – kliknij «Podgląd», aby je sprawdzić przed utworzeniem kopii.'
+            return
+        }
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Do utworzenia' })
+        if ($rows.Count -eq 0) { Show-Message -Text 'Brak kopii gotowych do utworzenia. Kliknij «Podgląd» (F5) dla zaznaczonych grup.' -Title 'Brak zmian'; return }
+        $per = @{}
+        foreach ($r in $rows) {
+            $per[[string]$r['__id']] = @{
+                SrcDn = [string]$r['__src']; Name = ([string]$r['Nowa nazwa']).Trim(); Sam = ([string]$r['Nowy sAMAccountName']).Trim(); Description = ([string]$r['Opis']).Trim(); Ou = ([string]$r['OU']).Trim()
+                CopyMembers = (Test-Checked $m.CopyMembers); CopyMemberOf = (Test-Checked $m.CopyMemberOf); CopyManager = (Test-Checked $m.CopyManager)
+                CopyInfo = (Test-Checked $m.CopyInfo); CopyMail = (Test-Checked $m.CopyMail); CopyProtect = (Test-Checked $m.CopyProtect)
+            }
+        }
+        $items = @($rows | ForEach-Object { '{0}  →  {1}' -f $_['Źródło'], $_['Nowa nazwa'] })
+        if (-not (Confirm-Action -Text "Utworzyć $($rows.Count) kopi(i) grup?" -Items $items -ConfirmText 'Utwórz kopie')) { return }
+        Start-AdOperation -Module $m -Name 'Duplikowanie grup' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:GroupDuplicateScript -OnResult {
+            param($m, $r)
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value $r.Target)) {
+                if ($r.Ok) {
+                    $d = @($r.Data)[0]
+                    Set-RowState -Module $m -Row $row -State 'Utworzono' -Tone $(if ($d.Warn) { 'warn' } else { 'ok' }) -Note $d.Notes
+                }
+                else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')) }
+            }
+        } -OnComplete {
+            param($m)
+            $created = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Utworzono' } | ForEach-Object { [string]$_['Nowy sAMAccountName'] })
+            if ($created.Count -gt 0) { Add-GroupNames -Module $script:UI.Modules['__groups'] -Names $created -Source 'kopie' }
+        }
+    }
+    $row4 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row4 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row4 -Text 'Utwórz kopie' -Icon 'E8C8' -Module $m -OnClick $m.Actions.Create | Out-Null
+    Add-RowAction -Module $m -Text 'Usuń wiersze z podglądu' -Icon 'E74D' -Action { param($m, $rows) Remove-ResultRows -Module $m -Rows $rows }
+    $m.EmptyHint = 'Zaznacz grupy na liście po lewej, ustaw regułę nowej nazwy i kliknij «Podgląd» (F5). Nazwy, sAMAccountName, opis i OU można poprawić w tabeli.'
+}
+#endregion
+
+#region Struktura OU: plan zmian (OU, grupy, członkostwa), drzewo OU, klonowanie OU, lokalizacje i role
+# Plan = lista pozycji (hashtabli) Kind = 'OU' | 'Grupa' | 'Członkostwo' z polami: Key, Name, Sam, Parent (DN kontenera), Dn,
+# Scope, Category, Description, Info, Protect, GpLink, GpOptions, Group (DN), Member (DN), Source (opis źródła).
+# Test-AdPlanItems (w wątku AD) uzupełnia State/Note/Tone, $script:AdPlanExecuteScript wykonuje plan po kolei.
+$script:AdHelpers += @'
+
+function Test-AdPlanItems {
+    # Sprawdza pozycje planu w AD: istniejące obiekty, brakujące OU nadrzędne, zajęte sAMAccountName (opcjonalnie z sufiksem -1, -2...)
+    param([object[]]$Items, [switch]$UniqueSam, [int]$SamMax = 0)
+    $planned = @{}
+    $samPlanned = @{}
+    $memberCache = @{}
+    $existsCache = @{}
+    $exists = {
+        param([string]$Dn)
+        $k = $Dn.ToLowerInvariant()
+        if (-not $existsCache.ContainsKey($k)) {
+            $o = $null
+            try { $o = Get-ADObject -Identity $Dn -Properties member @ad } catch { }
+            $existsCache[$k] = $o
+        }
+        return $existsCache[$k]
+    }
+    $parentOk = {
+        param([string]$Dn)
+        if ($planned.ContainsKey($Dn.ToLowerInvariant())) { return (@('Do utworzenia', 'Istnieje') -contains $planned[$Dn.ToLowerInvariant()].State) }
+        return ($null -ne (& $exists $Dn))
+    }
+    foreach ($it in $Items) {
+        $it.Note = [string]$it.Note
+        switch ($it.Kind) {
+            'OU' {
+                $o = & $exists $it.Dn
+                if ($o) { $it.State = 'Istnieje'; $it.Tone = ''; if (-not $it.Note) { $it.Note = 'Jednostka już istnieje – zostanie użyta.' } }
+                elseif (-not (& $parentOk $it.Parent)) { $it.State = 'Konflikt'; $it.Tone = 'crit'; $it.Note = "Brak jednostki nadrzędnej $($it.Parent)" }
+                elseif ($it.Name.Length -gt 64) { $it.State = 'Konflikt'; $it.Tone = 'crit'; $it.Note = 'Nazwa OU dłuższa niż 64 znaki' }
+                else { $it.State = 'Do utworzenia'; $it.Tone = 'info' }
+            }
+            'Grupa' {
+                $o = & $exists $it.Dn
+                if ($o) {
+                    if ([string]$o.ObjectClass -eq 'group') { $it.State = 'Istnieje'; $it.Tone = ''; $it.Note = 'Grupa już istnieje – zostanie użyta.'; $it.Sam = [string](Get-ADGroup -Identity $it.Dn @ad).SamAccountName }
+                    else { $it.State = 'Konflikt'; $it.Tone = 'crit'; $it.Note = "W OU istnieje inny obiekt o nazwie «$($it.Name)»" }
+                }
+                elseif (-not (& $parentOk $it.Parent)) { $it.State = 'Konflikt'; $it.Tone = 'crit'; $it.Note = "Brak jednostki $($it.Parent)" }
+                elseif ($it.Name.Length -gt 64) { $it.State = 'Konflikt'; $it.Tone = 'crit'; $it.Note = 'Nazwa grupy (CN) dłuższa niż 64 znaki' }
+                else {
+                    $base = [string]$it.Sam
+                    $sam = $base
+                    $i = 0
+                    while ($true) {
+                        $taken = $samPlanned.ContainsKey($sam.ToLowerInvariant()) -or @(Get-ADObject -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapValue $sam))" @ad).Count -gt 0
+                        if (-not $taken) { break }
+                        if (-not $UniqueSam) { break }
+                        $i++
+                        $suffix = "-$i"
+                        $stem = if ($SamMax -gt 0 -and $base.Length + $suffix.Length -gt $SamMax) { $base.Substring(0, $SamMax - $suffix.Length) } else { $base }
+                        $sam = $stem + $suffix
+                    }
+                    if ($taken) { $it.State = 'Konflikt'; $it.Tone = 'crit'; $it.Note = (@("sAMAccountName «$sam» jest zajęty", $it.Note) | Where-Object { $_ }) -join ' – ' }
+                    else {
+                        if ($sam -ne $base) { $it.Note = (@($it.Note, "sAMAccountName zajęty – użyto «$sam»") | Where-Object { $_ }) -join '; ' }
+                        $it.Sam = $sam
+                        $it.State = 'Do utworzenia'; $it.Tone = 'info'
+                    }
+                }
+                $samPlanned[([string]$it.Sam).ToLowerInvariant()] = $true
+            }
+            'Członkostwo' {
+                $gState = if ($planned.ContainsKey($it.Group.ToLowerInvariant())) { $planned[$it.Group.ToLowerInvariant()].State } elseif (& $exists $it.Group) { 'Istnieje' } else { 'Brak' }
+                $mState = if ($planned.ContainsKey($it.Member.ToLowerInvariant())) { $planned[$it.Member.ToLowerInvariant()].State } elseif (& $exists $it.Member) { 'Istnieje' } else { 'Brak' }
+                if (@('Do utworzenia', 'Istnieje') -notcontains $gState -or @('Do utworzenia', 'Istnieje') -notcontains $mState) {
+                    $it.State = 'Pominięto'; $it.Tone = 'warn'; $it.Note = 'Grupa lub członek nie zostanie utworzony (konflikt).'
+                }
+                elseif ($gState -eq 'Istnieje' -and $mState -eq 'Istnieje') {
+                    $k = $it.Group.ToLowerInvariant()
+                    if (-not $memberCache.ContainsKey($k)) {
+                        $set = @{}
+                        foreach ($d in @((& $exists $it.Group).member)) { $set[([string]$d).ToLowerInvariant()] = $true }
+                        $memberCache[$k] = $set
+                    }
+                    if ($memberCache[$k].ContainsKey($it.Member.ToLowerInvariant())) { $it.State = 'Istnieje'; $it.Tone = ''; $it.Note = 'Już jest członkiem.' }
+                    else { $it.State = 'Do dodania'; $it.Tone = 'info' }
+                }
+                else { $it.State = 'Do dodania'; $it.Tone = 'info' }
+            }
+        }
+        if ($it.Dn) { $planned[([string]$it.Dn).ToLowerInvariant()] = $it }
+    }
+    return , $Items
+}
+'@
+
+$script:AdPlanCheckScript = {
+    $items = @($P.Items | ForEach-Object { $h = @{}; foreach ($k in $_.Keys) { $h[$k] = $_[$k] }; $h })
+    $checked = Test-AdPlanItems -Items $items -UniqueSam:([bool]$P.UniqueSam) -SamMax ([int]$P.SamMax)
+    foreach ($it in $checked) { [pscustomobject]$it }
+}
+
+$script:AdPlanExecuteScript = {
+    # Wykonanie planu po kolei (najpierw elementy nadrzędne - kolejność pozycji jest kolejnością planu)
+    $failed = @{}
+    foreach ($src in $P.Items) {
+        $it = @{}
+        foreach ($k in $src.Keys) { $it[$k] = $src[$k] }
+        if (@('Do utworzenia', 'Do dodania') -notcontains $it.State) { continue }
+        $result = @{ Key = $it.Key; Ok = $true; State = ''; Note = '' }
+        try {
+            if ($it.Parent -and $failed.ContainsKey(([string]$it.Parent).ToLowerInvariant())) { throw 'Nie utworzono elementu nadrzędnego.' }
+            switch ($it.Kind) {
+                'OU' {
+                    $params = @{ Name = $it.Name; Path = $it.Parent; ProtectedFromAccidentalDeletion = [bool]$it.Protect }
+                    if ($it.Description) { $params.Description = $it.Description }
+                    $other = @{}
+                    if ($it.GpLink) { $other.gPLink = [string]$it.GpLink }
+                    if ($null -ne $it.GpOptions -and [string]$it.GpOptions -ne '' -and [int]$it.GpOptions -ne 0) { $other.gPOptions = [int]$it.GpOptions }
+                    if ($other.Count) { $params.OtherAttributes = $other }
+                    New-ADOrganizationalUnit @params @ad
+                    $result.State = 'Utworzono'
+                    if ($it.GpLink) { $result.Note = 'połączono zasady grupy' }
+                }
+                'Grupa' {
+                    $params = @{ Name = $it.Name; SamAccountName = $it.Sam; GroupScope = $it.Scope; GroupCategory = $it.Category; Path = $it.Parent }
+                    if ($it.Description) { $params.Description = $it.Description }
+                    if ($it.Info) { $params.OtherAttributes = @{ info = [string]$it.Info } }
+                    New-ADGroup @params @ad
+                    if ($it.Protect) { Set-ADObject -Identity $it.Dn -ProtectedFromAccidentalDeletion $true @ad }
+                    $result.State = 'Utworzono'
+                }
+                'Członkostwo' {
+                    if ($failed.ContainsKey(([string]$it.Group).ToLowerInvariant()) -or $failed.ContainsKey(([string]$it.Member).ToLowerInvariant())) { throw 'Nie utworzono grupy lub członka.' }
+                    Add-ADGroupMember -Identity $it.Group -Members $it.Member @ad
+                    $result.State = 'Dodano'
+                }
+            }
+        }
+        catch {
+            $result.Ok = $false
+            $result.State = 'Błąd'
+            $result.Note = $_.Exception.Message
+            if ($it.Dn) { $failed[([string]$it.Dn).ToLowerInvariant()] = $true }
+        }
+        [pscustomobject]$result
+    }
+}
+
+function ConvertTo-PlanRow {
+    # Pozycja planu -> wiersz tabeli podglądu
+    param($Item, [int]$Index)
+    $kind = [string]$Item.Kind
+    $target = switch ($kind) {
+        'Członkostwo' { '{0}  →  {1}' -f (Get-RdnValue ([string]$Item.Member)), (Get-RdnValue ([string]$Item.Group)) }
+        default { [string]$Item.Dn }
+    }
+    $indent = ''
+    if ($Item['Level']) { $indent = ('    ' * [int]$Item['Level']) }
+    return [pscustomobject][ordered]@{
+        'Lp'             = $Index
+        'Stan'           = [string]$Item.State
+        'Typ'            = $kind
+        'Nazwa'          = $(if ($kind -eq 'Członkostwo') { Get-RdnValue ([string]$Item.Member) } else { $indent + [string]$Item.Name })
+        'sAMAccountName' = [string]$Item['Sam']
+        'Opis'           = [string]$Item['Description']
+        'Cel'            = $target
+        'Źródło'         = [string]$Item['Source']
+        'Uwagi'          = [string]$Item.Note
+        '__tone'         = [string]$Item.Tone
+        '__key'          = [string]$Item.Key
+    }
+}
+
+function Show-AdPlan {
+    # Wyświetla plan w tabeli modułu i zapamiętuje go do wykonania
+    param([hashtable]$Module, [object[]]$Items)
+    $Module.Data.Plan = @($Items)
+    Reset-ResultTable -Module $Module
+    $i = 0
+    $rows = foreach ($it in $Items) { $i++; ConvertTo-PlanRow -Item $it -Index $i }
+    if (@($rows).Count -gt 0) { Add-ResultRows -Module $Module -Objects @($rows); Request-ResultSpace -Module $Module }
+    Update-AdPlanStats -Module $Module
+}
+
+function Update-AdPlanStats {
+    param([hashtable]$Module)
+    $plan = @($Module.Data['Plan'])
+    $count = { param([string[]]$States, [string]$Kind) @($plan | Where-Object { $_ -and $States -contains [string]$_.State -and (-not $Kind -or $_.Kind -eq $Kind) }).Count }
+    Set-StatTile -Module $Module -Key 'ou' -Value ([string](& $count @('Do utworzenia') 'OU')) -Tone 'info' -Label 'Nowe OU'
+    Set-StatTile -Module $Module -Key 'groups' -Value ([string](& $count @('Do utworzenia') 'Grupa')) -Tone 'info' -Label 'Nowe grupy'
+    Set-StatTile -Module $Module -Key 'members' -Value ([string](& $count @('Do dodania') 'Członkostwo')) -Tone 'info' -Label 'Nowe członkostwa'
+    Set-StatTile -Module $Module -Key 'done' -Value ([string](& $count @('Utworzono', 'Dodano') '')) -Tone 'ok' -Label 'Wykonane'
+    $bad = & $count @('Konflikt', 'Błąd') ''
+    Set-StatTile -Module $Module -Key 'bad' -Value ([string]$bad) -Tone $(if ($bad) { 'crit' } else { '' }) -Label 'Konflikty i błędy'
+}
+
+function Add-PlanTiles {
+    param([hashtable]$Module, [switch]$NoGroups)
+    Add-StatTile -Module $Module -Key 'ou' -Label 'Nowe OU' -Icon 'ED41' | Out-Null
+    if (-not $NoGroups) {
+        Add-StatTile -Module $Module -Key 'groups' -Label 'Nowe grupy' -Icon 'E902' | Out-Null
+        Add-StatTile -Module $Module -Key 'members' -Label 'Nowe członkostwa' -Icon 'E8FA' | Out-Null
+    }
+    Add-StatTile -Module $Module -Key 'done' -Label 'Wykonane' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $Module -Key 'bad' -Label 'Konflikty i błędy' -Icon 'E7BA' | Out-Null
+}
+
+function Start-AdPlanCheck {
+    # Sprawdzenie planu w AD i wyświetlenie wyniku (-UniqueSam: zajęty sAMAccountName dostaje sufiks)
+    param([hashtable]$Module, [object[]]$Items, [switch]$UniqueSam, [int]$SamMax = 0)
+    if (@($Items).Count -eq 0) { Show-Warning 'Plan jest pusty.'; return }
+    Show-AdPlan -Module $Module -Items @($Items | ForEach-Object { $_.State = 'Sprawdzanie…'; $_.Tone = ''; $_ })
+    Start-AdOperation -Module $Module -Name 'Sprawdzanie planu' -Targets @('AD') -Output None -Parameters @{ Items = @($Items); UniqueSam = [bool]$UniqueSam; SamMax = $SamMax } -ScriptBlock $script:AdPlanCheckScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { Invoke-Deferred -Module $m -Action { param($m) Show-Error 'Nie udało się sprawdzić planu w Active Directory.' $m.Data.LastError }; $m.Data.LastError = (@($r.Errors)) -join "`r`n"; return }
+        $items = @($r.Data | ForEach-Object { $h = @{}; foreach ($p in $_.PSObject.Properties) { $h[$p.Name] = $p.Value }; $h })
+        Show-AdPlan -Module $m -Items $items
+        Write-Log ("Plan: {0} pozycji." -f $items.Count)
+    }
+}
+
+function Start-AdPlanExecute {
+    # Wykonanie planu z potwierdzeniem; statusy wracają do tabeli
+    param([hashtable]$Module, [string]$Title = 'Wykonać plan?')
+    $plan = @($Module.Data['Plan'])
+    $todo = @($plan | Where-Object { $_ -and @('Do utworzenia', 'Do dodania') -contains [string]$_.State })
+    if ($todo.Count -eq 0) { Show-Message -Text 'Plan nie zawiera zmian do wykonania. Kliknij «Podgląd», aby go przygotować.' -Title 'Brak zmian'; return }
+    $items = @($todo | ForEach-Object { '{0}: {1}' -f $_.Kind, $(if ($_.Kind -eq 'Członkostwo') { '{0} → {1}' -f (Get-RdnValue $_.Member), (Get-RdnValue $_.Group) } else { $_.Name }) })
+    $ou = @($todo | Where-Object { $_.Kind -eq 'OU' }).Count
+    $gr = @($todo | Where-Object { $_.Kind -eq 'Grupa' }).Count
+    $mb = @($todo | Where-Object { $_.Kind -eq 'Członkostwo' }).Count
+    $text = "$Title`r`nNowe OU: $ou, nowe grupy: $gr, członkostwa: $mb."
+    if (-not (Confirm-Action -Text $text -Items $items -ConfirmText 'Wykonaj plan')) { return }
+    Start-AdOperation -Module $Module -Name 'Wykonywanie planu' -Targets @('AD') -Output None -Parameters @{ Items = $plan } -ScriptBlock $script:AdPlanExecuteScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { Write-Log ('Plan przerwany: ' + ((@($r.Errors)) -join ' ')) 'ERROR'; return }
+        $byKey = @{}
+        foreach ($p in @($m.Data.Plan)) { $byKey[[string]$p.Key] = $p }
+        foreach ($res in @($r.Data)) {
+            $p = $byKey[[string]$res.Key]
+            if ($p) { $p.State = $res.State; $p.Tone = $(if ($res.Ok) { 'ok' } else { 'crit' }); $p.Note = $(if ($res.Ok) { $res.Note } else { Get-FriendlyAdError $res.Note }) }
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__key' -Value ([string]$res.Key))) {
+                Set-RowState -Module $m -Row $row -State $res.State -Tone $(if ($res.Ok) { 'ok' } else { 'crit' }) -Note $(if ($res.Ok) { $res.Note } else { Get-FriendlyAdError $res.Note })
+            }
+        }
+    } -OnComplete { param($m) Update-AdPlanStats -Module $m }
+}
+
+function Get-DomainRootDn {
+    # DN domeny (dla pola OU pozostawionego pustego)
+    Import-AdModule
+    $ad = Get-AdSplat
+    return [string](Invoke-WithWaitCursor { (Get-ADDomain @ad).DistinguishedName })
+}
+
+function ConvertFrom-OuTreeText {
+    <#
+        Tekst ze strukturą OU -> pozycje planu. Obsługiwane formy wierszy:
+          wcięcia (spacje/tabulatory, także znaki drzewa ├─ └─ │), ścieżki «Firma/Biuro/Komputery» albo «Firma\Biuro»,
+          opcjonalny opis po znaku «|», komentarze od «#».
+    #>
+    param([string]$Text, [string]$BaseDn, [bool]$Protect, [string]$DescriptionTemplate = '')
+    $items = New-Object System.Collections.ArrayList
+    $known = @{}
+    $stack = New-Object System.Collections.ArrayList
+    $errors = @()
+    $lineNo = 0
+    foreach ($raw in ([string]$Text -split "\r?\n")) {
+        $lineNo++
+        $line = $raw.TrimEnd()
+        if (-not $line.Trim() -or $line.Trim().StartsWith('#')) { continue }
+        $desc = ''
+        $bar = $line.IndexOf('|')
+        if ($bar -ge 0) { $desc = $line.Substring($bar + 1).Trim(); $line = $line.Substring(0, $bar).TrimEnd() }
+        $m = [regex]::Match($line, '^[\s│├└─\-\*•]*')
+        $indent = ($m.Value -replace "`t", '    ').Length
+        $body = $line.Substring($m.Length).Trim()
+        if (-not $body) { continue }
+        if ($body -match '[/\\]') {
+            $path = @($body -split '[/\\]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+        else {
+            while ($stack.Count -gt 0 -and $stack[$stack.Count - 1].Indent -ge $indent) { $stack.RemoveAt($stack.Count - 1) }
+            $path = @($stack | ForEach-Object { $_.Name }) + @($body)
+            [void]$stack.Add(@{ Indent = $indent; Name = $body })
+        }
+        $parent = $BaseDn
+        for ($i = 0; $i -lt $path.Count; $i++) {
+            $name = $path[$i]
+            if ($name.Length -gt 64) { $errors += "Wiersz ${lineNo}: nazwa «$name» ma więcej niż 64 znaki" }
+            $dn = 'OU={0},{1}' -f (ConvertTo-RdnValue $name), $parent
+            $key = $dn.ToLowerInvariant()
+            $isLast = ($i -eq $path.Count - 1)
+            if (-not $known.ContainsKey($key)) {
+                $d = if ($isLast -and $desc) { $desc } elseif ($DescriptionTemplate) { Expand-Template $DescriptionTemplate @{ nazwa = $name; sciezka = ($path[0..$i] -join '/'); ścieżka = ($path[0..$i] -join '/') } } else { '' }
+                $item = @{ Key = 'ou:' + $key; Kind = 'OU'; Name = $name; Parent = $parent; Dn = $dn; Description = $d; Protect = $Protect; Level = $i; State = ''; Note = ''; Tone = ''; Source = "wiersz $lineNo" }
+                [void]$items.Add($item)
+                $known[$key] = $item
+            }
+            elseif ($isLast -and $desc) { $known[$key].Description = $desc }
+            $parent = $dn
+        }
+    }
+    return @{ Items = @($items); Errors = @($errors) }
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Struktura OU' -Key 'OuTree' -Title 'Drzewo OU' -Icon 'ED41' -Badge 'nowe' `
+    -Description 'Całe drzewo jednostek organizacyjnych z wcięć lub ścieżek w tekście (np. Firma/Warszawa/Komputery), z opisami i ochroną przed usunięciem. Istniejącą strukturę można wczytać jako tekst, zmienić i utworzyć w innym miejscu.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.Data.Plan = @()
+    $row = Add-ToolbarRow -Module $m -Title 'Miejsce'
+    $m.Base = Add-OuField -Parent $row -Module $m -Width 460 -Placeholder 'Korzeń domeny' -DialogTitle 'OU nadrzędna dla nowego drzewa' -AllowDomainRoot -Remember 'Base'
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Struktura' -Multiline -Height 190 -Placeholder "Firma`r`n    Warszawa | Oddział w Warszawie`r`n        Komputery`r`n        Użytkownicy`r`n    Kraków`r`nalbo ścieżki: Firma/Gdańsk/Komputery"
+    $m.Input.Text = [string](Get-ModuleSetting -Module $m -Name 'Text' -Default '')
+    $row2 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.Protect = Add-CheckBox -Parent $row2 -Text 'Chroń przed przypadkowym usunięciem' -Checked $true
+    Add-Label -Parent $row2 -Text 'Opis nowych OU' | Out-Null
+    $m.DescTpl = Add-TextBox -Parent $row2 -Width 260 -Placeholder 'np. Oddział {nazwa} (pola: {nazwa}, {sciezka})'
+    $m.Actions.Preview = {
+        param($m)
+        $base = $m.Base.Text.Trim()
+        if (-not $base) { $base = Get-DomainRootDn }
+        Set-ModuleSetting -Module $m -Name 'Text' -Value $m.Input.Text
+        $parsed = ConvertFrom-OuTreeText -Text $m.Input.Text -BaseDn $base -Protect (Test-Checked $m.Protect) -DescriptionTemplate $m.DescTpl.Text.Trim()
+        if (@($parsed.Errors).Count -gt 0) { Show-Warning ((@($parsed.Errors) | Select-Object -First 15) -join "`r`n"); return }
+        if (@($parsed.Items).Count -eq 0) { Show-Warning 'Wpisz strukturę jednostek organizacyjnych (jedna w wierszu, wcięcia oznaczają zagnieżdżenie).'; return }
+        Start-AdPlanCheck -Module $m -Items @($parsed.Items)
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row3 -Text 'Utwórz OU' -Icon 'ED41' -Module $m -OnClick { param($m) Start-AdPlanExecute -Module $m -Title 'Utworzyć jednostki organizacyjne?' } | Out-Null
+    Add-Button -Parent $row3 -Text 'Wczytaj istniejącą strukturę…' -Icon 'E8B7' -Module $m -ToolTip 'Wstawia do pola tekst z drzewem OU wybranej jednostki – do edycji i utworzenia w innym miejscu' -OnClick {
+        param($m)
+        $src = Select-OrganizationalUnit -Title 'Struktura do wczytania' -Selected $m.Base.Text.Trim()
+        if (-not $src) { return }
+        Start-AdOperation -Module $m -Name 'Wczytywanie struktury OU' -Targets @('AD') -Output None -Parameters @{ Source = $src } -ScriptBlock {
+            $root = Get-ADOrganizationalUnit -Identity $P.Source -Properties Description @ad
+            $all = @(Get-ADOrganizationalUnit -SearchBase $P.Source -SearchScope Subtree -LDAPFilter '(objectClass=organizationalUnit)' -Properties Description @ad)
+            foreach ($o in $all) {
+                $rel = ([string]$o.DistinguishedName).Substring(0, ([string]$o.DistinguishedName).Length - ([string]$root.DistinguishedName).Length).TrimEnd(',')
+                $parts = @(if ($rel) { $rel -split '(?<!\\),' | ForEach-Object { Get-DnName $_ } })
+                [array]::Reverse($parts)
+                [pscustomobject]@{ Path = (@($root.Name) + $parts); Description = [string]$o.Description }
+            }
+        } -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { return }
+            $lines = foreach ($o in (@($r.Data) | Sort-Object { ($_.Path -join [string][char]1) })) {
+                $path = @($o.Path)
+                ('    ' * ($path.Count - 1)) + $path[$path.Count - 1] + $(if ($o.Description) { ' | ' + $o.Description } else { '' })
+            }
+            $m.Input.Text = (@($lines) -join "`r`n")
+            Show-Toast ("Wczytano {0} jednostek – zmień nazwy i miejsce, potem «Podgląd»." -f @($r.Data).Count) 'ok' 6
+        }
+    } | Out-Null
+    Add-PlanTiles -Module $m -NoGroups
+    $m.EmptyHint = 'Wpisz strukturę (wcięcia albo ścieżki) i kliknij «Podgląd» (F5). Istniejące jednostki zostaną użyte, brakujące – utworzone po kliknięciu «Utwórz OU».'
+}
+
+$script:OuClonePlanScript = {
+    # Plan klonowania jednostki $P.Source: OU, grupy, zagnieżdżenia i członkostwa z zamianą tekstu w nazwach
+    $src = Get-ADOrganizationalUnit -Identity $P.Source -Properties Description, gPLink, gPOptions, ProtectedFromAccidentalDeletion @ad
+    $srcDn = [string]$src.DistinguishedName
+    $destParent = if ($P.Dest) { [string]$P.Dest } else { [string](Get-ADDomain @ad).DistinguishedName }
+    if ($destParent -ieq $srcDn -or $destParent.EndsWith(",$srcDn", [StringComparison]::OrdinalIgnoreCase)) { throw 'Nie można klonować jednostki do jej własnego wnętrza.' }
+    $pairs = @($P.Replace)
+    $conv = {
+        param([string]$Text)
+        $t = $Text
+        foreach ($pr in $pairs) { if ($pr[0]) { $t = [regex]::Replace($t, [regex]::Escape([string]$pr[0]), ([string]$pr[1]).Replace('$', '$$'), 'IgnoreCase') } }
+        return $t
+    }
+    $rootName = if ($P.NewName) { [string]$P.NewName } else { & $conv $src.Name }
+    $newRoot = 'OU={0},{1}' -f (ConvertTo-RdnValue $rootName), $destParent
+    if ($newRoot -ieq $srcDn) { throw 'Kopia miałaby tę samą nazwę i miejsce co źródło – podaj nową nazwę, inne miejsce albo zamianę tekstu.' }
+    $depth0 = @($srcDn -split '(?<!\\),').Count
+    $map = @{}
+    $items = New-Object System.Collections.ArrayList
+    $ous = @(Get-ADOrganizationalUnit -SearchBase $srcDn -SearchScope Subtree -LDAPFilter '(objectClass=organizationalUnit)' -Properties Description, gPLink, gPOptions, ProtectedFromAccidentalDeletion @ad |
+            Sort-Object { @(([string]$_.DistinguishedName) -split '(?<!\\),').Count })
+    foreach ($o in $ous) {
+        $dn = [string]$o.DistinguishedName
+        $isRoot = ($dn -ieq $srcDn)
+        $parentNew = if ($isRoot) { $destParent } else { $map[(Get-DnParent $dn).ToLowerInvariant()] }
+        $name = if ($isRoot) { $rootName } else { & $conv $o.Name }
+        $newDn = 'OU={0},{1}' -f (ConvertTo-RdnValue $name), $parentNew
+        $map[$dn.ToLowerInvariant()] = $newDn
+        [void]$items.Add(@{
+                Key = "ou:$newDn"; Kind = 'OU'; Name = $name; Parent = $parentNew; Dn = $newDn; Level = (@($dn -split '(?<!\\),').Count - $depth0)
+                Description = $(if ($P.CopyDescription) { & $conv ([string]$o.Description) } else { '' })
+                Protect = $(if ($P.CopyProtect) { [bool]$o.ProtectedFromAccidentalDeletion } else { $false })
+                GpLink = $(if ($P.CopyGpo) { [string]$o.gPLink } else { '' }); GpOptions = $(if ($P.CopyGpo) { $o.gPOptions } else { $null })
+                Source = $o.Name; State = ''; Note = $(if ($P.CopyGpo -and $o.gPLink) { 'z linkami GPO' } else { '' }); Tone = ''
+            })
+    }
+    if ($P.CopyGroups) {
+        $groups = @(Get-ADGroup -SearchBase $srcDn -SearchScope Subtree -LDAPFilter '(objectClass=group)' -Properties Description, member, memberOf, info @ad)
+        $gmap = @{}
+        foreach ($g in $groups) {
+            $name = & $conv $g.Name
+            $sam = ConvertTo-SamName (& $conv $g.SamAccountName)
+            $parentNew = $map[(Get-DnParent ([string]$g.DistinguishedName)).ToLowerInvariant()]
+            $newDn = 'CN={0},{1}' -f (ConvertTo-RdnValue $name), $parentNew
+            $gmap[([string]$g.DistinguishedName).ToLowerInvariant()] = $newDn
+            [void]$items.Add(@{
+                    Key = "grp:$newDn"; Kind = 'Grupa'; Name = $name; Sam = $sam; Parent = $parentNew; Dn = $newDn; Scope = [string]$g.GroupScope; Category = [string]$g.GroupCategory
+                    Description = $(if ($P.CopyDescription) { & $conv ([string]$g.Description) } else { '' }); Info = $(if ($P.CopyDescription) { [string]$g.info } else { '' })
+                    Protect = $false; Source = $g.Name; State = ''; Note = $(if ($sam -ieq $g.SamAccountName) { 'sAMAccountName bez zmian – dodaj zamianę tekstu, np. WAW=KRK' } else { '' }); Tone = ''
+                })
+        }
+        foreach ($g in $groups) {
+            $newG = $gmap[([string]$g.DistinguishedName).ToLowerInvariant()]
+            foreach ($mem in @($g.member)) {
+                $k = ([string]$mem).ToLowerInvariant()
+                if ($gmap.ContainsKey($k)) {
+                    if ($P.CopyNesting) { [void]$items.Add(@{ Key = "mem:$newG|$($gmap[$k])"; Kind = 'Członkostwo'; Group = $newG; Member = $gmap[$k]; Source = 'zagnieżdżenie'; State = ''; Note = ''; Tone = '' }) }
+                }
+                elseif ($P.CopyMembers -and $mem) { [void]$items.Add(@{ Key = "mem:$newG|$k"; Kind = 'Członkostwo'; Group = $newG; Member = [string]$mem; Source = 'członek spoza OU'; State = ''; Note = ''; Tone = '' }) }
+            }
+            if ($P.CopyMemberOf) {
+                foreach ($parent in @($g.memberOf)) {
+                    if ($parent -and -not $gmap.ContainsKey(([string]$parent).ToLowerInvariant())) { [void]$items.Add(@{ Key = "mem:$parent|$newG"; Kind = 'Członkostwo'; Group = [string]$parent; Member = $newG; Source = 'grupa nadrzędna spoza OU'; State = ''; Note = ''; Tone = '' }) }
+                }
+            }
+        }
+    }
+    $checked = Test-AdPlanItems -Items @($items)
+    foreach ($it in $checked) { [pscustomobject]$it }
+}
+
+function ConvertFrom-ReplacePairs {
+    # "WAW=KRK; Warszawa=Kraków" -> @(@('WAW','KRK'), @('Warszawa','Kraków'))
+    param([string]$Text)
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($part in ([string]$Text -split ';')) {
+        $p = $part.Trim()
+        if (-not $p) { continue }
+        $i = $p.IndexOf('=')
+        if ($i -lt 1) { throw "Niepoprawna zamiana «$p» – użyj formy STARY=NOWY." }
+        $list.Add([object[]]@($p.Substring(0, $i).Trim(), $p.Substring($i + 1).Trim()))
+    }
+    return , $list.ToArray()
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Struktura OU' -Key 'OuClone' -Title 'Klonowanie OU' -Icon 'E8C8' -Badge 'nowe' `
+    -Description 'Kopia całej jednostki organizacyjnej w nowe miejsce: podjednostki, grupy (z zamianą tekstu w nazwach, np. WAW=KRK), zagnieżdżenia między nimi, opcjonalnie członkowie i grupy nadrzędne, linki zasad grupy (GPO), opisy i ochrona. Konta użytkowników i komputerów nie są kopiowane.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.Data.Plan = @()
+    $row = Add-ToolbarRow -Module $m -Title 'Źródło'
+    $m.Source = Add-OuField -Parent $row -Module $m -Width 460 -Placeholder 'Jednostka do skopiowania' -DialogTitle 'Jednostka źródłowa' -Remember 'Source'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Cel'
+    $m.Dest = Add-OuField -Parent $row2 -Module $m -Width 360 -Placeholder 'Korzeń domeny' -DialogTitle 'Gdzie utworzyć kopię' -AllowDomainRoot -Remember 'Dest'
+    Add-Label -Parent $row2 -Text 'Nowa nazwa' | Out-Null
+    $m.NewName = Add-TextBox -Parent $row2 -Width 200 -Placeholder 'z zamiany tekstu'
+    $row3 = Add-ToolbarRow -Module $m -Title 'Zamiana tekstu'
+    $m.Replace = Add-TextBox -Parent $row3 -Width 360 -Placeholder 'np. WAW=KRK; Warszawa=Kraków'
+    Add-Label -Parent $row3 -Text 'Dotyczy nazw OU i grup, sAMAccountName oraz opisów (bez rozróżniania wielkości liter).' -Hint | Out-Null
+    $row4 = Add-ToolbarRow -Module $m -Title 'Kopiuj'
+    $m.CopyGroups = Add-CheckBox -Parent $row4 -Text 'Grupy' -Checked $true
+    $m.CopyNesting = Add-CheckBox -Parent $row4 -Text 'Zagnieżdżenia między grupami' -Checked $true
+    $m.CopyMembers = Add-CheckBox -Parent $row4 -Text 'Członków spoza OU' -ToolTip 'Konta i grupy spoza klonowanej jednostki, które należą do grup źródłowych, zostaną dodane także do kopii'
+    $m.CopyMemberOf = Add-CheckBox -Parent $row4 -Text 'Przynależność do grup spoza OU'
+    $m.CopyGpo = Add-CheckBox -Parent $row4 -Text 'Linki GPO' -Checked $true
+    $m.CopyDesc = Add-CheckBox -Parent $row4 -Text 'Opisy' -Checked $true
+    $m.CopyProtect = Add-CheckBox -Parent $row4 -Text 'Ochronę przed usunięciem' -Checked $true
+    $m.Actions.Preview = {
+        param($m)
+        $src = $m.Source.Text.Trim()
+        if (-not $src) { Show-Warning 'Wybierz jednostkę źródłową.'; return }
+        $pairs = ConvertFrom-ReplacePairs $m.Replace.Text
+        if (-not $m.NewName.Text.Trim() -and @($pairs).Count -eq 0 -and -not $m.Dest.Text.Trim()) { Show-Warning 'Podaj nową nazwę, miejsce docelowe albo zamianę tekstu – kopia musi różnić się od źródła.'; return }
+        $params = @{
+            Source = $src; Dest = $m.Dest.Text.Trim(); NewName = $m.NewName.Text.Trim(); Replace = $pairs
+            CopyGroups = (Test-Checked $m.CopyGroups); CopyNesting = (Test-Checked $m.CopyNesting); CopyMembers = (Test-Checked $m.CopyMembers); CopyMemberOf = (Test-Checked $m.CopyMemberOf)
+            CopyGpo = (Test-Checked $m.CopyGpo); CopyDescription = (Test-Checked $m.CopyDesc); CopyProtect = (Test-Checked $m.CopyProtect)
+        }
+        Show-AdPlan -Module $m -Items @()
+        Start-AdOperation -Module $m -Name 'Plan klonowania' -Targets @('AD') -Output None -Parameters $params -ScriptBlock $script:OuClonePlanScript -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { $m.Data.LastError = (@($r.Errors)) -join "`r`n"; Invoke-Deferred -Module $m -Action { param($m) Show-Error 'Nie udało się przygotować planu klonowania.' $m.Data.LastError }; return }
+            $items = @($r.Data | ForEach-Object { $h = @{}; foreach ($p in $_.PSObject.Properties) { $h[$p.Name] = $p.Value }; $h })
+            Show-AdPlan -Module $m -Items $items
+        }
+    }
+    $row5 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row5 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row5 -Text 'Klonuj' -Icon 'E8C8' -Module $m -OnClick { param($m) Start-AdPlanExecute -Module $m -Title 'Utworzyć kopię jednostki?' } | Out-Null
+    Add-PlanTiles -Module $m
+    $m.EmptyHint = 'Wybierz jednostkę źródłową, miejsce i zamianę tekstu, a potem «Podgląd» (F5). Pozycje z konfliktem (np. zajęty sAMAccountName) zostaną pominięte.'
+}
+
+function Read-NameCodeLines {
+    # Wiersze «Nazwa;KOD» (lub tabulator); brak kodu = pierwsze trzy litery nazwy bez polskich znaków
+    param([string]$Text, [string]$What)
+    $list = New-Object System.Collections.Generic.List[object]
+    $codes = @{}
+    foreach ($line in (Get-TextLines $Text)) {
+        $parts = @($line -split '[;\t]' | ForEach-Object { $_.Trim() })
+        $name = $parts[0]
+        if (-not $name) { continue }
+        $code = if ($parts.Count -gt 1 -and $parts[1]) { $parts[1] } else { ((ConvertTo-AsciiText $name) -replace '[^A-Za-z0-9]', '') }
+        if ($code.Length -gt 3 -and -not ($parts.Count -gt 1 -and $parts[1])) { $code = $code.Substring(0, 3) }
+        $code = $code.ToUpperInvariant()
+        if ($codes.ContainsKey($code)) { throw "$What`: skrót «$code» powtarza się ($($codes[$code]) i $name) – podaj skróty po średniku, np. $name;KOD." }
+        $codes[$code] = $name
+        $list.Add(@{ Name = $name; Code = $code })
+    }
+    # Bez przecinka: wywołujący zbiera wynik w @(...)
+    return $list.ToArray()
+}
+
+function New-LocationPlan {
+    # Plan modułu «Lokalizacje i role»: OU lokalizacji, grupy ról, grupy zbiorcze ALL i członkostwa
+    param([hashtable]$Module)
+    $m = $Module
+    $base = $m.Base.Text.Trim()
+    if (-not $base) { throw 'Wybierz jednostkę bazową (OU, w której powstaną lokalizacje).' }
+    $cities = @(Read-NameCodeLines -Text $m.Cities.Text -What 'Lokalizacje')
+    $roles = @(Read-NameCodeLines -Text $m.Roles.Text -What 'Role')
+    if ($cities.Count -eq 0 -or $roles.Count -eq 0) { throw 'Podaj co najmniej jedną lokalizację i jedną rolę.' }
+    $prefix = $m.Prefix.Text.Trim()
+    $sep = [string]$m.Sep.SelectedItem
+    $nameTpl = if ($m.NameTpl.Text.Trim()) { $m.NameTpl.Text.Trim() } else { '{PREFIKS}{SEP}{KOD_LOK}{SEP}{KOD_ROLI}' }
+    $descTpl = $m.DescTpl.Text.Trim()
+    $scope = ConvertTo-GroupScope ([string]$m.Scope.SelectedItem)
+    $cat = ConvertTo-GroupCategory ([string]$m.Category.SelectedItem)
+    $samMax = if (Test-Checked $m.Sam20) { 20 } else { 0 }
+    $subOu = $m.SubOu.Text.Trim()
+    $items = New-Object System.Collections.ArrayList
+    $vals = {
+        param($City, $CityCode, $Role, $RoleCode)
+        @{ PREFIKS = $prefix; PREFIX = $prefix; SEP = $sep; LOKALIZACJA = $City; CITY_FULL = $City; KOD_LOK = $CityCode; CITY_CODE = $CityCode; ROLA = $Role; ROLE = $Role; KOD_ROLI = $RoleCode; ROLE_CODE = $RoleCode }
+    }
+    $newGroup = {
+        param([hashtable]$V, [string]$Path, [string]$Source)
+        $name = Expand-Template $nameTpl $V
+        $dn = 'CN={0},{1}' -f (ConvertTo-RdnValue $name), $Path
+        $g = @{ Key = "grp:$dn"; Kind = 'Grupa'; Name = $name; Sam = (ConvertTo-SamName $name -MaxLength $samMax); Parent = $Path; Dn = $dn; Scope = $scope; Category = $cat
+            Description = $(if ($descTpl) { Expand-Template $descTpl $V } else { '' }); Protect = $false; Source = $Source; State = ''; Note = ''; Tone = '' }
+        [void]$items.Add($g)
+        return $g
+    }
+    $member = { param($Group, $Member) [void]$items.Add(@{ Key = "mem:$($Group.Dn)|$($Member.Dn)"; Kind = 'Członkostwo'; Group = $Group.Dn; Member = $Member.Dn; Source = 'grupa zbiorcza'; State = ''; Note = ''; Tone = '' }) }
+    $roleGroups = @{}
+    $globalMembers = New-Object System.Collections.ArrayList
+    foreach ($c in $cities) {
+        $cityDn = 'OU={0},{1}' -f (ConvertTo-RdnValue $c.Name), $base
+        [void]$items.Add(@{ Key = "ou:$cityDn"; Kind = 'OU'; Name = $c.Name; Parent = $base; Dn = $cityDn; Description = ''; Protect = (Test-Checked $m.Protect); Level = 0; Source = 'lokalizacja'; State = ''; Note = ''; Tone = '' })
+        $path = $cityDn
+        if ($subOu) {
+            $path = 'OU={0},{1}' -f (ConvertTo-RdnValue $subOu), $cityDn
+            [void]$items.Add(@{ Key = "ou:$path"; Kind = 'OU'; Name = $subOu; Parent = $cityDn; Dn = $path; Description = ''; Protect = (Test-Checked $m.Protect); Level = 1; Source = 'OU na grupy'; State = ''; Note = ''; Tone = '' })
+        }
+        $cityGroups = @()
+        foreach ($r in $roles) {
+            $g = & $newGroup (& $vals $c.Name $c.Code $r.Name $r.Code) $path "$($c.Name) / $($r.Name)"
+            $cityGroups += $g
+            if (-not $roleGroups.ContainsKey($r.Code)) { $roleGroups[$r.Code] = @{ Role = $r; Groups = New-Object System.Collections.ArrayList } }
+            [void]$roleGroups[$r.Code].Groups.Add($g)
+        }
+        if (Test-Checked $m.CityAll) {
+            $all = & $newGroup (& $vals $c.Name $c.Code 'ALL' 'ALL') $path "$($c.Name) / wszystkie role"
+            foreach ($g in $cityGroups) { & $member $all $g }
+            [void]$globalMembers.Add($all)
+        }
+        else { foreach ($g in $cityGroups) { [void]$globalMembers.Add($g) } }
+    }
+    if (Test-Checked $m.RoleAll) {
+        foreach ($code in @($roleGroups.Keys | Sort-Object)) {
+            $entry = $roleGroups[$code]
+            $all = & $newGroup (& $vals 'WSZYSTKIE' 'ALL' $entry.Role.Name $code) $base "wszystkie lokalizacje / $($entry.Role.Name)"
+            foreach ($g in $entry.Groups) { & $member $all $g }
+        }
+    }
+    if (Test-Checked $m.GlobalAll) {
+        $all = & $newGroup (& $vals 'WSZYSTKIE' 'ALL' 'ALL' 'ALL') $base 'grupa globalna'
+        foreach ($g in $globalMembers) { & $member $all $g }
+    }
+    return @($items)
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Tworzenie' -Key 'LocationGroups' -Title 'Lokalizacje i role' -Icon 'E707' -Badge 'nowe' `
+    -Description 'Jednostki dla lokalizacji (np. miast) i w każdej te same grupy ról według szablonu nazwy, z grupami zbiorczymi ALL: dla lokalizacji, dla roli i globalną. Unikalne sAMAccountName (opcjonalnie najwyżej 20 znaków), podgląd przed utworzeniem.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.Data.Plan = @()
+    $row = Add-ToolbarRow -Module $m -Title 'Miejsce'
+    $m.Base = Add-OuField -Parent $row -Module $m -Width 360 -Placeholder 'OU, w której powstaną lokalizacje' -DialogTitle 'Jednostka bazowa' -Remember 'Base'
+    Add-Label -Parent $row -Text 'OU na grupy' | Out-Null
+    $m.SubOu = Add-TextBox -Parent $row -Width 150 -Placeholder 'opcjonalnie, np. Grupy'
+    $m.SubOu.ToolTip = 'Gdy wypełnione: grupy ról trafią do tej podjednostki w każdej lokalizacji (zamiast bezpośrednio do OU lokalizacji)'
+    $boxes = Add-TextColumns -Module $m -Title 'Dane' -Height 110 -Columns @(
+        @{ Caption = 'Lokalizacje (OU) – nazwa;skrót'; Placeholder = "Warszawa;WAW`nKraków;KRK`nGdańsk"; Text = [string](Get-ModuleSetting -Module $m -Name 'Cities' -Default '') }
+        @{ Caption = 'Role (grupy) – nazwa;skrót'; Placeholder = "Rejestracja;REJ`nDiagnostyka;DIA`nInne"; Text = [string](Get-ModuleSetting -Module $m -Name 'Roles' -Default '') }
+    )
+    $m.Cities = $boxes[0]
+    $m.Roles = $boxes[1]
+    $row2 = Add-ToolbarRow -Module $m -Title 'Nazwy grup'
+    Add-Label -Parent $row2 -Text 'Prefiks' | Out-Null
+    $m.Prefix = Add-TextBox -Parent $row2 -Width 110 -Text ([string](Get-ModuleSetting -Module $m -Name 'Prefix' -Default 'GG-COMP'))
+    Add-Label -Parent $row2 -Text 'Separator' | Out-Null
+    $m.Sep = Add-ComboBox -Parent $row2 -Items @('-', '_', '.') -Width 60
+    Add-Label -Parent $row2 -Text 'Szablon' | Out-Null
+    $m.NameTpl = Add-TextBox -Parent $row2 -Width 300 -Text ([string](Get-ModuleSetting -Module $m -Name 'NameTpl' -Default '{PREFIKS}{SEP}{KOD_LOK}{SEP}{KOD_ROLI}'))
+    $m.NameTpl.ToolTip = 'Pola: {PREFIKS}, {SEP}, {LOKALIZACJA}, {KOD_LOK}, {ROLA}, {KOD_ROLI} (działają też dawne {PREFIX}, {CITY_FULL}, {CITY_CODE}, {ROLE}, {ROLE_CODE})'
+    $row3 = Add-ToolbarRow -Module $m -Title 'Opis i typ'
+    $m.DescTpl = Add-TextBox -Parent $row3 -Width 300 -Text ([string](Get-ModuleSetting -Module $m -Name 'DescTpl' -Default 'Grupa komputerów: {ROLA} ({LOKALIZACJA})'))
+    Add-Label -Parent $row3 -Text 'Zakres' | Out-Null
+    $m.Scope = Add-ComboBox -Parent $row3 -Items @('Globalna', 'Lokalna domeny', 'Uniwersalna') -Width 135
+    Add-Label -Parent $row3 -Text 'Typ' | Out-Null
+    $m.Category = Add-ComboBox -Parent $row3 -Items @('Zabezpieczeń', 'Dystrybucyjna') -Width 130
+    $row4 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.CityAll = Add-CheckBox -Parent $row4 -Text 'Grupa ALL lokalizacji' -Checked $true -ToolTip 'W każdej lokalizacji grupa zawierająca wszystkie jej grupy ról'
+    $m.RoleAll = Add-CheckBox -Parent $row4 -Text 'Grupa ALL roli' -Checked $true -ToolTip 'W jednostce bazowej grupa roli zawierająca tę rolę ze wszystkich lokalizacji'
+    $m.GlobalAll = Add-CheckBox -Parent $row4 -Text 'Grupa ALL globalna' -Checked $true
+    $m.Protect = Add-CheckBox -Parent $row4 -Text 'Chroń OU przed usunięciem' -Checked $true
+    $m.Sam20 = Add-CheckBox -Parent $row4 -Text 'sAMAccountName maks. 20 znaków' -Checked $true -ToolTip 'Zgodność z nazwami sprzed Windows 2000; zajęte nazwy dostaną sufiks -1, -2…'
+    $m.Actions.Preview = {
+        param($m)
+        foreach ($pair in @(@('Cities', $m.Cities), @('Roles', $m.Roles), @('Prefix', $m.Prefix), @('NameTpl', $m.NameTpl), @('DescTpl', $m.DescTpl))) { Set-ModuleSetting -Module $m -Name $pair[0] -Value $pair[1].Text }
+        $items = New-LocationPlan -Module $m
+        Start-AdPlanCheck -Module $m -Items $items -UniqueSam -SamMax $(if (Test-Checked $m.Sam20) { 20 } else { 0 })
+    }
+    $row5 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row5 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row5 -Text 'Utwórz' -Icon 'E710' -Module $m -OnClick { param($m) Start-AdPlanExecute -Module $m -Title 'Utworzyć jednostki, grupy i członkostwa?' } | Out-Null
+    Add-PlanTiles -Module $m
+    $m.EmptyHint = 'Wpisz lokalizacje i role (nazwa;skrót), ustaw szablon nazw i kliknij «Podgląd» (F5). Istniejące OU i grupy zostaną użyte, a nie utworzone ponownie.'
+}
+#endregion
+
+#region Grupy AD: drzewo zagnieżdżeń i raporty
+$script:GroupTreeScript = {
+    # Drzewo zagnieżdżeń: w dół (zawartość grup) albo w górę (przynależność); korzenie: $P.Roots albo grupy najwyższego poziomu
+    $roots = @($P.Roots)
+    if ($roots.Count -eq 0) {
+        $q = @{ LDAPFilter = '(&(objectCategory=group)(!(memberOf=*)))' }
+        if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+        $roots = @(Get-ADGroup @q @ad | Sort-Object Name | ForEach-Object { [string]$_.DistinguishedName })
+    }
+    $info = @{}
+    $getInfo = {
+        param([string]$Dn)
+        $k = $Dn.ToLowerInvariant()
+        if (-not $info.ContainsKey($k)) {
+            $o = $null
+            try { $o = Get-ADObject -Identity $Dn -Properties member, memberOf, description, sAMAccountName, groupType, userAccountControl @ad } catch { }
+            $info[$k] = $o
+        }
+        return $info[$k]
+    }
+    $children = {
+        param([string]$Dn)
+        $v = ConvertTo-LdapValue $Dn
+        if ($P.Up) {
+            $o = & $getInfo $Dn
+            return @(@($o.memberOf) | Where-Object { $_ } | ForEach-Object { & $getInfo ([string]$_) } | Where-Object { $_ } | Sort-Object { [string]$_.Name })
+        }
+        $filter = if ($P.ShowMembers) { "(memberOf=$v)" } else { "(&(memberOf=$v)(objectClass=group))" }
+        $list = @(Get-ADObject -LDAPFilter $filter -Properties description, sAMAccountName, groupType, userAccountControl @ad)
+        # Najpierw grupy, potem pozostali członkowie - alfabetycznie
+        return @($list | Sort-Object @{ Expression = { if ([string]$_.ObjectClass -eq 'group') { 0 } else { 1 } } }, @{ Expression = { [string]$_.Name } })
+    }
+    $scopeOf = {
+        param($o)
+        if ([string]$o.ObjectClass -ne 'group') { return '' }
+        $gt = [int64]$o.groupType
+        if ($gt -lt 0) { $gt += 4294967296 }
+        if ($gt -band 2) { 'Globalna' } elseif ($gt -band 4) { 'Lokalna domeny' } elseif ($gt -band 8) { 'Uniwersalna' } else { '' }
+    }
+    $emit = {
+        param($o, [int]$Level, [string]$Prefix, [string]$RootName, [string]$PathText, [string]$Note)
+        $class = [string]$o.ObjectClass
+        $isGroup = ($class -eq 'group')
+        [pscustomobject][ordered]@{
+            'Drzewo'       = $Prefix + [string]$o.Name
+            'Typ'          = Get-ObjectKind $class
+            'Poziom'       = $Level
+            'Zakres'       = (& $scopeOf $o)
+            'Członków'     = $(if ($isGroup) { @((& $getInfo ([string]$o.DistinguishedName)).member).Count } else { $null })
+            'Opis'         = $(if ($P.ShowDescription) { [string]$o.description } else { '' })
+            'Uwagi'        = $Note
+            'Grupa główna' = $RootName
+            'Ścieżka'      = $PathText
+            'Login'        = ([string]$o.sAMAccountName) -replace '\$$', ''
+            'DN'           = [string]$o.DistinguishedName
+            '__tone'       = $(if ($Note) { 'crit' } elseif ($isGroup) { 'info' } else { '' })
+            '__flag'       = $(if (-not $isGroup -and ([int64]$o.userAccountControl -band 2)) { 'muted' } else { '' })
+        }
+    }
+    $walk = $null
+    $walk = {
+        param($o, [int]$Level, [string]$Indent, [string]$RootName, [string[]]$Path, [hashtable]$OnPath)
+        $kids = @(& $children ([string]$o.DistinguishedName))
+        for ($i = 0; $i -lt $kids.Count; $i++) {
+            $k = $kids[$i]
+            $last = ($i -eq $kids.Count - 1)
+            $prefix = $Indent + $(if ($last) { '└─ ' } else { '├─ ' })
+            $nextIndent = $Indent + $(if ($last) { '    ' } else { '│   ' })
+            $dnKey = ([string]$k.DistinguishedName).ToLowerInvariant()
+            $pathText = ((@($Path) + @([string]$k.Name)) -join ' › ')
+            if ($OnPath.ContainsKey($dnKey)) { & $emit $k ($Level + 1) $prefix $RootName $pathText 'Zapętlenie – grupa zawiera samą siebie (pośrednio)'; continue }
+            if ($Level + 1 -ge $P.MaxDepth) { & $emit $k ($Level + 1) $prefix $RootName $pathText 'Osiągnięto maksymalną głębokość'; continue }
+            & $emit $k ($Level + 1) $prefix $RootName $pathText ''
+            if ([string]$k.ObjectClass -eq 'group') {
+                $OnPath[$dnKey] = $true
+                & $walk $k ($Level + 1) $nextIndent $RootName (@($Path) + @([string]$k.Name)) $OnPath
+                [void]$OnPath.Remove($dnKey)
+            }
+        }
+    }
+    foreach ($r in $roots) {
+        $o = & $getInfo ([string]$r)
+        if (-not $o) { try { $o = Get-ADGroup -Identity $r -Properties member, memberOf, description @ad; $o = & $getInfo ([string]$o.DistinguishedName) } catch { Write-Error "Nie znaleziono grupy $r"; continue } }
+        & $emit $o 0 '' ([string]$o.Name) ([string]$o.Name) ''
+        & $walk $o 0 '' ([string]$o.Name) @([string]$o.Name) @{ ([string]$o.DistinguishedName).ToLowerInvariant() = $true }
+    }
+}
+
+function Export-GroupTreeHtml {
+    # Zapis raportu HTML drzewa do pliku wybranego przez użytkownika
+    param([hashtable]$Module)
+    $rows = @(Get-ResultRowsAll -Module $Module | Where-Object { $Module.Table.Columns.Contains('Poziom') -and $_['Poziom'] -isnot [System.DBNull] })
+    if ($rows.Count -eq 0) { Show-Warning 'Najpierw zbuduj drzewo.'; return }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Filter = 'Raport HTML (*.html)|*.html'
+    $dlg.FileName = 'Drzewo_grup_{0:yyyyMMdd_HHmm}.html' -f (Get-Date)
+    $answer = if ($script:UI.Window) { $dlg.ShowDialog($script:UI.Window) } else { $dlg.ShowDialog() }
+    if ($answer -ne $true) { return }
+    [System.IO.File]::WriteAllText($dlg.FileName, (ConvertTo-GroupTreeHtml -Rows $rows), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Log "Zapisano raport drzewa grup: $($dlg.FileName)" 'OK' -Module $Module.Title
+    Show-Toast "Zapisano raport: $([System.IO.Path]::GetFileName($dlg.FileName))" 'ok'
+    try { Start-Process -FilePath $dlg.FileName } catch { }
+}
+
+function ConvertTo-GroupTreeHtml {
+    # Raport HTML drzewa (rozwijane gałęzie, wyszukiwanie, rozwiń/zwiń wszystko) z wierszy tabeli w kolejności drzewa
+    param([object[]]$Rows)
+    $rows = @($Rows)
+    $enc = { param($t) [System.Net.WebUtility]::HtmlEncode([string]$t) }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><title>Drzewo grup</title><style>')
+    [void]$sb.Append('body{margin:0;padding:28px;background:#0F1318;color:#E4E8EF;font:14px/1.5 "Segoe UI",system-ui,sans-serif}h1{font-size:22px;margin:0 0 4px}.meta{color:#8791A5;margin-bottom:18px}')
+    [void]$sb.Append('.bar{position:sticky;top:0;z-index:5;background:#161B22;border:1px solid #242B36;border-radius:10px;padding:12px;margin-bottom:16px;display:flex;gap:10px;align-items:center}')
+    [void]$sb.Append('input{flex:0 0 340px;background:#1B212A;color:#E4E8EF;border:1px solid #2A323F;border-radius:7px;padding:8px 10px;font:inherit}button{background:#3E6FE0;color:#fff;border:0;border-radius:7px;padding:8px 14px;font:inherit;cursor:pointer}button.g{background:#1E252F;color:#C9D0DC}')
+    [void]$sb.Append('details{margin-left:22px}details.root{margin:6px 0;background:#161B22;border:1px solid #242B36;border-radius:10px;padding:6px 10px}summary{cursor:pointer;padding:3px 4px;border-radius:6px;list-style:none}summary::-webkit-details-marker{display:none}')
+    [void]$sb.Append('summary::before{content:"▸";display:inline-block;width:16px;color:#8791A5}details[open]>summary::before{content:"▾";color:#8CB0FF}summary:hover{background:#1D2430}.leaf{margin-left:38px;padding:2px 4px;color:#AEB6C4}')
+    [void]$sb.Append('.k{display:inline-block;font-size:11px;padding:0 7px;border-radius:8px;background:#1A2640;color:#8CC0FF;margin-left:8px}.d{color:#7B8496;font-style:italic;margin-left:8px}.w{color:#FF7A86;margin-left:8px}.m{color:#5E6779}.hit{background:#2E2616 !important;outline:1px solid #FFC46B}')
+    [void]$sb.Append('</style><script>function all(s){document.querySelectorAll("details").forEach(function(d){d.open=s})}')
+    [void]$sb.Append('function find(){var q=document.getElementById("q").value.toLowerCase();document.querySelectorAll(".hit").forEach(function(e){e.classList.remove("hit")});if(!q)return;all(false);document.querySelectorAll("summary,.leaf").forEach(function(e){if(e.textContent.toLowerCase().indexOf(q)>=0){e.classList.add("hit");var p=e.parentElement;while(p&&p.tagName==="DETAILS"){p.open=true;p=p.parentElement}}})}</script></head><body>')
+    [void]$sb.Append('<h1>Drzewo zagnieżdżeń grup</h1><div class="meta">').Append((& $enc ('Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2} • wierszy: {3}' -f $script:AppVersion, (Get-Date), $env:USERNAME, $rows.Count))).Append('</div>')
+    [void]$sb.Append('<div class="bar"><input id="q" placeholder="Szukaj grupy lub konta…" onkeyup="find()"><button onclick="all(true)">Rozwiń wszystko</button><button class="g" onclick="all(false)">Zwiń wszystko</button></div>')
+    $open = 0
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        $level = [int]$r['Poziom']
+        $nextLevel = if ($i + 1 -lt $rows.Count) { [int]$rows[$i + 1]['Poziom'] } else { 0 }
+        while ($open -gt $level) { [void]$sb.Append('</details>'); $open-- }
+        $name = (& $enc ([string]$r['Drzewo'] -replace '^[\s│├└─]+', ''))
+        $extra = ''
+        if ([string]$r['Typ'] -ne 'Grupa') { $extra += '<span class="k">' + (& $enc $r['Typ']) + '</span>' }
+        elseif ([string]$r['Zakres']) { $extra += '<span class="k">' + (& $enc $r['Zakres']) + ' • ' + (& $enc $r['Członków']) + '</span>' }
+        if ([string]$r['Opis']) { $extra += '<span class="d">' + (& $enc $r['Opis']) + '</span>' }
+        if ([string]$r['Uwagi']) { $extra += '<span class="w">⚠ ' + (& $enc $r['Uwagi']) + '</span>' }
+        if ($nextLevel -gt $level) {
+            $cls = if ($level -eq 0) { ' class="root"' } else { '' }
+            [void]$sb.Append("<details$cls><summary>").Append($name).Append($extra).Append('</summary>')
+            $open = $level + 1
+        }
+        else {
+            if ($level -eq 0) { [void]$sb.Append('<details class="root"><summary>').Append($name).Append($extra).Append(' <span class="m">(bez zagnieżdżeń)</span></summary></details>') }
+            else { [void]$sb.Append('<div class="leaf">').Append($name).Append($extra).Append('</div>') }
+        }
+    }
+    while ($open -gt 0) { [void]$sb.Append('</details>'); $open-- }
+    [void]$sb.Append('</body></html>')
+    return $sb.ToString()
+}
+
+Register-Module -Workspace 'AdGroups' -Category 'Raporty' -Key 'GroupNesting' -Title 'Drzewo zagnieżdżeń' -Icon 'E8EC' -Badge 'nowe' `
+    -Description 'Drzewo grup zawartych w zaznaczonych grupach (w dół) albo grup, do których należą (w górę), z wykrywaniem zapętleń. Bez zaznaczenia – wszystkie grupy najwyższego poziomu. Raport HTML z rozwijanymi gałęziami i wyszukiwaniem.' -Build {
+    param($m)
+    $m.PillColumns = @('Typ')
+    $row = Add-ToolbarRow -Module $m -Title 'Kierunek'
+    $m.Direction = Add-Segmented -Parent $row -Items @('Zawartość grup (w dół)', 'Przynależność (w górę)')
+    $m.ShowMembers = Add-CheckBox -Parent $row -Text 'Także użytkownicy i komputery' -ToolTip 'Tylko dla kierunku «w dół» – wolniejsze przy dużych grupach'
+    $m.ShowDesc = Add-CheckBox -Parent $row -Text 'Opisy' -Checked $true
+    Add-Label -Parent $row -Text 'Maks. głębokość' | Out-Null
+    $m.Depth = Add-Numeric -Parent $row -Value 15 -Minimum 1 -Maximum 50 -Width 60
+    $row2 = Add-ToolbarRow -Module $m -Title 'Bez zaznaczenia'
+    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 380 -Placeholder 'Cała domena' -DialogTitle 'Zakres grup najwyższego poziomu' -AllowDomainRoot -Remember 'Ou'
+    Add-Label -Parent $row2 -Text 'Gdy na liście nie zaznaczono grup: wszystkie grupy, które nie należą do innych grup.' -Hint | Out-Null
+    $m.Actions.Build = {
+        param($m)
+        $roots = @(Get-TargetGroups -Quiet)
+        $up = ((Get-SegmentIndex $m.Direction) -eq 1)
+        if ($roots.Count -eq 0) {
+            if ($up) { Show-Warning 'Dla kierunku «w górę» zaznacz grupy na liście po lewej.'; return }
+            $scope = if ($m.Ou.Text.Trim()) { $m.Ou.Text.Trim() } else { 'całej domeny' }
+            if (-not (Confirm-Action -Text "Na liście nie zaznaczono grup. Zbudować drzewo wszystkich grup najwyższego poziomu z $scope? Przy dużej domenie może to potrwać." -ConfirmText 'Buduj drzewo')) { return }
+        }
+        $params = @{ Roots = $roots; Up = $up; ShowMembers = ((Test-Checked $m.ShowMembers) -and -not $up); ShowDescription = (Test-Checked $m.ShowDesc); MaxDepth = (Get-Num $m.Depth); SearchBase = $m.Ou.Text.Trim() }
+        Start-AdOperation -Module $m -Name 'Drzewo grup' -Targets @('AD') -Parameters $params -ScriptBlock $script:GroupTreeScript -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m)
+            $cycles = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Uwagi') -like 'Zapętlenie*' }).Count
+            Set-StatTile -Module $m -Key 'roots' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Poziom') -eq '0' }).Count)
+            Set-StatTile -Module $m -Key 'rows' -Value ([string]$rows.Count)
+            $maxLevel = 0
+            foreach ($r in $rows) { $lv = Get-ObjectValue $r 'Poziom'; if ($null -ne $lv -and [int]$lv -gt $maxLevel) { $maxLevel = [int]$lv } }
+            Set-StatTile -Module $m -Key 'depth' -Value ([string]$maxLevel)
+            Set-StatTile -Module $m -Key 'cycles' -Value ([string]$cycles) -Tone $(if ($cycles) { 'crit' } else { 'ok' })
+        }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Buduj drzewo' -Icon 'E8EC' -Module $m -Primary -OnClick $m.Actions.Build | Out-Null
+    Add-Button -Parent $row3 -Text 'Raport HTML…' -Icon 'E8A5' -Module $m -OnClick { param($m) Export-GroupTreeHtml -Module $m } | Out-Null
+    Add-RowAction -Module $m -Text 'Zaznacz grupy na liście' -Icon 'E8B3' -Action {
+        param($m, $rows)
+        $groups = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Typ') -eq 'Grupa' } | ForEach-Object { [string](Get-ObjectValue $_ 'Login') } | Where-Object { $_ } | Select-Object -Unique)
+        if ($groups.Count -eq 0) { Show-Warning 'Wybierz wiersze z grupami.'; return }
+        Set-TargetCheck -Panel $script:UI.GroupPanel -Mode UncheckAll
+        Add-GroupNames -Module $script:UI.Modules['__groups'] -Names $groups -Source 'drzewo'
+    }
+    Add-RowAction -Module $m -Text 'Kopiuj ścieżkę' -Icon 'E8C8' -Action {
+        param($m, $rows)
+        Set-ClipboardText ((@($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Ścieżka') })) -join [Environment]::NewLine)
+        Show-Toast 'Skopiowano ścieżki.' 'ok'
+    }
+    Add-StatTile -Module $m -Key 'roots' -Label 'Grupy główne' -Icon 'E902' | Out-Null
+    Add-StatTile -Module $m -Key 'rows' -Label 'Węzły drzewa' -Icon 'E8EC' | Out-Null
+    Add-StatTile -Module $m -Key 'depth' -Label 'Największa głębokość' -Icon 'E74A' | Out-Null
+    Add-StatTile -Module $m -Key 'cycles' -Label 'Zapętlenia' -Icon 'E7BA' | Out-Null
+    $m.EmptyHint = 'Zaznacz grupy po lewej (albo żadnej – grupy najwyższego poziomu) i kliknij «Buduj drzewo» (F5). Sortowanie kolumn zmienia kolejność – raport HTML zawsze zachowuje układ drzewa.'
+}
+
+$script:GroupReports = @(
+    @{ Key = 'Empty'; Name = 'Puste grupy (bez członków)' }
+    @{ Key = 'Single'; Name = 'Grupy z jednym członkiem' }
+    @{ Key = 'Large'; Name = 'Duże grupy (co najmniej N członków)' }
+    @{ Key = 'NoDescription'; Name = 'Grupy bez opisu' }
+    @{ Key = 'NoManager'; Name = 'Grupy bez zarządcy' }
+    @{ Key = 'Disabled'; Name = 'Grupy z wyłączonymi kontami' }
+    @{ Key = 'Privileged'; Name = 'Grupy uprzywilejowane (adminCount = 1)' }
+    @{ Key = 'Distribution'; Name = 'Grupy dystrybucyjne' }
+    @{ Key = 'Created'; Name = 'Utworzone w ciągu N dni' }
+    @{ Key = 'Changed'; Name = 'Zmienione w ciągu N dni' }
+    @{ Key = 'Cycles'; Name = 'Zapętlone zagnieżdżenia' }
+)
+
+Register-Module -Workspace 'AdGroups' -Category 'Raporty' -Key 'GroupReports' -Title 'Raporty grup' -Icon 'E9F9' -Badge 'nowe' `
+    -Description 'Zestawienia grup z domeny lub jednostki: puste, z jednym członkiem, duże, bez opisu lub zarządcy, z wyłączonymi kontami, uprzywilejowane, dystrybucyjne, nowe i zmienione oraz zapętlone zagnieżdżenia. Wyniki można zaznaczyć na liście grup.' -Build {
+    param($m)
+    $m.PillColumns = @('Typ')
+    $row = Add-ToolbarRow -Module $m -Title 'Raport'
+    $m.Report = Add-ComboBox -Parent $row -Items @($script:GroupReports | ForEach-Object { $_.Name }) -Width 340
+    Add-Label -Parent $row -Text 'N' | Out-Null
+    $m.N = Add-Numeric -Parent $row -Value 30 -Minimum 1 -Maximum 100000 -Width 80
+    $m.N.ToolTip = 'Liczba dni (nowe/zmienione) albo liczba członków (duże grupy)'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Zakres'
+    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 420 -Placeholder 'Cała domena' -DialogTitle 'Zakres raportu' -AllowDomainRoot -Remember 'Ou'
+    Add-Button -Parent $row2 -Text 'Generuj raport' -Icon 'E9F9' -Module $m -Primary -OnClick {
+        param($m)
+        $report = $script:GroupReports[$m.Report.SelectedIndex]
+        $params = @{ Report = $report.Key; N = (Get-Num $m.N); SearchBase = $m.Ou.Text.Trim(); Protected = @($script:Settings.ProtectedGroups) }
+        Start-AdOperation -Module $m -Name $report.Name -Targets @('AD') -Parameters $params -ScriptBlock {
+            $now = Get-Date
+            $base = '(objectCategory=group)'
+            $gen = $now.AddDays( - [int]$P.N).ToUniversalTime().ToString('yyyyMMddHHmmss.0Z')
+            $extra = switch ($P.Report) {
+                'Empty' { '(!(member=*))' }
+                'NoDescription' { '(!(description=*))' }
+                'NoManager' { '(!(managedBy=*))' }
+                'Privileged' { '(adminCount=1)' }
+                'Distribution' { '(!(groupType:1.2.840.113556.1.4.803:=2147483648))' }
+                'Created' { "(whenCreated>=$gen)" }
+                'Changed' { "(whenChanged>=$gen)" }
+                default { '' }
+            }
+            $q = @{ LDAPFilter = "(&$base$extra)"; Properties = @('Description', 'member', 'memberOf', 'managedBy', 'mail', 'whenCreated', 'whenChanged', 'adminCount', 'isCriticalSystemObject') }
+            if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+            $groups = @(Get-ADGroup @q @ad)
+            $notes = @{}
+            switch ($P.Report) {
+                'Single' { $groups = @($groups | Where-Object { @($_.member).Count -eq 1 }) }
+                'Large' { $groups = @($groups | Where-Object { @($_.member).Count -ge [int]$P.N } | Sort-Object { @($_.member).Count } -Descending) }
+                'Disabled' {
+                    $counts = @{}
+                    foreach ($u in @(Get-ADObject -LDAPFilter '(&(|(objectClass=user)(objectClass=computer))(userAccountControl:1.2.840.113556.1.4.803:=2))' -Properties memberOf @ad)) {
+                        foreach ($g in @($u.memberOf)) { $k = ([string]$g).ToLowerInvariant(); $counts[$k] = 1 + [int]$counts[$k] }
+                    }
+                    $groups = @($groups | Where-Object { $counts.ContainsKey(([string]$_.DistinguishedName).ToLowerInvariant()) })
+                    foreach ($g in $groups) { $notes[[string]$g.DistinguishedName] = 'wyłączonych kont: ' + $counts[([string]$g.DistinguishedName).ToLowerInvariant()] }
+                }
+                'Empty' {
+                    # Grupy podstawowe (Domain Users itp.) mają członków przez primaryGroupID, nie przez atrybut member
+                    $groups = @($groups | Where-Object { @(513, 514, 515, 516, 521) -notcontains [int](([string]$_.SID.Value) -split '-')[-1] })
+                    foreach ($g in $groups) { if ($g.isCriticalSystemObject) { $notes[[string]$g.DistinguishedName] = 'grupa systemowa' } }
+                }
+                'Cycles' {
+                    $parents = @{}
+                    foreach ($g in $groups) { $parents[([string]$g.DistinguishedName).ToLowerInvariant()] = @($g.memberOf | ForEach-Object { ([string]$_).ToLowerInvariant() }) }
+                    $inCycle = @{}
+                    foreach ($start in @($parents.Keys)) {
+                        $stack = New-Object System.Collections.Stack
+                        $stack.Push(@($start, @($start)))
+                        $seen = @{}
+                        while ($stack.Count -gt 0) {
+                            $cur = $stack.Pop()
+                            foreach ($p in @($parents[$cur[0]])) {
+                                if ($p -eq $start) { $inCycle[$start] = ((@($cur[1]) + @($p)) | ForEach-Object { Get-DnName $_ }) -join ' › '; break }
+                                if (-not $seen.ContainsKey($p) -and $parents.ContainsKey($p)) { $seen[$p] = $true; $stack.Push(@($p, (@($cur[1]) + @($p)))) }
+                            }
+                            if ($inCycle.ContainsKey($start)) { break }
+                        }
+                    }
+                    $groups = @($groups | Where-Object { $inCycle.ContainsKey(([string]$_.DistinguishedName).ToLowerInvariant()) })
+                    foreach ($g in $groups) { $notes[[string]$g.DistinguishedName] = $inCycle[([string]$g.DistinguishedName).ToLowerInvariant()] }
+                }
+            }
+            foreach ($g in ($groups | Sort-Object Name)) {
+                [pscustomobject][ordered]@{
+                    'Grupa'          = $g.SamAccountName
+                    'Nazwa'          = $g.Name
+                    'Zakres'         = Get-ScopeLabel $g.GroupScope
+                    'Typ'            = Get-CategoryLabel $g.GroupCategory
+                    'Członków'       = @($g.member).Count
+                    'Należy do grup' = @($g.memberOf).Count
+                    'Opis'           = $g.Description
+                    'Zarządca'       = $(if ($g.managedBy) { Get-DnName $g.managedBy } else { '' })
+                    'E-mail'         = $g.mail
+                    'Utworzono'      = $g.whenCreated
+                    'Zmieniono'      = $g.whenChanged
+                    'Uwagi'          = [string]$notes[[string]$g.DistinguishedName]
+                    'Jednostka OU'   = Get-DnParent $g.DistinguishedName
+                    'DN'             = $g.DistinguishedName
+                    '__tone'         = $(if ([string]$g.GroupCategory -eq 'Security') { 'info' } else { '' })
+                }
+            }
+        } -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Status') -ne 'Błąd' })
+            Set-StatTile -Module $m -Key 'count' -Value ([string]$rows.Count) -Tone $(if ($rows.Count) { 'warn' } else { 'ok' })
+            $members = 0
+            foreach ($r in $rows) { $v = Get-ObjectValue $r 'Członków'; if ($null -ne $v) { $members += [int]$v } }
+            Set-StatTile -Module $m -Key 'members' -Value ([string]$members)
+            Set-StatTile -Module $m -Key 'security' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Typ') -eq 'Zabezpieczeń' }).Count)
+        }
+    } | Out-Null
+    $row3 = Add-ToolbarRow -Module $m -Title 'Wyniki'
+    Add-Button -Parent $row3 -Text 'Zaznacz na liście grup' -Icon 'E8B3' -Module $m -AlwaysEnabled -ToolTip 'Zaznaczone wiersze (albo wszystkie widoczne) trafią na listę grup po lewej – zaznaczone do dalszych operacji' -OnClick {
+        param($m)
+        Add-ResultsToTargets -Module $m -Kind Group -Column 'Grupa'
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Zaznacz na liście grup' -Icon 'E8B3' -Action { param($m, $rows) Add-ResultsToTargets -Module $m -Kind Group -Column 'Grupa' -Rows $rows }
+    Add-RowAction -Module $m -Text 'Zmień opis…' -Icon 'E70F' -Separator -Action { param($m, $rows) Invoke-GroupChange -Module $m -Op 'Description' -Rows $rows }
+    Add-RowAction -Module $m -Text 'Usuń grupy' -Icon 'E74D' -Danger -Action { param($m, $rows) Invoke-GroupChange -Module $m -Op 'Delete' -Rows $rows }
+    Add-StatTile -Module $m -Key 'count' -Label 'Grupy w raporcie' -Icon 'E902' | Out-Null
+    Add-StatTile -Module $m -Key 'members' -Label 'Członkowie (suma)' -Icon 'E716' | Out-Null
+    Add-StatTile -Module $m -Key 'security' -Label 'Grupy zabezpieczeń' -Icon 'E72E' | Out-Null
+    $m.EmptyHint = 'Wybierz raport i kliknij «Generuj raport» (F5). Nie trzeba zaznaczać grup na liście.'
+}
+#endregion
+
+#region Użytkownicy AD: tworzenie kont (profile, podgląd z edycją, sprawdzenie w AD, utworzenie, synchronizacja Entra ID)
+$script:LoginFormatLabels = [ordered]@{
+    'i.nazwisko'    = 'i.nazwisko  (j.kowalski)'
+    'inazwisko'     = 'inazwisko  (jkowalski)'
+    'imie.nazwisko' = 'imie.nazwisko  (jan.kowalski)'
+    'nazwisko.imie' = 'nazwisko.imie  (kowalski.jan)'
+    'imienazwisko'  = 'imienazwisko  (jankowalski)'
+    'nazwisko.i'    = 'nazwisko.i  (kowalski.j)'
+    'numer'         = 'z kolumny Numer (np. nr albumu)'
+}
+
+$script:UserPasteHeaders = [ordered]@{
+    First       = @('imię', 'first', 'firstname', 'givenname', 'first name')
+    Last        = @('nazwisko', 'last', 'lastname', 'surname', 'sn', 'last name')
+    Number      = @('numer', 'nr', 'nr albumu', 'nralbumu', 'album', 'employeeid', 'numer pracownika', 'indeks')
+    Login       = @('login', 'samaccountname', 'sam', 'konto', 'nazwa użytkownika')
+    Mail        = @('e-mail', 'email', 'mail', 'adres e-mail')
+    Password    = @('hasło', 'password', 'pass')
+    City        = @('miasto', 'city', 'miejscowość')
+    Department  = @('dział', 'department', 'wydział')
+    Title       = @('stanowisko', 'title', 'job title', 'funkcja')
+    Description = @('opis', 'description', 'uwagi')
+}
+
+function New-UserProfile {
+    param([string]$Name = 'Domyślny')
+    return @{
+        Name = $Name; Ou = ''; Upn = ''; MailDomain = ''; SetMail = $true; LoginFormat = 'i.nazwisko'; DisplayFormat = '{Imię} {Nazwisko}'
+        Description = ''; Company = ''; Department = ''; City = ''; Groups = @(); Enabled = $true; MustChange = $false; NumberLogins = $true
+        PasswordLength = 12; ExpireDays = 0
+    }
+}
+
+function ConvertFrom-LegacyUserCreatorConfig {
+    # Ustawienia dawnego AD-BulkUserCreator (.AD-BulkUserCreator.json): zakładki -> profile
+    param([string]$Path)
+    $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $tabs = New-Object System.Collections.ArrayList
+    foreach ($src in @($json.OU_Defaults, $json.Domain_Defaults, $json.LoginFormatByTab, $json.DisplayNameFormatByTab)) {
+        if ($src) { foreach ($p in $src.PSObject.Properties) { if (-not $tabs.Contains($p.Name)) { [void]$tabs.Add($p.Name) } } }
+    }
+    $get = { param($obj, $name) if ($obj -and $obj.PSObject.Properties[$name]) { [string]$obj.PSObject.Properties[$name].Value } else { '' } }
+    foreach ($tab in $tabs) {
+        $p = New-UserProfile -Name $tab
+        $p.Ou = & $get $json.OU_Defaults $tab
+        $p.Upn = & $get $json.Domain_Defaults $tab
+        $fmt = & $get $json.LoginFormatByTab $tab
+        if ($tab -eq 'Student') { $p.LoginFormat = 'numer'; $p.NumberLogins = $false; $p.DisplayFormat = '{Imię} {Nazwisko} ({Numer})' }
+        else {
+            if ($script:LoginFormatLabels.Contains($fmt)) { $p.LoginFormat = $fmt }
+            $d = & $get $json.DisplayNameFormatByTab $tab
+            if ($d) { $p.DisplayFormat = $d.Replace('{Album}', '{Numer}').Replace('{SamAccountName}', '{Login}') }
+        }
+        $p
+    }
+}
+
+function Get-UserProfiles {
+    # Profile tworzenia kont z ustawień; przy pierwszym użyciu - import ustawień dawnego kreatora (jeśli plik istnieje)
+    if (@($script:Settings.UserProfiles).Count -eq 0 -and -not $script:Settings.ProfilesImported) {
+        $script:Settings.ProfilesImported = $true
+        $legacy = if ($PSScriptRoot) { Join-Path $PSScriptRoot '.AD-BulkUserCreator.json' } else { '' }
+        if ($legacy -and (Test-Path -LiteralPath $legacy)) {
+            try {
+                $script:Settings.UserProfiles = @(ConvertFrom-LegacyUserCreatorConfig -Path $legacy)
+                Write-Log ("Zaimportowano {0} profili z {1}" -f @($script:Settings.UserProfiles).Count, $legacy) 'OK' -Module 'Tworzenie kont'
+            }
+            catch { Write-Log "Nie udało się wczytać $legacy`: $($_.Exception.Message)" 'WARN' -Module 'Tworzenie kont' }
+        }
+    }
+    if (@($script:Settings.UserProfiles).Count -eq 0) { $script:Settings.UserProfiles = @(New-UserProfile) }
+    return @($script:Settings.UserProfiles)
+}
+
+function Get-ProfileValue([hashtable]$UserProfile, [string]$Key) {
+    # Brakujące pola (profil z wcześniejszej wersji) - wartość domyślna
+    if ($UserProfile.ContainsKey($Key)) { return $UserProfile[$Key] }
+    return (New-UserProfile)[$Key]
+}
+
+function Set-UserProfileControls {
+    param([hashtable]$Module, [hashtable]$UserProfile)
+    $m = $Module
+    $m.Data.Loading = $true
+    try {
+        $m.Ou.Text = [string](Get-ProfileValue $UserProfile 'Ou')
+        $m.Upn.Text = [string](Get-ProfileValue $UserProfile 'Upn')
+        $m.MailDomain.Text = [string](Get-ProfileValue $UserProfile 'MailDomain')
+        $m.SetMail.IsChecked = [bool](Get-ProfileValue $UserProfile 'SetMail')
+        $keys = @($script:LoginFormatLabels.Keys)
+        $m.LoginFormat.SelectedIndex = [Math]::Max(0, [array]::IndexOf($keys, [string](Get-ProfileValue $UserProfile 'LoginFormat')))
+        $m.DisplayFormat.Text = [string](Get-ProfileValue $UserProfile 'DisplayFormat')
+        $m.Description.Text = [string](Get-ProfileValue $UserProfile 'Description')
+        $m.Company.Text = [string](Get-ProfileValue $UserProfile 'Company')
+        $m.Department.Text = [string](Get-ProfileValue $UserProfile 'Department')
+        $m.City.Text = [string](Get-ProfileValue $UserProfile 'City')
+        $m.Groups.Text = (@(Get-ProfileValue $UserProfile 'Groups') -join '; ')
+        $m.Enabled.IsChecked = [bool](Get-ProfileValue $UserProfile 'Enabled')
+        $m.MustChange.IsChecked = [bool](Get-ProfileValue $UserProfile 'MustChange')
+        $m.NumberLogins.IsChecked = [bool](Get-ProfileValue $UserProfile 'NumberLogins')
+        $m.PwdLength.Text = [string](Get-ProfileValue $UserProfile 'PasswordLength')
+        $m.ExpireDays.Text = [string](Get-ProfileValue $UserProfile 'ExpireDays')
+    }
+    finally { $m.Data.Loading = $false }
+}
+
+function Get-UserProfileFromControls {
+    param([hashtable]$Module, [string]$Name)
+    $m = $Module
+    return @{
+        Name = $Name; Ou = $m.Ou.Text.Trim(); Upn = $m.Upn.Text.Trim().TrimStart('@'); MailDomain = $m.MailDomain.Text.Trim().TrimStart('@'); SetMail = (Test-Checked $m.SetMail)
+        LoginFormat = @($script:LoginFormatLabels.Keys)[[Math]::Max(0, $m.LoginFormat.SelectedIndex)]; DisplayFormat = $m.DisplayFormat.Text.Trim()
+        Description = $m.Description.Text.Trim(); Company = $m.Company.Text.Trim(); Department = $m.Department.Text.Trim(); City = $m.City.Text.Trim()
+        Groups = @(Split-ListText $m.Groups.Text); Enabled = (Test-Checked $m.Enabled); MustChange = (Test-Checked $m.MustChange); NumberLogins = (Test-Checked $m.NumberLogins)
+        PasswordLength = (Get-Num $m.PwdLength); ExpireDays = (Get-Num $m.ExpireDays)
+    }
+}
+
+function Update-UserProfileList {
+    param([hashtable]$Module, [string]$Select = '')
+    $m = $Module
+    $profiles = @(Get-UserProfiles)
+    $m.Data.Loading = $true
+    try {
+        $m.Profile.Items.Clear()
+        foreach ($p in $profiles) { [void]$m.Profile.Items.Add([string]$p.Name) }
+        $idx = 0
+        if ($Select) { for ($i = 0; $i -lt $profiles.Count; $i++) { if ([string]$profiles[$i].Name -eq $Select) { $idx = $i } } }
+        $m.Profile.SelectedIndex = $idx
+    }
+    finally { $m.Data.Loading = $false }
+    Set-UserProfileControls -Module $m -UserProfile $profiles[$m.Profile.SelectedIndex]
+}
+
+function Get-UserTokens {
+    # Pola szablonów nazwy wyświetlanej i opisu
+    param([hashtable]$Row, [string]$ProfileName)
+    return @{
+        'Imię' = $Row.First; Imie = $Row.First; Nazwisko = $Row.Last; Login = $Row.Login; Numer = $Row.Number; Album = $Row.Number
+        Rola = $ProfileName; Profil = $ProfileName; 'Dział' = $Row.Department; Dzial = $Row.Department; Miasto = $Row.City; Stanowisko = $Row.Title
+    }
+}
+
+function Update-UserComputedFields {
+    # Wylicza pola automatyczne wiersza (login, nazwa wyświetlana, UPN, e-mail) - wartości oznaczone __auto* = '1'
+    param([hashtable]$Module, $Row)
+    $m = $Module
+    $prof = $m.Data.Profile
+    $first = ([string]$Row['Imię']).Trim()
+    $last = ([string]$Row['Nazwisko']).Trim()
+    $number = ([string]$Row['Numer']).Trim()
+    if ([string]$Row['__autoLogin'] -eq '1') { Set-ResultValue -Module $m -Row $Row -Column 'Login' -Value (Get-LoginFromName -First $first -Last $last -Format $prof.LoginFormat -Number $number) }
+    $login = ([string]$Row['Login']).Trim()
+    $vals = @{ First = $first; Last = $last; Login = $login; Number = $number; Department = [string]$Row['Dział']; City = [string]$Row['Miasto']; Title = [string]$Row['Stanowisko'] }
+    if ([string]$Row['__autoName'] -eq '1') { Set-ResultValue -Module $m -Row $Row -Column 'Nazwa wyświetlana' -Value (Expand-Template $prof.DisplayFormat (Get-UserTokens -Row $vals -ProfileName $prof.Name)) }
+    if ([string]$Row['__autoUpn'] -eq '1') { Set-ResultValue -Module $m -Row $Row -Column 'UPN' -Value $(if ($login -and $prof.Upn) { "$login@$($prof.Upn)" } else { '' }) }
+    if ([string]$Row['__autoMail'] -eq '1') {
+        $domain = if ($prof.MailDomain) { $prof.MailDomain } else { $prof.Upn }
+        Set-ResultValue -Module $m -Row $Row -Column 'E-mail' -Value $(if ($prof.SetMail -and $login -and $domain) { "$login@$domain" } else { '' })
+    }
+}
+
+function Test-UserRowData {
+    # Walidacja danych wiersza (bez AD); zwraca listę problemów
+    param($Row)
+    $issues = @()
+    foreach ($pair in @(@('Imię', 'imienia'), @('Nazwisko', 'nazwiska'))) {
+        $p = Test-PersonName -Text ([string]$Row[$pair[0]]) -Field $pair[0]
+        if ($p) { $issues += $p }
+    }
+    $login = ([string]$Row['Login']).Trim()
+    if (-not $login) { $issues += 'brak loginu (dla formatu «numer» uzupełnij kolumnę Numer)' }
+    else { $p = Test-SamName -Name $login -User; if ($p) { $issues += $p } }
+    $upn = ([string]$Row['UPN']).Trim()
+    if (-not $upn) { $issues += 'brak UPN – ustaw sufiks UPN w profilu' }
+    elseif ($upn -notmatch '^[^@\s]+@[^@\s]+$') { $issues += 'niepoprawny UPN' }
+    $mail = ([string]$Row['E-mail']).Trim()
+    if ($mail -and $mail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { $issues += 'niepoprawny adres e-mail' }
+    if (-not ([string]$Row['OU'] -match '^(OU|CN|DC)=')) { $issues += 'brak jednostki organizacyjnej (OU)' }
+    if (([string]$Row['Nazwa wyświetlana']).Length -gt 64) { $issues += 'nazwa wyświetlana dłuższa niż 64 znaki (CN)' }
+    return $issues
+}
+
+$script:UserCheckScript = {
+    # Sprawdzenie planowanych kont: login (z numerowaniem), UPN, nazwa CN w OU, istnienie OU
+    $reserved = @{}
+    $ouCache = @{}
+    foreach ($r in $P.Rows) {
+        $login = [string]$r.Login
+        $notes = @()
+        $issues = @()
+        $state = 'Gotowe'
+        if (-not $ouCache.ContainsKey($r.Ou)) { $ok = $true; try { [void](Get-ADObject -Identity $r.Ou @ad) } catch { $ok = $false }; $ouCache[$r.Ou] = $ok }
+        if (-not $ouCache[$r.Ou]) { $issues += "nie ma jednostki $($r.Ou)" }
+        $taken = { param($s) $reserved.ContainsKey($s.ToLowerInvariant()) -or @(Get-ADObject -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapValue $s))" @ad).Count -gt 0 }
+        if (& $taken $login) {
+            if ($r.AutoLogin -and $P.Number) {
+                $found = ''
+                for ($i = 1; $i -lt 1000; $i++) {
+                    $suffix = [string]$i
+                    $stem = if ($login.Length + $suffix.Length -gt 20) { $login.Substring(0, 20 - $suffix.Length) } else { $login }
+                    $cand = $stem + $suffix
+                    if (-not (& $taken $cand)) { $found = $cand; break }
+                }
+                if ($found) { $notes += "login $login zajęty – użyto $found"; $login = $found }
+                else { $issues += "login $login zajęty" }
+            }
+            elseif ($reserved.ContainsKey($login.ToLowerInvariant())) { $issues += "login $login powtarza się w danych" }
+            else { $state = 'Istnieje'; $notes += "konto $login już istnieje w AD" }
+        }
+        $reserved[$login.ToLowerInvariant()] = $true
+        $upn = if ($r.AutoUpn -and $r.UpnSuffix) { "$login@$($r.UpnSuffix)" } else { [string]$r.Upn }
+        $mail = if ($r.AutoMail -and $r.MailDomain) { "$login@$($r.MailDomain)" } else { [string]$r.Mail }
+        if ($state -eq 'Gotowe' -and @(Get-ADObject -LDAPFilter "(userPrincipalName=$(ConvertTo-LdapValue $upn))" @ad).Count -gt 0) { $issues += "UPN $upn jest zajęty" }
+        $display = if ($r.AutoName -and $r.DisplayFormat) {
+            Expand-Template $r.DisplayFormat @{ 'Imię' = $r.First; Imie = $r.First; Nazwisko = $r.Last; Login = $login; Numer = $r.Number; Album = $r.Number; Rola = $r.ProfileName; Profil = $r.ProfileName; 'Dział' = $r.Department; Dzial = $r.Department; Miasto = $r.City; Stanowisko = $r.Title }
+        }
+        else { [string]$r.Display }
+        $cn = $display
+        if ($ouCache[$r.Ou] -and $state -eq 'Gotowe') {
+            if (@(Get-ADObject -LDAPFilter "(name=$(ConvertTo-LdapValue $cn))" -SearchBase $r.Ou -SearchScope OneLevel @ad).Count -gt 0) {
+                $cn = "$display ($login)"
+                $notes += "nazwa «$display» zajęta w OU – CN: $cn"
+            }
+        }
+        if ($issues.Count -gt 0) { $state = 'Konflikt' }
+        [pscustomobject]@{
+            Id = $r.Id; Login = $login; Upn = $upn; Mail = $mail; Display = $display; Cn = $cn; State = $state
+            Note = ((@($issues) + @($notes)) -join '; '); Tone = $(switch ($state) { 'Gotowe' { $(if ($notes.Count) { 'warn' } else { 'info' }) } 'Istnieje' { 'warn' } default { 'crit' } })
+        }
+    }
+}
+
+$script:UserCreateScript = {
+    # Utworzenie jednego konta ($Target = login, $P = dane konta); hasło tylko w pamięci operacji
+    $params = @{
+        Name = $P.Cn; SamAccountName = $Target; UserPrincipalName = $P.Upn; GivenName = $P.First; Surname = $P.Last; DisplayName = $P.Display
+        Path = $P.Ou; Enabled = [bool]$P.Enabled; ChangePasswordAtLogon = [bool]$P.MustChange
+        AccountPassword = (ConvertTo-SecureString -String $P.Password -AsPlainText -Force)
+    }
+    foreach ($pair in @(@('EmailAddress', 'Mail'), @('City', 'City'), @('Department', 'Department'), @('Title', 'Title'), @('Description', 'Description'), @('Company', 'Company'), @('EmployeeID', 'Number'))) {
+        if ($P[$pair[1]]) { $params[$pair[0]] = [string]$P[$pair[1]] }
+    }
+    if ($P.Expire) { $params.AccountExpirationDate = [datetime]$P.Expire }
+    try { New-ADUser @params @ad }
+    catch {
+        $msg = $_.Exception.Message
+        # New-ADUser tworzy obiekt przed ustawieniem hasła - przy odrzuconym haśle konto zostaje (wyłączone)
+        $left = @(Get-ADObject -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapValue $Target))" @ad)
+        if ($left.Count -gt 0) { return [pscustomobject]@{ Dn = [string]$left[0].DistinguishedName; State = 'Utworzono z błędem'; Note = "Konto powstało, ale: $msg – sprawdź hasło i włącz konto ręcznie."; Warn = $true } }
+        throw
+    }
+    $user = Get-ADUser -Identity $Target @ad
+    $notes = @()
+    $warn = $false
+    foreach ($g in @($P.Groups)) {
+        if (-not $g) { continue }
+        try {
+            $grp = Resolve-AdPrincipal -Id $g -Classes @('group')
+            Add-ADGroupMember -Identity $grp.DistinguishedName -Members $user.DistinguishedName @ad
+            $notes += "grupa $($grp.Name)"
+        }
+        catch { $notes += "grupa ${g}: $($_.Exception.Message)"; $warn = $true }
+    }
+    [pscustomobject]@{ Dn = [string]$user.DistinguishedName; State = 'Utworzono'; Note = ($notes -join '; '); Warn = $warn }
+}
+
+function Start-AadDeltaSync {
+    # Synchronizacja przyrostowa Microsoft Entra Connect (Start-ADSyncSyncCycle -PolicyType Delta): lokalnie albo na serwerze
+    param([hashtable]$Module)
+    $server = ([string]$script:Settings.AadSyncServer).Trim()
+    if ($server) {
+        Start-HostOperation -Module $Module -Name 'Synchronizacja Entra ID' -Targets @($server) -Output Log -ScriptBlock {
+            param($P)
+            Import-Module ADSync -ErrorAction Stop
+            $r = Start-ADSyncSyncCycle -PolicyType Delta
+            "Uruchomiono synchronizację Delta: $($r.Result)"
+        }
+    }
+    else {
+        Start-HostOperation -Module $Module -Name 'Synchronizacja Entra ID' -Targets @($env:COMPUTERNAME) -Local -Output Log -ScriptBlock {
+            param($Target, $P, $Ctx)
+            Import-Module ADSync -ErrorAction Stop
+            $r = Start-ADSyncSyncCycle -PolicyType Delta
+            "Uruchomiono synchronizację Delta: $($r.Result)"
+        }
+    }
+}
+
+function Start-UserPlanCheck {
+    param([hashtable]$Module, [switch]$ThenCreate)
+    $m = $Module
+    $prof = $m.Data.Profile
+    $rows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Utworzono', 'Utworzono z błędem') -notcontains [string](Get-ObjectValue $_ 'Stan') })
+    $check = @()
+    foreach ($r in $rows) {
+        $issues = @(Test-UserRowData -Row $r)
+        if ($issues.Count -gt 0) { Set-RowState -Module $m -Row $r -State 'Błąd danych' -Tone 'crit' -Note ($issues -join '; '); continue }
+        Set-RowState -Module $m -Row $r -State 'Sprawdzanie…' -Tone '' -Note ''
+        $check += @{
+            Id = [string]$r['__id']; Login = ([string]$r['Login']).Trim(); AutoLogin = ([string]$r['__autoLogin'] -eq '1'); Upn = ([string]$r['UPN']).Trim(); AutoUpn = ([string]$r['__autoUpn'] -eq '1')
+            UpnSuffix = $prof.Upn; Mail = ([string]$r['E-mail']).Trim(); AutoMail = ([string]$r['__autoMail'] -eq '1'); MailDomain = $(if (-not $prof.SetMail) { '' } elseif ($prof.MailDomain) { $prof.MailDomain } else { $prof.Upn })
+            Display = ([string]$r['Nazwa wyświetlana']).Trim(); AutoName = ([string]$r['__autoName'] -eq '1'); DisplayFormat = $prof.DisplayFormat; ProfileName = $prof.Name
+            First = ([string]$r['Imię']).Trim(); Last = ([string]$r['Nazwisko']).Trim(); Number = ([string]$r['Numer']).Trim(); Department = [string]$r['Dział']; City = [string]$r['Miasto']; Title = [string]$r['Stanowisko']
+            Ou = ([string]$r['OU']).Trim()
+        }
+    }
+    $m.Data.Stale = $false
+    if ($check.Count -eq 0) { & $m.Actions.Stats $m; if ($rows.Count) { Show-Warning 'Wszystkie wiersze zawierają błędy danych – popraw je w tabeli (kolumny z ołówkiem).' }; return }
+    $m.Data.ThenCreate = [bool]$ThenCreate
+    Start-AdOperation -Module $m -Name 'Sprawdzanie kont' -Targets @('AD') -Output None -Parameters @{ Rows = $check; Number = [bool]$prof.NumberLogins } -ScriptBlock $script:UserCheckScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) {
+            foreach ($row in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Sprawdzanie…' })) { Set-RowState -Module $m -Row $row -State 'Nie sprawdzono' -Tone 'warn' -Note ((@($r.Errors)) -join ' ') }
+            return
+        }
+        $m.Loading = $true
+        try {
+            foreach ($res in @($r.Data)) {
+                foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value ([string]$res.Id))) {
+                    Set-ResultValue -Module $m -Row $row -Column 'Login' -Value $res.Login
+                    Set-ResultValue -Module $m -Row $row -Column 'UPN' -Value $res.Upn
+                    Set-ResultValue -Module $m -Row $row -Column 'E-mail' -Value $res.Mail
+                    Set-ResultValue -Module $m -Row $row -Column 'Nazwa wyświetlana' -Value $res.Display
+                    Set-ResultValue -Module $m -Row $row -Column '__cn' -Value $res.Cn
+                    Set-RowState -Module $m -Row $row -State $res.State -Tone $res.Tone -Note $res.Note
+                }
+            }
+        }
+        finally { $m.Loading = $false }
+    } -OnComplete {
+        param($m)
+        & $m.Actions.Stats $m
+        if ($m.Data.ThenCreate) { Invoke-Deferred -Module $m -Action { param($m) & $m.Actions.Create $m } }
+    }
+}
+
+Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCreate' -Title 'Tworzenie kont' -Icon 'E8FA' -Badge 'nowe' `
+    -Description 'Wiele kont naraz z danych wklejonych z Excela. Profile (np. Pracownik, Student) z OU, sufiksem UPN, formatem loginu i nazwy, grupami i ustawieniami konta. Podgląd z edycją, sprawdzenie w AD (zajęte loginy numerowane), hasła losowe, kopiowanie danych logowania i synchronizacja z Entra ID.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.SecretColumns = @('Hasło')
+    $m.EditableColumns = @('Imię', 'Nazwisko', 'Numer', 'Login', 'Nazwa wyświetlana', 'UPN', 'E-mail', 'Dział', 'Stanowisko', 'Miasto', 'Opis', 'OU')
+    $m.Data.Stale = $true
+    $m.Data.ThenCreate = $false
+    $m.Data.Loading = $false
+    $m.OnCellEdit = {
+        param($m, $row, $column)
+        switch ($column) {
+            'Login' { Set-ResultValue -Module $m -Row $row -Column '__autoLogin' -Value '' }
+            'Nazwa wyświetlana' { Set-ResultValue -Module $m -Row $row -Column '__autoName' -Value '' }
+            'UPN' { Set-ResultValue -Module $m -Row $row -Column '__autoUpn' -Value '' }
+            'E-mail' { Set-ResultValue -Module $m -Row $row -Column '__autoMail' -Value '' }
+        }
+        Update-UserComputedFields -Module $m -Row $row
+        if (@('Utworzono', 'Utworzono z błędem') -notcontains [string]$row['Stan']) { Set-RowState -Module $m -Row $row -State 'Zmieniono – sprawdź' -Tone 'warn' }
+        $m.Data.Stale = $true
+    }
+
+    $row = Add-ToolbarRow -Module $m -Title 'Profil'
+    $m.Profile = Add-ComboBox -Parent $row -Width 220
+    Register-ControlHandler -Control $m.Profile -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        if ($m.Data.Loading -or $m.Profile.SelectedIndex -lt 0) { return }
+        $profiles = @(Get-UserProfiles)
+        Set-UserProfileControls -Module $m -UserProfile $profiles[$m.Profile.SelectedIndex]
+    }
+    Add-Button -Parent $row -Text 'Zapisz profil' -Icon 'E74E' -Module $m -AlwaysEnabled -ToolTip 'Zapisuje bieżące ustawienia w wybranym profilu' -OnClick {
+        param($m)
+        $profiles = @(Get-UserProfiles)
+        $i = $m.Profile.SelectedIndex
+        $profiles[$i] = Get-UserProfileFromControls -Module $m -Name ([string]$profiles[$i].Name)
+        $script:Settings.UserProfiles = $profiles
+        Export-Settings
+        Show-Toast "Zapisano profil «$($profiles[$i].Name)»." 'ok'
+    } | Out-Null
+    Add-Button -Parent $row -Text 'Nowy…' -Icon 'E710' -Module $m -AlwaysEnabled -ToolTip 'Nowy profil z bieżących ustawień' -OnClick {
+        param($m)
+        $name = Show-InputDialog -Title 'Nowy profil' -Prompt 'Nazwa profilu (np. Pracownik, Student, Wykładowca). Profil zapamięta bieżące ustawienia.' -Icon 'E8FA' -Validate {
+            param($t)
+            if (-not $t.Trim()) { return 'Podaj nazwę.' }
+            if (@(Get-UserProfiles | Where-Object { [string]$_.Name -eq $t.Trim() }).Count) { return 'Profil o tej nazwie już istnieje.' }
+            return ''
+        }
+        if (-not $name) { return }
+        $script:Settings.UserProfiles = @(Get-UserProfiles) + @(Get-UserProfileFromControls -Module $m -Name $name.Trim())
+        Export-Settings
+        Update-UserProfileList -Module $m -Select $name.Trim()
+    } | Out-Null
+    Add-MenuButton -Parent $row -Text 'Więcej' -Module $m -Items @(
+        @{ Text = 'Zmień nazwę profilu…'; Icon = 'E8AC'; Action = {
+                param($m)
+                $profiles = @(Get-UserProfiles)
+                $i = $m.Profile.SelectedIndex
+                $name = Show-InputDialog -Title 'Nazwa profilu' -Prompt 'Nowa nazwa profilu.' -Default ([string]$profiles[$i].Name) -Icon 'E8AC'
+                if (-not $name -or -not $name.Trim()) { return }
+                $profiles[$i].Name = $name.Trim()
+                $script:Settings.UserProfiles = $profiles
+                Export-Settings
+                Update-UserProfileList -Module $m -Select $name.Trim()
+            }
+        }
+        @{ Text = 'Usuń profil'; Icon = 'E74D'; Danger = $true; Action = {
+                param($m)
+                $profiles = @(Get-UserProfiles)
+                $i = $m.Profile.SelectedIndex
+                if (-not (Confirm-Action -Text "Usunąć profil «$($profiles[$i].Name)»?" -ConfirmText 'Usuń' -Danger)) { return }
+                $script:Settings.UserProfiles = @(for ($j = 0; $j -lt $profiles.Count; $j++) { if ($j -ne $i) { $profiles[$j] } })
+                Export-Settings
+                Update-UserProfileList -Module $m
+            }
+        }
+        '-'
+        @{ Text = 'Importuj profile z pliku…'; Icon = 'E8E5'; Action = {
+                param($m)
+                $dlg = New-Object Microsoft.Win32.OpenFileDialog
+                $dlg.Filter = 'Profile (*.json)|*.json|Wszystkie pliki (*.*)|*.*'
+                if ($PSScriptRoot) { $dlg.InitialDirectory = $PSScriptRoot }
+                if ($dlg.ShowDialog($script:UI.Window) -ne $true) { return }
+                $raw = Get-Content -LiteralPath $dlg.FileName -Raw -Encoding UTF8 | ConvertFrom-Json
+                $new = if ($raw.PSObject.Properties['OU_Defaults']) { @(ConvertFrom-LegacyUserCreatorConfig -Path $dlg.FileName) }
+                else { @($raw.Profiles | ForEach-Object { $h = ConvertTo-Hashtable $_; $h['Groups'] = @($h['Groups'] | ForEach-Object { [string]$_ }); $h }) }
+                if ($new.Count -eq 0) { Show-Warning 'Plik nie zawiera profili.'; return }
+                $existing = @(Get-UserProfiles | Where-Object { $names = @($new | ForEach-Object { [string]$_.Name }); $names -notcontains [string]$_.Name })
+                $script:Settings.UserProfiles = @($existing) + @($new)
+                Export-Settings
+                Update-UserProfileList -Module $m -Select ([string]$new[0].Name)
+                Show-Toast "Zaimportowano profili: $($new.Count)" 'ok'
+            }
+        }
+        @{ Text = 'Eksportuj profile do pliku…'; Icon = 'EDE1'; Action = {
+                param($m)
+                $dlg = New-Object Microsoft.Win32.SaveFileDialog
+                $dlg.Filter = 'Profile (*.json)|*.json'
+                $dlg.FileName = 'DomainOps_profile_kont.json'
+                if ($dlg.ShowDialog($script:UI.Window) -ne $true) { return }
+                @{ Profiles = @(Get-UserProfiles) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $dlg.FileName -Encoding UTF8
+                Show-Toast 'Zapisano profile.' 'ok'
+            }
+        }
+    ) | Out-Null
+
+    $row2 = Add-ToolbarRow -Module $m -Title 'Miejsce'
+    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 400 -Placeholder 'OU dla nowych kont' -DialogTitle 'Jednostka dla nowych kont'
+    Add-Label -Parent $row2 -Text 'Sufiks UPN  @' | Out-Null
+    $m.Upn = Add-TextBox -Parent $row2 -Width 180 -Placeholder 'firma.pl'
+    Add-MenuButton -Parent $row2 -Text '' -Icon 'E721' -Module $m -ToolTip 'Sufiksy UPN z lasu AD' -Items @(
+        @{ Text = 'Pobierz sufiksy z Active Directory'; Icon = 'E896'; Action = {
+                param($m)
+                if (-not (Test-AdAvailable)) { return }
+                Import-AdModule
+                $ad = Get-AdSplat
+                $forest = Invoke-WithWaitCursor { Get-ADForest @ad }
+                $suffixes = @(@($forest.RootDomain) + @($forest.Domains) + @($forest.UPNSuffixes) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+                $pick = Show-FormDialog -Title 'Sufiks UPN' -Icon 'E721' -Fields @(@{ Key = 'S'; Label = 'Sufiks'; Type = 'Combo'; Items = $suffixes; Value = $m.Upn.Text })
+                if ($pick) { $m.Upn.Text = $pick.S }
+            }
+        }
+    ) | Out-Null
+    $row3 = Add-ToolbarRow -Module $m -Title 'Konwencje'
+    Add-Label -Parent $row3 -Text 'Login' | Out-Null
+    $m.LoginFormat = Add-ComboBox -Parent $row3 -Items @($script:LoginFormatLabels.Values) -Width 230
+    Add-Label -Parent $row3 -Text 'Nazwa' | Out-Null
+    $m.DisplayFormat = Add-TextBox -Parent $row3 -Width 220 -Placeholder '{Imię} {Nazwisko}'
+    $m.DisplayFormat.ToolTip = 'Pola: {Imię}, {Nazwisko}, {Login}, {Numer}, {Profil}, {Dział}, {Miasto}, {Stanowisko}'
+    $m.SetMail = Add-CheckBox -Parent $row3 -Text 'E-mail = login@' -Checked $true
+    $m.MailDomain = Add-TextBox -Parent $row3 -Width 150 -Placeholder 'domena (jak UPN)'
+    $row4 = Add-ToolbarRow -Module $m -Title 'Konto'
+    $m.Enabled = Add-CheckBox -Parent $row4 -Text 'Włączone' -Checked $true
+    $m.MustChange = Add-CheckBox -Parent $row4 -Text 'Zmiana hasła przy logowaniu'
+    $m.NumberLogins = Add-CheckBox -Parent $row4 -Text 'Numeruj zajęte loginy' -Checked $true -ToolTip 'jan.kowalski zajęty -> jan.kowalski1 (tylko loginy generowane z imienia i nazwiska)'
+    Add-Label -Parent $row4 -Text 'Długość hasła' | Out-Null
+    $m.PwdLength = Add-Numeric -Parent $row4 -Value 12 -Minimum 8 -Maximum 64 -Width 60
+    Add-Label -Parent $row4 -Text 'Wygasa po (dni, 0 = nigdy)' | Out-Null
+    $m.ExpireDays = Add-Numeric -Parent $row4 -Value 0 -Minimum 0 -Maximum 3650 -Width 70
+    $row5 = Add-ToolbarRow -Module $m -Title 'Atrybuty'
+    $m.Description = Add-TextBox -Parent $row5 -Width 220 -Placeholder 'Opis (pola jak w nazwie)'
+    $m.Company = Add-TextBox -Parent $row5 -Width 150 -Placeholder 'Firma'
+    $m.Department = Add-TextBox -Parent $row5 -Width 150 -Placeholder 'Dział (domyślny)'
+    $m.City = Add-TextBox -Parent $row5 -Width 140 -Placeholder 'Miasto (domyślne)'
+    $row6 = Add-ToolbarRow -Module $m -Title 'Grupy'
+    $m.Groups = Add-TextBox -Parent $row6 -Width 460 -Placeholder 'grupy dla nowych kont, rozdzielone średnikiem'
+    Add-Button -Parent $row6 -Text '' -Icon 'E710' -Module $m -AlwaysEnabled -ToolTip 'Wybierz grupy z AD' -OnClick {
+        param($m)
+        $groups = Select-AdGroups -Title 'Grupy dla nowych kont'
+        if (-not $groups) { return }
+        $current = @(Split-ListText $m.Groups.Text)
+        $m.Groups.Text = ((@($current) + @($groups | ForEach-Object { $_.Sam } | Where-Object { $current -notcontains $_ })) -join '; ')
+    } | Out-Null
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Dane' -Multiline -Height 110 -Placeholder "Imię [TAB] Nazwisko [TAB] Numer – wklej z Excela. Z nagłówkiem można podać też: Login, E-mail, Hasło, Dział, Stanowisko, Miasto, Opis.`r`nJan [TAB] Kowalski`r`nAnna [TAB] Nowak [TAB] 12345"
+
+    $m.Actions.Stats = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m)
+        $count = { param([string[]]$s) @($rows | Where-Object { $s -contains [string](Get-ObjectValue $_ 'Stan') }).Count }
+        Set-StatTile -Module $m -Key 'ready' -Value ([string](& $count @('Gotowe'))) -Tone 'info'
+        Set-StatTile -Module $m -Key 'done' -Value ([string](& $count @('Utworzono', 'Utworzono z błędem'))) -Tone 'ok'
+        Set-StatTile -Module $m -Key 'exists' -Value ([string](& $count @('Istnieje')))
+        $bad = & $count @('Błąd danych', 'Konflikt', 'Błąd', 'Nie sprawdzono')
+        Set-StatTile -Module $m -Key 'bad' -Value ([string]$bad) -Tone $(if ($bad) { 'crit' } else { '' })
+    }
+    $m.Actions.Preview = {
+        param($m)
+        $text = $m.Input.Text
+        if (-not $text.Trim()) { Show-Warning 'Wklej lub wpisz dane kont w polu «Dane» (Imię [TAB] Nazwisko).'; return }
+        $profileName = if ($m.Profile.SelectedIndex -ge 0) { [string]$m.Profile.SelectedItem } else { 'Domyślny' }
+        $prof = Get-UserProfileFromControls -Module $m -Name $profileName
+        $m.Data.Profile = $prof
+        $t = ConvertFrom-PastedTable -Text $text -Headers $script:UserPasteHeaders -Order @('First', 'Last', 'Number', 'Login', 'Mail', 'Department', 'Title', 'City')
+        Reset-ResultTable -Module $m
+        $lp = 0
+        $objects = foreach ($r in $t.Rows) {
+            $first = ConvertTo-ProperName (Get-PastedValue $r $t.Map 'First')
+            $last = ConvertTo-ProperName (Get-PastedValue $r $t.Map 'Last')
+            if (-not $first -and -not $last) { continue }
+            $lp++
+            $login = (Get-PastedValue $r $t.Map 'Login').Trim()
+            $mail = (Get-PastedValue $r $t.Map 'Mail').Trim()
+            $pass = Get-PastedValue $r $t.Map 'Password'
+            $vals = @{ First = $first; Last = $last; Number = (Get-PastedValue $r $t.Map 'Number').Trim(); Login = $login
+                Department = $(if (Get-PastedValue $r $t.Map 'Department') { Get-PastedValue $r $t.Map 'Department' } else { $prof.Department })
+                City = $(if (Get-PastedValue $r $t.Map 'City') { Get-PastedValue $r $t.Map 'City' } else { $prof.City }); Title = (Get-PastedValue $r $t.Map 'Title')
+            }
+            $desc = if (Get-PastedValue $r $t.Map 'Description') { Get-PastedValue $r $t.Map 'Description' } elseif ($prof.Description) { Expand-Template $prof.Description (Get-UserTokens -Row $vals -ProfileName $prof.Name) } else { '' }
+            [pscustomobject][ordered]@{
+                'Lp' = $lp; 'Stan' = ''; 'Imię' = $first; 'Nazwisko' = $last; 'Numer' = $vals.Number; 'Login' = $login; 'Nazwa wyświetlana' = ''; 'UPN' = ''; 'E-mail' = $mail
+                'Hasło' = $(if ($pass) { $pass } else { New-RandomPassword -Length $prof.PasswordLength }); 'Dział' = $vals.Department; 'Stanowisko' = $vals.Title; 'Miasto' = $vals.City
+                'Opis' = $desc; 'OU' = $prof.Ou; 'Uwagi' = ''; '__tone' = ''
+                '__id' = [guid]::NewGuid().ToString('N'); '__autoLogin' = $(if ($login) { '' } else { '1' }); '__autoName' = '1'; '__autoUpn' = '1'; '__autoMail' = $(if ($mail) { '' } else { '1' }); '__cn' = ''
+            }
+        }
+        $objects = @($objects)
+        if ($objects.Count -eq 0) { Show-Warning 'Nie rozpoznano żadnego wiersza z imieniem i nazwiskiem.'; return }
+        Add-ResultRows -Module $m -Objects $objects
+        $m.Loading = $true
+        try { foreach ($row in @(Get-ResultRowsAll -Module $m)) { Update-UserComputedFields -Module $m -Row $row } }
+        finally { $m.Loading = $false }
+        # Duplikaty generowanych loginów w obrębie danych dostaną numery przy sprawdzeniu w AD
+        Request-ResultSpace -Module $m
+        Write-Log ("Podgląd: {0} kont, profil {1}{2}." -f $objects.Count, $prof.Name, $(if ($t.HasHeader) { ' (rozpoznano nagłówek)' } else { '' }))
+        Start-UserPlanCheck -Module $m
+    }
+    $m.Actions.Create = {
+        param($m)
+        if (-not $m.Table -or $m.Table.Rows.Count -eq 0) { & $m.Actions.Preview $m; return }
+        if ($m.Data.Stale) { Start-UserPlanCheck -Module $m -ThenCreate; return }
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Gotowe' })
+        if ($rows.Count -eq 0) { Show-Message -Text 'Brak kont gotowych do utworzenia. Popraw wiersze z błędami i sprawdź ponownie.' -Title 'Brak zmian'; return }
+        $prof = $m.Data.Profile
+        $expire = if ([int]$prof.ExpireDays -gt 0) { (Get-Date).Date.AddDays([int]$prof.ExpireDays + 1) } else { $null }
+        $per = @{}
+        foreach ($r in $rows) {
+            $per[([string]$r['Login']).Trim()] = @{
+                Cn = $(if ([string]$r['__cn']) { [string]$r['__cn'] } else { [string]$r['Nazwa wyświetlana'] }); First = [string]$r['Imię']; Last = [string]$r['Nazwisko']; Display = [string]$r['Nazwa wyświetlana']
+                Upn = [string]$r['UPN']; Mail = [string]$r['E-mail']; Ou = [string]$r['OU']; Password = [string](Get-RowValue $r 'Hasło'); Enabled = [bool]$prof.Enabled; MustChange = [bool]$prof.MustChange
+                City = [string]$r['Miasto']; Department = [string]$r['Dział']; Title = [string]$r['Stanowisko']; Description = [string]$r['Opis']; Company = $prof.Company; Number = [string]$r['Numer']
+                Expire = $expire; Groups = @($prof.Groups)
+            }
+        }
+        $items = @($rows | ForEach-Object { '{0}  ({1})' -f $_['Nazwa wyświetlana'], $_['Login'] })
+        $text = "Utworzyć $($rows.Count) kont(a) w profilu «$($prof.Name)»?"
+        if (@($prof.Groups).Count) { $text += "`r`nGrupy: $(@($prof.Groups) -join ', ')" }
+        if (-not $prof.Enabled) { $text += "`r`nKonta zostaną utworzone jako wyłączone." }
+        if (-not (Confirm-Action -Text $text -Items $items -ConfirmText 'Utwórz konta')) { return }
+        foreach ($r in $rows) { Set-RowState -Module $m -Row $r -State 'Tworzenie…' -Tone '' }
+        Start-AdOperation -Module $m -Name 'Tworzenie kont' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:UserCreateScript -OnResult {
+            param($m, $r)
+            foreach ($row in @(Find-ResultRow -Module $m -Column 'Login' -Value $r.Target)) {
+                if ($r.Ok) {
+                    $d = @($r.Data)[0]
+                    Set-RowState -Module $m -Row $row -State $d.State -Tone $(if ($d.Warn) { 'warn' } else { 'ok' }) -Note $d.Note
+                    Set-ResultValue -Module $m -Row $row -Column 'DN' -Value $d.Dn
+                }
+                else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')) }
+            }
+        } -OnComplete {
+            param($m)
+            & $m.Actions.Stats $m
+            $created = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -like 'Utworzono*' })
+            if ($created.Count -eq 0) { return }
+            Write-Log "Utworzono kont: $($created.Count). Hasła – «Kopiuj dane logowania» albo «Pokaż poufne»." 'OK'
+            if (Test-Checked $m.Sync) { Start-AadDeltaSync -Module $m }
+        }
+    }
+    $row7 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row7 -Text 'Wklej ze schowka' -Icon 'E77F' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $clip = Get-ClipboardText
+        if (-not $clip.Trim()) { Show-Warning 'Schowek nie zawiera tekstu.'; return }
+        $m.Input.Text = $clip
+        & $m.Actions.Preview $m
+    } | Out-Null
+    Add-Button -Parent $row7 -Text 'Sprawdź' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row7 -Text 'Sprawdź ponownie' -Icon 'E72C' -Module $m -ToolTip 'Sprawdza wiersze tabeli po edycji (bez ponownego wczytywania pola «Dane»)' -OnClick {
+        param($m)
+        if (-not $m.Table -or $m.Table.Rows.Count -eq 0) { & $m.Actions.Preview $m; return }
+        Start-UserPlanCheck -Module $m
+    } | Out-Null
+    Add-Button -Parent $row7 -Text 'Utwórz konta' -Icon 'E8FA' -Module $m -OnClick $m.Actions.Create | Out-Null
+    Add-Button -Parent $row7 -Text 'Kopiuj dane logowania' -Icon 'E8C8' -Module $m -AlwaysEnabled -ToolTip 'Nazwa, login, UPN, e-mail i hasło utworzonych kont (format Excel) – schowek wyczyści się po 2 minutach' -OnClick {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -like 'Utworzono*' })
+        if ($rows.Count -eq 0) { Show-Warning 'Brak utworzonych kont.'; return }
+        $lines = @("Nazwa wyświetlana`tLogin`tUPN`tE-mail`tHasło") + @($rows | ForEach-Object { "{0}`t{1}`t{2}`t{3}`t{4}" -f $_['Nazwa wyświetlana'], $_['Login'], $_['UPN'], $_['E-mail'], (Get-RowValue $_ 'Hasło') })
+        Set-ClipboardSecret -Text ($lines -join "`r`n") -Seconds 120
+        Write-Log "Skopiowano dane logowania $($rows.Count) kont; schowek zostanie wyczyszczony po 2 minutach." 'OK'
+        Show-Toast "Skopiowano dane $($rows.Count) kont – schowek wyczyści się po 2 min." 'ok' 6
+    } | Out-Null
+    $row8 = Add-ToolbarRow -Module $m -Title 'Entra ID'
+    $m.Sync = Add-CheckBox -Parent $row8 -Text 'Po utworzeniu uruchom synchronizację (Delta)'
+    Add-Label -Parent $row8 -Text 'Serwer Entra Connect' | Out-Null
+    $m.SyncServer = Add-TextBox -Parent $row8 -Width 200 -Text ([string]$script:Settings.AadSyncServer) -Placeholder 'puste = ten komputer'
+    Register-ControlHandler -Control $m.SyncServer -EventName 'TextChanged' -Module $m -Action { param($m) $script:Settings.AadSyncServer = $m.SyncServer.Text.Trim() }
+    Add-Button -Parent $row8 -Text 'Synchronizuj teraz' -Icon 'E895' -Module $m -OnClick { param($m) Start-AadDeltaSync -Module $m } | Out-Null
+    Add-RowAction -Module $m -Text 'Kopiuj hasło (60 s)' -Icon 'E8C8' -Action {
+        param($m, $rows)
+        $secret = [string](Get-RowValue $rows[0] 'Hasło')
+        if (-not $secret) { return }
+        Set-ClipboardSecret -Text $secret -Seconds 60
+        Show-Toast 'Hasło w schowku – zostanie wyczyszczone po 60 s.' 'ok'
+    }
+    Add-RowAction -Module $m -Text 'Nowe hasło' -Icon 'E8D7' -Action {
+        param($m, $rows)
+        foreach ($r in $rows) { if ([string](Get-ObjectValue $r 'Stan') -notlike 'Utworzono*') { Set-ResultValue -Module $m -Row $r -Column 'Hasło' -Value (New-RandomPassword -Length (Get-Num $m.PwdLength)) } }
+        Show-Toast 'Wygenerowano nowe hasła (dla kont jeszcze nieutworzonych).' 'ok'
+    }
+    Add-RowAction -Module $m -Text 'Usuń wiersze z podglądu' -Icon 'E74D' -Action { param($m, $rows) Remove-ResultRows -Module $m -Rows $rows; & $m.Actions.Stats $m }
+    Add-StatTile -Module $m -Key 'ready' -Label 'Gotowe do utworzenia' -Icon 'E9D5' | Out-Null
+    Add-StatTile -Module $m -Key 'done' -Label 'Utworzone' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'exists' -Label 'Już istnieją' -Icon 'E73A' | Out-Null
+    Add-StatTile -Module $m -Key 'bad' -Label 'Błędy i konflikty' -Icon 'E7BA' | Out-Null
+    $m.ResultHint = 'Kolumny z ołówkiem można poprawić • hasła są ukryte («Pokaż poufne», «Kopiuj dane logowania»)'
+    $m.EmptyHint = 'Wybierz profil, wklej dane (Wklej ze schowka) i kliknij «Sprawdź» (F5). Popraw wiersze w tabeli, a potem «Utwórz konta».'
+    Update-UserProfileList -Module $m
+}
+#endregion
+
+#region Użytkownicy AD: import atrybutów z CSV, ostatnio utworzone obiekty, porządkowanie wyłączonych kont
+$script:ImportAttributes = [ordered]@{
+    title                      = @('Stanowisko', 'title', 'job title', 'funkcja')
+    department                 = @('Dział', 'department', 'wydział')
+    company                    = @('Firma', 'company')
+    description                = @('Opis', 'description')
+    physicalDeliveryOfficeName = @('Biuro', 'office', 'pokój', 'physicaldeliveryofficename')
+    telephoneNumber            = @('Telefon', 'phone', 'telephone', 'telephonenumber', 'tel')
+    mobile                     = @('Komórka', 'mobile', 'telefon komórkowy', 'tel. kom.')
+    ipPhone                    = @('Telefon IP', 'ipphone')
+    homePhone                  = @('Telefon domowy', 'homephone')
+    facsimileTelephoneNumber   = @('Faks', 'fax', 'facsimiletelephonenumber')
+    pager                      = @('Pager', 'pager')
+    mail                       = @('E-mail', 'email', 'mail')
+    manager                    = @('Przełożony', 'manager', 'kierownik')
+    givenName                  = @('Imię', 'givenname', 'first name')
+    sn                         = @('Nazwisko', 'sn', 'surname', 'last name')
+    displayName                = @('Nazwa wyświetlana', 'displayname')
+    initials                   = @('Inicjały', 'initials')
+    employeeID                 = @('Numer pracownika', 'employeeid', 'nr pracownika')
+    employeeNumber             = @('Numer kadrowy', 'employeenumber')
+    streetAddress              = @('Ulica', 'streetaddress', 'adres')
+    postOfficeBox              = @('Skrytka pocztowa', 'postofficebox')
+    postalCode                 = @('Kod pocztowy', 'postalcode')
+    l                          = @('Miasto', 'city', 'l', 'miejscowość')
+    st                         = @('Województwo', 'st', 'state')
+    co                         = @('Kraj', 'co', 'country')
+    wWWHomePage                = @('Strona WWW', 'wwwhomepage', 'www')
+    info                       = @('Uwagi', 'info', 'notatki')
+}
+foreach ($i in 1..15) { $script:ImportAttributes["extensionAttribute$i"] = @("extensionAttribute$i", "extensionattribute$i") }
+
+$script:ImportKeyTypes = [ordered]@{ sam = 'login (sAMAccountName)'; upn = 'UPN'; mail = 'e-mail'; employeeID = 'numer pracownika (employeeID)' }
+
+function Read-TextFileAuto {
+    # Plik tekstowy: BOM UTF-8/UTF-16, poprawny UTF-8 bez BOM albo Windows-1250 (CSV z polskiego Excela)
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2) }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2) }
+    try { return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes) }
+    catch { return [System.Text.Encoding]::GetEncoding(1250).GetString($bytes) }
+}
+
+function Get-CsvDelimiterGuess {
+    param([string]$FirstLine)
+    $best = ';'
+    $max = -1
+    foreach ($d in @(';', ',', "`t", '|')) {
+        $n = ($FirstLine.Split($d)).Count
+        if ($n -gt $max) { $max = $n; $best = $d }
+    }
+    return $best
+}
+
+function Find-ImportAttribute {
+    # Kolumna CSV -> atrybut AD (po nazwie atrybutu albo polskiej etykiecie); '' gdy brak
+    param([string]$Column)
+    $norm = { param($t) ((ConvertTo-AsciiText ([string]$t)).ToLowerInvariant() -replace '[\s_\-\.]', '') }
+    $c = & $norm $Column
+    foreach ($attr in $script:ImportAttributes.Keys) {
+        if ((& $norm $attr) -eq $c) { return $attr }
+        foreach ($alias in $script:ImportAttributes[$attr]) { if ((& $norm $alias) -eq $c) { return $attr } }
+    }
+    return ''
+}
+
+$script:ImportDiffScript = {
+    # Porównanie wartości z pliku z AD: wiersz na każdą parę konto-atrybut
+    $attrs = @($P.Map | ForEach-Object { $_.Attr } | Select-Object -Unique)
+    $keyAttr = switch ($P.KeyType) { 'upn' { 'userPrincipalName' } 'mail' { 'mail' } 'employeeID' { 'employeeID' } default { 'sAMAccountName' } }
+    $seen = @{}
+    $lp = 0
+    foreach ($r in $P.Rows) {
+        $lp++
+        $key = ([string]$r[$P.KeyColumn]).Trim()
+        $base = [ordered]@{ 'Wiersz' = $lp; 'Klucz' = $key; 'Login' = ''; 'Konto' = ''; 'Atrybut' = ''; 'Obecna wartość' = ''; 'Nowa wartość' = ''; 'Stan' = ''; 'Uwagi' = ''; '__dn' = ''; '__attr' = ''; '__new' = ''; '__old' = ''; '__tone' = 'crit'; '__flag' = '' }
+        if (-not $key) { $base['Stan'] = 'Brak klucza'; [pscustomobject]$base; continue }
+        $users = @(Get-ADUser -LDAPFilter "($keyAttr=$(ConvertTo-LdapValue $key))" -Properties (@($attrs) + @('displayName')) @ad)
+        if ($users.Count -eq 0) { $base['Stan'] = 'Nie znaleziono konta'; [pscustomobject]$base; continue }
+        if ($users.Count -gt 1) { $base['Stan'] = 'Niejednoznaczne'; $base['Uwagi'] = "$($users.Count) konta z tą wartością"; [pscustomobject]$base; continue }
+        $u = $users[0]
+        $dup = $seen.ContainsKey([string]$u.DistinguishedName)
+        $seen[[string]$u.DistinguishedName] = $true
+        foreach ($map in $P.Map) {
+            $row = [ordered]@{}
+            foreach ($k in $base.Keys) { $row[$k] = $base[$k] }
+            $row['Login'] = $u.SamAccountName
+            $row['Konto'] = $u.displayName
+            $row['Atrybut'] = $map.Attr
+            $row['__dn'] = [string]$u.DistinguishedName
+            $row['__attr'] = $map.Attr
+            $cur = $u.($map.Attr)
+            $curText = if ($null -eq $cur) { '' } else { (@($cur) | ForEach-Object { [string]$_ }) -join '; ' }
+            $new = ([string]$r[$map.Column]).Trim()
+            $newRaw = $new
+            $row['Obecna wartość'] = $(if ($map.Attr -eq 'manager' -and $curText) { Get-DnName $curText } else { $curText })
+            $row['Nowa wartość'] = $new
+            $row['__old'] = $curText
+            if ($map.Attr -eq 'manager' -and $new) {
+                try { $newRaw = [string](Resolve-AdPrincipal -Id $new -Classes @('user', 'contact')).DistinguishedName; $row['Nowa wartość'] = Get-DnName $newRaw }
+                catch { $row['Stan'] = 'Błąd danych'; $row['Uwagi'] = "przełożony: $($_.Exception.Message)"; [pscustomobject]$row; continue }
+            }
+            $row['__new'] = $newRaw
+            if (-not $new) {
+                if ($P.AllowClear -and $curText) { $row['Stan'] = 'Do wyczyszczenia'; $row['__tone'] = 'warn' }
+                elseif ($curText) { $row['Stan'] = 'Pominięto (puste)'; $row['__tone'] = ''; $row['__flag'] = 'muted' }
+                else { $row['Stan'] = 'Bez zmian'; $row['__tone'] = ''; $row['__flag'] = 'muted' }
+            }
+            elseif ($curText -ceq $newRaw) { $row['Stan'] = 'Bez zmian'; $row['__tone'] = ''; $row['__flag'] = 'muted' }
+            else { $row['Stan'] = 'Do zmiany'; $row['__tone'] = 'info' }
+            if ($dup) { $row['Uwagi'] = 'Konto występuje w pliku więcej niż raz – obowiązuje ostatni wiersz' }
+            [pscustomobject]$row
+        }
+    }
+}
+
+function Show-ImportMapping {
+    # Panel mapowania kolumn CSV na atrybuty AD (wypełniany po wczytaniu pliku)
+    param([hashtable]$Module)
+    $m = $Module
+    $panel = $m.MapPanel
+    $panel.Children.Clear()
+    $m.Data.Map = New-Object System.Collections.ArrayList
+    $items = @('(pomiń)') + @($script:ImportKeyTypes.Keys | ForEach-Object { '★ Klucz: ' + $script:ImportKeyTypes[$_] }) + @($script:ImportAttributes.Keys | ForEach-Object { '{0} – {1}' -f $_, $script:ImportAttributes[$_][0] })
+    $keyDone = $false
+    foreach ($col in $m.Data.Csv.Columns) {
+        $sp = New-Object System.Windows.Controls.StackPanel
+        $sp.Margin = '0,0,10,8'
+        $sp.Width = 220
+        $cap = New-Object System.Windows.Controls.TextBlock
+        $cap.Text = [string]$col
+        $cap.Foreground = Get-Brush '#C9D0DC'
+        $cap.FontWeight = 'SemiBold'
+        $cap.Margin = '1,0,0,4'
+        $cap.TextTrimming = 'CharacterEllipsis'
+        $cap.ToolTip = [string]$col
+        [void]$sp.Children.Add($cap)
+        $cb = New-Object System.Windows.Controls.ComboBox
+        foreach ($i in $items) { [void]$cb.Items.Add($i) }
+        $sel = 0
+        $norm = ((ConvertTo-AsciiText ([string]$col)).ToLowerInvariant() -replace '[\s_\-\.]', '')
+        if (-not $keyDone -and $norm -match '^(sam|samaccountname|login|konto|uzytkownik|username)$') { $sel = 1; $keyDone = $true }
+        elseif (-not $keyDone -and $norm -match '^(upn|userprincipalname)$') { $sel = 2; $keyDone = $true }
+        else {
+            $attr = Find-ImportAttribute -Column $col
+            if ($attr) { $sel = 1 + $script:ImportKeyTypes.Count + [array]::IndexOf(@($script:ImportAttributes.Keys), $attr) }
+        }
+        $cb.SelectedIndex = $sel
+        [void]$sp.Children.Add($cb)
+        [void]$panel.Children.Add($sp)
+        [void]$m.Data.Map.Add(@{ Column = [string]$col; Combo = $cb })
+    }
+    $m.MapRow.Visibility = 'Visible'
+}
+
+function Get-ImportMapping {
+    # Wybrany klucz i mapowanie kolumna -> atrybut; zwraca @{ KeyType; KeyColumn; Map } albo rzuca opis problemu
+    param([hashtable]$Module)
+    $keyType = ''
+    $keyColumn = ''
+    $map = @()
+    $keyTypes = @($script:ImportKeyTypes.Keys)
+    $attrs = @($script:ImportAttributes.Keys)
+    foreach ($e in $Module.Data.Map) {
+        $i = $e.Combo.SelectedIndex
+        if ($i -le 0) { continue }
+        if ($i -le $keyTypes.Count) {
+            if ($keyColumn) { throw 'Wskaż tylko jedną kolumnę klucza (★).' }
+            $keyType = $keyTypes[$i - 1]
+            $keyColumn = $e.Column
+            continue
+        }
+        $attr = $attrs[$i - 1 - $keyTypes.Count]
+        if (@($map | Where-Object { $_.Attr -eq $attr }).Count) { throw "Atrybut $attr jest przypisany do kilku kolumn." }
+        $map += @{ Column = $e.Column; Attr = $attr }
+    }
+    if (-not $keyColumn) { throw 'Wskaż kolumnę z kluczem konta (★ Klucz: login, UPN, e-mail albo numer pracownika).' }
+    if ($map.Count -eq 0) { throw 'Przypisz co najmniej jedną kolumnę do atrybutu AD.' }
+    return @{ KeyType = $keyType; KeyColumn = $keyColumn; Map = $map }
+}
+
+function Start-ImportDiff {
+    param([hashtable]$Module, [hashtable]$Mapping, [object[]]$Rows, [bool]$AllowClear, [string]$Name = 'Podgląd zmian')
+    $Module.ExtraFilter = ''
+    $params = @{ KeyType = $Mapping.KeyType; KeyColumn = $Mapping.KeyColumn; Map = $Mapping.Map; Rows = $Rows; AllowClear = $AllowClear }
+    Start-AdOperation -Module $Module -Name $Name -Targets @('AD') -Parameters $params -ScriptBlock $script:ImportDiffScript -OnComplete {
+        param($m)
+        $m.Data.Mode = 'Diff'
+        & $m.Actions.Stats $m
+        Request-ResultSpace -Module $m
+    }
+}
+
+Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserImport' -Title 'Import atrybutów z CSV' -Icon 'E8B5' -Badge 'nowe' `
+    -Description 'Hurtowa zmiana atrybutów kont (stanowisko, dział, telefon, przełożony…) z pliku CSV: mapowanie kolumn, podgląd «było → będzie» dla każdego konta, zastosowanie zmian z plikiem cofania i przywracanie poprzednich wartości.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.Data.Csv = $null
+    $m.Data.Mode = ''
+    $row = Add-ToolbarRow -Module $m -Title 'Plik'
+    Add-Button -Parent $row -Text 'Wczytaj CSV…' -Icon 'E8E5' -Module $m -Primary -OnClick {
+        param($m)
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Filter = 'Pliki CSV i tekstowe (*.csv;*.txt)|*.csv;*.txt|Wszystkie pliki (*.*)|*.*'
+        if ($dlg.ShowDialog($script:UI.Window) -ne $true) { return }
+        & $m.Actions.Load $m $dlg.FileName
+    } | Out-Null
+    Add-Label -Parent $row -Text 'Separator' | Out-Null
+    $m.Delimiter = Add-ComboBox -Parent $row -Items @('automatycznie', 'średnik ;', 'przecinek ,', 'tabulator', 'kreska |') -Width 140
+    $m.FileLabel = Add-Label -Parent $row -Text 'Nie wczytano pliku.' -Hint
+    $m.MapPanel = New-Object System.Windows.Controls.WrapPanel
+    $m.MapRow = Add-ParamRow -Module $m -Title 'Mapowanie' -Content $m.MapPanel
+    $m.MapRow.Parent.Visibility = 'Collapsed'
+    $m.MapRow = $m.MapRow.Parent
+    $row2 = Add-ToolbarRow -Module $m -Title 'Zmiany'
+    $m.AllowClear = Add-CheckBox -Parent $row2 -Text 'Puste komórki czyszczą atrybut' -ToolTip 'Domyślnie pusta komórka nie zmienia wartości w AD'
+    Add-Button -Parent $row2 -Text 'Podgląd zmian' -Icon 'E9D5' -Module $m -OnClick {
+        param($m)
+        if (-not $m.Data.Csv) { Show-Warning 'Najpierw wczytaj plik CSV.'; return }
+        $mapping = $null
+        try { $mapping = Get-ImportMapping -Module $m } catch { Show-Warning $_.Exception.Message; return }
+        $rows = @($m.Data.Csv.Rows | ForEach-Object { $h = @{}; foreach ($p in $_.PSObject.Properties) { $h[$p.Name] = [string]$p.Value }; $h })
+        Start-ImportDiff -Module $m -Mapping $mapping -Rows $rows -AllowClear (Test-Checked $m.AllowClear)
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Zastosuj zmiany' -Icon 'E74E' -Module $m -Danger -OnClick { param($m) & $m.Actions.Apply $m } | Out-Null
+    Add-Button -Parent $row2 -Text 'Cofnij zmiany z pliku…' -Icon 'E7A7' -Module $m -ToolTip 'Wczytuje plik cofania zapisany przy wcześniejszym imporcie i przygotowuje przywrócenie poprzednich wartości' -OnClick {
+        param($m)
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Filter = 'Pliki cofania (*.json)|*.json'
+        $dlg.InitialDirectory = Get-DataFolder 'Rollback'
+        if ($dlg.ShowDialog($script:UI.Window) -ne $true) { return }
+        & $m.Actions.LoadRollback $m $dlg.FileName
+    } | Out-Null
+    $m.Actions.LoadRollback = {
+        param($m, [string]$Path)
+        $snap = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $rows = @()
+        $attrs = New-Object System.Collections.ArrayList
+        foreach ($it in @($snap.Items)) {
+            $h = @{ Login = [string]$it.Sam }
+            foreach ($c in @($it.Changes)) { $h[[string]$c.Attr] = [string]$c.Old; if (-not $attrs.Contains([string]$c.Attr)) { [void]$attrs.Add([string]$c.Attr) } }
+            $rows += $h
+        }
+        if ($rows.Count -eq 0) { Show-Warning 'Plik cofania nie zawiera zmian.'; return }
+        $mapping = @{ KeyType = 'sam'; KeyColumn = 'Login'; Map = @($attrs | ForEach-Object { @{ Column = $_; Attr = $_ } }) }
+        $m.FileLabel.Text = "Przywracanie z: $([System.IO.Path]::GetFileName($Path)) ($($rows.Count) kont)"
+        Write-Log "Przygotowanie przywrócenia z $Path – przejrzyj tabelę i kliknij «Zastosuj zmiany»." 'INFO'
+        Start-ImportDiff -Module $m -Mapping $mapping -Rows $rows -AllowClear $true -Name 'Podgląd przywrócenia'
+    }
+    $m.Actions.Load = {
+        param($m, [string]$Path)
+        $text = Read-TextFileAuto -Path $Path
+        $lines = @($text -split "\r?\n" | Where-Object { $_.Trim() })
+        if ($lines.Count -lt 2) { Show-Warning 'Plik musi zawierać wiersz nagłówka i co najmniej jeden wiersz danych.'; return }
+        $d = switch ($m.Delimiter.SelectedIndex) { 1 { ';' } 2 { ',' } 3 { "`t" } 4 { '|' } default { Get-CsvDelimiterGuess $lines[0] } }
+        $headers = @(($lines[0] -split [regex]::Escape($d)) | ForEach-Object { $_.Trim().Trim('"').Trim() })
+        $dupe = @($headers | Group-Object | Where-Object { $_.Count -gt 1 -or -not $_.Name })
+        if ($dupe.Count) { Show-Warning ('Nagłówek pliku zawiera puste lub powtórzone nazwy kolumn: ' + (($dupe | ForEach-Object { "«$($_.Name)»" }) -join ', ')); return }
+        $rows = @($lines | ConvertFrom-Csv -Delimiter $d)
+        $m.Data.Csv = @{ Path = $Path; Columns = $headers; Rows = $rows; Delimiter = $d }
+        $m.FileLabel.Text = '{0} • {1} wierszy • separator {2}' -f [System.IO.Path]::GetFileName($Path), $rows.Count, $(switch ($d) { ';' { 'średnik' } ',' { 'przecinek' } "`t" { 'tabulator' } default { $d } })
+        Show-ImportMapping -Module $m
+        Reset-ResultTable -Module $m
+        Add-ResultRows -Module $m -Objects @($rows | Select-Object -First 500)
+        $m.Data.Mode = 'Csv'
+        Reset-StatTiles $m
+        Write-Log ("Wczytano {0} wierszy z {1}" -f $rows.Count, $Path) 'OK'
+        Show-Toast 'Sprawdź mapowanie kolumn (★ = klucz konta) i kliknij «Podgląd zmian».' 'info' 6
+    }
+    $m.Actions.Stats = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m)
+        $count = { param([string[]]$s) @($rows | Where-Object { $s -contains [string](Get-ObjectValue $_ 'Stan') }).Count }
+        $users = @($rows | Where-Object { [string](Get-ObjectValue $_ '__dn') } | ForEach-Object { [string]$_['__dn'] } | Select-Object -Unique).Count
+        Set-StatTile -Module $m -Key 'users' -Value ([string]$users)
+        Set-StatTile -Module $m -Key 'todo' -Value ([string](& $count @('Do zmiany', 'Do wyczyszczenia'))) -Tone 'info'
+        Set-StatTile -Module $m -Key 'done' -Value ([string](& $count @('Zmieniono'))) -Tone 'ok'
+        $bad = & $count @('Nie znaleziono konta', 'Niejednoznaczne', 'Brak klucza', 'Błąd danych', 'Błąd')
+        Set-StatTile -Module $m -Key 'bad' -Value ([string]$bad) -Tone $(if ($bad) { 'crit' } else { '' })
+    }
+    $m.Actions.Apply = {
+        param($m)
+        if ($m.Data.Mode -ne 'Diff') { Show-Warning 'Najpierw kliknij «Podgląd zmian».'; return }
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Do zmiany', 'Do wyczyszczenia') -contains [string](Get-ObjectValue $_ 'Stan') })
+        if ($rows.Count -eq 0) { Show-Message -Text 'Podgląd nie zawiera zmian do wykonania.' -Title 'Brak zmian'; return }
+        $per = @{}
+        $snapshot = New-Object System.Collections.ArrayList
+        foreach ($g in ($rows | Group-Object { [string]$_['Login'] })) {
+            $first = $g.Group[0]
+            $replace = @{}
+            $clear = @()
+            $changes = @()
+            # Kilka wierszy tego samego konta i atrybutu (powtórzony klucz w pliku) - obowiązuje ostatni
+            $last = @{}
+            foreach ($r in $g.Group) { $last[[string]$r['__attr']] = $r }
+            foreach ($attr in $last.Keys) {
+                $r = $last[$attr]
+                $new = [string]$r['__new']
+                if ($new) { $replace[$attr] = $new } else { $clear += $attr }
+                $changes += [ordered]@{ Attr = $attr; Old = [string]$r['__old']; New = $new }
+            }
+            $per[$g.Name] = @{ Dn = [string]$first['__dn']; Replace = $replace; Clear = $clear }
+            [void]$snapshot.Add([ordered]@{ Sam = $g.Name; Dn = [string]$first['__dn']; Changes = $changes })
+        }
+        $items = @($rows | ForEach-Object { '{0}: {1}  «{2}» → «{3}»' -f $_['Login'], $_['Atrybut'], $_['Obecna wartość'], $_['Nowa wartość'] })
+        if (-not (Confirm-Action -Text "Zmienić $($rows.Count) wartości na $($per.Count) kontach? Przed zmianą zostanie zapisany plik cofania." -Items $items -ConfirmText 'Zastosuj zmiany' -Danger)) { return }
+        $file = Join-Path (Get-DataFolder 'Rollback') ('Import_{0:yyyyMMdd_HHmmss}.json' -f (Get-Date))
+        $doc = [ordered]@{ CreatedAt = (Get-Date).ToString('s'); CreatedBy = "$env:USERDOMAIN\$env:USERNAME"; Source = $(if ($m.Data.Csv) { [string]$m.Data.Csv.Path } else { '' }); Items = @($snapshot) }
+        try { $doc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $file -Encoding UTF8 }
+        catch { Show-Error 'Nie udało się zapisać pliku cofania – zmiany nie zostały wykonane.' $_; return }
+        Write-Log "Zapisano plik cofania: $file" 'OK'
+        Start-AdOperation -Module $m -Name 'Zmiana atrybutów' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock {
+            if ($P.Replace.Count -gt 0) {
+                $rep = @{}
+                foreach ($k in $P.Replace.Keys) { $rep[$k] = $P.Replace[$k] }
+                Set-ADUser -Identity $P.Dn -Replace $rep @ad
+            }
+            if (@($P.Clear).Count -gt 0) { Set-ADUser -Identity $P.Dn -Clear @($P.Clear) @ad }
+            'OK'
+        } -OnResult {
+            param($m, $r)
+            foreach ($row in @(Find-ResultRow -Module $m -Column 'Login' -Value $r.Target | Where-Object { @('Do zmiany', 'Do wyczyszczenia') -contains [string]$_['Stan'] })) {
+                if ($r.Ok) { Set-RowState -Module $m -Row $row -State 'Zmieniono' -Tone 'ok' }
+                else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')) }
+            }
+        } -OnComplete { param($m) & $m.Actions.Stats $m; Show-Toast 'Zmiany zapisane. Plik cofania: Ustawienia → Folder ustawień → Rollback.' 'ok' 6 }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Widok'
+    [void](Add-Segmented -Parent $row3 -Items @('Wszystkie', 'Tylko zmiany', 'Problemy') -Module $m -OnChange {
+            param($m, $s)
+            $m.ExtraFilter = switch ([string]$s.Content) {
+                'Tylko zmiany' { "Stan IN ('Do zmiany', 'Do wyczyszczenia', 'Zmieniono')" }
+                'Problemy' { "__tone = 'crit'" }
+                default { '' }
+            }
+            Update-ResultFilter -Module $m
+        })
+    Add-RowAction -Module $m -Text 'Pomiń wybrane zmiany' -Icon 'E711' -Action {
+        param($m, $rows)
+        foreach ($r in $rows) { if (@('Do zmiany', 'Do wyczyszczenia') -contains [string](Get-ObjectValue $r 'Stan')) { Set-RowState -Module $m -Row $r -State 'Pominięto (ręcznie)' -Tone '' } }
+        & $m.Actions.Stats $m
+    }
+    Add-StatTile -Module $m -Key 'users' -Label 'Konta' -Icon 'E716' | Out-Null
+    Add-StatTile -Module $m -Key 'todo' -Label 'Zmiany do wykonania' -Icon 'E9D5' | Out-Null
+    Add-StatTile -Module $m -Key 'done' -Label 'Wykonane' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'bad' -Label 'Problemy' -Icon 'E7BA' | Out-Null
+    Register-DropTarget -Control $m.Root -Module $m -Action { param($m, $paths) $f = @($paths | Where-Object { $_ -match '\.(csv|txt)$' }); if ($f.Count) { & $m.Actions.Load $m $f[0] } }
+    $m.EmptyHint = 'Wczytaj plik CSV (albo upuść go tutaj), sprawdź mapowanie kolumn i kliknij «Podgląd zmian». Kluczem konta może być login, UPN, e-mail albo numer pracownika.'
+}
+
+Register-Module -Workspace 'AdUsers' -Category 'Porządki' -Key 'RecentObjects' -Title 'Ostatnio utworzone' -Icon 'E823' -Badge 'nowe' `
+    -Description 'Konta użytkowników, komputery, grupy i jednostki utworzone w ostatnich minutach, godzinach lub dniach – z twórcą (właścicielem obiektu). Szybkie wyłączenie lub usunięcie obiektów utworzonych przez pomyłkę.' -Build {
+    param($m)
+    $m.PillColumns = @('Typ')
+    $m.ColorBools = $true
+    $row = Add-ToolbarRow -Module $m -Title 'Okres'
+    Add-Label -Parent $row -Text 'Ostatnie' | Out-Null
+    $m.Amount = Add-Numeric -Parent $row -Value 60 -Minimum 1 -Maximum 100000 -Width 70
+    $m.Unit = Add-Segmented -Parent $row -Items @('minut', 'godzin', 'dni')
+    $m.Users = Add-CheckBox -Parent $row -Text 'Użytkownicy' -Checked $true
+    $m.Computers = Add-CheckBox -Parent $row -Text 'Komputery' -Checked $true
+    $m.Groups = Add-CheckBox -Parent $row -Text 'Grupy' -Checked $true
+    $m.Ous = Add-CheckBox -Parent $row -Text 'Jednostki OU'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Zakres'
+    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 380 -Placeholder 'Cała domena' -DialogTitle 'Zakres wyszukiwania' -AllowDomainRoot
+    $m.Owner = Add-CheckBox -Parent $row2 -Text 'Pokaż twórcę (właściciel obiektu)' -Checked $true
+    Add-Button -Parent $row2 -Text 'Pokaż obiekty' -Icon 'E823' -Module $m -Primary -OnClick {
+        param($m)
+        $classes = @()
+        if (Test-Checked $m.Users) { $classes += '(&(objectCategory=person)(objectClass=user))' }
+        if (Test-Checked $m.Computers) { $classes += '(objectCategory=computer)' }
+        if (Test-Checked $m.Groups) { $classes += '(objectCategory=group)' }
+        if (Test-Checked $m.Ous) { $classes += '(objectCategory=organizationalUnit)' }
+        if ($classes.Count -eq 0) { Show-Warning 'Zaznacz co najmniej jeden rodzaj obiektów.'; return }
+        $n = Get-Num $m.Amount
+        $since = switch (Get-SegmentIndex $m.Unit) { 1 { (Get-Date).AddHours(-$n) } 2 { (Get-Date).AddDays(-$n) } default { (Get-Date).AddMinutes(-$n) } }
+        $params = @{ Filter = '(&(|' + ($classes -join '') + ")(whenCreated>=$(Get-LdapDate $since)))"; SearchBase = $m.Ou.Text.Trim(); Owner = (Test-Checked $m.Owner) }
+        Start-AdOperation -Module $m -Name 'Ostatnio utworzone' -Targets @('AD') -Parameters $params -ScriptBlock {
+            $props = @('whenCreated', 'sAMAccountName', 'displayName', 'userAccountControl', 'description')
+            if ($P.Owner) { $props += 'nTSecurityDescriptor' }
+            $q = @{ LDAPFilter = $P.Filter; Properties = $props }
+            if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+            $now = Get-Date
+            foreach ($o in (@(Get-ADObject @q @ad) | Sort-Object whenCreated -Descending)) {
+                $class = [string]$o.ObjectClass
+                $isAccount = ($class -eq 'user' -or $class -eq 'computer')
+                $owner = ''
+                if ($P.Owner -and $o.nTSecurityDescriptor) {
+                    # Metoda .NET zamiast właściwości Owner (rozszerzenie typu bywa niedostępne w wątkach w tle)
+                    try { $owner = [string]$o.nTSecurityDescriptor.GetOwner([System.Security.Principal.NTAccount]) }
+                    catch { try { $owner = [string]$o.nTSecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier]) } catch { } }
+                }
+                [pscustomobject][ordered]@{
+                    'Typ'          = Get-ObjectKind $class
+                    'Nazwa'        = $o.Name
+                    'Login'        = ([string]$o.sAMAccountName) -replace '\$$', ''
+                    'Utworzono'    = $o.whenCreated
+                    'Minut temu'   = [int]($now - [datetime]$o.whenCreated).TotalMinutes
+                    'Włączone'     = $(if ($isAccount) { -not ([int64]$o.userAccountControl -band 2) } else { $null })
+                    'Twórca'       = $owner
+                    'Opis'         = $o.description
+                    'Jednostka OU' = Get-DnParent ([string]$o.DistinguishedName)
+                    'DN'           = [string]$o.DistinguishedName
+                    '__tone'       = $(switch ($class) { 'user' { 'info' } 'computer' { 'ok' } 'group' { 'warn' } default { '' } })
+                }
+            }
+        } -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Status') -ne 'Błąd' })
+            Set-StatTile -Module $m -Key 'all' -Value ([string]$rows.Count)
+            Set-StatTile -Module $m -Key 'users' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Typ') -eq 'Użytkownik' }).Count)
+            Set-StatTile -Module $m -Key 'computers' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Typ') -eq 'Komputer' }).Count)
+            Set-StatTile -Module $m -Key 'groups' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Typ') -eq 'Grupa' }).Count)
+        }
+    } | Out-Null
+    $m.Actions.Change = {
+        param($m, [string]$Op, $Rows)
+        $source = @(if ($null -ne $Rows) { $Rows } else { Get-SelectedResultRows -Module $m })
+        if ($source.Count -eq 0) { Show-Warning 'Zaznacz obiekty w tabeli wyników.'; return }
+        if ($Op -eq 'Disable') { $source = @($source | Where-Object { @('Użytkownik', 'Komputer') -contains [string](Get-ObjectValue $_ 'Typ') }) }
+        if ($source.Count -eq 0) { Show-Warning 'Wyłączyć można tylko konta użytkowników i komputerów.'; return }
+        $per = @{}
+        foreach ($r in $source) { $per[[string](Get-ObjectValue $r 'DN')] = @{ Op = $Op } }
+        $items = @($source | ForEach-Object { '{0}: {1}' -f (Get-ObjectValue $_ 'Typ'), (Get-ObjectValue $_ 'Nazwa') })
+        $ok = if ($Op -eq 'Delete') { Confirm-Action -Text "Usunąć $($source.Count) obiekt(ów) z Active Directory? Tej operacji nie można cofnąć (chyba że włączony jest Kosz AD)." -Items $items -ConfirmText 'Usuń obiekty' -Danger }
+        else { Confirm-Action -Text "Wyłączyć $($source.Count) kont(a)?" -Items $items -ConfirmText 'Wyłącz' }
+        if (-not $ok) { return }
+        $m.Data.ChangeOp = $Op
+        Start-AdOperation -Module $m -Name $(if ($Op -eq 'Delete') { 'Usuwanie obiektów' } else { 'Wyłączanie kont' }) -Targets @($per.Keys) -PerTarget $per -Output Log -ScriptBlock {
+            if ($P.Op -eq 'Delete') {
+                $o = Get-ADObject -Identity $Target -Properties ProtectedFromAccidentalDeletion @ad
+                if ($o.ProtectedFromAccidentalDeletion) { throw "Obiekt $($o.Name) jest chroniony przed przypadkowym usunięciem." }
+                Remove-ADObject -Identity $Target -Confirm:$false @ad
+                "Usunięto: $(Get-DnName $Target)"
+            }
+            else { Disable-ADAccount -Identity $Target @ad; "Wyłączono: $(Get-DnName $Target)" }
+        } -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { return }
+            foreach ($row in @(Find-ResultRow -Module $m -Column 'DN' -Value $r.Target)) {
+                if ($m.Data.ChangeOp -eq 'Delete') { Remove-ResultRows -Module $m -Rows @($row) }
+                else { Set-ResultValue -Module $m -Row $row -Column 'Włączone' -Value $false }
+            }
+        }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Zaznaczone'
+    Add-Button -Parent $row3 -Text 'Wyłącz konta' -Icon 'E8D8' -Module $m -OnClick { param($m) & $m.Actions.Change $m 'Disable' $null } | Out-Null
+    Add-Button -Parent $row3 -Text 'Usuń obiekty' -Icon 'E74D' -Module $m -Danger -OnClick { param($m) & $m.Actions.Change $m 'Delete' $null } | Out-Null
+    Add-RowAction -Module $m -Text 'Wyłącz konto' -Icon 'E8D8' -Action { param($m, $rows) & $m.Actions.Change $m 'Disable' $rows }
+    Add-RowAction -Module $m -Text 'Usuń obiekt' -Icon 'E74D' -Danger -Action { param($m, $rows) & $m.Actions.Change $m 'Delete' $rows }
+    Add-RowAction -Module $m -Text 'Zaznacz konta na liście użytkowników' -Icon 'E8B3' -Separator -Action {
+        param($m, $rows)
+        $users = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Typ') -eq 'Użytkownik' })
+        if ($users.Count -eq 0) { Show-Warning 'Wybierz wiersze z kontami użytkowników.'; return }
+        Add-ResultsToTargets -Module $m -Kind User -Column 'Login' -Rows $users
+    }
+    Add-StatTile -Module $m -Key 'all' -Label 'Obiekty' -Icon 'E823' | Out-Null
+    Add-StatTile -Module $m -Key 'users' -Label 'Użytkownicy' -Icon 'E77B' | Out-Null
+    Add-StatTile -Module $m -Key 'computers' -Label 'Komputery' -Icon 'E7F4' | Out-Null
+    Add-StatTile -Module $m -Key 'groups' -Label 'Grupy' -Icon 'E902' | Out-Null
+    $m.EmptyHint = 'Ustaw okres i kliknij «Pokaż obiekty» (F5). Nie trzeba zaznaczać kont na liście.'
+}
+
+Register-Module -Workspace 'AdUsers' -Category 'Porządki' -Key 'DisabledCleanup' -Title 'Wyłączone konta' -Icon 'E8D8' -Badge 'nowe' `
+    -Description 'Wyłączone konta poza jednostką dla nieaktywnych: przeniesienie do niej i usunięcie z grup (z pominięciem grup chronionych i kont-wyjątków) z kopią członkostw w pliku CSV i możliwością przywrócenia.' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $m.PillColumns = @('Stan')
+    $m.GoodWhenNo = @('Wyjątek')
+    $row = Add-ToolbarRow -Module $m -Title 'Wyszukaj'
+    $m.Scope = Add-OuField -Parent $row -Module $m -Width 340 -Placeholder 'Cała domena' -DialogTitle 'Gdzie szukać wyłączonych kont' -AllowDomainRoot -Remember 'Scope'
+    Add-Label -Parent $row -Text 'Nieaktywne od (dni, 0 = wszystkie)' | Out-Null
+    $m.Days = Add-Numeric -Parent $row -Value 0 -Minimum 0 -Maximum 3650 -Width 70
+    $row2 = Add-ToolbarRow -Module $m -Title 'OU wyłączonych'
+    $m.Target = Add-TextBox -Parent $row2 -Width 340 -Text ([string]$script:Settings.DisabledBaseOU) -Placeholder 'np. OU=Nieaktywni,…'
+    Add-Button -Parent $row2 -Text '' -Icon 'E8B7' -Module $m -AlwaysEnabled -ToolTip 'Wybierz jednostkę dla wyłączonych kont' -OnClick {
+        param($m)
+        $ou = Select-OrganizationalUnit -Title 'Jednostka dla wyłączonych kont' -Selected $m.Target.Text.Trim()
+        if ($ou) { $m.Target.Text = $ou }
+    } | Out-Null
+    Register-ControlHandler -Control $m.Target -EventName 'TextChanged' -Module $m -Action { param($m) $script:Settings.DisabledBaseOU = $m.Target.Text.Trim() }
+    $m.SkipInTarget = Add-CheckBox -Parent $row2 -Text 'Pomiń konta, które już są w tej OU' -Checked $true
+    Add-Button -Parent $row2 -Text 'Szukaj' -Icon 'E721' -Module $m -Primary -OnClick {
+        param($m)
+        $target = $m.Target.Text.Trim()
+        $params = @{ SearchBase = $m.Scope.Text.Trim(); Days = (Get-Num $m.Days); Exclude = $(if ((Test-Checked $m.SkipInTarget) -and $target) { $target } else { '' }); Protected = @($script:Settings.ProtectedGroups); Exceptions = @($script:Settings.ExceptionUsers) }
+        Start-AdOperation -Module $m -Name 'Wyłączone konta' -Targets @('AD') -TargetColumn '' -Parameters $params -ScriptBlock {
+            $filter = '(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2))'
+            if ([int]$P.Days -gt 0) {
+                $ft = (Get-Date).AddDays( - [int]$P.Days).ToFileTimeUtc()
+                $filter = "(&$filter(|(lastLogonTimestamp<=$ft)(!(lastLogonTimestamp=*))))"
+            }
+            $q = @{ LDAPFilter = $filter; Properties = @('memberOf', 'displayName', 'LastLogonDate', 'whenChanged', 'description') }
+            if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+            $prot = @{}
+            foreach ($g in $P.Protected) { $prot[([string]$g).ToLowerInvariant()] = $true }
+            foreach ($u in (@(Get-ADUser @q @ad) | Sort-Object SamAccountName)) {
+                $dn = [string]$u.DistinguishedName
+                if ($P.Exclude -and ($dn.EndsWith(",$($P.Exclude)", [StringComparison]::OrdinalIgnoreCase))) { continue }
+                $exception = $false
+                foreach ($e in $P.Exceptions) { if ([string]$u.SamAccountName -ieq $e -or [string]$u.Name -ieq $e) { $exception = $true } }
+                $groups = @($u.memberOf)
+                $protCount = @($groups | Where-Object { $prot.ContainsKey((Get-DnName $_).ToLowerInvariant()) }).Count
+                [pscustomobject][ordered]@{
+                    'Login'              = $u.SamAccountName
+                    'Nazwa'              = $u.displayName
+                    'Stan'               = $(if ($exception) { 'Wyjątek' } else { 'Wyłączone' })
+                    'Grupy'              = $groups.Count
+                    'Do usunięcia z grup' = $(if ($exception) { 0 } else { $groups.Count - $protCount })
+                    'Grupy chronione'    = $protCount
+                    'Ostatnie logowanie' = $u.LastLogonDate
+                    'Zmieniono'          = $u.whenChanged
+                    'Wyjątek'            = $exception
+                    'Opis'               = $u.description
+                    'Jednostka OU'       = Get-DnParent $dn
+                    'DN'                 = $dn
+                    '__tone'             = $(if ($exception) { 'warn' } else { '' })
+                    '__flag'             = $(if ($exception) { 'muted' } else { '' })
+                }
+            }
+        } -OnComplete { param($m) & $m.Actions.Stats $m }
+    } | Out-Null
+    $m.Actions.Stats = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { $null -ne (Get-ObjectValue $_ 'Login') })
+        Set-StatTile -Module $m -Key 'accounts' -Value ([string]$rows.Count)
+        $sum = 0
+        foreach ($r in $rows) { $v = Get-ObjectValue $r 'Do usunięcia z grup'; if ($null -ne $v) { $sum += [int]$v } }
+        Set-StatTile -Module $m -Key 'memberships' -Value ([string]$sum) -Tone $(if ($sum) { 'warn' } else { 'ok' })
+        Set-StatTile -Module $m -Key 'exceptions' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Wyjątek') -eq 'Tak' }).Count)
+        Set-StatTile -Module $m -Key 'done' -Value ([string]@($rows | Where-Object { [string](Get-ObjectValue $_ 'Stan') -match 'Przeniesiono|Usunięto|Gotowe' }).Count) -Tone 'ok'
+    }
+    $m.Actions.Process = {
+        param($m, [bool]$Move, [bool]$Strip)
+        $rows = @(Get-SelectedResultRows -Module $m)
+        if ($rows.Count -le 1) { $rows = @($m.View | ForEach-Object { $_ }) }
+        $rows = @($rows | Where-Object { $null -ne (Get-ObjectValue $_ 'Login') -and [string](Get-ObjectValue $_ 'Wyjątek') -ne 'Tak' })
+        if ($rows.Count -eq 0) { Show-Warning 'Brak kont do przetworzenia (konta-wyjątki są pomijane).'; return }
+        $target = $m.Target.Text.Trim()
+        if ($Move -and -not $target) { Show-Warning 'Wskaż jednostkę dla wyłączonych kont (pole «OU wyłączonych»).'; return }
+        $what = @()
+        if ($Move) { $what += "przeniesienie do $target" }
+        if ($Strip) { $what += 'usunięcie z grup (poza chronionymi: ' + ((@($script:Settings.ProtectedGroups) | Select-Object -First 4) -join ', ') + '…)' }
+        $text = "Wykonać dla $($rows.Count) wyłączonych kont: " + ($what -join ' oraz ') + '?'
+        if ($Strip) { $text += "`r`nPrzed usunięciem członkostwa zostaną zapisane w pliku CSV (można je przywrócić)." }
+        if (-not (Confirm-Action -Text $text -Items @($rows | ForEach-Object { '{0} ({1})' -f (Get-ObjectValue $_ 'Nazwa'), (Get-ObjectValue $_ 'Login') }) -ConfirmText 'Wykonaj' -Danger:$Strip)) { return }
+        $m.Data.Job = @{ Move = $Move; Strip = $Strip; Target = $target; Logins = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Login') }) }
+        if ($Strip) {
+            # Krok 1: kopia członkostw (zapis pliku przed jakąkolwiek zmianą)
+            Start-AdOperation -Module $m -Name 'Kopia członkostw' -Targets $m.Data.Job.Logins -TargetColumn '' -Output None -Parameters @{ Protected = @($script:Settings.ProtectedGroups) } -ScriptBlock {
+                $u = Get-ADUser -Identity $Target -Properties memberOf, displayName @ad
+                $prot = @{}
+                foreach ($g in $P.Protected) { $prot[([string]$g).ToLowerInvariant()] = $true }
+                foreach ($g in @($u.memberOf)) {
+                    $name = Get-DnName $g
+                    if ($prot.ContainsKey($name.ToLowerInvariant())) { continue }
+                    [pscustomobject][ordered]@{ TimeStamp = (Get-Date).ToString('s'); Login = $u.SamAccountName; UserName = $u.displayName; UserDN = $u.DistinguishedName; GroupName = $name; GroupDN = [string]$g }
+                }
+            } -OnResult {
+                param($m, $r)
+                if (-not $m.Data.Job.ContainsKey('Backup')) { $m.Data.Job.Backup = New-Object System.Collections.ArrayList }
+                foreach ($d in @($r.Data)) { [void]$m.Data.Job.Backup.Add($d) }
+            } -OnComplete {
+                param($m)
+                $job = $m.Data.Job
+                $backup = if ($job.ContainsKey('Backup')) { @($job.Backup) } else { @() }
+                if ($backup.Count -gt 0) {
+                    $file = Join-Path (Get-DataFolder 'Backup') ('Czlonkostwa_wylaczonych_{0:yyyyMMdd_HHmmss}.csv' -f (Get-Date))
+                    try {
+                        $encoding = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
+                        $backup | Export-Csv -LiteralPath $file -NoTypeInformation -Encoding $encoding -Delimiter ';'
+                    }
+                    catch { Show-Error 'Nie udało się zapisać kopii członkostw – zmiany nie zostały wykonane.' $_; return }
+                    Write-Log ("Zapisano kopię {0} członkostw: {1}" -f $backup.Count, $file) 'OK'
+                }
+                else { Write-Log 'Wybrane konta nie należą do grup, z których można je usunąć.' 'INFO' }
+                $per = @{}
+                foreach ($g in ($backup | Group-Object Login)) { $per[$g.Name] = @{ Groups = @($g.Group | ForEach-Object { $_.GroupDN }); Move = $job.Move; Target = $job.Target } }
+                foreach ($l in $job.Logins) { if (-not $per.ContainsKey($l)) { $per[$l] = @{ Groups = @(); Move = $job.Move; Target = $job.Target } } }
+                $m.Data.JobPer = $per
+                Invoke-Deferred -Module $m -Action { param($m) & $m.Actions.Execute $m $m.Data.JobPer }
+            }
+        }
+        else {
+            $per = @{}
+            foreach ($l in $m.Data.Job.Logins) { $per[$l] = @{ Groups = @(); Move = $Move; Target = $target } }
+            & $m.Actions.Execute $m $per
+        }
+    }
+    $m.Actions.Execute = {
+        param($m, [hashtable]$Per)
+        Start-AdOperation -Module $m -Name 'Porządkowanie kont' -Targets @($Per.Keys) -PerTarget $Per -TargetColumn '' -Output None -ScriptBlock {
+            $u = Get-ADUser -Identity $Target @ad
+            $notes = @()
+            $removed = 0
+            foreach ($g in @($P.Groups)) {
+                try { Remove-ADGroupMember -Identity $g -Members $u.DistinguishedName -Confirm:$false @ad; $removed++ }
+                catch { $notes += "$(Get-DnName $g): $($_.Exception.Message)" }
+            }
+            $moved = $false
+            if ($P.Move) {
+                if ((Get-DnParent ([string]$u.DistinguishedName)) -ieq $P.Target) { $notes += 'już w docelowej OU' }
+                else { Move-ADObject -Identity $u.DistinguishedName -TargetPath $P.Target @ad; $moved = $true }
+            }
+            [pscustomobject]@{ Removed = $removed; Moved = $moved; Notes = ($notes -join '; ') }
+        } -OnResult {
+            param($m, $r)
+            foreach ($row in @(Find-ResultRow -Module $m -Column 'Login' -Value $r.Target)) {
+                if (-not $r.Ok) { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')); continue }
+                $d = @($r.Data)[0]
+                $parts = @()
+                if ($d.Moved) { $parts += 'Przeniesiono' }
+                if ($d.Removed) { $parts += "Usunięto z $($d.Removed) grup" }
+                if (-not $parts) { $parts += 'Gotowe' }
+                Set-RowState -Module $m -Row $row -State ($parts -join ', ') -Tone $(if ($d.Notes) { 'warn' } else { 'ok' }) -Note $d.Notes
+                if ($d.Removed) { Set-ResultValue -Module $m -Row $row -Column 'Do usunięcia z grup' -Value 0 }
+            }
+        } -OnComplete { param($m) & $m.Actions.Stats $m }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Przenieś do OU' -Icon 'E8DE' -Module $m -OnClick { param($m) & $m.Actions.Process $m $true $false } | Out-Null
+    Add-Button -Parent $row3 -Text 'Usuń z grup' -Icon 'E74D' -Module $m -Danger -OnClick { param($m) & $m.Actions.Process $m $false $true } | Out-Null
+    Add-Button -Parent $row3 -Text 'Przenieś i usuń z grup' -Icon 'E8DE' -Module $m -Danger -OnClick { param($m) & $m.Actions.Process $m $true $true } | Out-Null
+    $row4 = Add-ToolbarRow -Module $m -Title 'Ustawienia'
+    Add-Button -Parent $row4 -Text 'Wyjątki i grupy chronione…' -Icon 'E713' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $f = Show-FormDialog -Title 'Wyjątki i grupy chronione' -Subtitle 'Konta-wyjątki są pomijane w całości; z grup chronionych nikt nie jest usuwany. Jedna nazwa w wierszu (login, nazwa konta lub nazwa grupy).' -Icon 'E713' -Width 620 -Fields @(
+            @{ Key = 'Exceptions'; Label = 'Konta-wyjątki'; Type = 'Multi'; Value = (@($script:Settings.ExceptionUsers) -join "`r`n") }
+            @{ Key = 'Protected'; Label = 'Grupy chronione'; Type = 'Multi'; Value = (@($script:Settings.ProtectedGroups) -join "`r`n") }
+        )
+        if (-not $f) { return }
+        $script:Settings.ExceptionUsers = @(Get-TextLines $f.Exceptions)
+        $script:Settings.ProtectedGroups = @(Get-TextLines $f.Protected)
+        Export-Settings
+        Show-Toast 'Zapisano wyjątki i grupy chronione – wyszukaj ponownie.' 'ok'
+    } | Out-Null
+    Add-Button -Parent $row4 -Text 'Przywróć członkostwa z kopii…' -Icon 'E7A7' -Module $m -OnClick {
+        param($m)
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Filter = 'Kopie członkostw (*.csv)|*.csv'
+        $dlg.InitialDirectory = Get-DataFolder 'Backup'
+        if ($dlg.ShowDialog($script:UI.Window) -ne $true) { return }
+        & $m.Actions.Restore $m $dlg.FileName
+    } | Out-Null
+    $m.Actions.Restore = {
+        param($m, [string]$Path)
+        $text = Read-TextFileAuto -Path $Path
+        $d = Get-CsvDelimiterGuess (@($text -split "\r?\n")[0])
+        $rows = @($text -split "\r?\n" | Where-Object { $_.Trim() } | ConvertFrom-Csv -Delimiter $d)
+        $rows = @($rows | Where-Object { $_.PSObject.Properties['GroupDN'] -and ($_.PSObject.Properties['Login'] -or $_.PSObject.Properties['SamAccountName']) })
+        if ($rows.Count -eq 0) { Show-Warning 'Plik nie wygląda na kopię członkostw (wymagane kolumny Login lub SamAccountName oraz GroupDN).'; return }
+        $per = @{}
+        foreach ($r in $rows) {
+            $g = [string]$r.GroupDN
+            $login = if ($r.PSObject.Properties['Login']) { [string]$r.Login } else { [string]$r.SamAccountName }
+            if (-not $per.ContainsKey($g)) { $per[$g] = @{ Logins = New-Object System.Collections.ArrayList } }
+            [void]$per[$g].Logins.Add($login)
+        }
+        foreach ($k in @($per.Keys)) { $per[$k] = @{ Logins = @($per[$k].Logins) } }
+        if (-not (Confirm-Action -Text "Przywrócić $($rows.Count) członkostw w $($per.Count) grupach z pliku $([System.IO.Path]::GetFileName($Path))?" -Items @($rows | ForEach-Object { '{0}  →  {1}' -f $(if ($_.PSObject.Properties['Login']) { $_.Login } else { $_.SamAccountName }), (Get-RdnValue ([string]$_.GroupDN)) }) -ConfirmText 'Przywróć')) { return }
+        Start-AdOperation -Module $m -Name 'Przywracanie członkostw' -Targets @($per.Keys) -PerTarget $per -TargetColumn '' -Output Log -ScriptBlock {
+            foreach ($l in $P.Logins) {
+                try { $u = Get-ADUser -Identity $l @ad; Add-ADGroupMember -Identity $Target -Members $u.DistinguishedName @ad; "Przywrócono: $l → $(Get-DnName $Target)" }
+                catch { "Błąd – $l → $(Get-DnName $Target): $($_.Exception.Message)" }
+            }
+        }
+    }
+    Add-RowAction -Module $m -Text 'Pokaż grupy konta' -Icon 'E902' -Action {
+        param($m, $rows)
+        $login = [string](Get-ObjectValue $rows[0] 'Login')
+        Start-AdOperation -Module $m -Name 'Grupy konta' -Targets @($login) -TargetColumn '' -Output None -Parameters @{ Protected = @($script:Settings.ProtectedGroups) } -ScriptBlock {
+            $u = Get-ADUser -Identity $Target -Properties memberOf @ad
+            $prot = @{}
+            foreach ($g in $P.Protected) { $prot[([string]$g).ToLowerInvariant()] = $true }
+            foreach ($g in @($u.memberOf)) { [pscustomobject]@{ 'Grupa' = Get-DnName $g; 'Chroniona' = $prot.ContainsKey((Get-DnName $g).ToLowerInvariant()); 'DN' = [string]$g } }
+        } -OnResult {
+            param($m, $r)
+            $m.Data.Popup = @{ Title = "Grupy konta $($r.Target)"; Rows = @($r.Data) }
+            Invoke-Deferred -Module $m -Action { param($m) Show-GridDialog -Title $m.Data.Popup.Title -Rows $m.Data.Popup.Rows }
+        }
+    }
+    Add-StatTile -Module $m -Key 'accounts' -Label 'Wyłączone konta' -Icon 'E8D8' | Out-Null
+    Add-StatTile -Module $m -Key 'memberships' -Label 'Członkostwa do usunięcia' -Icon 'E902' | Out-Null
+    Add-StatTile -Module $m -Key 'exceptions' -Label 'Wyjątki' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'done' -Label 'Przetworzone' -Icon 'E73E' | Out-Null
+    $m.EmptyHint = 'Ustaw jednostkę dla wyłączonych kont i kliknij «Szukaj» (F5). Akcje dotyczą zaznaczonych wierszy (albo wszystkich widocznych).'
+}
+#endregion
+
+#region Pliki i uprawnienia: nadawanie uprawnień NTFS, raport uprawnień, sumy kontrolne
+$script:NtfsRights = [ordered]@{
+    'Odczyt'               = [int][System.Security.AccessControl.FileSystemRights]::Read
+    'Odczyt i wykonywanie' = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+    'Zapis'                = [int][System.Security.AccessControl.FileSystemRights]::Write
+    'Modyfikacja'          = [int][System.Security.AccessControl.FileSystemRights]::Modify
+    'Pełna kontrola'       = [int][System.Security.AccessControl.FileSystemRights]::FullControl
+}
+# Zakres (dotyczy): flagi dziedziczenia (ContainerInherit = 1, ObjectInherit = 2) i propagacji (InheritOnly = 2)
+$script:NtfsScopes = [ordered]@{
+    'Ten folder'                     = @(0, 0)
+    'Ten folder i podfoldery'        = @(1, 0)
+    'Ten folder i pliki'             = @(2, 0)
+    'Ten folder, podfoldery i pliki' = @(3, 0)
+    'Tylko podfoldery'               = @(1, 2)
+    'Tylko pliki'                    = @(2, 2)
+    'Tylko podfoldery i pliki'       = @(3, 2)
+}
+
+function Find-ListLabel {
+    # Wartość wpisana w komórce -> etykieta z listy (dokładnie albo jednoznaczny początek, bez wielkości liter)
+    param([string]$Text, [string[]]$Labels)
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return '' }
+    foreach ($l in $Labels) { if ($l -ieq $t) { return $l } }
+    $hits = @($Labels | Where-Object { $_.StartsWith($t, [StringComparison]::OrdinalIgnoreCase) })
+    if ($hits.Count -eq 1) { return $hits[0] }
+    return ''
+}
+
+function Select-FolderPath {
+    param([string]$Description = 'Wybierz folder', [string]$Selected = '')
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = $Description
+    $dlg.ShowNewFolderButton = $false
+    if ($Selected -and (Test-Path -LiteralPath $Selected)) { $dlg.SelectedPath = $Selected }
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return $dlg.SelectedPath
+}
+
+function Add-FolderField {
+    # Pole ścieżki folderu z przyciskiem wyboru i polem komputera zdalnego (opcjonalnie)
+    param([hashtable]$Module, [string]$Title = 'Folder', [string]$Remember = 'Path')
+    $row = Add-ToolbarRow -Module $Module -Title $Title
+    $box = Add-TextBox -Parent $row -Width 420 -Placeholder 'np. \\serwer\dane\Dział albo D:\Dane' -Text ([string](Get-ModuleSetting -Module $Module -Name $Remember -Default ''))
+    Add-Button -Parent $row -Text '' -Icon 'E838' -Module $Module -AlwaysEnabled -ToolTip 'Wybierz folder' -OnClick {
+        param($m)
+        $p = Select-FolderPath -Selected $m.Path.Text.Trim()
+        if ($p) { $m.Path.Text = $p }
+    } | Out-Null
+    Add-Label -Parent $row -Text 'na komputerze' | Out-Null
+    $computer = Add-TextBox -Parent $row -Width 150 -Placeholder 'lokalnie / UNC'
+    $computer.ToolTip = 'Opcjonalnie: serwer, na którym ścieżka jest lokalna (np. D:\Dane) – operacja wykona się na nim przez PowerShell Remoting (szybciej przy dużych drzewach)'
+    Register-ControlHandler -Control $box -EventName 'TextChanged' -Module $Module -Action { param($m, $s) Set-ModuleSetting -Module $m -Name 'Path' -Value $s.Text.Trim() }
+    return @($box, $computer)
+}
+
+$script:NtfsAclHelpers = @'
+# Metody .NET zamiast Get-Acl/Set-Acl i właściwości Access/Owner (rozszerzenia typów bywają niedostępne w wątkach w tle)
+function Get-ItemAcl($Item, [switch]$WithOwner) {
+    # Tylko sekcja uprawnień (DACL) - Set-Acl z Get-Acl próbowałby też zmienić właściciela
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access
+    if ($WithOwner) { $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Owner }
+    if ($Item.PSObject.Methods['GetAccessControl']) { return $Item.GetAccessControl($sections) }
+    return [System.IO.FileSystemAclExtensions]::GetAccessControl($Item, $sections)
+}
+function Set-ItemAcl($Item, $Acl) {
+    if ($Item.PSObject.Methods['SetAccessControl']) { $Item.SetAccessControl($Acl) } else { [System.IO.FileSystemAclExtensions]::SetAccessControl($Item, $Acl) }
+}
+function Get-AclRules($Acl) {
+    # Wpisy z nazwami kont; nierozpoznane SID (usunięte konta) zostają jako SID
+    return @($Acl.GetAccessRules($true, $true, [System.Security.Principal.NTAccount]))
+}
+function Get-AclOwner($Acl) {
+    try { return [string]$Acl.GetOwner([System.Security.Principal.NTAccount]) }
+    catch { try { return [string]$Acl.GetOwner([System.Security.Principal.SecurityIdentifier]) } catch { return '' } }
+}
+'@
+
+$script:NtfsApplyCore = @'
+$item = Get-Item -LiteralPath $P.Path -Force -ErrorAction Stop
+if (-not $item.PSIsContainer) { throw "To nie jest folder: $($P.Path)" }
+$acl = Get-ItemAcl $item
+if ($P.Protect) { $acl.SetAccessRuleProtection($true, $true) }
+foreach ($e in $P.Entries) {
+    $sid = New-Object System.Security.Principal.SecurityIdentifier([string]$e.Sid)
+    if ($P.Purge) { $acl.PurgeAccessRules($sid) }
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, [System.Security.AccessControl.FileSystemRights][int]$e.Rights,
+        [System.Security.AccessControl.InheritanceFlags][int]$e.Inherit, [System.Security.AccessControl.PropagationFlags][int]$e.Propagate,
+        [System.Security.AccessControl.AccessControlType]::Allow)
+    $acl.AddAccessRule($rule)
+}
+Set-ItemAcl $item $acl
+foreach ($e in $P.Entries) { [pscustomobject]@{ Sid = [string]$e.Sid; Ok = $true } }
+'@
+
+$script:NtfsScanCore = @'
+# Wpisy ACL folderu i (opcjonalnie) plików do zadanej głębokości; $P.Depth < 0 = bez limitu
+function Get-RightsLabel([int]$Value) {
+    switch ($Value) {
+        2032127 { 'Pełna kontrola' } 1245631 { 'Modyfikacja' } 1179817 { 'Odczyt i wykonywanie' } 1179785 { 'Odczyt' } 1180063 { 'Odczyt i zapis' }
+        1179926 { 'Zapis' } 278 { 'Zapis' } 1180086 { 'Zapis' } 268435456 { 'Pełna kontrola (ogólne)' } -536805376 { 'Modyfikacja (ogólne)' }
+        -1610612736 { 'Odczyt i wykonywanie (ogólne)' } 1179808 { 'Wyświetlanie zawartości folderu' } 131241 { 'Wyświetlanie zawartości folderu' }
+        default { 'Specjalne: ' + [string][System.Security.AccessControl.FileSystemRights]$Value }
+    }
+}
+function Get-ScopeLabel([int]$Inherit, [int]$Propagate) {
+    $only = ($Propagate -band 2) -ne 0
+    switch ($Inherit) {
+        0 { 'Ten folder' } 1 { if ($only) { 'Tylko podfoldery' } else { 'Ten folder i podfoldery' } } 2 { if ($only) { 'Tylko pliki' } else { 'Ten folder i pliki' } }
+        3 { if ($only) { 'Tylko podfoldery i pliki' } else { 'Ten folder, podfoldery i pliki' } } default { "flagi $Inherit/$Propagate" }
+    }
+}
+$hidden = @($P.Hidden)
+$emit = {
+    param($Item, [int]$Level)
+    $acl = $null
+    $owner = ''
+    try { $acl = Get-ItemAcl $Item -WithOwner; $owner = Get-AclOwner $acl } catch { }
+    if (-not $acl) { try { $acl = Get-ItemAcl $Item } catch { [pscustomobject][ordered]@{ 'Ścieżka' = $Item.FullName; 'Element' = $(if ($Item.PSIsContainer) { 'Folder' } else { 'Plik' }); 'Poziom' = $Level; 'Tożsamość' = ''; 'Uprawnienia' = ''; 'Typ' = ''; 'Dziedziczone' = $null; 'Dotyczy' = ''; 'Dziedziczenie folderu' = ''; 'Właściciel' = ''; 'Uwagi' = "Brak dostępu: $($_.Exception.Message)"; '__tone' = 'crit' }; return } }
+    $protected = $acl.AreAccessRulesProtected
+    foreach ($r in (Get-AclRules $acl)) {
+        $id = [string]$r.IdentityReference
+        if ($P.ExplicitOnly -and $r.IsInherited) { continue }
+        if ($P.HideSystem) {
+            $skip = $false
+            foreach ($h in $hidden) { if ($id -ieq $h -or $id.EndsWith('\' + $h, [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break } }
+            if ($skip) { continue }
+        }
+        if ($P.HideSids -and $id -match '^S-1-') { continue }
+        [pscustomobject][ordered]@{
+            'Ścieżka'               = $Item.FullName
+            'Element'               = $(if ($Item.PSIsContainer) { 'Folder' } else { 'Plik' })
+            'Poziom'                = $Level
+            'Tożsamość'             = $id
+            'Uprawnienia'           = Get-RightsLabel ([int]$r.FileSystemRights)
+            'Typ'                   = $(if ([string]$r.AccessControlType -eq 'Allow') { 'Zezwalaj' } else { 'Odmawiaj' })
+            'Dziedziczone'          = [bool]$r.IsInherited
+            'Dotyczy'               = Get-ScopeLabel ([int]$r.InheritanceFlags) ([int]$r.PropagationFlags)
+            'Dziedziczenie folderu' = $(if ($protected) { 'Wyłączone' } else { 'Włączone' })
+            'Właściciel'            = $owner
+            'Uwagi'                 = $(if ($id -match '^S-1-') { 'Nierozwiązany SID (usunięte konto?)' } else { '' })
+            '__tone'                = $(if ([string]$r.AccessControlType -ne 'Allow') { 'crit' } elseif (-not $r.IsInherited) { 'info' } else { '' })
+            '__flag'                = $(if ($r.IsInherited) { 'muted' } else { '' })
+        }
+    }
+}
+$root = Get-Item -LiteralPath $P.Path -Force -ErrorAction Stop
+& $emit $root $P.BaseLevel
+if ($P.RootOnly) {
+    if ($P.Files) { foreach ($f in @(Get-ChildItem -LiteralPath $root.FullName -File -Force -ErrorAction SilentlyContinue)) { & $emit $f ($P.BaseLevel + 1) } }
+    return
+}
+$queue = New-Object System.Collections.Queue
+$queue.Enqueue(@($root, $P.BaseLevel))
+while ($queue.Count -gt 0) {
+    $cur = $queue.Dequeue()
+    $dir = $cur[0]
+    $level = [int]$cur[1]
+    if ($P.Depth -ge 0 -and $level -ge $P.Depth) { continue }
+    $children = @()
+    try { $children = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction Stop) }
+    catch { [pscustomobject][ordered]@{ 'Ścieżka' = $dir.FullName; 'Element' = 'Folder'; 'Poziom' = $level; 'Tożsamość' = ''; 'Uprawnienia' = ''; 'Typ' = ''; 'Dziedziczone' = $null; 'Dotyczy' = ''; 'Dziedziczenie folderu' = ''; 'Właściciel' = ''; 'Uwagi' = "Brak dostępu do zawartości: $($_.Exception.Message)"; '__tone' = 'crit' }; continue }
+    foreach ($c in $children) {
+        if ($c.PSIsContainer) { & $emit $c ($level + 1); $queue.Enqueue(@($c, ($level + 1))) }
+        elseif ($P.Files) { & $emit $c ($level + 1) }
+    }
+}
+'@
+
+function Get-NtfsCore([string]$Body) {
+    # Tekst skryptu wykonywanego lokalnie albo na serwerze: param($P) musi być pierwszy, potem funkcje pomocnicze
+    return "param(`$P)`n" + $script:NtfsAclHelpers + "`n" + $Body
+}
+
+$script:NtfsResolveScript = {
+    # Tożsamości do uprawnień: konto/grupa AD (DOMENA\nazwa + SID) albo konto lokalne / wbudowane (BUILTIN\Users)
+    $netbios = ''
+    try { $netbios = [string](Get-ADDomain @ad).NetBIOSName } catch { }
+    foreach ($e in $P.Entries) {
+        $res = [ordered]@{ Id = $e.Id; Name = ''; Sid = ''; Kind = ''; Error = '' }
+        $id = [string]$e.Identity
+        $found = $null
+        if ($id -notmatch '^(BUILTIN|NT AUTHORITY|NT SERVICE)\\' -and $id -notmatch '^(Everyone|Wszyscy|CREATOR OWNER)$') {
+            try { $found = Resolve-AdPrincipal -Id $id -Classes @('group', 'user', 'computer') } catch { $res.Error = $_.Exception.Message }
+        }
+        if ($found) {
+            $res.Name = $(if ($netbios) { "$netbios\" } else { '' }) + ([string]$found.sAMAccountName)
+            $res.Sid = [string]$found.objectSid
+            if (-not $res.Sid) { $res.Sid = [string](Get-ADObject -Identity $found.DistinguishedName -Properties objectSid @ad).objectSid }
+            $res.Kind = Get-ObjectKind ([string]$found.ObjectClass)
+            $res.Error = ''
+        }
+        else {
+            try {
+                $nt = New-Object System.Security.Principal.NTAccount($id)
+                $res.Sid = $nt.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                $res.Name = $id
+                $res.Kind = 'Konto lokalne / wbudowane'
+                $res.Error = ''
+            }
+            catch { if (-not $res.Error) { $res.Error = "Nie rozpoznano «$id»." } }
+        }
+        [pscustomobject]$res
+    }
+}
+
+function Update-NtfsRow {
+    # Normalizacja kolumn Uprawnienie i Zakres po edycji; błędne wartości oznaczają wiersz
+    param([hashtable]$Module, $Row, [switch]$Edited)
+    $r = Find-ListLabel ([string]$Row['Uprawnienie']) @($script:NtfsRights.Keys)
+    $s = Find-ListLabel ([string]$Row['Zakres']) @($script:NtfsScopes.Keys)
+    if ($r -and $r -cne [string]$Row['Uprawnienie']) { Set-ResultValue -Module $Module -Row $Row -Column 'Uprawnienie' -Value $r }
+    if ($s -and $s -cne [string]$Row['Zakres']) { Set-ResultValue -Module $Module -Row $Row -Column 'Zakres' -Value $s }
+    if ([string](Get-ObjectValue $Row 'SID') -eq '') { return }
+    if (-not $r) { Set-RowState -Module $Module -Row $Row -State 'Błąd danych' -Tone 'crit' -Note ('Uprawnienie: ' + (@($script:NtfsRights.Keys) -join ', ')) }
+    elseif (-not $s) { Set-RowState -Module $Module -Row $Row -State 'Błąd danych' -Tone 'crit' -Note ('Zakres: ' + (@($script:NtfsScopes.Keys) -join ', ')) }
+    elseif ($Edited -and [string]$Row['Stan'] -eq 'Nadano') { Set-RowState -Module $Module -Row $Row -State 'Gotowe' -Tone 'info' -Note 'Zmieniono po nadaniu – można nadać ponownie' }
+    elseif (@('Nadano', 'Błąd') -notcontains [string]$Row['Stan']) { Set-RowState -Module $Module -Row $Row -State 'Gotowe' -Tone 'info' -Note '' }
+}
+
+function Set-NtfsColumn {
+    # Uprawnienie lub zakres w zaznaczonych wierszach (albo we wszystkich, gdy zaznaczono najwyżej jeden)
+    param([hashtable]$Module, [string]$Column, [string]$Value)
+    Complete-GridEdit -Module $Module
+    $rows = @(Get-SelectedResultRows -Module $Module | ForEach-Object { $_.Row })
+    if ($rows.Count -le 1) { $rows = @($Module.View | ForEach-Object { $_.Row }) }
+    $Module.Loading = $true
+    try {
+        foreach ($r in $rows) {
+            Set-ResultValue -Module $Module -Row $r -Column $Column -Value $Value
+            Update-NtfsRow -Module $Module -Row $r -Edited
+        }
+    }
+    finally { $Module.Loading = $false }
+    Show-Toast ("«{0}»: {1} – zmieniono w {2} wierszach." -f $Column, $Value, $rows.Count) 'info'
+}
+
+Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsGrant' -Title 'Nadawanie uprawnień' -Icon 'E72E' -Badge 'nowe' `
+    -Description 'Uprawnienia NTFS do folderu dla wielu grup lub kont naraz – każda z własnym poziomem i zakresem. Rozpoznawanie w AD (wpis przez SID), opcjonalne zastąpienie dotychczasowych wpisów i wyłączenie dziedziczenia; lokalnie, przez UNC albo na serwerze.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.EditableColumns = @('Uprawnienie', 'Zakres')
+    $m.OnCellEdit = { param($m, $row, $column) Update-NtfsRow -Module $m -Row $row -Edited }
+    $f = Add-FolderField -Module $m
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Tożsamości' -Multiline -Height 100 -Placeholder "Grupy lub konta – po jednej w wierszu (nazwa, sAMAccountName, DN, SID, BUILTIN\Users).`r`nOpcjonalnie po średniku uprawnienie i zakres: GG_Finanse;Modyfikacja;Ten folder, podfoldery i pliki"
+    $row = Add-ToolbarRow -Module $m -Title 'Domyślnie'
+    Add-Label -Parent $row -Text 'Uprawnienie' | Out-Null
+    $m.Right = Add-ComboBox -Parent $row -Items @($script:NtfsRights.Keys) -Width 180 -Selected 3
+    Add-Label -Parent $row -Text 'Zakres' | Out-Null
+    $m.Scope = Add-ComboBox -Parent $row -Items @($script:NtfsScopes.Keys) -Width 230 -Selected 3
+    $row2 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.Purge = Add-CheckBox -Parent $row2 -Text 'Zastąp dotychczasowe wpisy tych tożsamości' -ToolTip 'Usuwa jawne wpisy ACL tych grup/kont w folderze przed dodaniem nowych'
+    $m.Protect = Add-CheckBox -Parent $row2 -Text 'Wyłącz dziedziczenie (zachowaj kopię wpisów)'
+    $m.Actions.Resolve = {
+        param($m)
+        $path = $m.Path.Text.Trim()
+        if (-not $path) { Show-Warning 'Podaj folder.'; return }
+        $entries = @()
+        $i = 0
+        foreach ($line in (Get-TextLines $m.Input)) {
+            $parts = @($line -split ';' | ForEach-Object { $_.Trim() })
+            $i++
+            $entries += @{
+                Id = [string]$i; Identity = $parts[0]
+                Right = $(if ($parts.Count -gt 1 -and $parts[1]) { $parts[1] } else { [string]$m.Right.SelectedItem })
+                Scope = $(if ($parts.Count -gt 2 -and $parts[2]) { $parts[2] } else { [string]$m.Scope.SelectedItem })
+            }
+        }
+        if ($entries.Count -eq 0) { Show-Warning 'Wpisz grupy lub konta (po jednej w wierszu).'; return }
+        Reset-ResultTable -Module $m
+        $rows = foreach ($e in $entries) {
+            [pscustomobject][ordered]@{ 'Lp' = [int]$e.Id; 'Stan' = 'Sprawdzanie…'; 'Tożsamość' = $e.Identity; 'Rozpoznana' = ''; 'Rodzaj' = ''; 'Uprawnienie' = $e.Right; 'Zakres' = $e.Scope; 'SID' = ''; 'Uwagi' = ''; '__tone' = ''; '__id' = $e.Id }
+        }
+        Add-ResultRows -Module $m -Objects @($rows)
+        Start-AdOperation -Module $m -Name 'Rozpoznawanie tożsamości' -Targets @('AD') -Output None -Parameters @{ Entries = @($entries | ForEach-Object { @{ Id = $_.Id; Identity = $_.Identity } }) } -ScriptBlock $script:NtfsResolveScript -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { foreach ($row in @(Get-ResultRowsAll -Module $m)) { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note ((@($r.Errors)) -join ' ') }; return }
+            $m.Loading = $true
+            try {
+                foreach ($res in @($r.Data)) {
+                    foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value ([string]$res.Id))) {
+                        if ($res.Error) { Set-RowState -Module $m -Row $row -State 'Nie rozpoznano' -Tone 'crit' -Note $res.Error; continue }
+                        Set-ResultValue -Module $m -Row $row -Column 'Rozpoznana' -Value $res.Name
+                        Set-ResultValue -Module $m -Row $row -Column 'Rodzaj' -Value $res.Kind
+                        Set-ResultValue -Module $m -Row $row -Column 'SID' -Value $res.Sid
+                        Update-NtfsRow -Module $m -Row $row
+                    }
+                }
+            }
+            finally { $m.Loading = $false }
+        }
+    }
+    $m.Actions.Apply = {
+        param($m)
+        $path = $m.Path.Text.Trim()
+        if (-not $path) { Show-Warning 'Podaj folder.'; return }
+        Complete-GridEdit -Module $m
+        # Gotowe oraz te, których nadanie wcześniej się nie powiodło (ponowna próba)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'SID') -and @('Gotowe', 'Błąd') -contains [string](Get-ObjectValue $_ 'Stan') })
+        if ($rows.Count -eq 0) { Show-Warning 'Brak tożsamości gotowych do nadania uprawnień – kliknij «Sprawdź» i popraw wiersze z błędami.'; return }
+        $entries = @(foreach ($r in $rows) {
+                $scope = $script:NtfsScopes[[string]$r['Zakres']]
+                @{ Sid = [string]$r['SID']; Rights = $script:NtfsRights[[string]$r['Uprawnienie']]; Inherit = $scope[0]; Propagate = $scope[1]; Label = [string]$r['Rozpoznana'] }
+            })
+        $items = @($rows | ForEach-Object { '{0}: {1} ({2})' -f $_['Rozpoznana'], $_['Uprawnienie'], $_['Zakres'] })
+        $text = "Nadać uprawnienia do folderu:`r`n$path"
+        if ($m.Computer.Text.Trim()) { $text += "`r`n(na komputerze $($m.Computer.Text.Trim()))" }
+        if (Test-Checked $m.Purge) { $text += "`r`nDotychczasowe jawne wpisy tych tożsamości zostaną usunięte." }
+        if (Test-Checked $m.Protect) { $text += "`r`nDziedziczenie uprawnień z folderu nadrzędnego zostanie wyłączone (z kopią wpisów)." }
+        if (-not (Confirm-Action -Text $text -Items $items -ConfirmText 'Nadaj uprawnienia' -Danger:((Test-Checked $m.Purge) -or (Test-Checked $m.Protect)))) { return }
+        $params = @{ Path = $path; Entries = $entries; Purge = (Test-Checked $m.Purge); Protect = (Test-Checked $m.Protect); Core = (Get-NtfsCore $script:NtfsApplyCore) }
+        $computer = $m.Computer.Text.Trim()
+        $m.Data.ApplyIds = @($rows | ForEach-Object { [string]$_['__id'] })
+        foreach ($row in $rows) { Set-RowState -Module $m -Row $row -State 'Nadawanie…' -Tone '' -Note '' }
+        $onResult = {
+            param($m, $r)
+            foreach ($id in @($m.Data.ApplyIds)) {
+                foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value $id)) {
+                    if ($r.Ok) { Set-RowState -Module $m -Row $row -State 'Nadano' -Tone 'ok' -Note ('{0:HH:mm:ss}' -f (Get-Date)) }
+                    else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note ((@($r.Errors)) -join ' ') }
+                }
+            }
+        }
+        if ($computer) {
+            Start-HostOperation -Module $m -Name 'Nadawanie uprawnień' -Targets @($computer) -Output None -Parameters $params -OnResult $onResult -ScriptBlock {
+                param($P)
+                & ([scriptblock]::Create($P.Core)) $P
+            }
+        }
+        else {
+            Start-HostOperation -Module $m -Name 'Nadawanie uprawnień' -Targets @($path) -Local -Output None -Parameters $params -OnResult $onResult -ScriptBlock {
+                param($Target, $P, $Ctx)
+                & ([scriptblock]::Create($P.Core)) $P
+            }
+        }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Sprawdź' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Resolve | Out-Null
+    Add-Button -Parent $row3 -Text 'Nadaj uprawnienia' -Icon 'E72E' -Module $m -OnClick $m.Actions.Apply | Out-Null
+    $setItems = @()
+    foreach ($k in $script:NtfsRights.Keys) { $setItems += @{ Text = "Uprawnienie: $k"; Value = @('Uprawnienie', $k); Action = { param($m, $v) Set-NtfsColumn -Module $m -Column $v[0] -Value $v[1] } } }
+    $setItems += '-'
+    foreach ($k in $script:NtfsScopes.Keys) { $setItems += @{ Text = "Zakres: $k"; Value = @('Zakres', $k); Action = { param($m, $v) Set-NtfsColumn -Module $m -Column $v[0] -Value $v[1] } } }
+    Add-MenuButton -Parent $row3 -Text 'Ustaw w zaznaczonych' -Icon 'E70F' -Module $m -Items $setItems | Out-Null
+    Add-Button -Parent $row3 -Text 'Bieżące uprawnienia' -Icon 'E8A1' -Module $m -AlwaysEnabled -ToolTip 'Wpisy ACL folderu (bez podfolderów)' -OnClick {
+        param($m)
+        $path = $m.Path.Text.Trim()
+        if (-not $path) { Show-Warning 'Podaj folder.'; return }
+        $params = @{ Path = $path; Depth = 0; RootOnly = $true; Files = $false; BaseLevel = 0; ExplicitOnly = $false; HideSystem = $false; HideSids = $false; Hidden = @(); Core = (Get-NtfsCore $script:NtfsScanCore) }
+        Start-HostOperation -Module $m -Name 'Bieżące uprawnienia' -Targets @($path) -Local -Output None -Parameters $params -ScriptBlock {
+            param($Target, $P, $Ctx)
+            & ([scriptblock]::Create($P.Core)) $P
+        } -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { $m.Data.LastError = (@($r.Errors)) -join "`r`n"; Invoke-Deferred -Module $m -Action { param($m) Show-Error 'Nie można odczytać uprawnień folderu.' $m.Data.LastError }; return }
+            # Ścieżka, element i poziom są w tym oknie takie same dla wszystkich wierszy (folder jest w podtytule)
+            $m.Data.Popup = @($r.Data | Select-Object 'Tożsamość', 'Uprawnienia', 'Typ', 'Dziedziczone', 'Dotyczy', 'Dziedziczenie folderu', 'Właściciel', 'Uwagi', '__tone')
+            Invoke-Deferred -Module $m -Action { param($m) Show-GridDialog -Title 'Bieżące uprawnienia' -Subtitle $m.Path.Text.Trim() -Rows $m.Data.Popup -PillColumns @('Typ') }
+        }
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Usuń wiersze' -Icon 'E74D' -Action { param($m, $rows) Remove-ResultRows -Module $m -Rows $rows }
+    $m.EmptyHint = 'Podaj folder i tożsamości, kliknij «Sprawdź» (F5), popraw uprawnienia i zakresy w tabeli, a potem «Nadaj uprawnienia».'
+}
+
+Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsReport' -Title 'Raport uprawnień' -Icon 'E9F9' -Badge 'nowe' `
+    -Description 'Wpisy ACL folderów (i opcjonalnie plików) do zadanej głębokości: kto, jakie uprawnienia, czy dziedziczone, czego dotyczą, właściciel i wyłączone dziedziczenie. Filtry: tylko jawne wpisy, bez kont systemowych i nierozwiązanych SID. Eksport do CSV/HTML.' -Build {
+    param($m)
+    $m.PillColumns = @('Typ')
+    $m.ColorBools = $true
+    $f = Add-FolderField -Module $m
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $row = Add-ToolbarRow -Module $m -Title 'Zakres'
+    Add-Label -Parent $row -Text 'Głębokość' | Out-Null
+    $m.Depth = Add-Numeric -Parent $row -Value 2 -Minimum 0 -Maximum 100 -Width 60
+    $m.Unlimited = Add-CheckBox -Parent $row -Text 'Bez limitu'
+    $m.Files = Add-CheckBox -Parent $row -Text 'Także pliki'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Filtry'
+    $m.Explicit = Add-CheckBox -Parent $row2 -Text 'Tylko jawne wpisy (bez dziedziczonych)' -Checked $true
+    $m.HideSystem = Add-CheckBox -Parent $row2 -Text 'Ukryj konta systemowe' -Checked $true
+    $m.HideSids = Add-CheckBox -Parent $row2 -Text 'Ukryj nierozwiązane SID'
+    Add-Button -Parent $row2 -Text 'Konta systemowe…' -Icon 'E713' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $v = Show-FormDialog -Title 'Konta systemowe' -Subtitle 'Tożsamości ukrywane opcją «Ukryj konta systemowe» – pełna nazwa (np. NT AUTHORITY\SYSTEM) albo sama nazwa (np. Domain Admins).' -Icon 'E713' -Width 600 -Fields @(
+            @{ Key = 'List'; Label = 'Jedna tożsamość w wierszu'; Type = 'Multi'; Value = (@($script:Settings.NtfsHiddenIdentities) -join "`r`n") }
+        )
+        if (-not $v) { return }
+        $script:Settings.NtfsHiddenIdentities = @(Get-TextLines $v.List)
+        Export-Settings
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Generuj raport' -Icon 'E9F9' -Module $m -Primary -OnClick {
+        param($m)
+        $path = $m.Path.Text.Trim()
+        if (-not $path) { Show-Warning 'Podaj folder.'; return }
+        $depth = if (Test-Checked $m.Unlimited) { -1 } else { Get-Num $m.Depth }
+        $base = @{ Depth = $depth; Files = (Test-Checked $m.Files); ExplicitOnly = (Test-Checked $m.Explicit); HideSystem = (Test-Checked $m.HideSystem); HideSids = (Test-Checked $m.HideSids); Hidden = @($script:Settings.NtfsHiddenIdentities); Core = (Get-NtfsCore $script:NtfsScanCore) }
+        $computer = $m.Computer.Text.Trim()
+        Reset-StatTiles $m
+        if ($computer) {
+            $p = $base.Clone(); $p.Path = $path; $p.BaseLevel = 0; $p.RootOnly = $false
+            Start-HostOperation -Module $m -Name 'Raport uprawnień' -Targets @($computer) -TargetColumn '' -Parameters $p -ScriptBlock {
+                param($P)
+                & ([scriptblock]::Create($P.Core)) $P
+            } -OnComplete { param($m) & $m.Actions.Stats $m }
+            return
+        }
+        if (-not (Test-Path -LiteralPath $path)) { Show-Warning "Ścieżka nie istnieje lub jest niedostępna: $path"; return }
+        # Folder główny i każdy podfolder pierwszego poziomu jako osobne zadania (równolegle, z postępem)
+        $per = @{}
+        $root = $base.Clone(); $root.Path = $path; $root.BaseLevel = 0; $root.RootOnly = $true
+        $per[$path] = $root
+        if ($depth -ne 0) {
+            $subs = @()
+            try { $subs = @(Get-ChildItem -LiteralPath $path -Directory -Force -ErrorAction Stop) } catch { Write-Log "Nie można wyświetlić podfolderów: $($_.Exception.Message)" 'WARN' }
+            foreach ($s in $subs) { $p = $base.Clone(); $p.Path = $s.FullName; $p.BaseLevel = 1; $p.RootOnly = $false; $per[$s.FullName] = $p }
+        }
+        Start-HostOperation -Module $m -Name 'Raport uprawnień' -Targets @($per.Keys | Sort-Object) -PerTarget $per -Local -TargetColumn '' -ScriptBlock {
+            param($Target, $P, $Ctx)
+            & ([scriptblock]::Create($P.Core)) $P
+        } -OnComplete { param($m) & $m.Actions.Stats $m }
+    } | Out-Null
+    $m.Actions.Stats = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { $null -ne (Get-ObjectValue $_ 'Ścieżka') })
+        Set-StatTile -Module $m -Key 'items' -Value ([string]@($rows | ForEach-Object { [string]$_['Ścieżka'] } | Select-Object -Unique).Count)
+        Set-StatTile -Module $m -Key 'entries' -Value ([string]@($rows | Where-Object { [string]$_['Tożsamość'] }).Count)
+        Set-StatTile -Module $m -Key 'explicit' -Value ([string]@($rows | Where-Object { [string]$_['Dziedziczone'] -eq 'Nie' }).Count) -Tone 'info'
+        Set-StatTile -Module $m -Key 'broken' -Value ([string]@($rows | Where-Object { [string]$_['Dziedziczenie folderu'] -eq 'Wyłączone' } | ForEach-Object { [string]$_['Ścieżka'] } | Select-Object -Unique).Count) -Tone 'warn'
+        $denied = @($rows | Where-Object { [string]$_['Uwagi'] -like 'Brak dostępu*' }).Count
+        Set-StatTile -Module $m -Key 'denied' -Value ([string]$denied) -Tone $(if ($denied) { 'crit' } else { '' })
+    }
+    Add-RowAction -Module $m -Text 'Członkowie grupy (AD)' -Icon 'E716' -Action {
+        param($m, $rows)
+        $id = [string](Get-ObjectValue $rows[0] 'Tożsamość')
+        if (-not $id -or $id -match '^(BUILTIN|NT AUTHORITY|NT SERVICE|CREATOR)') { Show-Warning 'Wybierz wiersz z grupą domenową.'; return }
+        Start-AdOperation -Module $m -Name 'Członkowie grupy' -Targets @($id) -Output None -ScriptBlock {
+            $g = Resolve-AdPrincipal -Id $Target -Classes @('group')
+            foreach ($o in @(Get-GroupMemberObjects -GroupDn $g.DistinguishedName -Recursive)) {
+                [pscustomobject][ordered]@{ 'Członek' = $o.Name; 'Login' = ([string]$o.sAMAccountName) -replace '\$$', ''; 'Typ' = Get-ObjectKind ([string]$o.ObjectClass); 'Włączone' = $(if ([string]$o.ObjectClass -eq 'group') { $null } else { -not ([int64]$o.userAccountControl -band 2) }); 'DN' = [string]$o.DistinguishedName }
+            }
+        } -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { $m.Data.LastError = (@($r.Errors)) -join "`r`n"; Invoke-Deferred -Module $m -Action { param($m) Show-Error 'Nie udało się pobrać członków grupy.' $m.Data.LastError }; return }
+            $m.Data.Popup = @{ Title = "Członkowie (także zagnieżdżeni): $($r.Target)"; Rows = @($r.Data) }
+            Invoke-Deferred -Module $m -Action { param($m) Show-GridDialog -Title $m.Data.Popup.Title -Rows $m.Data.Popup.Rows }
+        }
+    }
+    Add-RowAction -Module $m -Text 'Otwórz w Eksploratorze' -Icon 'E838' -Action {
+        param($m, $rows)
+        $p = [string](Get-ObjectValue $rows[0] 'Ścieżka')
+        if ([string](Get-ObjectValue $rows[0] 'Element') -eq 'Plik') { $p = Split-Path -Path $p -Parent }
+        Open-Folder $p
+    }
+    Add-RowAction -Module $m -Text 'Kopiuj ścieżki' -Icon 'E8C8' -Action {
+        param($m, $rows)
+        $paths = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Ścieżka') } | Select-Object -Unique)
+        Set-ClipboardText ($paths -join [Environment]::NewLine)
+        Show-Toast "Skopiowano ścieżek: $($paths.Count)" 'ok'
+    }
+    Add-StatTile -Module $m -Key 'items' -Label 'Foldery i pliki' -Icon 'E838' | Out-Null
+    Add-StatTile -Module $m -Key 'entries' -Label 'Wpisy ACL' -Icon 'E72E' | Out-Null
+    Add-StatTile -Module $m -Key 'explicit' -Label 'Wpisy jawne' -Icon 'E70F' | Out-Null
+    Add-StatTile -Module $m -Key 'broken' -Label 'Wyłączone dziedziczenie' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'denied' -Label 'Brak dostępu' -Icon 'E72E' | Out-Null
+    $m.EmptyHint = 'Podaj folder i kliknij «Generuj raport» (F5). Duże drzewa najszybciej sprawdzisz na serwerze plików (pole «na komputerze»).'
+}
+
+$script:HashAlgorithms = @('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')
+
+Register-Module -Workspace 'Files' -Category 'Pliki' -Key 'FileHash' -Title 'Sumy kontrolne' -Icon 'E8EC' -Badge 'nowe' `
+    -Description 'Skróty MD5, SHA1, SHA256, SHA384 i SHA512 wielu plików i całych folderów (także przeciągniętych z Eksploratora), liczone w tle, z porównaniem z oczekiwaną wartością i historią w tabeli.' -Build {
+    param($m)
+    $m.PillColumns = @('Zgodność')
+    $row = Add-ToolbarRow -Module $m -Title 'Algorytm'
+    $m.Algorithm = Add-Segmented -Parent $row -Items $script:HashAlgorithms -Selected 2
+    $m.Recurse = Add-CheckBox -Parent $row -Text 'Podfoldery' -Checked $true
+    $m.Append = Add-CheckBox -Parent $row -Text 'Dopisuj do wyników (historia)' -Checked $true
+    $row2 = Add-ToolbarRow -Module $m -Title 'Porównaj z'
+    $m.Expected = Add-TextBox -Parent $row2 -Width 520 -Placeholder 'oczekiwany skrót (opcjonalnie) – np. z witryny producenta'
+    Add-Button -Parent $row2 -Text 'Porównaj' -Icon 'E73E' -Module $m -AlwaysEnabled -ToolTip 'Oznacza w tabeli pliki zgodne i niezgodne z oczekiwanym skrótem' -OnClick { param($m) & $m.Actions.Compare $m } | Out-Null
+    $m.Actions.Compare = {
+        param($m)
+        $exp = ($m.Expected.Text -replace '\s', '').ToUpperInvariant()
+        $match = 0; $diff = 0
+        foreach ($r in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Skrót') })) {
+            if (-not $exp) { Set-ResultValue -Module $m -Row $r -Column 'Zgodność' -Value ''; Set-ResultValue -Module $m -Row $r -Column '__tone' -Value ''; continue }
+            if ([string]$r['Skrót'] -eq $exp) { $match++; Set-ResultValue -Module $m -Row $r -Column 'Zgodność' -Value 'Zgodny'; Set-ResultValue -Module $m -Row $r -Column '__tone' -Value 'ok' }
+            else { $diff++; Set-ResultValue -Module $m -Row $r -Column 'Zgodność' -Value 'Inny'; Set-ResultValue -Module $m -Row $r -Column '__tone' -Value 'crit' }
+        }
+        Set-StatTile -Module $m -Key 'match' -Value ([string]$match) -Tone $(if ($match) { 'ok' } else { '' })
+        Set-StatTile -Module $m -Key 'diff' -Value ([string]$diff) -Tone $(if ($diff -and $exp) { 'crit' } else { '' })
+        if ($exp -and $match -eq 0) { Show-Toast 'Żaden plik nie ma oczekiwanego skrótu.' 'warn' }
+    }
+    $m.Actions.Hash = {
+        param($m, [string[]]$Paths)
+        $files = New-Object System.Collections.ArrayList
+        $missing = @()
+        Invoke-WithWaitCursor {
+            foreach ($p in $Paths) {
+                if (-not $p) { continue }
+                if (Test-Path -LiteralPath $p -PathType Container) {
+                    $gci = @{ LiteralPath = $p; File = $true; Force = $true; ErrorAction = 'SilentlyContinue' }
+                    if (Test-Checked $m.Recurse) { $gci.Recurse = $true }
+                    foreach ($f in @(Get-ChildItem @gci)) { [void]$files.Add($f.FullName) }
+                }
+                elseif (Test-Path -LiteralPath $p -PathType Leaf) { [void]$files.Add($p) }
+                else { $missing += $p }
+            }
+        }
+        foreach ($x in $missing) { Write-Log "Nie znaleziono: $x" 'WARN' }
+        if ($files.Count -eq 0) { Show-Warning 'Brak plików do sprawdzenia.'; return }
+        $algo = $script:HashAlgorithms[(Get-SegmentIndex $m.Algorithm)]
+        # Partie po 25 plików - równoległe liczenie i postęp na pasku stanu
+        $per = @{}
+        $batches = [Math]::Ceiling($files.Count / 25)
+        for ($i = 0; $i -lt $batches; $i++) {
+            $chunk = @($files[($i * 25)..([Math]::Min($files.Count, ($i + 1) * 25) - 1)])
+            $per[('Partia {0:D4}' -f ($i + 1))] = @{ Files = $chunk; Algorithm = $algo }
+        }
+        $m.Data.Total = $files.Count
+        Start-HostOperation -Module $m -Name "Sumy kontrolne ($algo)" -Targets @($per.Keys | Sort-Object) -PerTarget $per -Local -TargetColumn '' -Append:(Test-Checked $m.Append) -ScriptBlock {
+            param($Target, $P, $Ctx)
+            foreach ($f in $P.Files) {
+                $item = Get-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+                try {
+                    $h = Get-FileHash -LiteralPath $f -Algorithm $P.Algorithm -ErrorAction Stop
+                    [pscustomobject][ordered]@{ 'Plik' = $item.Name; 'Algorytm' = $P.Algorithm; 'Skrót' = $h.Hash; 'Zgodność' = ''; 'Rozmiar (B)' = [int64]$item.Length; 'Zmodyfikowano' = $item.LastWriteTime; 'Folder' = $item.DirectoryName; 'Ścieżka' = $f; 'Obliczono' = Get-Date; 'Uwagi' = '' }
+                }
+                catch { [pscustomobject][ordered]@{ 'Plik' = $(if ($item) { $item.Name } else { $f }); 'Algorytm' = $P.Algorithm; 'Skrót' = ''; 'Zgodność' = ''; 'Rozmiar (B)' = $null; 'Zmodyfikowano' = $null; 'Folder' = ''; 'Ścieżka' = $f; 'Obliczono' = Get-Date; 'Uwagi' = $_.Exception.Message; '__tone' = 'crit' } }
+            }
+        } -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Skrót') })
+            $size = 0
+            foreach ($r in $rows) { $v = Get-ObjectValue $r 'Rozmiar (B)'; if ($null -ne $v) { $size += [double]$v } }
+            Set-StatTile -Module $m -Key 'files' -Value ([string]$rows.Count)
+            Set-StatTile -Module $m -Key 'size' -Value (Format-Bytes $size)
+            if ($m.Expected.Text.Trim()) { & $m.Actions.Compare $m }
+        }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Pliki'
+    Add-Button -Parent $row3 -Text 'Wybierz pliki…' -Icon 'E8E5' -Module $m -Primary -OnClick {
+        param($m)
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Multiselect = $true
+        $dlg.Title = 'Pliki do sprawdzenia'
+        if ($dlg.ShowDialog($script:UI.Window) -ne $true) { return }
+        & $m.Actions.Hash $m @($dlg.FileNames)
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Wybierz folder…' -Icon 'E838' -Module $m -OnClick {
+        param($m)
+        $p = Select-FolderPath -Description 'Folder do sprawdzenia'
+        if ($p) { & $m.Actions.Hash $m @($p) }
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Wyczyść wyniki' -Icon 'E894' -Module $m -OnClick { param($m) Reset-ResultTable -Module $m; Reset-StatTiles $m } | Out-Null
+    Add-Label -Parent $row3 -Text 'Możesz też przeciągnąć pliki lub foldery z Eksploratora w dowolne miejsce tego widoku.' -Hint | Out-Null
+    Register-DropTarget -Control $m.Root -Module $m -Action { param($m, $paths) & $m.Actions.Hash $m $paths }
+    Add-RowAction -Module $m -Text 'Kopiuj skrót' -Icon 'E8C8' -Action {
+        param($m, $rows)
+        Set-ClipboardText ((@($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Skrót') })) -join [Environment]::NewLine)
+        Show-Toast 'Skopiowano skrót.' 'ok' 2
+    }
+    Add-RowAction -Module $m -Text 'Kopiuj w formacie «skrót  plik»' -Icon 'E8C8' -Action {
+        param($m, $rows)
+        Set-ClipboardText ((@($rows | ForEach-Object { '{0}  {1}' -f (Get-ObjectValue $_ 'Skrót'), (Get-ObjectValue $_ 'Plik') })) -join [Environment]::NewLine)
+        Show-Toast 'Skopiowano.' 'ok' 2
+    }
+    Add-RowAction -Module $m -Text 'Użyj jako oczekiwanego skrótu' -Icon 'E73E' -Action { param($m, $rows) $m.Expected.Text = [string](Get-ObjectValue $rows[0] 'Skrót'); & $m.Actions.Compare $m }
+    Add-StatTile -Module $m -Key 'files' -Label 'Pliki' -Icon 'E8A5' | Out-Null
+    Add-StatTile -Module $m -Key 'size' -Label 'Łączny rozmiar' -Icon 'EDA2' | Out-Null
+    Add-StatTile -Module $m -Key 'match' -Label 'Zgodne z oczekiwanym' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'diff' -Label 'Niezgodne' -Icon 'E7BA' | Out-Null
+    $m.EmptyHint = 'Wybierz pliki lub folder (albo przeciągnij je tutaj). Skróty liczą się w tle – można w tym czasie korzystać z innych modułów.'
+}
+#endregion
+
 #region Uruchomienie
 function Initialize-MainWindow {
     # Buduje okno główne (bez wyświetlania) - wydzielone, aby dało się je testować
@@ -9360,6 +14440,9 @@ function Initialize-MainWindow {
     $up = Initialize-UserPanel
     [void]$c.targetHost.Children.Add($up.Root)
     $c.panelUsers = $up.Root
+    $gp = Initialize-GroupPanel
+    [void]$c.targetHost.Children.Add($gp.Root)
+    $c.panelGroups = $gp.Root
 
     Initialize-Navigation
     Set-LogVisible ([bool]$script:Settings.LogVisible)
