@@ -75,7 +75,7 @@ $env:ADPS_LoadDefaultDrive = '0'
 #endregion
 
 #region Konfiguracja i stan
-$script:AppVersion = '4.2'
+$script:AppVersion = '4.3'
 
 $script:App = @{
     Name       = 'Domain Ops'
@@ -151,6 +151,9 @@ $script:Engine = @{
     NextId     = 1
     InTick     = $false
     Deferred   = New-Object System.Collections.ArrayList
+    # Zadania porzucone po przerwaniu (nie zareagowały w ciągu AbandonAfterSec sekund)
+    Abandoned  = New-Object System.Collections.ArrayList
+    AbandonAfterSec = 10
 }
 
 $script:LogContext = $null
@@ -755,8 +758,8 @@ $script:ThemeXaml = @'
     <Setter Property="Foreground" Value="#E4E8EF"/>
     <Setter Property="BorderBrush" Value="#2A323F"/>
     <Setter Property="BorderThickness" Value="1"/>
-    <Setter Property="Padding" Value="13,6"/>
-    <Setter Property="MinHeight" Value="32"/>
+    <Setter Property="Padding" Value="12,5"/>
+    <Setter Property="MinHeight" Value="30"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
     <Setter Property="Template">
@@ -820,8 +823,8 @@ $script:ThemeXaml = @'
     <Setter Property="Foreground" Value="#E4E8EF"/>
     <Setter Property="BorderBrush" Value="#2A323F"/>
     <Setter Property="BorderThickness" Value="1"/>
-    <Setter Property="Padding" Value="8,5"/>
-    <Setter Property="MinHeight" Value="32"/>
+    <Setter Property="Padding" Value="6,4"/>
+    <Setter Property="MinHeight" Value="30"/>
     <Setter Property="CaretBrush" Value="#E4E8EF"/>
     <Setter Property="SelectionBrush" Value="#3E6FE0"/>
     <Setter Property="VerticalContentAlignment" Value="Center"/>
@@ -830,10 +833,13 @@ $script:ThemeXaml = @'
         <ControlTemplate TargetType="TextBox">
           <Border x:Name="b" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
                   BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7">
-            <Grid Margin="{TemplateBinding Padding}">
+            <Grid>
+              <!-- Padding pola TextBox stosuje sam do tekstu - szablon nie dodaje go drugi raz -->
               <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-              <TextBlock x:Name="wm" Text="{TemplateBinding Tag}" Foreground="#5E6779" Margin="2,0,0,0"
-                         VerticalAlignment="{TemplateBinding VerticalContentAlignment}" IsHitTestVisible="False" Visibility="Collapsed"/>
+              <Border Margin="{TemplateBinding Padding}" IsHitTestVisible="False">
+                <TextBlock x:Name="wm" Text="{TemplateBinding Tag}" Foreground="#5E6779" Margin="2,0,0,0"
+                           VerticalAlignment="{TemplateBinding VerticalContentAlignment}" Visibility="Collapsed"/>
+              </Border>
             </Grid>
           </Border>
           <ControlTemplate.Triggers>
@@ -891,8 +897,8 @@ $script:ThemeXaml = @'
     <Setter Property="Foreground" Value="#E4E8EF"/>
     <Setter Property="BorderBrush" Value="#2A323F"/>
     <Setter Property="BorderThickness" Value="1"/>
-    <Setter Property="Padding" Value="8,5"/>
-    <Setter Property="MinHeight" Value="32"/>
+    <Setter Property="Padding" Value="6,4"/>
+    <Setter Property="MinHeight" Value="30"/>
     <Setter Property="CaretBrush" Value="#E4E8EF"/>
     <Setter Property="SelectionBrush" Value="#3E6FE0"/>
     <Setter Property="VerticalContentAlignment" Value="Center"/>
@@ -901,7 +907,7 @@ $script:ThemeXaml = @'
         <ControlTemplate TargetType="PasswordBox">
           <Border x:Name="b" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
                   BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7">
-            <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
+            <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="Center"/>
           </Border>
           <ControlTemplate.Triggers>
             <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="#4C7DF0"/></Trigger>
@@ -913,7 +919,7 @@ $script:ThemeXaml = @'
 
   <Style TargetType="ComboBox">
     <Setter Property="Foreground" Value="#E4E8EF"/>
-    <Setter Property="MinHeight" Value="32"/>
+    <Setter Property="MinHeight" Value="30"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
     <Setter Property="Template">
@@ -934,7 +940,7 @@ $script:ThemeXaml = @'
                 </ControlTemplate>
               </ToggleButton.Template>
             </ToggleButton>
-            <ContentPresenter IsHitTestVisible="False" Margin="10,0,28,0" VerticalAlignment="Center"
+            <ContentPresenter IsHitTestVisible="False" Margin="9,0,28,0" VerticalAlignment="Center"
                               Content="{TemplateBinding SelectionBoxItem}"
                               ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"/>
             <Popup IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True"
@@ -985,9 +991,10 @@ $script:ThemeXaml = @'
               <ColumnDefinition Width="Auto"/>
               <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
-            <Border x:Name="box" Width="17" Height="17" CornerRadius="4" BorderThickness="1" BorderBrush="#3A4352" Background="#1B212A" VerticalAlignment="Center">
+            <!-- 16 px: całe piksele przy skalowaniu 125/150/175% (17 px bywało przycinane od dołu) -->
+            <Border x:Name="box" Width="16" Height="16" Margin="0,1" CornerRadius="4" BorderThickness="1" BorderBrush="#3A4352" Background="#1B212A" VerticalAlignment="Center">
               <Grid>
-                <Path x:Name="mark" Data="M 3.5 8 L 6.5 11 L 12.5 4.5" Stroke="White" StrokeThickness="2" Visibility="Collapsed"
+                <Path x:Name="mark" Data="M 3 7.2 L 5.8 10 L 11 4.2" Stroke="White" StrokeThickness="2" Visibility="Collapsed"
                       StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
                 <Rectangle x:Name="dash" Width="8" Height="2" Fill="White" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center"/>
               </Grid>
@@ -1016,7 +1023,7 @@ $script:ThemeXaml = @'
 
   <Style x:Key="SegmentRadio" TargetType="RadioButton">
     <Setter Property="Foreground" Value="#8791A5"/>
-    <Setter Property="Padding" Value="12,5"/>
+    <Setter Property="Padding" Value="12,3"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
     <Setter Property="Template">
@@ -1041,7 +1048,7 @@ $script:ThemeXaml = @'
     <Setter Property="BorderBrush" Value="#242B36"/>
     <Setter Property="BorderThickness" Value="1"/>
     <Setter Property="CornerRadius" Value="8"/>
-    <Setter Property="Padding" Value="3"/>
+    <Setter Property="Padding" Value="2"/>
   </Style>
 
   <Style x:Key="WorkspaceTab" TargetType="RadioButton">
@@ -2199,13 +2206,20 @@ function Show-Error {
 }
 
 function Confirm-Action {
-    # Pytanie z listą obiektów, których dotyczy operacja
+    <#
+        Pytanie z listą obiektów, których dotyczy operacja. Zwraca $true/$false.
+        -Select: lista z polami wyboru (wszystkie zaznaczone) - można zawęzić operację do części obiektów
+                 bez zmiany zaznaczenia na liście po lewej. Zwraca wybrane pozycje z -Items (albo ich numery
+                 z -ReturnIndex); po anulowaniu nic nie zwraca. Wywołanie: $targets = @(Confirm-Action ... -Select)
+    #>
     param(
         [Parameter(Mandatory)][string]$Text,
         [string[]]$Items = @(),
         [string]$Title = 'Potwierdzenie',
         [string]$ConfirmText = 'Wykonaj',
-        [switch]$Danger
+        [switch]$Danger,
+        [switch]$Select,
+        [switch]$ReturnIndex
     )
     $body = @'
 <StackPanel>
@@ -2224,18 +2238,87 @@ function Confirm-Action {
       </ItemsControl>
     </ScrollViewer>
   </Border>
+  <StackPanel x:Name="cfSelHost" Margin="0,14,0,0" Visibility="Collapsed">
+    <TextBlock Text="Odznacz pozycje, których operacja ma nie dotyczyć (zaznaczenie na liście po lewej się nie zmieni)." Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="2,0,0,8"/>
+    <Grid Margin="0,0,0,8">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <TextBox x:Name="cfFilter" Tag="Filtruj listę (fragment nazwy)…"/>
+      <Button x:Name="cfAll" Grid.Column="1" Style="{StaticResource GhostButton}" Content="Zaznacz" Padding="8,3" Margin="6,0,0,0" ToolTip="Zaznacz widoczne pozycje"/>
+      <Button x:Name="cfNone" Grid.Column="2" Style="{StaticResource GhostButton}" Content="Odznacz" Padding="8,3" Margin="4,0,0,0" ToolTip="Odznacz widoczne pozycje"/>
+      <Button x:Name="cfInvert" Grid.Column="3" Style="{StaticResource GhostButton}" Content="Odwróć" Padding="8,3" Margin="4,0,0,0" ToolTip="Odwróć zaznaczenie widocznych pozycji"/>
+    </Grid>
+    <Border Style="{StaticResource Card}" Padding="6,4">
+      <ListBox x:Name="cfSel" MaxHeight="260" BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+               VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling">
+        <ListBox.ItemContainerStyle>
+          <Style TargetType="ListBoxItem">
+            <Setter Property="Padding" Value="4,1"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Focusable" Value="False"/>
+          </Style>
+        </ListBox.ItemContainerStyle>
+        <ListBox.ItemTemplate>
+          <DataTemplate>
+            <CheckBox IsChecked="{Binding [Sel], Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Content="{Binding [Text]}" Margin="2,2" ToolTip="{Binding [Text]}"/>
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+      </ListBox>
+    </Border>
+  </StackPanel>
   <TextBlock x:Name="cfCount" Foreground="#7B8496" FontSize="12" Margin="2,8,0,0" Visibility="Collapsed"/>
 </StackPanel>
 '@
     $tone = if ($Danger) { 'crit' } else { 'warn' }
-    $w = New-Dialog -Title $Title -Body $body -Tone $tone -OkText $ConfirmText -Danger:$Danger -Width 520
+    $list = @($Items | ForEach-Object { [string]$_ })
+    $useSelect = ($Select -and $list.Count -gt 1)
+    $validate = $null
+    if ($useSelect) {
+        $validate = {
+            param($w)
+            if ($w.Tag.SelTable.Select('Sel = true').Length -eq 0) { Show-Warning 'Zaznacz co najmniej jedną pozycję albo anuluj operację.'; return $false }
+            return $true
+        }
+    }
+    $w = New-Dialog -Title $Title -Body $body -Tone $tone -OkText $ConfirmText -Danger:$Danger -Width $(if ($useSelect) { 560 } else { 520 }) -Validate $validate
     $w.FindName('cfText').Text = $Text
-    $list = @($Items | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    if ($list.Count -gt 0) {
+    $count = $w.FindName('cfCount')
+    if ($useSelect) {
+        $table = New-Object System.Data.DataTable
+        [void]$table.Columns.Add('Sel', [bool])
+        [void]$table.Columns.Add('Text', [string])
+        [void]$table.Columns.Add('Index', [int])
+        for ($i = 0; $i -lt $list.Count; $i++) { [void]$table.Rows.Add($true, $list[$i], $i) }
+        $table.AcceptChanges()
+        $w.Tag.SelTable = $table
+        $w.Tag.SelView = $table.DefaultView
+        $w.Tag.SelCount = $count
+        $w.Tag.SelBulk = $false
+        # Licznik odświeżany chwilę po zmianie - w zdarzeniu ColumnChanged wiersz nie jest jeszcze zatwierdzony
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [TimeSpan]::FromMilliseconds(40)
+        $timer.Tag = $w
+        $timer.add_Tick($script:ConfirmSelectEvents.Tick)
+        $w.Tag.SelTimer = $timer
+        $w.add_Closed({ param($s, $e) if ($s.Tag.SelTimer) { $s.Tag.SelTimer.Stop() } })
+        $table.ExtendedProperties['Window'] = $w
+        $table.add_ColumnChanged($script:ConfirmSelectEvents.ColumnChanged)
+        $w.FindName('cfSelHost').Visibility = 'Visible'
+        $w.FindName('cfSel').ItemsSource = $w.Tag.SelView
+        $w.FindName('cfFilter').add_TextChanged($script:ConfirmSelectEvents.Filter)
+        foreach ($n in 'cfAll', 'cfNone', 'cfInvert') { $w.FindName($n).add_Click($script:ConfirmSelectEvents.Bulk) }
+        $count.Visibility = 'Visible'
+        Update-ConfirmSelectCount $w
+    }
+    elseif ($list.Count -gt 0) {
+        $shown = @($list | Where-Object { $_ })
         $w.FindName('cfListHost').Visibility = 'Visible'
-        $w.FindName('cfList').ItemsSource = @($list | Select-Object -First 200)
-        $count = $w.FindName('cfCount')
-        $count.Text = if ($list.Count -gt 200) { "Pozycji: $($list.Count) (pokazano 200)" } else { "Pozycji: $($list.Count)" }
+        $w.FindName('cfList').ItemsSource = @($shown | Select-Object -First 200)
+        $count.Text = if ($shown.Count -gt 200) { "Pozycji: $($shown.Count) (pokazano 200)" } else { "Pozycji: $($shown.Count)" }
         $count.Visibility = 'Visible'
     }
     # Przy operacjach niszczących domyślnym przyciskiem (Enter) jest Anuluj
@@ -2244,7 +2327,66 @@ function Confirm-Action {
         $w.FindName('btnCancel').IsDefault = $true
         $w.add_ContentRendered({ param($s, $e) [void]$s.FindName('btnCancel').Focus() })
     }
-    return (Invoke-Dialog $w)
+    $ok = Invoke-Dialog $w
+    if (-not $Select) { return $ok }
+    if (-not $ok) { return }
+    if (-not $useSelect) {
+        if ($ReturnIndex) { if ($list.Count -gt 0) { return @(0..($list.Count - 1)) } else { return } }
+        return $list
+    }
+    $chosen = @($w.Tag.SelTable.Select('Sel = true', 'Index ASC'))
+    if ($chosen.Count -lt $list.Count) { Write-Log ("Wybrano {0} z {1} pozycji do operacji." -f $chosen.Count, $list.Count) }
+    if ($ReturnIndex) { return @($chosen | ForEach-Object { [int]$_['Index'] }) }
+    return @($chosen | ForEach-Object { [string]$_['Text'] })
+}
+
+function Update-ConfirmSelectCount($Window) {
+    $t = $Window.Tag
+    $n = $t.SelTable.Select('Sel = true').Length
+    $total = $t.SelTable.Rows.Count
+    $text = "Wybrano $n z $total"
+    if ($t.SelView.Count -ne $total) { $text += "   •   widoczne po filtrze: $($t.SelView.Count)" }
+    $t.SelCount.Text = $text
+    $t.SelCount.Foreground = Get-Brush $(if ($n -eq 0) { '#FF7A86' } elseif ($n -lt $total) { '#F5C46B' } else { '#7B8496' })
+}
+
+$script:ConfirmSelectEvents = @{
+    ColumnChanged = {
+        param($s, $e)
+        $w = $s.ExtendedProperties['Window']
+        if ($w -and -not $w.Tag.SelBulk) { $w.Tag.SelTimer.Stop(); $w.Tag.SelTimer.Start() }
+    }
+    Tick          = {
+        param($s, $e)
+        $s.Stop()
+        Update-ConfirmSelectCount $s.Tag
+    }
+    Filter        = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        $text = $s.Text.Trim()
+        $filter = ''
+        if ($text) {
+            # Znaki specjalne wyrażenia LIKE (* % [ ]) w nawiasach, apostrof podwojony
+            $escaped = ($text -replace '([\*\%\[\]])', '[$1]').Replace("'", "''")
+            $filter = "Text LIKE '*$escaped*'"
+        }
+        $w.Tag.SelView.RowFilter = $filter
+        Update-ConfirmSelectCount $w
+    }
+    Bulk          = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        $w.Tag.SelBulk = $true
+        try {
+            foreach ($rv in @($w.Tag.SelView)) {
+                $value = switch ($s.Name) { 'cfAll' { $true } 'cfNone' { $false } default { -not [bool]$rv['Sel'] } }
+                if ([bool]$rv.Row['Sel'] -ne $value) { $rv.Row['Sel'] = $value }
+            }
+        }
+        finally { $w.Tag.SelBulk = $false }
+        Update-ConfirmSelectCount $w
+    }
 }
 
 function Show-CredentialDialog {
@@ -2973,7 +3115,8 @@ $script:ModuleViewXaml = @'
       <Border x:Name="busyChip" Style="{StaticResource Chip}" Background="#1A2640" Padding="12,5" Visibility="Collapsed" VerticalAlignment="Center">
         <StackPanel Orientation="Horizontal">
           <Ellipse Width="8" Height="8" Fill="#4C7DF0" Margin="0,0,8,0" VerticalAlignment="Center"/>
-          <TextBlock x:Name="busyText" Text="Trwa operacja…" Foreground="#8CC0FF" FontSize="12"/>
+          <TextBlock x:Name="busyText" Text="Trwa operacja…" Foreground="#8CC0FF" FontSize="12" VerticalAlignment="Center"/>
+          <Button x:Name="btnStopOp" Style="{StaticResource GhostButton}" Padding="6,0" MinHeight="20" Margin="10,-2,-6,-2" ToolTip="Przerwij operację w tym module"/>
         </StackPanel>
       </Border>
       <Button x:Name="btnCollapse" Style="{StaticResource GhostButton}" Padding="8,4" MinHeight="28" ToolTip="Zwiń / rozwiń panel parametrów"/>
@@ -3059,7 +3202,7 @@ function New-ModuleView {
     $Module.Root = $root
     foreach ($n in 'paramsCard', 'paramsStack', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
         'btnDetail', 'btnCopy', 'btnExport', 'grid', 'emptyState', 'emptyIcon', 'emptyText', 'emptyHint', 'detailCol', 'detailSplit',
-        'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse') {
+        'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse', 'btnStopOp') {
         $Module.View_[$n] = $root.FindName($n)
     }
     $Module.ParamsCard = $Module.View_['paramsCard']
@@ -3081,6 +3224,8 @@ function New-ModuleView {
     $v.btnDetailCopy.Content = New-IconContent -Text '' -Icon 'E8C8' -IconSize 11
     $v.btnCollapse.Content = New-IconContent -Text '' -Icon 'E70E' -IconSize 12
     $v.btnCollapse.Visibility = 'Collapsed'
+    $v.btnStopOp.Content = New-IconContent -Text 'Przerwij' -Icon 'E71A' -IconSize 10
+    Register-ControlHandler -Control $v.btnStopOp -EventName 'Click' -Module $Module -Action { param($m) Stop-ModuleOperations -Module $m }
     Register-ControlHandler -Control $v.btnCollapse -EventName 'Click' -Module $Module -Action {
         param($m)
         $m.ParamsCollapsed = -not $m.ParamsCollapsed
@@ -3356,6 +3501,10 @@ function Add-GridColumn {
         $col.Binding = $binding
         $style = New-Object System.Windows.Style ([System.Windows.Controls.TextBlock])
         $style.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.TextBlock]::TextTrimmingProperty, [System.Windows.TextTrimming]::CharacterEllipsis)))
+        # Wartości wielowierszowe (wynik polecenia, wpis logu ze stosem wywołań): w tabeli pierwsza linia, całość w panelu szczegółów
+        $style.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.TextBlock]::LineStackingStrategyProperty, [System.Windows.LineStackingStrategy]::BlockLineHeight)))
+        $style.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.TextBlock]::LineHeightProperty, [double]18)))
+        $style.Setters.Add((New-Object System.Windows.Setter([System.Windows.FrameworkElement]::MaxHeightProperty, [double]18)))
         $col.ElementStyle = $style
         if ($Module.GoodWhenNo -contains $Name) { $col.CellStyle = Get-ThemeResource 'BoolCellInv' }
         elseif ($Module.ColorBools) { $col.CellStyle = Get-ThemeResource 'BoolCell' }
@@ -3766,24 +3915,18 @@ function Export-ResultView {
 }
 
 function ConvertTo-HtmlReport {
-    # Samodzielny raport HTML (ciemny motyw jak w programie) z widocznych wierszy
+    # Samodzielny raport HTML (ciemny motyw jak w programie) z widocznych wierszy: wyszukiwarka, filtr i sortowanie
+    # kolumn, kopiowanie wiersza lub widocznych wierszy, otwieranie wiersza w osobnym oknie (32-htmlreport.ps1)
     param([hashtable]$Module, [string[]]$Columns, [object[]]$Rows)
     $enc = { param($t) ConvertTo-HtmlText $t }
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><title>').Append((& $enc $Module.Title)).Append('</title><style>')
-    [void]$sb.Append(':root{--bg:#0F1318;--card:#161B22;--line:#242B36;--text:#E4E8EF;--muted:#8791A5;--ok:#5EE3AE;--warn:#FFC46B;--crit:#FF7A86}')
-    [void]$sb.Append('*{box-sizing:border-box}body{margin:0;padding:32px;background:var(--bg);color:var(--text);font:13px/1.45 "Segoe UI",system-ui,sans-serif}')
-    [void]$sb.Append('h1{font-size:22px;margin:0 0 4px}.meta{color:var(--muted);margin-bottom:20px}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:auto}')
-    [void]$sb.Append('table{border-collapse:collapse;width:100%}th{position:sticky;top:0;background:#1B212A;color:var(--muted);text-align:left;font-weight:600;padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap}')
-    [void]$sb.Append('td{padding:7px 12px;border-bottom:1px solid #1F2530;vertical-align:top;white-space:pre-wrap}tr:nth-child(even) td{background:#181E26}')
-    [void]$sb.Append('tr.crit td{color:var(--crit)}tr.warn td{color:var(--warn)}tr.muted td{color:#7B8496}.pill{display:inline-block;padding:1px 9px;border-radius:9px;font-weight:600;background:#1E252F}')
-    [void]$sb.Append('.ok{color:var(--ok);background:#15291F}.p-warn{color:var(--warn);background:#2E2616}.p-crit{color:var(--crit);background:#2E1A1E}.info{color:#8CC0FF;background:#1A2640}</style></head><body>')
-    [void]$sb.Append('<h1>').Append((& $enc $Module.Title)).Append('</h1><div class="meta">')
     $filter = if ($Module.FilterBox) { $Module.FilterBox.Text.Trim() } else { '' }
     $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2} • wierszy: {3}' -f $script:AppVersion, (Get-Date), $env:USERNAME, $Rows.Count
     if ($filter) { $meta += " • filtr: $filter" }
     if ($Module.ColumnFilters.Count -gt 0) { $meta += ' • filtry kolumn: ' + (Get-ColumnFiltersText -Module $Module) }
-    [void]$sb.Append((& $enc $meta)).Append('</div><div class="card"><table><thead><tr>')
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append((Get-ReportHead -Title $Module.Title -Meta $meta))
+    [void]$sb.Append((Get-ReportBar -Mode 'rows' -Placeholder 'Szukaj we wszystkich kolumnach…' -Buttons @('copy', 'clear', 'print') -Extra ('<span class="cnt">wiersze: <b data-count-for="t1">' + $Rows.Count + '</b></span>')))
+    [void]$sb.Append('<div class="box"><table class="dt" id="t1"><thead><tr>')
     foreach ($c in $Columns) { [void]$sb.Append('<th>').Append((& $enc $c)).Append('</th>') }
     [void]$sb.Append('</tr></thead><tbody>')
     foreach ($drv in $Rows) {
@@ -3793,14 +3936,15 @@ function ConvertTo-HtmlReport {
         foreach ($c in $Columns) {
             $v = & $enc (Get-ExportValue -Module $Module -Row $drv -Column $c)
             if ($Module.PillColumns -contains $c -and $v) {
-                $cls = switch ($tone) { 'ok' { 'ok' } 'warn' { 'p-warn' } 'crit' { 'p-crit' } 'info' { 'info' } default { '' } }
+                $cls = switch ($tone) { 'ok' { 'ok' } 'warn' { 'warn' } 'crit' { 'crit' } 'info' { 'info' } default { '' } }
                 $v = "<span class=`"pill $cls`">$v</span>"
             }
             [void]$sb.Append('<td>').Append($v).Append('</td>')
         }
         [void]$sb.Append('</tr>')
     }
-    [void]$sb.Append('</tbody></table></div></body></html>')
+    [void]$sb.Append('</tbody></table></div>')
+    [void]$sb.Append((Get-ReportTail))
     return $sb.ToString()
 }
 
@@ -4474,6 +4618,142 @@ function Find-VisualParent {
 }
 #endregion
 
+#region Wspólne elementy raportów HTML (style, skrypt, nagłówek i pasek narzędzi)
+# Wszystkie raporty HTML programu korzystają z tych samych stylów i jednego skryptu:
+#  - przyciski działają przez atrybut data-act (bez onclick - w atrybutach onclick nazwy takie jak «all»
+#    trafiają na document.all zamiast na funkcję raportu),
+#  - tabele class="dt": sortowanie po kliknięciu nagłówka, filtr pod każdą kolumną, akcje wiersza
+#    (kopiuj, otwórz w osobnym oknie), kopiowanie widocznych wierszy do Excela,
+#  - karty class="card" i gałęzie drzewa: kopiowanie i otwieranie w osobnym oknie,
+#  - wyszukiwarka #q w trybie cards / rows / tree, zwijanie i rozwijanie list, druk z rozwiniętymi listami.
+# Raport nie pobiera niczego z sieci.
+$script:ReportCss = @'
+:root{--bg:#0F1318;--card:#161B22;--card2:#1B212A;--line:#242B36;--line2:#222935;--text:#E4E8EF;--muted:#8791A5;--faint:#5E6779;--ok:#5EE3AE;--warn:#FFC46B;--crit:#FF7A86;--info:#8CC0FF;--accent:#3E6FE0}
+*{box-sizing:border-box}body{margin:0;padding:28px 32px;background:var(--bg);color:var(--text);font:13.5px/1.5 "Segoe UI",system-ui,sans-serif}body.popup{padding:20px 22px}a{color:var(--info);text-decoration:none}a:hover{text-decoration:underline}
+h1{font-size:24px;margin:0 0 4px}.meta{color:var(--muted);margin-bottom:18px}
+.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 18px;min-width:140px}.tile b{display:block;font-size:22px;font-weight:600}.tile span{color:var(--muted);font-size:12px}
+.tile.ok b{color:var(--ok)}.tile.warn b{color:var(--warn)}.tile.crit b{color:var(--crit)}.tile.info b{color:var(--info)}
+.bar{position:sticky;top:0;z-index:5;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+input,select{background:var(--card2);color:var(--text);border:1px solid #2A323F;border-radius:7px;padding:7px 10px;font:inherit}.bar input#q{flex:0 1 380px}input[type=checkbox]{width:16px;height:16px;padding:0;margin:0;accent-color:#3E6FE0}
+button{background:var(--accent);color:#fff;border:0;border-radius:7px;padding:7px 14px;font:inherit;cursor:pointer}button.g{background:#1E252F;color:#C9D0DC}button:hover{filter:brightness(1.12)}.cnt{color:var(--muted);margin-left:auto}
+label.opt{display:inline-flex;align-items:center;gap:7px;color:#C9D0DC;cursor:pointer;white-space:nowrap}
+.box{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:auto;max-height:80vh}
+table{border-collapse:collapse;width:100%}th{background:#1B212A;color:var(--muted);text-align:left;font-weight:600;padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap;font-size:12.5px;position:sticky;top:0;z-index:2}
+td{padding:6px 12px;border-bottom:1px solid #1F2530;vertical-align:top;white-space:pre-wrap}tr:nth-child(even) td{background:#181E26}
+table.dt th.s{cursor:pointer;user-select:none}table.dt th.s:hover{color:var(--text)}table.dt th.asc::after{content:" ▲";color:var(--info)}table.dt th.desc::after{content:" ▼";color:var(--info)}
+table.dt tr.fl th{top:35px;padding:4px 6px;background:#181E26}table.dt tr.fl input{width:100%;min-width:70px;padding:3px 7px;font-size:12px;border-radius:5px}
+td.ra{white-space:nowrap;width:1%;padding:3px 6px}.ra button,.acts button,.cacts button{background:transparent;color:var(--muted);padding:1px 6px;border-radius:5px;font-size:13px;line-height:1.3}
+.ra button:hover,.acts button:hover,.cacts button:hover{background:#2A3342;color:var(--text);filter:none}tbody tr .ra{opacity:.35}tbody tr:hover .ra{opacity:1}
+tr.crit td{color:var(--crit)}tr.warn td{color:var(--warn)}tr.muted td{color:#7B8496}
+.pill{display:inline-block;padding:2px 11px;border-radius:10px;font-weight:600;font-size:12.5px;white-space:nowrap;background:#1E252F;color:#AEB6C4}.pill.ok{color:var(--ok);background:#15291F}.pill.warn{color:var(--warn);background:#2E2616}.pill.crit{color:var(--crit);background:#2E1A1E}.pill.info{color:var(--info);background:#1A2640}
+.chips{margin:10px 0 0}.chip{display:inline-block;font-size:11.5px;padding:1px 9px;border-radius:9px;margin:0 6px 4px 0;background:#1E252F;color:#C9D0DC}.chip.warn{background:#2E2616;color:var(--warn)}.chip.crit{background:#2E1A1E;color:var(--crit)}.chip.info{background:#1A2640;color:var(--info)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:0 0 16px;scroll-margin-top:80px}
+.head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.head h2{margin:0;font-size:18px}.sub{color:var(--muted);margin-top:2px}.top{font-size:12px;color:var(--faint)}.cacts{margin-top:4px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-top:14px}.sec{background:var(--card2);border:1px solid var(--line2);border-radius:10px;padding:10px 14px}
+.sec h3{margin:0 0 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}dl{display:grid;grid-template-columns:minmax(130px,42%) 1fr;gap:3px 12px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-word}dd.e{color:#3F4757}
+details{margin-top:12px;border:1px solid var(--line2);border-radius:10px;background:var(--card2);overflow:auto}summary{cursor:pointer;padding:9px 14px;font-weight:600;list-style:none}summary::-webkit-details-marker{display:none}summary::before{content:"▸";display:inline-block;width:16px;color:var(--muted)}details[open]>summary::before{content:"▾";color:var(--info)}
+.n{display:inline-block;margin-left:6px;padding:0 8px;border-radius:8px;background:#1A2640;color:var(--info);font-size:11.5px}.empty{padding:2px 14px 12px;color:var(--faint)}.note{padding:6px 14px 10px;color:var(--warn);font-size:12px}
+.lf{padding:2px 14px 8px}.lf input{width:260px;padding:4px 8px;font-size:12px}
+.tree details{margin:0 0 0 22px;border:0;background:transparent;overflow:visible}.tree details.root{margin:6px 0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 10px}
+.tree summary{padding:3px 4px;border-radius:6px;font-weight:400}.tree summary:hover{background:#1D2430}.leaf{margin-left:38px;padding:2px 4px;color:#AEB6C4;border-radius:6px}.leaf:hover{background:#1D2430}
+.acts{display:inline-block;margin-left:8px;opacity:0}summary:hover>.acts,.leaf:hover>.acts{opacity:1}
+.k{display:inline-block;font-size:11px;padding:0 7px;border-radius:8px;background:#1A2640;color:#8CC0FF;margin-left:8px}.d{color:#7B8496;font-style:italic;margin-left:8px}.w{color:#FF7A86;margin-left:8px}.m{color:#5E6779}
+.hit{background:#2E2616 !important;outline:1px solid #FFC46B}.hide{display:none !important}
+.errs{border-color:#4A2A32}.errs h2{color:var(--crit);font-size:15px;margin:0;padding:12px 14px}
+#dop-toast{position:fixed;right:20px;bottom:20px;background:#1E2530;border:1px solid #2F3846;color:var(--text);padding:9px 16px;border-radius:9px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:50}#dop-toast.on{opacity:1}
+@media print{body{background:#fff;color:#111;padding:0;font-size:11.5px}.bar,.top,.cacts,.acts,.ra,tr.fl,.lf,#dop-toast{display:none !important}.tile,.card,.sec,details,.box{background:#fff !important;border-color:#bbb;max-height:none}.card{break-inside:avoid-page}
+th{background:#eee;color:#333;position:static}td{border-color:#ddd}tr:nth-child(even) td{background:#fff}dt,.sub,.meta,.tile span,.sec h3{color:#555}.pill,.chip,.n,.k{border:1px solid #999;background:#fff !important;color:#111 !important}a{color:#111}.tile b{color:#111 !important}.hide{display:none !important}}
+'@
+
+$script:ReportJs = @'
+(function(){
+"use strict";
+function T(el){return (el.innerText||el.textContent||"").replace(/ /g," ").trim();}
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+var tt=null;function toast(m){var t=document.getElementById("dop-toast");if(!t)return;t.textContent=m;t.classList.add("on");clearTimeout(tt);tt=setTimeout(function(){t.classList.remove("on")},1800);}
+function fallbackCopy(s){var a=document.createElement("textarea");a.value=s;a.style.position="fixed";a.style.top="-1000px";document.body.appendChild(a);a.select();var ok=false;try{ok=document.execCommand("copy")}catch(e){}document.body.removeChild(a);toast(ok?"Skopiowano do schowka":"Nie udało się skopiować");}
+function copy(s){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(s).then(function(){toast("Skopiowano do schowka")},function(){fallbackCopy(s)})}else{fallbackCopy(s)}}
+function openWin(title,html){var w=window.open("","_blank","width=980,height=720,resizable=yes,scrollbars=yes");if(!w){toast("Przeglądarka zablokowała nowe okno – zezwól na wyskakujące okna dla tego pliku");return;}
+var css=document.getElementById("dop-css");w.document.open();w.document.write("<!DOCTYPE html><html lang=\"pl\"><head><meta charset=\"utf-8\"><title>"+esc(title)+"</title><style>"+(css?css.textContent:"")+"</style></head><body class=\"popup\">"+html+"</body></html>");w.document.close();}
+function clean(el){var c=el.cloneNode(true);c.querySelectorAll(".acts,.cacts,.ra,.lf,tr.fl,.top").forEach(function(x){x.remove()});c.querySelectorAll("details").forEach(function(d){d.open=true});c.querySelectorAll(".hide").forEach(function(x){x.classList.remove("hide")});return c;}
+function heads(tbl){var r=tbl.tHead?tbl.tHead.rows[0]:null;if(!r)return[];return Array.prototype.filter.call(r.cells,function(c){return !c.classList.contains("ra")}).map(T);}
+function cellsOf(tr){return Array.prototype.filter.call(tr.cells,function(c){return !c.classList.contains("ra")});}
+function rowLines(tr){var tbl=tr.closest("table"),h=heads(tbl),c=cellsOf(tr),out=[];for(var i=0;i<c.length;i++){var v=T(c[i]);if(v!=="")out.push((h[i]||("Kolumna "+(i+1)))+": "+v);}return out.join("\n");}
+function rowHtml(tr){var tbl=tr.closest("table"),h=heads(tbl),c=cellsOf(tr),s="<h1>"+esc(T(c[0]||tr))+"</h1><div class=\"meta\">"+esc(document.title)+"</div><div class=\"box\"><table>";for(var i=0;i<c.length;i++){s+="<tr><th style=\"position:static\">"+esc(h[i]||"")+"</th><td>"+c[i].innerHTML+"</td></tr>";}return s+"</table></div>";}
+function visibleTsv(tbl){var h=heads(tbl),lines=[h.join("\t")];Array.prototype.forEach.call(tbl.tBodies[0].rows,function(tr){if(tr.classList.contains("hide")||tr.style.display==="none")return;lines.push(cellsOf(tr).map(function(c){return T(c).replace(/[\t\r\n]+/g," ")}).join("\t"));});return {text:lines.join("\n"),n:lines.length-1};}
+function nodeText(el,depth){var pad=new Array(depth+1).join("  ");if(el.classList&&el.classList.contains("leaf"))return pad+T(el)+"\n";var s=el.querySelector(":scope>summary");var out=pad+(s?T(s):"")+"\n";Array.prototype.forEach.call(el.children,function(ch){if(ch.tagName==="DETAILS"||(ch.classList&&ch.classList.contains("leaf")))out+=nodeText(ch,depth+1);});return out;}
+function num(s){var t=String(s).replace(/\s/g,"").replace(",",".");return (t!==""&&!isNaN(t))?parseFloat(t):null;}
+function cmp(a,b){var x=num(a),y=num(b);if(x!==null&&y!==null)return x-y;return a.localeCompare(b,"pl",{sensitivity:"base",numeric:true});}
+function match(v,f){if(!f)return true;var neg=false;if(f.charAt(0)==="!"){neg=true;f=f.slice(1);if(!f)return true;}var lv=v.toLowerCase(),r;
+if(f.charAt(0)==="="){r=lv===f.slice(1).toLowerCase();}else if(f.charAt(0)===">"||f.charAt(0)==="<"){var a=f.slice(1).trim(),x=num(v),y=num(a);var c=(x!==null&&y!==null)?x-y:v.localeCompare(a,"pl",{numeric:true});r=f.charAt(0)===">"?c>0:c<0;if(v==="")r=false;}else{r=lv.indexOf(f.toLowerCase())>=0;}return neg?!r:r;}
+function applyTable(tbl){var fr=tbl.tHead.querySelector("tr.fl");var fs=fr?Array.prototype.map.call(fr.querySelectorAll("input"),function(i){return i.value.trim()}):[];var q=tbl.getAttribute("data-q")||"";var n=0,tot=0;
+Array.prototype.forEach.call(tbl.tBodies[0].rows,function(tr){tot++;var c=cellsOf(tr),ok=true;for(var i=0;i<fs.length&&ok;i++){if(fs[i]&&!match(T(c[i]||tr),fs[i]))ok=false;}if(ok&&q){ok=T(tr).toLowerCase().indexOf(q)>=0;}tr.classList.toggle("hide",!ok);if(ok)n++;});
+var cnt=document.querySelector("[data-count-for=\""+tbl.id+"\"]");if(cnt)cnt.textContent=(n===tot?String(tot):n+" z "+tot);return n;}
+function initTable(tbl,i){if(!tbl.id)tbl.id="dt"+i;var h=tbl.tHead?tbl.tHead.rows[0]:null;if(!h||!tbl.tBodies[0])return;var cols=h.cells.length;
+Array.prototype.forEach.call(h.cells,function(th,ci){th.classList.add("s");th.title="Kliknij, aby posortować";th.addEventListener("click",function(){var asc=!th.classList.contains("asc");Array.prototype.forEach.call(h.cells,function(x){x.classList.remove("asc","desc")});th.classList.add(asc?"asc":"desc");var rows=Array.prototype.slice.call(tbl.tBodies[0].rows);rows.sort(function(a,b){var r=cmp(T(cellsOf(a)[ci]||a),T(cellsOf(b)[ci]||b));return asc?r:-r;});rows.forEach(function(r){tbl.tBodies[0].appendChild(r)});});});
+if(tbl.getAttribute("data-filters")!=="no"){var fr=document.createElement("tr");fr.className="fl";for(var c=0;c<cols;c++){var th=document.createElement("th"),inp=document.createElement("input");inp.placeholder="filtr…";inp.title="Zawiera tekst; !tekst – nie zawiera; =tekst – dokładnie; >10, <2026-01-01 – większe/mniejsze";inp.addEventListener("input",function(){applyTable(tbl)});th.appendChild(inp);fr.appendChild(th);}var e=document.createElement("th");e.className="ra";fr.appendChild(e);tbl.tHead.appendChild(fr);}
+var eh=document.createElement("th");eh.className="ra";h.appendChild(eh);
+Array.prototype.forEach.call(tbl.tBodies[0].rows,function(tr){var td=document.createElement("td");td.className="ra";td.innerHTML="<button data-act=\"copy-row\" title=\"Kopiuj wiersz\">⧉</button><button data-act=\"open-row\" title=\"Otwórz w osobnym oknie\">↗</button>";tr.appendChild(td);});}
+function search(){var q=document.getElementById("q");if(!q)return;var v=q.value.trim().toLowerCase(),mode=q.getAttribute("data-mode")||"cards",n=0;
+if(mode==="rows"){document.querySelectorAll("table.dt").forEach(function(t){t.setAttribute("data-q",v);n+=applyTable(t)});}
+else if(mode==="tree"){document.querySelectorAll(".hit").forEach(function(e){e.classList.remove("hit")});document.querySelectorAll(".tree details.root").forEach(function(r){var h=!v||T(r).toLowerCase().indexOf(v)>=0;r.classList.toggle("hide",!h);if(h)n++;});if(v){document.querySelectorAll(".tree summary,.tree .leaf").forEach(function(e){var own=e.cloneNode(true);own.querySelectorAll(".acts").forEach(function(x){x.remove()});if(T(own).toLowerCase().indexOf(v)>=0){e.classList.add("hit");var p=e.parentElement;while(p&&p.tagName==="DETAILS"){p.open=true;p=p.parentElement;}}});}}
+else{document.querySelectorAll(".card").forEach(function(c){var h=!v||T(c).toLowerCase().indexOf(v)>=0;c.classList.toggle("hide",!h);if(h)n++;var t=document.getElementById("t-"+c.id);if(t)t.classList.toggle("hide",!h);});}
+var cnt=document.getElementById("cnt");if(cnt)cnt.textContent=n;}
+document.addEventListener("click",function(ev){var b=ev.target.closest("[data-act]");if(!b)return;var a=b.getAttribute("data-act");if(b.closest("summary"))ev.preventDefault();
+if(a==="expand"||a==="collapse"){var sel=b.getAttribute("data-sel")||"details";document.querySelectorAll(sel).forEach(function(d){d.open=(a==="expand")});}
+else if(a==="print"){window.print();}
+else if(a==="copy-row"){copy(rowLines(b.closest("tr")));}
+else if(a==="open-row"){var tr=b.closest("tr");openWin(T(cellsOf(tr)[0]||tr),rowHtml(tr));}
+else if(a==="copy-card"){copy(T(clean(b.closest(".card"))));}
+else if(a==="open-card"){var c=b.closest(".card");var h2=c.querySelector("h2");openWin(h2?T(h2):document.title,clean(c).outerHTML);}
+else if(a==="copy-node"){var n=b.closest(".leaf")||b.closest("details");copy(nodeText(n,0).replace(/\s+$/,""));}
+else if(a==="open-node"){var d=b.closest("details");var s=d.querySelector(":scope>summary");var c=clean(d);c.open=true;c.classList.add("root");openWin(s?T(clean(s)):document.title,"<div class=\"tree\">"+c.outerHTML+"</div>");}
+else if(a==="copy-visible"){var t=document.getElementById(b.getAttribute("data-table"))||document.querySelector("table.dt");if(t){var r=visibleTsv(t);copy(r.text);}}
+else if(a==="clear-filters"){document.querySelectorAll("table.dt tr.fl input").forEach(function(i){i.value=""});var q=document.getElementById("q");if(q)q.value="";document.querySelectorAll("table.dt").forEach(function(t){t.setAttribute("data-q","");applyTable(t)});search();}
+else if(a==="toggle"){var tg=b.getAttribute("data-class");document.body.classList.toggle(tg,b.checked);}});
+document.addEventListener("change",function(ev){var b=ev.target;if(b.getAttribute&&b.getAttribute("data-act")==="toggle"){document.body.classList.toggle(b.getAttribute("data-class"),b.checked);}});
+document.querySelectorAll("table.dt").forEach(initTable);
+document.querySelectorAll(".lf input").forEach(function(inp){inp.addEventListener("input",function(){var t=document.getElementById(inp.getAttribute("data-table"));if(t){t.setAttribute("data-q",inp.value.trim().toLowerCase());applyTable(t);}})});
+var q=document.getElementById("q");if(q)q.addEventListener("input",search);
+window.addEventListener("beforeprint",function(){document.querySelectorAll("details").forEach(function(d){d.open=true})});
+window.dopReport={copy:copy,openWin:openWin,applyTable:applyTable,search:search};
+})();
+'@
+
+function Get-ReportHead {
+    # Początek dokumentu: tytuł, wspólne style (+ dodatkowe) i nagłówek z metadanymi
+    param([string]$Title, [string]$Meta = '', [string]$ExtraCss = '')
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>').Append((ConvertTo-HtmlText $Title)).Append('</title><style id="dop-css">')
+    [void]$sb.Append($script:ReportCss).Append($ExtraCss).Append('</style></head><body><h1>').Append((ConvertTo-HtmlText $Title)).Append('</h1>')
+    if ($Meta) { [void]$sb.Append('<div class="meta">').Append((ConvertTo-HtmlText $Meta)).Append('</div>') }
+    return $sb.ToString()
+}
+
+function Get-ReportBar {
+    # Pasek narzędzi: wyszukiwarka (tryb cards / rows / tree) i przyciski
+    param([string]$Mode = 'cards', [string]$Placeholder = 'Szukaj…', [string[]]$Buttons = @('expand', 'collapse', 'print'), [int]$Count = -1, [string]$Extra = '')
+    $labels = @{
+        expand  = '<button data-act="expand">Rozwiń listy</button>'
+        collapse = '<button class="g" data-act="collapse">Zwiń listy</button>'
+        print   = '<button class="g" data-act="print">Drukuj</button>'
+        copy    = '<button class="g" data-act="copy-visible" title="Widoczne wiersze w formacie Excela (z nagłówkami)">Kopiuj widoczne</button>'
+        clear   = '<button class="g" data-act="clear-filters">Wyczyść filtry</button>'
+    }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<div class="bar"><input id="q" data-mode="').Append($Mode).Append('" placeholder="').Append((ConvertTo-HtmlText $Placeholder)).Append('">')
+    foreach ($b in $Buttons) { if ($labels.ContainsKey($b)) { [void]$sb.Append($labels[$b]) } }
+    [void]$sb.Append($Extra)
+    if ($Count -ge 0) { [void]$sb.Append('<span class="cnt">widoczne: <b id="cnt">').Append($Count).Append('</b></span>') }
+    [void]$sb.Append('</div>')
+    return $sb.ToString()
+}
+
+function Get-ReportTail {
+    return '<div id="dop-toast"></div><script>' + $script:ReportJs + '</script></body></html>'
+}
+#endregion
+
 #region Silnik operacji w tle
 # Każdy obiekt docelowy to osobne zadanie w puli wątków. Tryb 'Remote' wykonuje blok skryptu na komputerze
 # przez Invoke-Command (blok dostaje jeden parametr: hashtablę $P). Tryb 'Local' wykonuje blok lokalnie
@@ -4632,6 +4912,7 @@ function Start-HostOperation {
         Done         = 0
         Failed       = 0
         Cancelled    = $false
+        CancelAt     = $null
         Started      = Get-Date
     }
     $script:Engine.NextId++
@@ -4661,9 +4942,19 @@ function Update-Operations {
     if ($script:Engine.InTick) { return }
     $script:Engine.InTick = $true
     try {
+        Clear-AbandonedTasks
         foreach ($op in @($script:Engine.Operations)) {
             $changed = $false
+            $abandon = ($op.Cancelled -and $op.CancelAt -and ((Get-Date) - $op.CancelAt).TotalSeconds -ge $script:Engine.AbandonAfterSec)
             foreach ($item in $op.Items) {
+                if (-not $item.Finished -and $abandon -and -not $item.Handle.IsCompleted) {
+                    $item.Finished = $true
+                    $changed = $true
+                    [void]$script:Engine.Abandoned.Add(@{ PS = $item.PS; Handle = $item.Handle })
+                    $msg = 'Przerwano – zadanie nie odpowiedziało i zostało porzucone (może jeszcze działać w tle albo na komputerze docelowym).'
+                    Complete-OperationItem -Operation $op -Result ([pscustomobject]@{ Target = $item.Target; Ok = $false; Data = @(); Errors = @($msg) })
+                    continue
+                }
                 if ($item.Finished -or -not $item.Handle.IsCompleted) { continue }
                 $item.Finished = $true
                 $changed = $true
@@ -4686,7 +4977,7 @@ function Update-Operations {
                 }
                 Complete-OperationItem -Operation $op -Result $r
             }
-            if ($changed -and $op.Module.View_['busyText']) {
+            if ($changed -and -not $op.Cancelled -and $op.Module.View_['busyText']) {
                 $text = '{0}: {1}/{2}' -f $op.Name, $op.Done, $op.Total
                 if ($op.Failed -gt 0) { $text += " • błędy: $($op.Failed)" }
                 $op.Module.View_['busyText'].Text = $text
@@ -4792,16 +5083,45 @@ function Complete-Operation {
     }
 }
 
-function Stop-AllOperations {
-    $ops = @($script:Engine.Operations)
+function Stop-Operation {
+    # Przerwanie jednej operacji. Zadania, które nie zareagują (np. zablokowane wywołanie .NET lub WMI),
+    # po $script:Engine.AbandonAfterSec sekundach są porzucane - patrz Update-Operations.
+    param([Parameter(Mandatory)][hashtable]$Operation)
+    if ($Operation.Cancelled) { return }
+    $Operation.Cancelled = $true
+    $Operation.CancelAt = Get-Date
+    foreach ($item in $Operation.Items) {
+        if (-not $item.Finished) { try { [void]$item.PS.BeginStop($null, $null) } catch { } }
+    }
+    $text = $Operation.Module.View_['busyText']
+    if ($text) { $text.Text = '{0}: przerywanie…' -f $Operation.Name }
+}
+
+function Stop-ModuleOperations {
+    param([Parameter(Mandatory)][hashtable]$Module)
+    $ops = @($script:Engine.Operations | Where-Object { $_.Module -eq $Module -and -not $_.Cancelled })
     if ($ops.Count -eq 0) { return }
-    foreach ($op in $ops) {
-        $op.Cancelled = $true
-        foreach ($item in $op.Items) {
-            if (-not $item.Finished) { try { [void]$item.PS.BeginStop($null, $null) } catch { } }
+    foreach ($op in $ops) { Stop-Operation -Operation $op }
+    Write-Log ('Przerywanie: {0}…' -f ((@($ops | ForEach-Object { $_.Name })) -join ', ')) 'WARN' -Module $Module.Title
+    Update-StatusBar
+}
+
+function Stop-AllOperations {
+    $ops = @($script:Engine.Operations | Where-Object { -not $_.Cancelled })
+    if ($ops.Count -eq 0) { return }
+    foreach ($op in $ops) { Stop-Operation -Operation $op }
+    Write-Log 'Przerywanie trwających operacji…' 'WARN' -Module ''
+    Update-StatusBar
+}
+
+function Clear-AbandonedTasks {
+    # Porzucone zadania zwalniamy dopiero, gdy same się zakończą (Dispose trwającego zadania blokowałby okno)
+    foreach ($a in @($script:Engine.Abandoned)) {
+        if ($a.Handle.IsCompleted) {
+            try { $a.PS.Dispose() } catch { }
+            [void]$script:Engine.Abandoned.Remove($a)
         }
     }
-    Write-Log 'Przerywanie trwających operacji…' 'WARN' -Module ''
 }
 
 function Close-Engine {
@@ -4813,9 +5133,13 @@ function Close-Engine {
         }
     }
     foreach ($h in $handles) { try { [void]$h.AsyncWaitHandle.WaitOne(3000) } catch { } }
+    Clear-AbandonedTasks
+    # Zamknięcie puli czeka na zakończenie wszystkich zadań - z wiszącym zadaniem zamknięcie programu by zawisło.
+    # Wątki puli są wątkami tła, więc i tak skończą się razem z procesem.
+    $stuck = @($handles | Where-Object { -not $_.IsCompleted }).Count + $script:Engine.Abandoned.Count
     foreach ($key in 'Pool', 'AdPool') {
         if ($script:Engine[$key]) {
-            try { $script:Engine[$key].Close(); $script:Engine[$key].Dispose() } catch { }
+            if ($stuck -eq 0) { try { $script:Engine[$key].Close(); $script:Engine[$key].Dispose() } catch { } }
             $script:Engine[$key] = $null
         }
     }
@@ -6686,62 +7010,10 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Inventory' -Ti
     } | Out-Null
 }
 
-Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Performance' -Title 'Wydajność' -Icon 'E9D2' -Badge 'Nowość w wersji 4.0' `
-    -Description 'Bieżące obciążenie: procesor, pamięć, dysk systemowy, kolejka dysku i procesy zużywające najwięcej zasobów. Kolor oceny wskazuje komputery wymagające uwagi.' -Build {
+Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Performance' -Title 'Wydajność' -Icon 'E9D2' -Badge 'nowe' `
+    -Description 'Co obciąża komputer lub serwer: procesor (kolejka, jądro, przerwania), pamięć (dostępna, commit, stronicowanie), dyski (opóźnienia, kolejki, IOPS), sieć (wykorzystanie, kolejki, błędy, retransmisje TCP), procesy z czołówki CPU/pamięci/I/O (z usługami i użytkownikiem) oraz zdarzenia o awariach. Ocena wskazuje wąskie gardło.' -Build {
     param($m)
-    $m.PillColumns = @('Ocena')
-    $row = Add-ToolbarRow -Module $m -Title 'Parametry'
-    Add-Label -Parent $row -Text 'Próbkowanie (s)' | Out-Null
-    $m.Sample = Add-Numeric -Parent $row -Value 2 -Minimum 1 -Maximum 10 -Width 60
-    Add-Label -Parent $row -Text 'Procesy w zestawieniu' | Out-Null
-    $m.Top = Add-Numeric -Parent $row -Value 5 -Minimum 1 -Maximum 20 -Width 60
-    $row2 = Add-ToolbarRow -Module $m -Title 'Akcje'
-    Add-Button -Parent $row2 -Text 'Zmierz obciążenie' -Icon 'E9D2' -Module $m -Primary -OnClick {
-        param($m)
-        $targets = @(Get-TargetComputers)
-        if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Wydajność' -Targets $targets -Parameters @{ Sample = (Get-Num $m.Sample); Top = (Get-Num $m.Top) } -ScriptBlock {
-            param($P)
-            $cores = [Math]::Max(1, [int](Get-CimInstance -ClassName Win32_ComputerSystem).NumberOfLogicalProcessors)
-            # Pierwszy odczyt liczników sformatowanych bywa zerowy - dwa odczyty w odstępie
-            $null = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds ([int]$P.Sample)
-            $cpu = (Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
-            $procs = @(Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '_Total' -and $_.Name -ne 'Idle' })
-            $os = Get-CimInstance -ClassName Win32_OperatingSystem
-            $memPct = [Math]::Round((1 - ($os.FreePhysicalMemory / [double]$os.TotalVisibleMemorySize)) * 100)
-            $commitPct = [Math]::Round((1 - ($os.FreeVirtualMemory / [double]$os.TotalVirtualMemorySize)) * 100)
-            $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
-            $freePct = if ($disk -and $disk.Size) { [Math]::Round($disk.FreeSpace / [double]$disk.Size * 100) } else { $null }
-            $queue = $null
-            try { $queue = (Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop).CurrentDiskQueueLength } catch { }
-            $topCpu = @($procs | Sort-Object PercentProcessorTime -Descending | Select-Object -First ([int]$P.Top) | Where-Object { $_.PercentProcessorTime -gt 0 } |
-                ForEach-Object { '{0} {1}%' -f ($_.Name -replace '#\d+$', ''), [Math]::Round($_.PercentProcessorTime / $cores) }) -join ', '
-            $topMem = @($procs | Sort-Object WorkingSetPrivate -Descending | Select-Object -First ([int]$P.Top) |
-                ForEach-Object { '{0} {1} MB' -f ($_.Name -replace '#\d+$', ''), [Math]::Round($_.WorkingSetPrivate / 1MB) }) -join ', '
-            $issues = @()
-            $tone = 'ok'
-            if ($cpu -ge 90) { $issues += 'procesor'; $tone = 'crit' } elseif ($cpu -ge 75) { $issues += 'procesor'; if ($tone -eq 'ok') { $tone = 'warn' } }
-            if ($memPct -ge 92) { $issues += 'pamięć'; $tone = 'crit' } elseif ($memPct -ge 80) { $issues += 'pamięć'; if ($tone -eq 'ok') { $tone = 'warn' } }
-            if ($null -ne $freePct) {
-                if ($freePct -le 5) { $issues += 'mało miejsca'; $tone = 'crit' } elseif ($freePct -le 15) { $issues += 'mało miejsca'; if ($tone -eq 'ok') { $tone = 'warn' } }
-            }
-            $boot = $os.LastBootUpTime
-            [pscustomobject]@{
-                'Ocena'                  = $(if ($issues.Count -eq 0) { 'OK' } else { $issues -join ', ' })
-                'CPU %'                  = [int]$cpu
-                'Pamięć %'               = $memPct
-                'Pamięć zadeklarowana %' = $commitPct
-                'Wolne na systemowym %'  = $freePct
-                'Kolejka dysku'          = $queue
-                'Procesy'                = $procs.Count
-                'Najwięcej CPU'          = $topCpu
-                'Najwięcej pamięci'      = $topMem
-                'Czas pracy (dni)'       = [Math]::Round(((Get-Date) - $boot).TotalDays, 1)
-                '__tone'                 = $tone
-            }
-        }
-    } | Out-Null
+    Initialize-PerfModule -Module $m
 }
 
 Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Power' -Title 'Zasilanie i uptime' -Icon 'E7E8' `
@@ -6796,8 +7068,8 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Power' -Title 
         $mode = [string]$s.Tag
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        $verb = @{ '/r' = 'Uruchomić ponownie'; '/s' = 'Wyłączyć'; '/a' = 'Anulować zaplanowany restart lub wyłączenie na' }[$mode]
-        if (-not (Confirm-Action -Text "$verb $($targets.Count) komputer(ów)?" -Items $targets -ConfirmText $(if ($mode -eq '/a') { 'Anuluj zaplanowane' } else { 'Wykonaj' }) -Danger:($mode -ne '/a'))) { return }
+        $question = @{ '/r' = 'Uruchomić ponownie wybrane komputery?'; '/s' = 'Wyłączyć wybrane komputery?'; '/a' = 'Anulować zaplanowany restart lub wyłączenie na wybranych komputerach?' }[$mode]
+        $targets = @(Confirm-Action -Text $question -Items $targets -ConfirmText $(if ($mode -eq '/a') { 'Anuluj zaplanowane' } else { 'Wykonaj' }) -Danger:($mode -ne '/a') -Select); if ($targets.Count -eq 0) { return }
         $params = @{ Mode = $mode; Delay = (Get-Num $m.Delay); Message = $m.Message.Text.Trim(); Force = (Test-Checked $m.Force) }
         Start-HostOperation -Module $m -Name "Zasilanie ($mode)" -Targets $targets -Output Log -Parameters $params -ScriptBlock {
             param($P)
@@ -7378,7 +7650,7 @@ Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'Loc
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
         $sid = $script:LocalGroupDefs[$m.Group.SelectedIndex].Sid
-        if (-not (Confirm-Action -Text ("Dodać {0} do grupy «{1}» na {2} komputer(ach)?" -f ($members -join ', '), $m.Group.SelectedItem, $targets.Count) -Items $targets -ConfirmText 'Dodaj')) { return }
+        $targets = @(Confirm-Action -Text ("Dodać {0} do grupy «{1}» na wybranych komputerach?" -f ($members -join ', '), $m.Group.SelectedItem) -Items $targets -ConfirmText 'Dodaj' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name 'Dodawanie do grupy' -Targets $targets -Output Log -Parameters @{ Members = $members; GroupSid = $sid } -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
             param($P)
             $groupName = (New-Object System.Security.Principal.SecurityIdentifier($P.GroupSid)).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
@@ -7524,7 +7796,7 @@ Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'Rdp
             NlaOn      = 'Włączyć wymaganie uwierzytelniania na poziomie sieci (NLA)?'
             NlaOff     = 'Wyłączyć wymaganie NLA? Obniża to bezpieczeństwo – używaj tylko do diagnostyki.'
         }[$Op]
-        if (-not (Confirm-Action -Text $text -Items $targets -ConfirmText 'Wykonaj' -Danger:($Op -eq 'Disable' -or $Op -eq 'NlaOff'))) { return }
+        $targets = @(Confirm-Action -Text $text -Items $targets -ConfirmText 'Wykonaj' -Danger:($Op -eq 'Disable' -or $Op -eq 'NlaOff') -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name "Pulpit zdalny – $Op" -Targets $targets -Output Log -Parameters @{ Op = $Op } -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
             param($P)
             $ts = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
@@ -7564,9 +7836,177 @@ Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'Rdp
 #endregion
 
 #region Zarządzanie zdalne: Zdalne wykonanie
+# Blok uruchamiany na komputerze docelowym (Invoke-Command). Polecenie działa w osobnym procesie bez okna:
+#  - wejście procesu jest od razu zamykane, więc programy czekające na klawiaturę (cmd, pause, choice, set /p,
+#    Read-Host w trybie -NonInteractive) kończą się zamiast wisieć,
+#  - wyjście jest czytane w pętli, która co chwilę oddaje sterowanie PowerShell - przerwanie operacji
+#    (zatrzymanie potoku) albo przekroczenie limitu czasu kończy pętlę, a blok finally zabija całe drzewo procesów,
+#  - zebrany wynik ma limit rozmiaru, a proces potomny trzymający wyjście (np. start notepad) nie blokuje zakończenia.
+# $P: Mode (PS | CMD | EXE), Command (PS/CMD) albo FilePath + Arguments (EXE), Input (tekst na wejście, opcjonalnie),
+#     TimeoutSec (0 = bez limitu).
+$script:RemoteExecScript = {
+    param($P)
+    $ErrorActionPreference = 'Stop'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $tempFile = $null
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $timeout = 0
+    if ($P.ContainsKey('TimeoutSec') -and $P.TimeoutSec) { $timeout = [int]$P.TimeoutSec }
+    $mode = [string]$P.Mode
+    if ($mode -eq 'PS') {
+        $exe = @('powershell.exe', 'pwsh.exe') | ForEach-Object { Join-Path $PSHOME $_ } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (-not $exe) { throw "Nie znaleziono powershell.exe w katalogu $PSHOME." }
+        $encoding = New-Object System.Text.UTF8Encoding $false
+        $userScript = [string]$P.Command
+        $wrapperFor = {
+            param($load)
+            # Kod startowy procesu potomnego: wynik w UTF-8, błędy liczone i dołączane do wyniku
+            "`$ProgressPreference = 'SilentlyContinue'`n" +
+            "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding `$false`n" +
+            "`$__errors = 0`n" +
+            "try { `$__sb = [scriptblock]::Create($load); & `$__sb 2>&1 | ForEach-Object { if (`$_ -is [System.Management.Automation.ErrorRecord]) { `$__errors++ }; `$_ } | Out-String -Width 250 -Stream }`n" +
+            "catch { `$__errors++; 'BŁĄD: ' + `$_.Exception.Message }`n" +
+            "'##DOMAINOPS_ERRORS=' + `$__errors`n" +
+            "if (`$LASTEXITCODE) { exit `$LASTEXITCODE }"
+        }
+        $payload = [Convert]::ToBase64String($encoding.GetBytes($userScript))
+        $wrapper = & $wrapperFor ("[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{0}'))" -f $payload)
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapper))
+        if ($encoded.Length -gt 30000) {
+            # Wiersz polecenia ma limit 32767 znaków - długi skrypt przekazujemy w pliku tymczasowym
+            $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ('DomainOps_' + [guid]::NewGuid().ToString('N') + '.txt')
+            [System.IO.File]::WriteAllText($tempFile, $userScript, $encoding)
+            $wrapper = & $wrapperFor ("[System.IO.File]::ReadAllText('{0}')" -f $tempFile.Replace("'", "''"))
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapper))
+        }
+        $psi.FileName = $exe
+        $psi.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + $encoded
+    }
+    elseif ($mode -eq 'CMD') {
+        $encoding = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+        $text = ([string]$P.Command).Trim()
+        $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        if ($text -match "[\r\n]") {
+            # Kilka linii - uruchamiamy jak plik wsadowy (w pętlach for zmienne zapisuje się wtedy jako %%i)
+            $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ('DomainOps_' + [guid]::NewGuid().ToString('N') + '.cmd')
+            [System.IO.File]::WriteAllText($tempFile, "@echo off`r`n" + ($text -replace "`r?`n", "`r`n") + "`r`n", $encoding)
+            $psi.Arguments = '/d /s /c ""' + $tempFile + '""'
+        }
+        else {
+            $psi.Arguments = '/d /s /c "' + $text + '"'
+        }
+    }
+    else {
+        $encoding = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+        $psi.FileName = [string]$P.FilePath
+        $psi.Arguments = [string]$P.Arguments
+    }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $encoding
+    $psi.StandardErrorEncoding = $encoding
+    # Przygotowane wcześniej: w bloku finally po przerwaniu potoku używamy tylko wywołań .NET
+    $kill = New-Object System.Diagnostics.ProcessStartInfo
+    $kill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $kill.UseShellExecute = $false
+    $kill.CreateNoWindow = $true
+    $limit = 1000000
+    $truncated = $false
+    $state = 'exited'
+    $proc = $null
+    $outBuf = New-Object System.Text.StringBuilder
+    $errBuf = New-Object System.Text.StringBuilder
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if ($P.ContainsKey('Input') -and $P.Input) { try { $proc.StandardInput.Write([string]$P.Input) } catch { } }
+        $proc.StandardInput.Close()
+        $readers = @(
+            @{ R = $proc.StandardOutput; B = $outBuf; C = (New-Object char[] 8192); T = $null; Eof = $false }
+            @{ R = $proc.StandardError; B = $errBuf; C = (New-Object char[] 8192); T = $null; Eof = $false }
+        )
+        foreach ($r in $readers) { $r.T = $r.R.ReadAsync($r.C, 0, $r.C.Length) }
+        $exitedAt = -1
+        while ($true) {
+            $progress = $false
+            foreach ($r in $readers) {
+                while (-not $r.Eof -and $r.T.IsCompleted) {
+                    $n = 0
+                    if (-not $r.T.IsFaulted -and -not $r.T.IsCanceled) { $n = $r.T.Result }
+                    if ($n -le 0) { $r.Eof = $true; break }
+                    if ($r.B.Length -lt $limit) { [void]$r.B.Append($r.C, 0, $n) } else { $truncated = $true }
+                    $r.T = $r.R.ReadAsync($r.C, 0, $r.C.Length)
+                    $progress = $true
+                }
+            }
+            $exited = $proc.HasExited
+            if ($exited -and $readers[0].Eof -and $readers[1].Eof) { break }
+            if ($exited) {
+                # Proces potomny (np. uruchomiony przez start) może trzymać otwarte wyjście - nie czekamy na niego
+                if ($exitedAt -lt 0) { $exitedAt = $sw.Elapsed.TotalSeconds }
+                elseif (($sw.Elapsed.TotalSeconds - $exitedAt) -gt 3) { $state = 'detached'; break }
+            }
+            if ($timeout -gt 0 -and $sw.Elapsed.TotalSeconds -ge $timeout) { $state = 'timeout'; break }
+            if (-not $progress) { Start-Sleep -Milliseconds 150 }
+        }
+    }
+    finally {
+        # Wykonywane także po przerwaniu operacji - wtedy proces i jego potomkowie muszą zniknąć
+        if ($proc -and -not $proc.HasExited) {
+            try {
+                $kill.Arguments = '/T /F /PID ' + $proc.Id
+                $k = [System.Diagnostics.Process]::Start($kill)
+                [void]$k.WaitForExit(10000)
+            }
+            catch { }
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+        }
+        if ($tempFile) { try { [System.IO.File]::Delete($tempFile) } catch { } }
+    }
+    $code = $null
+    if ($state -ne 'timeout') { try { $code = $proc.ExitCode } catch { } }
+    $out = $outBuf.ToString()
+    $err = $errBuf.ToString()
+    $psErrors = 0
+    if ($mode -eq 'PS') {
+        $mk = [regex]::Match($out, '(?m)^##DOMAINOPS_ERRORS=(\d+)\s*$')
+        if ($mk.Success) { $psErrors = [int]$mk.Groups[1].Value; $out = $out.Remove($mk.Index, $mk.Length) }
+        if ($err.StartsWith('#< CLIXML')) {
+            # Strumienie serializowane przez powershell.exe - zostawiamy sam tekst błędów
+            $err = ((@([regex]::Matches($err, '<S S="Error">(.*?)</S>') | ForEach-Object { $_.Groups[1].Value })) -join '')
+            $err = [System.Net.WebUtility]::HtmlDecode(($err -replace '_x000D_', "`r" -replace '_x000A_', "`n"))
+        }
+    }
+    $text = $out.TrimStart([char]0xFEFF).TrimEnd()
+    if ($err.Trim()) { $text = ($text + "`r`n" + $err.Trim()).Trim() }
+    if ($truncated) { $text += "`r`n… (wynik obcięty do $limit znaków)" }
+    $seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+    $status = 'OK'
+    $tone = 'ok'
+    if ($state -eq 'timeout') { $status = "Przekroczono limit czasu ($timeout s) – proces zatrzymany"; $tone = 'crit' }
+    elseif ($code -ne 0 -and $null -ne $code) { $status = "Kod wyjścia $code"; $tone = 'warn' }
+    elseif ($psErrors -gt 0) { $status = "Błędy PowerShell: $psErrors"; $tone = 'warn' }
+    if ($state -eq 'detached') {
+        $status += ' (proces potomny działa dalej)'
+        if ($tone -eq 'ok') { $tone = 'info' }
+    }
+    [pscustomobject]@{
+        'Stan'        = $status
+        'Kod wyjścia' = $code
+        'Czas (s)'    = $seconds
+        'Wynik'       = $text
+        '__tone'      = $tone
+    }
+}
+
+$script:ExecTimeouts = [ordered]@{ '1 min' = 60; '5 min' = 300; '15 min' = 900; '30 min' = 1800; '1 godz.' = 3600; '2 godz.' = 7200; 'bez limitu' = 0 }
+
 Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands' -Title 'Polecenia' -Icon 'E756' `
     -Description 'Uruchamia polecenia PowerShell lub cmd.exe na zaznaczonych komputerach (sesja WinRM, bez pulpitu użytkownika). Pełny wynik w panelu szczegółów lub po dwukliku.' -Build {
     param($m)
+    $m.PillColumns = @('Stan')
     $m.Templates = @(
         @{ Name = '(wybierz szablon polecenia)'; Mode = ''; Text = '' }
         @{ Name = 'Wersja systemu i czas pracy'; Mode = 'PS'; Text = 'Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, LastBootUpTime' }
@@ -7579,7 +8019,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
         @{ Name = 'Test połączenia z kontrolerem domeny'; Mode = 'PS'; Text = 'Test-NetConnection -ComputerName $env:USERDNSDOMAIN -Port 389 | Select-Object ComputerName, RemoteAddress, TcpTestSucceeded' }
         @{ Name = 'Kanał zaufania z domeną'; Mode = 'PS'; Text = 'Test-ComputerSecureChannel -Verbose 4>&1' }
         @{ Name = 'Synchronizacja czasu (w32tm)'; Mode = 'CMD'; Text = 'w32tm /query /status && w32tm /resync' }
-        @{ Name = 'Naprawa obrazu systemu (DISM + SFC)'; Mode = 'CMD'; Text = 'DISM /Online /Cleanup-Image /RestoreHealth && sfc /scannow' }
+        @{ Name = 'Naprawa obrazu systemu (DISM + SFC)'; Mode = 'CMD'; Text = 'DISM /Online /Cleanup-Image /RestoreHealth && sfc /scannow'; Timeout = '2 godz.' }
     )
     $row = Add-ToolbarRow -Module $m -Title 'Interpreter'
     $m.Mode = Add-Segmented -Parent $row -Items @('PowerShell', 'cmd.exe')
@@ -7591,9 +8031,13 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
         if (-not $t.Mode) { return }
         Set-SegmentIndex $m.Mode $(if ($t.Mode -eq 'PS') { 0 } else { 1 })
         $m.CommandBox.Text = $t.Text
+        $limit = if ($t.ContainsKey('Timeout')) { $t.Timeout } else { '15 min' }
+        $m.Timeout.SelectedIndex = @($script:ExecTimeouts.Keys).IndexOf($limit)
     }
     $m.CommandBox = Add-StretchTextBox -Module $m -Title 'Polecenie' -Multiline -Height 130 -Placeholder 'Wpisz polecenie lub skrypt…'
-    $row3 = Add-ToolbarRow -Module $m -Title ' '
+    $row3 = Add-ToolbarRow -Module $m -Title 'Limit czasu'
+    $m.Timeout = Add-ComboBox -Parent $row3 -Items @($script:ExecTimeouts.Keys) -Width 120
+    $m.Timeout.SelectedIndex = 2
     Add-Button -Parent $row3 -Text 'Uruchom na zaznaczonych' -Icon 'E768' -Module $m -Primary -OnClick {
         param($m)
         $command = $m.CommandBox.Text.Trim()
@@ -7602,42 +8046,16 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
         if (-not $targets) { return }
         $isPs = ((Get-SegmentIndex $m.Mode) -eq 0)
         $mode = if ($isPs) { 'PowerShell' } else { 'cmd.exe' }
+        $limitName = [string]$m.Timeout.SelectedItem
+        $timeout = [int]$script:ExecTimeouts[$limitName]
         $preview = if ($command.Length -gt 400) { $command.Substring(0, 400) + '…' } else { $command }
-        if (-not (Confirm-Action -Text "Uruchomić polecenie ($mode) na $($targets.Count) komputer(ach)?`r`n`r`n$preview" -Items $targets -ConfirmText 'Uruchom')) { return }
-        Write-Log "Polecenie ($mode): $command"
-        if ($isPs) {
-            Start-HostOperation -Module $m -Name 'Polecenie PowerShell' -Targets $targets -Parameters @{ Command = $command } -ScriptBlock {
-                param($P)
-                $sb = [scriptblock]::Create($P.Command)
-                $text = (& $sb 2>&1 | Out-String -Width 250).Trim()
-                [pscustomobject]@{ 'Wynik' = $text }
-            }
-        }
-        else {
-            Start-HostOperation -Module $m -Name 'Polecenie cmd.exe' -Targets $targets -Parameters @{ Command = $command } -ScriptBlock {
-                param($P)
-                $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-                $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
-                $psi.Arguments = '/d /s /c "' + $P.Command + '"'
-                $psi.UseShellExecute = $false
-                $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardError = $true
-                $psi.CreateNoWindow = $true
-                $psi.StandardOutputEncoding = $oem
-                $psi.StandardErrorEncoding = $oem
-                $proc = [System.Diagnostics.Process]::Start($psi)
-                $errTask = $proc.StandardError.ReadToEndAsync()
-                $stdout = $proc.StandardOutput.ReadToEnd()
-                $proc.WaitForExit()
-                $stderr = $errTask.Result
-                $text = $stdout
-                if ($stderr) { $text += "`r`n" + $stderr }
-                [pscustomobject]@{ 'Kod wyjścia' = $proc.ExitCode; 'Wynik' = $text.Trim(); '__flag' = $(if ($proc.ExitCode -ne 0) { 'warn' } else { '' }) }
-            }
-        }
+        $targets = @(Confirm-Action -Text "Uruchomić polecenie ($mode, limit czasu: $limitName) na zaznaczonych komputerach?`r`n`r`n$preview" -Items $targets -ConfirmText 'Uruchom' -Select)
+        if ($targets.Count -eq 0) { return }
+        Write-Log "Polecenie ($mode, limit $limitName): $command"
+        $params = @{ Mode = $(if ($isPs) { 'PS' } else { 'CMD' }); Command = $command; TimeoutSec = $timeout }
+        Start-HostOperation -Module $m -Name "Polecenie $mode" -Targets $targets -Parameters $params -ScriptBlock $script:RemoteExecScript
     } | Out-Null
-    Add-Label -Parent $row3 -Text 'Polecenia działają bez profilu i pulpitu użytkownika; zasoby sieciowe mogą być niedostępne (podwójny przeskok).' -Hint -MaxWidth 560 | Out-Null
+    Add-Label -Parent $row3 -Text 'Polecenie działa w osobnym procesie, bez okna i bez klawiatury: programy czekające na odpowiedź (cmd, pause, choice, set /p, Read-Host) kończą się od razu. Po upływie limitu albo po kliknięciu «Przerwij» proces wraz z potomnymi jest zamykany. Kilka linii w trybie cmd.exe działa jak plik .cmd (@echo off). Zasoby sieciowe mogą być niedostępne (podwójny przeskok).' -Hint -MaxWidth 760 | Out-Null
 }
 
 Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' -Title 'Instalacja oprogramowania' -Icon 'E896' `
@@ -7655,6 +8073,9 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
     $row2 = Add-ToolbarRow -Module $m -Title 'Opcje'
     $m.Args = Add-TextBox -Parent $row2 -Width 300 -Placeholder 'Dodatkowe argumenty (EXE: np. /S, /quiet)'
     $m.Cleanup = Add-CheckBox -Parent $row2 -Text 'Usuń instalator po zakończeniu' -Checked $true
+    Add-Label -Parent $row2 -Text '   Limit czasu' | Out-Null
+    $m.Timeout = Add-ComboBox -Parent $row2 -Items @($script:ExecTimeouts.Keys) -Width 120
+    $m.Timeout.SelectedIndex = 4
     Add-Button -Parent $row2 -Text 'Zainstaluj na zaznaczonych' -Icon 'E896' -Module $m -Primary -OnClick {
         param($m)
         $path = $m.Path.Text.Trim().Trim('"')
@@ -7663,12 +8084,13 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
         if (@('.msi', '.msp', '.msu', '.exe') -notcontains $ext) { Show-Warning 'Obsługiwane są pliki .msi, .msp, .msu i .exe.'; return }
         $extra = $m.Args.Text.Trim()
         if ($ext -eq '.exe' -and -not $extra) {
-            if (-not (Confirm-Action -Text 'Nie podano argumentów cichej instalacji dla pliku EXE. Instalator może czekać na odpowiedź użytkownika, którego nie ma – operacja zawiśnie do czasu przerwania. Kontynuować?' -ConfirmText 'Kontynuuj')) { return }
+            if (-not (Confirm-Action -Text 'Nie podano argumentów cichej instalacji dla pliku EXE. Instalator może czekać na odpowiedź użytkownika, którego nie ma – zostanie zatrzymany po upływie limitu czasu albo po kliknięciu «Przerwij». Kontynuować?' -ConfirmText 'Kontynuuj')) { return }
         }
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        if (-not (Confirm-Action -Text "Zainstalować $([System.IO.Path]::GetFileName($path)) na $($targets.Count) komputer(ach)?" -Items $targets -ConfirmText 'Zainstaluj')) { return }
-        $params = @{ LocalPath = $path; FileName = [System.IO.Path]::GetFileName($path); Args = $extra; Cleanup = (Test-Checked $m.Cleanup) }
+        $targets = @(Confirm-Action -Text "Zainstalować $([System.IO.Path]::GetFileName($path)) na zaznaczonych komputerach?" -Items $targets -ConfirmText 'Zainstaluj' -Select)
+        if ($targets.Count -eq 0) { return }
+        $params = @{ LocalPath = $path; FileName = [System.IO.Path]::GetFileName($path); Args = $extra; Cleanup = (Test-Checked $m.Cleanup); TimeoutSec = [int]$script:ExecTimeouts[[string]$m.Timeout.SelectedItem] }
         Start-HostOperation -Module $m -Name 'Instalacja' -Targets $targets -Local -Parameters $params -ScriptBlock {
             param($Target, $P, $Ctx)
             $ErrorActionPreference = 'Stop'
@@ -7696,8 +8118,8 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
                     Copy-Item -LiteralPath $P.LocalPath -Destination $remoteFile -ToSession $session -Force
                     $method = 'WinRM'
                 }
-                $res = Invoke-Command -Session $session -ArgumentList $remoteFile, $P.Args, $P.Cleanup -ScriptBlock {
-                    param($File, $ExtraArgs, $Cleanup)
+                $res = Invoke-Command -Session $session -ArgumentList $remoteFile, $P.Args, $P.Cleanup, $P.TimeoutSec -ScriptBlock {
+                    param($File, $ExtraArgs, $Cleanup, $TimeoutSec)
                     $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
                     $log = [System.IO.Path]::ChangeExtension($File, '.log')
                     $exe = $File
@@ -7711,9 +8133,30 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
                     $sw = [System.Diagnostics.Stopwatch]::StartNew()
                     $spArgs = @{ FilePath = $exe; PassThru = $true; WindowStyle = 'Hidden' }
                     if ($arguments.Trim()) { $spArgs.ArgumentList = $arguments.Trim() }
+                    $kill = New-Object System.Diagnostics.ProcessStartInfo
+                    $kill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                    $kill.UseShellExecute = $false
+                    $kill.CreateNoWindow = $true
                     $proc = Start-Process @spArgs
                     $null = $proc.Handle
-                    $proc.WaitForExit()
+                    $timedOut = $false
+                    try {
+                        # Czekanie w pętli (zamiast WaitForExit) pozwala przerwać operację; finally zamyka instalator
+                        while (-not $proc.HasExited) {
+                            if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $timedOut = $true; break }
+                            Start-Sleep -Milliseconds 500
+                        }
+                    }
+                    finally {
+                        if (-not $proc.HasExited) {
+                            try { $kill.Arguments = '/T /F /PID ' + $proc.Id; [void][System.Diagnostics.Process]::Start($kill).WaitForExit(10000) } catch { }
+                            try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+                        }
+                    }
+                    if ($timedOut) {
+                        if ($Cleanup) { Start-Sleep -Seconds 1; Remove-Item -LiteralPath $File -Force -ErrorAction SilentlyContinue }
+                        return [pscustomobject]@{ Plik = [System.IO.Path]::GetFileName($File); Kod = $null; Wynik = "Błąd – przekroczono limit czasu ($TimeoutSec s), instalator zatrzymany (czekał na odpowiedź? sprawdź przełączniki cichej instalacji)"; Czas = [Math]::Round($sw.Elapsed.TotalSeconds); Log = $log }
+                    }
                     $code = $proc.ExitCode
                     $known = @{
                         0           = 'Sukces'
@@ -7767,39 +8210,27 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'GPUpdate'
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
         $scope = @('Computer', '', 'User')[$m.Scope.SelectedIndex]
-        Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters @{ Target = $scope; Force = (Test-Checked $m.Force) } -ScriptBlock {
-            param($P)
-            $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-            $arguments = @()
-            if ($P.Target) { $arguments += "/target:$($P.Target)" }
-            if ($P.Force) { $arguments += '/force' }
-            $arguments += '/wait:600'
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = Join-Path $env:SystemRoot 'System32\gpupdate.exe'
-            $psi.Arguments = $arguments -join ' '
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.RedirectStandardInput = $true
-            $psi.CreateNoWindow = $true
-            $psi.StandardOutputEncoding = $oem
-            $psi.StandardErrorEncoding = $oem
-            $proc = [System.Diagnostics.Process]::Start($psi)
-            # gpupdate może pytać o wylogowanie/restart - odpowiadamy "N"
-            $proc.StandardInput.WriteLine('N')
-            $proc.StandardInput.WriteLine('N')
-            $proc.StandardInput.Close()
-            $errTask = $proc.StandardError.ReadToEndAsync()
-            $stdout = $proc.StandardOutput.ReadToEnd()
-            $proc.WaitForExit()
-            $lines = @(($stdout + "`n" + $errTask.Result) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            [pscustomobject]@{
-                'Wynik'       = $(if ($proc.ExitCode -eq 0) { 'OK' } else { "Błąd – kod $($proc.ExitCode)" })
-                'Kod wyjścia' = $proc.ExitCode
-                'Komunikaty'  = ($lines -join ' | ')
-                '__tone'      = $(if ($proc.ExitCode -eq 0) { 'ok' } else { 'crit' })
-            }
-        }
+        $arguments = @()
+        if ($scope) { $arguments += "/target:$scope" }
+        if (Test-Checked $m.Force) { $arguments += '/force' }
+        $arguments += '/wait:600'
+        # gpupdate może zapytać o wylogowanie lub restart - odpowiedź «N» trafia na wejście procesu
+        $params = @{ Mode = 'EXE'; FilePath = '%SystemRoot%\System32\gpupdate.exe'; Arguments = ($arguments -join ' '); Input = "N`r`nN`r`n"; TimeoutSec = 900 }
+        $sb = [scriptblock]::Create(@"
+param(`$P)
+`$P.FilePath = [Environment]::ExpandEnvironmentVariables(`$P.FilePath)
+`$r = & { $($script:RemoteExecScript.ToString()) } `$P
+`$lines = @(`$r.'Wynik' -split "``r?``n" | ForEach-Object { `$_.Trim() } | Where-Object { `$_ })
+`$ok = (`$r.'Kod wyjścia' -eq 0)
+[pscustomobject]@{
+    'Wynik'       = `$(if (`$ok) { 'OK' } elseif (`$null -eq `$r.'Kod wyjścia') { `$r.'Stan' } else { 'Błąd – kod ' + `$r.'Kod wyjścia' })
+    'Kod wyjścia' = `$r.'Kod wyjścia'
+    'Czas (s)'    = `$r.'Czas (s)'
+    'Komunikaty'  = (`$lines -join ' | ')
+    '__tone'      = `$(if (`$ok) { 'ok' } else { 'crit' })
+}
+"@)
+        Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters $params -ScriptBlock $sb
     } | Out-Null
 }
 #endregion
@@ -8002,7 +8433,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
         if (-not ((Test-Checked $m.WinTemp) -or (Test-Checked $m.UserTemp) -or (Test-Checked $m.Recycle) -or (Test-Checked $m.WuCache))) { Show-Warning 'Wybierz, co ma zostać wyczyszczone.'; return }
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        if (-not (Confirm-Action -Text "Usunąć pliki tymczasowe na $($targets.Count) komputer(ach)?" -Items $targets -ConfirmText 'Wyczyść' -Danger)) { return }
+        $targets = @(Confirm-Action -Text "Usunąć pliki tymczasowe na wybranych komputerach?" -Items $targets -ConfirmText 'Wyczyść' -Danger -Select); if ($targets.Count -eq 0) { return }
         $params = @{ WindowsTemp = (Test-Checked $m.WinTemp); UserTemp = (Test-Checked $m.UserTemp); RecycleBin = (Test-Checked $m.Recycle); WuCache = (Test-Checked $m.WuCache); OlderThanDays = (Get-Num $m.Days) }
         Start-HostOperation -Module $m -Name 'Czyszczenie dysków' -Targets $targets -Parameters $params -ScriptBlock {
             param($P)
@@ -8278,7 +8709,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Tasks' -Title 'Harm
         if (($trigger -eq 'Daily' -or $trigger -eq 'Once') -and $time -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') { Show-Warning 'Podaj godzinę w formacie GG:MM (np. 07:30).'; return }
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        if (-not (Confirm-Action -Text "Utworzyć zadanie «$name» (konto SYSTEM, najwyższe uprawnienia)?`r`nProgram: $exe $($m.NewArgs.Text.Trim())" -Items $targets -ConfirmText 'Utwórz')) { return }
+        $targets = @(Confirm-Action -Text "Utworzyć zadanie «$name» (konto SYSTEM, najwyższe uprawnienia)?`r`nProgram: $exe $($m.NewArgs.Text.Trim())" -Items $targets -ConfirmText 'Utwórz' -Select); if ($targets.Count -eq 0) { return }
         $params = @{ Name = $name; Execute = $exe; Arguments = $m.NewArgs.Text.Trim(); Trigger = $trigger; Time = $time }
         Start-HostOperation -Module $m -Name 'Tworzenie zadania' -Targets $targets -Output Log -Parameters $params -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
             param($P)
@@ -8407,21 +8838,21 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Printers' -Title 'D
             $spooler = Get-Service -Name Spooler -ErrorAction SilentlyContinue
             $printers = @(Get-CimInstance -ClassName Win32_Printer)
             $jobs = @(Get-CimInstance -ClassName Win32_PrintJob -ErrorAction SilentlyContinue)
-            foreach ($p in $printers) {
-                $count = @($jobs | Where-Object { ($_.Name -split ',')[0] -eq $p.Name }).Count
-                $status = switch ([int]$p.PrinterStatus) { 1 { 'Inny' } 2 { 'Nieznany' } 3 { 'Bezczynna' } 4 { 'Drukuje' } 5 { 'Rozgrzewanie' } 6 { 'Zatrzymana' } 7 { 'Offline' } default { [string]$p.PrinterStatus } }
-                if ($p.WorkOffline) { $status = 'Offline' }
+            foreach ($prn in $printers) {
+                $count = @($jobs | Where-Object { ($_.Name -split ',')[0] -eq $prn.Name }).Count
+                $status = switch ([int]$prn.PrinterStatus) { 1 { 'Inny' } 2 { 'Nieznany' } 3 { 'Bezczynna' } 4 { 'Drukuje' } 5 { 'Rozgrzewanie' } 6 { 'Zatrzymana' } 7 { 'Offline' } default { [string]$prn.PrinterStatus } }
+                if ($prn.WorkOffline) { $status = 'Offline' }
                 $tone = switch ($status) { 'Bezczynna' { 'ok' } 'Drukuje' { 'info' } 'Offline' { 'crit' } 'Zatrzymana' { 'crit' } default { 'warn' } }
                 [pscustomobject]@{
-                    'Drukarka'     = $p.Name
+                    'Drukarka'     = $prn.Name
                     'Stan'         = $status
                     'Zadania'      = $count
-                    'Domyślna'     = [bool]$p.Default
-                    'Sterownik'    = $p.DriverName
-                    'Port'         = $p.PortName
-                    'Udostępniona' = [bool]$p.Shared
-                    'Nazwa udziału' = $p.ShareName
-                    'Lokalizacja'  = $p.Location
+                    'Domyślna'     = [bool]$prn.Default
+                    'Sterownik'    = $prn.DriverName
+                    'Port'         = $prn.PortName
+                    'Udostępniona' = [bool]$prn.Shared
+                    'Nazwa udziału' = $prn.ShareName
+                    'Lokalizacja'  = $prn.Location
                     'Bufor wydruku' = $(if ($spooler) { [string]$spooler.Status } else { '?' })
                     '__tone'       = $tone
                 }
@@ -8464,7 +8895,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Printers' -Title 'D
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        if (-not (Confirm-Action -Text 'Uruchomić ponownie usługę bufora wydruku (Spooler)? Zadania w trakcie drukowania mogą zostać przerwane.' -Items $targets -ConfirmText 'Uruchom ponownie')) { return }
+        $targets = @(Confirm-Action -Text 'Uruchomić ponownie usługę bufora wydruku (Spooler)? Zadania w trakcie drukowania mogą zostać przerwane.' -Items $targets -ConfirmText 'Uruchom ponownie' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name 'Restart bufora wydruku' -Targets $targets -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
             param($P)
             Restart-Service -Name Spooler -Force -ErrorAction Stop
@@ -8590,93 +9021,288 @@ catch {
 Write-WuLog '==== KONIEC ===='
 '@
 
+# Wspólna funkcja (wklejana do bloków zdalnych): jak odinstalować program z danego wpisu rejestru.
+# Kind: msi | quiet | inno (da się po cichu), interactive (tylko z przełącznikami), none, blocked.
+$script:UninstallPlanText = @'
+function Get-UninstallPlan($Key) {
+    $id = [string]$Key.PSChildName
+    $us = [string]$Key.UninstallString
+    $qs = [string]$Key.QuietUninstallString
+    if ($Key.NoRemove -eq 1) { return @{ Kind = 'blocked'; Label = 'Zablokowane (NoRemove)'; Command = ''; Reason = 'Producent zablokował odinstalowanie (NoRemove=1 w rejestrze).' } }
+    $guid = ''
+    if ($id -match '^\{[0-9A-Fa-f-]{36}\}$' -and ($Key.WindowsInstaller -eq 1 -or $us -match '(?i)msiexec')) { $guid = $id }
+    else {
+        $mx = [regex]::Match($us, '(?i)msiexec(?:\.exe)?["\s].*?/[IX]\s*(\{[0-9A-Fa-f-]{36}\})')
+        if ($mx.Success) { $guid = $mx.Groups[1].Value }
+    }
+    if ($guid) { return @{ Kind = 'msi'; Label = 'MSI – cicho'; Command = "msiexec.exe /x $guid /qn /norestart"; Reason = ''; Guid = $guid } }
+    if ($qs) { return @{ Kind = 'quiet'; Label = 'Tryb cichy producenta'; Command = $qs; Reason = '' } }
+    if ($us -match '(?i)unins\d{3}\.exe') { return @{ Kind = 'inno'; Label = 'Inno Setup – cicho'; Command = ($us + ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART'); Reason = '' } }
+    if ($us) { return @{ Kind = 'interactive'; Label = 'Tylko z przełącznikami'; Command = $us; Reason = 'deinstalator nie ma w rejestrze trybu cichego – bez przełączników producenta (np. /S, /silent, /quiet) czekałby na kliknięcie, którego nikt nie wykona' } }
+    return @{ Kind = 'none'; Label = 'Brak deinstalatora'; Command = ''; Reason = 'wpis w rejestrze nie zawiera polecenia odinstalowania' }
+}
+'@
+
+$script:ProgramListBody = @'
+$roots = @(
+    @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Komputer' },
+    @{ Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Komputer (32-bit)' },
+    @{ Path = 'Registry::HKEY_USERS\*\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Użytkownik' }
+)
+$accounts = @{}
+foreach ($root in $roots) {
+    Get-ItemProperty -Path $root.Path -ErrorAction SilentlyContinue | ForEach-Object {
+        if (-not $_.DisplayName) { return }
+        if (-not $P.ShowSystem -and ($_.SystemComponent -eq 1 -or $_.ParentKeyName -or @('Update', 'Hotfix', 'Security Update') -contains $_.ReleaseType)) { return }
+        if ($P.Filter -and $_.DisplayName -notlike "*$($P.Filter)*" -and $_.Publisher -notlike "*$($P.Filter)*") { return }
+        $date = $null
+        if ($_.InstallDate -match '^\d{8}$') { try { $date = [datetime]::ParseExact($_.InstallDate, 'yyyyMMdd', $null) } catch { } }
+        $plan = Get-UninstallPlan $_
+        $hive = ''
+        $user = ''
+        if ($root.Scope -eq 'Użytkownik') {
+            $hive = [regex]::Match([string]$_.PSPath, 'HKEY_USERS\\([^\\]+)\\').Groups[1].Value
+            if (-not $accounts.ContainsKey($hive)) {
+                $name = $hive
+                try { $name = (New-Object System.Security.Principal.SecurityIdentifier($hive)).Translate([System.Security.Principal.NTAccount]).Value } catch { }
+                $accounts[$hive] = $name
+            }
+            $user = $accounts[$hive]
+        }
+        $quiet = @('msi', 'quiet', 'inno') -contains $plan.Kind
+        $label = $plan.Label
+        $tone = if ($quiet) { 'ok' } elseif ($plan.Kind -eq 'interactive') { 'warn' } else { 'crit' }
+        if ($root.Scope -eq 'Użytkownik') {
+            if ($quiet) { $label = 'W sesji użytkownika (' + $plan.Label + ')'; $tone = 'warn' }
+            else { $label = 'Profil użytkownika – ' + $plan.Label.ToLower(); $tone = 'crit' }
+        }
+        [pscustomobject]@{
+            'Nazwa'                   = $_.DisplayName
+            'Odinstalowanie zdalne'   = $label
+            'Stan'                    = ''
+            'Wersja'                  = $_.DisplayVersion
+            'Wydawca'                 = $_.Publisher
+            'Data instalacji'         = $date
+            'Rozmiar (MB)'            = $(if ($_.EstimatedSize) { [Math]::Round($_.EstimatedSize / 1024, 1) } else { $null })
+            'Zakres'                  = $root.Scope
+            'Użytkownik'              = $user
+            'Identyfikator'           = $_.PSChildName
+            'Polecenie odinstalowania' = $plan.Command
+            '__plan'                  = $plan.Kind
+            '__reason'                = $plan.Reason
+            '__hive'                  = $hive
+            '__tone'                  = $tone
+        }
+    }
+}
+'@
+
+$script:ProgramUninstallBody = @'
+$ErrorActionPreference = 'Stop'
+$logDir = Join-Path $env:SystemRoot 'Temp\DomainOps'
+if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+$kill = New-Object System.Diagnostics.ProcessStartInfo
+$kill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+$kill.UseShellExecute = $false
+$kill.CreateNoWindow = $true
+$meaning = @{
+    0 = @('Odinstalowano', 'ok'); 3010 = @('Odinstalowano – wymagany restart', 'warn'); 1641 = @('Odinstalowano – deinstalator uruchomił restart', 'warn')
+    1605 = @('Program nie jest zainstalowany (MSI 1605)', 'info'); 1614 = @('Program był już odinstalowany (MSI 1614)', 'info')
+    1602 = @('Anulowano (MSI 1602)', 'crit'); 1603 = @('Błąd krytyczny MSI (1603) – szczegóły w logu', 'crit'); 1618 = @('Trwa inna instalacja – spróbuj ponownie później (MSI 1618)', 'crit')
+    1625 = @('Zablokowane przez zasady (MSI 1625)', 'crit'); 1612 = @('Brak źródła instalacji potrzebnego do odinstalowania (MSI 1612)', 'crit')
+}
+foreach ($item in $P.Items) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $res = [ordered]@{ Id = $item.Id; Name = $item.Name; Status = ''; Tone = 'crit'; Code = $null; Detail = ''; Seconds = 0 }
+    try {
+        $roots = if ($item.Scope -eq 'Użytkownik') { @("Registry::HKEY_USERS\$($item.Hive)\Software\Microsoft\Windows\CurrentVersion\Uninstall") }
+        else { @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') }
+        $keyPath = $null
+        foreach ($r in $roots) { $c = Join-Path $r $item.Id; if (Test-Path -LiteralPath $c) { $keyPath = $c; break } }
+        if (-not $keyPath) { $res.Status = 'Programu już nie ma w rejestrze (odinstalowany wcześniej?)'; $res.Tone = 'info'; [pscustomobject]$res; continue }
+        $key = Get-ItemProperty -LiteralPath $keyPath
+        $plan = Get-UninstallPlan $key
+        $command = $plan.Command
+        if ($plan.Kind -eq 'interactive' -and $item.Args) { $command = $plan.Command + ' ' + $item.Args }
+        elseif (@('msi', 'quiet', 'inno') -notcontains $plan.Kind) { throw ('Nie da się odinstalować zdalnie: ' + $plan.Reason) }
+        $msiLog = ''
+        if ($plan.Kind -eq 'msi') {
+            $msiLog = Join-Path $logDir ('Uninstall_{0}.log' -f ($plan.Guid -replace '[{}]', ''))
+            $command = 'msiexec.exe /x {0} /qn /norestart /l*v "{1}"' -f $plan.Guid, $msiLog
+            if ($item.Args) { $command += ' ' + $item.Args }
+        }
+        $timedOut = $false
+        if ($item.Scope -eq 'Użytkownik') {
+            # Program w profilu: deinstalator musi działać jako ten użytkownik - zadanie w jego zalogowanej sesji
+            $account = (New-Object System.Security.Principal.SecurityIdentifier($item.Hive)).Translate([System.Security.Principal.NTAccount]).Value
+            $taskName = 'DomainOps_Uninstall_' + [guid]::NewGuid().ToString('N')
+            $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument ('/d /s /c "' + $command + '"')
+            $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromSeconds([Math]::Max(60, [int]$P.TimeoutSec)))
+            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+            try {
+                Start-ScheduledTask -TaskName $taskName
+                Start-Sleep -Seconds 2
+                while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
+                    if ([int]$P.TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge [int]$P.TimeoutSec) { $timedOut = $true; Stop-ScheduledTask -TaskName $taskName; break }
+                    Start-Sleep -Seconds 1
+                }
+                $info = Get-ScheduledTaskInfo -TaskName $taskName
+                $res.Code = [int64]$info.LastTaskResult
+                if ($res.Code -eq 0x41303 -or $res.Code -eq 0x41306) { throw "Zadanie nie wystartowało – użytkownik $account nie jest zalogowany interaktywnie (zaloguj go albo odinstaluj program w jego sesji)." }
+            }
+            finally { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
+        }
+        else {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            if ($plan.Kind -eq 'msi') { $psi.FileName = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $psi.Arguments = $command.Substring('msiexec.exe '.Length) }
+            else { $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'; $psi.Arguments = '/d /s /c "' + $command + '"' }
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            try {
+                while (-not $proc.HasExited) {
+                    if ([int]$P.TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge [int]$P.TimeoutSec) { $timedOut = $true; break }
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+            finally {
+                if (-not $proc.HasExited) {
+                    try { $kill.Arguments = '/T /F /PID ' + $proc.Id; [void][System.Diagnostics.Process]::Start($kill).WaitForExit(10000) } catch { }
+                    try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+                }
+            }
+            if (-not $timedOut) { $res.Code = $proc.ExitCode }
+        }
+        if ($timedOut) {
+            $res.Status = "Przekroczono limit czasu ($($P.TimeoutSec) s) – deinstalator zatrzymany; prawdopodobnie czekał na odpowiedź użytkownika"
+        }
+        else {
+            $known = $meaning[[int]$res.Code]
+            if ($known) { $res.Status = $known[0]; $res.Tone = $known[1] } else { $res.Status = "Błąd – kod wyjścia $($res.Code)" }
+            # Weryfikacja: wpis w rejestrze powinien zniknąć
+            Start-Sleep -Seconds 2
+            if (@('ok', 'warn') -contains $res.Tone -and (Test-Path -LiteralPath $keyPath)) {
+                if ($res.Tone -eq 'ok') { $res.Status = 'Deinstalator zakończył się bez błędu, ale program nadal jest zainstalowany – mógł czekać na potwierdzenie, uruchomić osobny proces albo wymaga restartu'; $res.Tone = 'warn' }
+            }
+        }
+        if ($msiLog) { $res.Detail = "Log MSI: $msiLog" }
+    }
+    catch {
+        $res.Status = $_.Exception.Message
+        $res.Tone = 'crit'
+    }
+    $res.Seconds = [Math]::Round($sw.Elapsed.TotalSeconds)
+    [pscustomobject]$res
+}
+'@
+
+function New-ProgramScript([string]$Body) {
+    # Blok zdalny: param($P) musi być pierwszy, potem wspólna funkcja Get-UninstallPlan i właściwa treść
+    return [scriptblock]::Create("param(`$P)`n" + $script:UninstallPlanText + "`n" + $Body)
+}
+
+function Start-ProgramUninstall {
+    # -Args: dodatkowe przełączniki (dla deinstalatorów bez trybu cichego w rejestrze albo dodatkowe opcje MSI)
+    param([hashtable]$Module, $Rows, [string]$Switches = '')
+    $m = $Module
+    $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Identyfikator', 'Nazwa', 'Zakres') -Rows $Rows
+    if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli programy do odinstalowania.'; return }
+    $possible = New-Object System.Collections.ArrayList
+    $blocked = New-Object System.Collections.ArrayList
+    foreach ($h in $byHost.Keys) {
+        foreach ($i in $byHost[$h]) {
+            $row = $i['__row']
+            $plan = [string](Get-RowValue $row '__plan')
+            $entry = @{ Host = $h; Row = $row; Id = [string]$i['Identyfikator']; Name = [string]$i['Nazwa']; Scope = [string]$i['Zakres']; Hive = [string](Get-RowValue $row '__hive'); Plan = $plan; Reason = [string](Get-RowValue $row '__reason') }
+            if (@('msi', 'quiet', 'inno') -contains $plan -or ($plan -eq 'interactive' -and $Switches)) { [void]$possible.Add($entry) } else { [void]$blocked.Add($entry) }
+        }
+    }
+    foreach ($b in $blocked) {
+        $why = if ($b.Plan -eq 'interactive') { 'Nie zdalnie: brak trybu cichego (użyj «Odinstaluj z przełącznikami…»)' } else { 'Nie zdalnie: ' + $b.Reason }
+        Set-RowState -Module $m -Row $b.Row -State $why -Tone 'crit'
+    }
+    $blockedText = (@($blocked | Select-Object -First 8 | ForEach-Object { '• {0}: {1} – {2}' -f $_.Host, $_.Name, $(if ($_.Reason) { $_.Reason } else { 'brak metody' }) }) -join "`r`n")
+    if ($blocked.Count -gt 8) { $blockedText += "`r`n• … i $($blocked.Count - 8) więcej" }
+    if ($possible.Count -eq 0) {
+        Show-Message -Title 'Nie można odinstalować zdalnie' -Tone 'warn' -Text ("Żadnego z wybranych programów nie da się odinstalować bez udziału użytkownika:`r`n`r`n$blockedText`r`n`r`n" +
+            "Co można zrobić:`r`n• «Odinstaluj z przełącznikami…» – podaj przełączniki cichego trybu z dokumentacji producenta (często /S, /silent, /quiet, /uninstall)`r`n" +
+            "• program w profilu użytkownika bez trybu cichego – odinstaluj go w sesji tego użytkownika (np. pulpit zdalny / pomoc zdalna)`r`n• NoRemove – użyj narzędzia do usuwania od producenta")
+        return
+    }
+    $items = @($possible | ForEach-Object { '{0}: {1}{2}' -f $_.Host, $_.Name, $(if ($_.Scope -eq 'Użytkownik') { '  (w sesji użytkownika)' } else { '' }) })
+    $text = 'Odinstalować wybrane programy? Deinstalator działa bez okien i bez restartu; po zakończeniu sprawdzane jest, czy program zniknął z rejestru.'
+    if ($Switches) { $text += "`r`nDodatkowe przełączniki: $Switches" }
+    if (@($possible | Where-Object { $_.Scope -eq 'Użytkownik' }).Count) { $text += "`r`nProgramy z profilu użytkownika zostaną odinstalowane zadaniem w jego sesji – użytkownik musi być zalogowany." }
+    if ($blocked.Count) { $text += "`r`n`r`nPominięte – nie da się ich odinstalować zdalnie ($($blocked.Count)):`r`n$blockedText" }
+    $chosen = @(Confirm-Action -Text $text -Items $items -ConfirmText 'Odinstaluj' -Danger -Select -ReturnIndex)
+    if ($chosen.Count -eq 0) { return }
+    $timeout = [int]$script:ExecTimeouts[[string]$m.Timeout.SelectedItem]
+    $per = @{}
+    $m.Data.UninstallRows = @{}
+    foreach ($i in $chosen) {
+        $e = $possible[$i]
+        if (-not $per.ContainsKey($e.Host)) { $per[$e.Host] = @{ Items = @(); TimeoutSec = $timeout } }
+        $per[$e.Host].Items += @{ Id = $e.Id; Name = $e.Name; Scope = $e.Scope; Hive = $e.Hive; Args = $Switches }
+        $m.Data.UninstallRows[('{0}|{1}' -f $e.Host, $e.Id)] = $e.Row
+        Set-RowState -Module $m -Row $e.Row -State 'Odinstalowywanie…' -Tone 'info'
+    }
+    $m.Data.UninstallResults = New-Object System.Collections.ArrayList
+    $sb = New-ProgramScript $script:ProgramUninstallBody
+    Start-HostOperation -Module $m -Name 'Odinstalowanie' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $sb -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) {
+            foreach ($k in @($m.Data.UninstallRows.Keys | Where-Object { $_ -like "$($r.Target)|*" })) { Set-RowState -Module $m -Row $m.Data.UninstallRows[$k] -State ('Błąd połączenia: ' + ((@($r.Errors)) -join ' | ')) -Tone 'crit' }
+            return
+        }
+        foreach ($d in @($r.Data)) {
+            $row = $m.Data.UninstallRows[('{0}|{1}' -f $r.Target, $d.Id)]
+            if ($row) { Set-RowState -Module $m -Row $row -State ([string]$d.Status) -Tone ([string]$d.Tone) }
+            $level = @{ ok = 'OK'; info = 'INFO'; warn = 'WARN'; crit = 'ERROR' }[[string]$d.Tone]
+            Write-Log ('[{0}] {1}: {2}{3}' -f $r.Target, $d.Name, $d.Status, $(if ($d.Detail) { " ($($d.Detail))" } else { '' })) $level
+            [void]$m.Data.UninstallResults.Add([pscustomobject][ordered]@{ 'Komputer' = $r.Target; 'Program' = $d.Name; 'Wynik' = $d.Status; 'Kod wyjścia' = $d.Code; 'Czas (s)' = $d.Seconds; 'Szczegóły' = $d.Detail; '__tone' = $d.Tone })
+        }
+    } -OnComplete {
+        param($m)
+        $res = @($m.Data.UninstallResults)
+        $bad = @($res | Where-Object { @('warn', 'crit') -contains $_.__tone }).Count
+        if ($bad -gt 0) { Show-GridDialog -Title 'Wynik odinstalowania' -Subtitle "Nie wszystko się udało ($bad z $($res.Count)) – przyczyny w kolumnie «Wynik»." -Rows $res -PillColumns @('Wynik') }
+        else { Show-Toast "Odinstalowano: $($res.Count)" 'ok' }
+    }
+}
+
 Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'Programs' -Title 'Zainstalowane programy' -Icon 'E71D' `
-    -Description 'Programy z rejestru (64/32-bit i profile zalogowanych użytkowników) oraz ciche odinstalowanie zaznaczonych (MSI albo QuietUninstallString).' -Build {
+    -Description 'Programy z rejestru (64/32-bit i profile zalogowanych użytkowników). Kolumna «Odinstalowanie zdalne» mówi, czy i jak program da się usunąć bez użytkownika (MSI, tryb cichy, Inno Setup, zadanie w sesji użytkownika); wynik i przyczyna niepowodzenia trafiają do kolumny «Stan».' -Build {
     param($m)
+    $m.PillColumns = @('Odinstalowanie zdalne', 'Stan')
+    $m.Data.UninstallRows = @{}
+    $m.Data.UninstallResults = @()
     $m.Actions.List = {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Programy' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); ShowSystem = (Test-Checked $m.ShowSystem) } -ScriptBlock {
-            param($P)
-            $roots = @(
-                @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Komputer' },
-                @{ Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Komputer (32-bit)' },
-                @{ Path = 'Registry::HKEY_USERS\*\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'Użytkownik' }
-            )
-            foreach ($root in $roots) {
-                Get-ItemProperty -Path $root.Path -ErrorAction SilentlyContinue | ForEach-Object {
-                    if (-not $_.DisplayName) { return }
-                    if (-not $P.ShowSystem -and ($_.SystemComponent -eq 1 -or $_.ParentKeyName -or @('Update', 'Hotfix', 'Security Update') -contains $_.ReleaseType)) { return }
-                    if ($P.Filter -and $_.DisplayName -notlike "*$($P.Filter)*" -and $_.Publisher -notlike "*$($P.Filter)*") { return }
-                    $date = $null
-                    if ($_.InstallDate -match '^\d{8}$') { try { $date = [datetime]::ParseExact($_.InstallDate, 'yyyyMMdd', $null) } catch { } }
-                    $isMsi = ($_.WindowsInstaller -eq 1 -and $_.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$')
-                    $uninstall = if ($_.QuietUninstallString) { $_.QuietUninstallString } else { $_.UninstallString }
-                    [pscustomobject]@{
-                        'Nazwa'           = $_.DisplayName
-                        'Wersja'          = $_.DisplayVersion
-                        'Wydawca'         = $_.Publisher
-                        'Data instalacji' = $date
-                        'Rozmiar (MB)'    = $(if ($_.EstimatedSize) { [Math]::Round($_.EstimatedSize / 1024, 1) } else { $null })
-                        'Zakres'          = $root.Scope
-                        'Typ'             = $(if ($isMsi) { 'MSI' } else { 'Inny' })
-                        'Identyfikator'   = $_.PSChildName
-                        'Odinstalowanie'  = $uninstall
-                    }
-                }
-            }
-        }
-    }
-    $m.Actions.Uninstall = {
-        param($m, $Rows)
-        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Identyfikator', 'Nazwa', 'Zakres') -Rows $Rows
-        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli programy do odinstalowania.'; return }
-        $items = Get-HostItemList -ByHost $byHost -Format { param($i) $i['Nazwa'] }
-        if (-not (Confirm-Action -Text 'Odinstalować wybrane programy? Operacja jest wykonywana bez interakcji z użytkownikiem i bez restartu.' -Items $items -ConfirmText 'Odinstaluj' -Danger)) { return }
-        $per = @{}
-        foreach ($h in $byHost.Keys) {
-            $per[$h] = @{ Items = @($byHost[$h] | ForEach-Object { @{ Id = [string]$_['Identyfikator']; Name = [string]$_['Nazwa']; Scope = [string]$_['Zakres'] } }) }
-        }
-        Start-HostOperation -Module $m -Name 'Odinstalowanie' -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
-            param($P)
-            foreach ($item in $P.Items) {
-                try {
-                    if ($item.Scope -eq 'Użytkownik') { throw 'Programy instalowane w profilu użytkownika trzeba odinstalować w jego sesji.' }
-                    $key = $null
-                    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
-                        $candidate = Join-Path $root $item.Id
-                        if (Test-Path -LiteralPath $candidate) { $key = Get-ItemProperty -LiteralPath $candidate; break }
-                    }
-                    if (-not $key) { throw 'Nie znaleziono wpisu w rejestrze.' }
-                    if ($key.WindowsInstaller -eq 1 -and $item.Id -match '^\{[0-9A-Fa-f-]{36}\}$') {
-                        $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'
-                        $arguments = '/x {0} /qn /norestart' -f $item.Id
-                    }
-                    elseif ($key.QuietUninstallString) {
-                        $exe = Join-Path $env:SystemRoot 'System32\cmd.exe'
-                        $arguments = '/d /s /c "' + $key.QuietUninstallString + '"'
-                    }
-                    else { throw 'Brak cichego odinstalowania (QuietUninstallString) – odinstaluj program ręcznie.' }
-                    $proc = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -WindowStyle Hidden
-                    $null = $proc.Handle
-                    $proc.WaitForExit()
-                    $code = $proc.ExitCode
-                    $status = switch ($code) { 0 { 'Odinstalowano' } 3010 { 'Odinstalowano – wymagany restart' } 1605 { 'Program nie jest zainstalowany' } default { "Błąd – kod wyjścia $code" } }
-                    [pscustomobject]@{ 'Program' = $item.Name; 'Kod wyjścia' = $code; 'Wynik' = $status }
-                }
-                catch { [pscustomobject]@{ 'Program' = $item.Name; 'Wynik' = "Błąd – $($_.Exception.Message)" } }
-            }
-        }
+        $sb = New-ProgramScript $script:ProgramListBody
+        Start-HostOperation -Module $m -Name 'Programy' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); ShowSystem = (Test-Checked $m.ShowSystem) } -ScriptBlock $sb
     }
     $row = Add-ToolbarRow -Module $m -Title 'Lista'
     Add-Label -Parent $row -Text 'Nazwa lub wydawca' | Out-Null
     $m.Filter = Add-TextBox -Parent $row -Width 200 -Placeholder 'np. Office'
     $m.ShowSystem = Add-CheckBox -Parent $row -Text 'Pokaż aktualizacje i składniki systemowe'
     Add-Button -Parent $row -Text 'Pokaż programy' -Icon 'E72C' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
-    Add-Button -Parent $row -Text 'Odinstaluj zaznaczone' -Icon 'E74D' -Module $m -Danger -OnClick { param($m) & $m.Actions.Uninstall $m $null } | Out-Null
-    Add-RowAction -Module $m -Text 'Odinstaluj' -Icon 'E74D' -Danger -Action { param($m, $rows) & $m.Actions.Uninstall $m $rows }
-    Add-RowAction -Module $m -Text 'Pokaż ten program na wszystkich komputerach' -Icon 'E721' -Action {
+    $row2 = Add-ToolbarRow -Module $m -Title 'Odinstalowanie'
+    Add-Button -Parent $row2 -Text 'Odinstaluj zaznaczone' -Icon 'E74D' -Module $m -Danger -OnClick { param($m) Start-ProgramUninstall -Module $m -Rows $null } | Out-Null
+    Add-Label -Parent $row2 -Text 'Limit czasu' | Out-Null
+    $m.Timeout = Add-ComboBox -Parent $row2 -Items @($script:ExecTimeouts.Keys) -Width 120
+    $m.Timeout.SelectedIndex = 2
+    Add-Label -Parent $row2 -Text 'Zielone – usunie się po cichu; żółte – z zastrzeżeniem (przełączniki albo sesja użytkownika); czerwone – nie zdalnie (powód w «Stan» po próbie).' -Hint -MaxWidth 640 | Out-Null
+    Add-RowAction -Module $m -Text 'Odinstaluj' -Icon 'E74D' -Danger -Action { param($m, $rows) Start-ProgramUninstall -Module $m -Rows $rows }
+    Add-RowAction -Module $m -Text 'Odinstaluj z przełącznikami…' -Icon 'E74D' -Danger -Action {
+        param($m, $rows)
+        $switches = Show-InputDialog -Title 'Przełączniki deinstalatora' -Prompt 'Przełączniki cichego trybu z dokumentacji producenta, dopisywane do polecenia odinstalowania (np. /S – NSIS, /silent, /quiet /norestart, --uninstall --force-uninstall). Bez właściwych przełączników deinstalator zostanie zatrzymany po upływie limitu czasu.' -Default '/S' -Icon 'E74D' -Validate { param($t) if (-not $t.Trim()) { 'Podaj przełączniki.' } else { '' } }
+        if (-not $switches) { return }
+        Start-ProgramUninstall -Module $m -Rows $rows -Switches $switches.Trim()
+    }
+    Add-RowAction -Module $m -Text 'Pokaż ten program na wszystkich komputerach' -Icon 'E721' -Separator -Action {
         param($m, $rows)
         $name = [string](Get-ObjectValue $rows[0] 'Nazwa')
         if ($name) { $m.FilterBox.Text = $name }
@@ -8785,7 +9411,7 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
         $reboot = if (Test-Checked $m.AutoReboot) { 'z automatycznym restartem' } else { 'bez restartu' }
-        if (-not (Confirm-Action -Text "Zainstalować wszystkie dostępne aktualizacje ($reboot) na $($targets.Count) komputer(ach)?" -Items $targets -ConfirmText 'Zainstaluj')) { return }
+        $targets = @(Confirm-Action -Text "Zainstalować wszystkie dostępne aktualizacje ($reboot) na wybranych komputerach?" -Items $targets -ConfirmText 'Zainstaluj' -Select); if ($targets.Count -eq 0) { return }
         $params = @{ Script = $script:WuJobScript; AutoReboot = (Test-Checked $m.AutoReboot); IncludeDrivers = (Test-Checked $m.Drivers) }
         Start-HostOperation -Module $m -Name 'Instalacja aktualizacji' -Targets $targets -Output Log -Parameters $params -ScriptBlock {
             param($P)
@@ -9047,7 +9673,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Defender' 
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
         $label = @{ Update = 'Zaktualizować sygnatury'; QuickScan = 'Uruchomić szybkie skanowanie'; FullScan = 'Uruchomić PEŁNE skanowanie (może trwać godzinami i obciąża dysk)' }[$op]
-        if (-not (Confirm-Action -Text "$label na $($targets.Count) komputer(ach)?" -Items $targets -ConfirmText 'Wykonaj')) { return }
+        $targets = @(Confirm-Action -Text "$label na wybranych komputerach?" -Items $targets -ConfirmText 'Wykonaj' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name "Defender – $op" -Targets $targets -Output Log -Parameters @{ Op = $op } -ScriptBlock {
             param($P)
             if (-not (Get-Command Start-MpScan -ErrorAction SilentlyContinue)) { throw 'Brak modułu Defender na komputerze.' }
@@ -9113,7 +9739,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'BitLocker'
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        if (-not (Confirm-Action -Text "Zapisać w AD klucze odzyskiwania BitLocker (wszystkie woluminy) z $($targets.Count) komputer(ów)?" -Items $targets -ConfirmText 'Zapisz w AD')) { return }
+        $targets = @(Confirm-Action -Text "Zapisać w AD klucze odzyskiwania BitLocker (wszystkie woluminy) z wybranych komputerów?" -Items $targets -ConfirmText 'Zapisz w AD' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name 'BitLocker – kopia do AD' -Targets $targets -Output Log -ScriptBlock {
             param($P)
             if (Get-Command Backup-BitLockerKeyProtector -ErrorAction SilentlyContinue) {
@@ -9277,7 +9903,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Firewall' 
             Profile       = @('Any', 'Domain', 'Private', 'Public')[$m.NewProfile.SelectedIndex]
             RemoteAddress = $remote
         }
-        if (-not (Confirm-Action -Text ("Utworzyć regułę «{0}» ({1}, {2}, {3}/{4})?" -f $name, $m.NewDirection.SelectedItem, $m.NewAction.SelectedItem, $params.Protocol, ($ports -join ',')) -Items $targets -ConfirmText 'Utwórz')) { return }
+        $targets = @(Confirm-Action -Text ("Utworzyć regułę «{0}» ({1}, {2}, {3}/{4})?" -f $name, $m.NewDirection.SelectedItem, $m.NewAction.SelectedItem, $params.Protocol, ($ports -join ',')) -Items $targets -ConfirmText 'Utwórz' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name 'Nowa reguła zapory' -Targets $targets -Output Log -Parameters $params -ScriptBlock {
             param($P)
             $rp = @{
@@ -9497,7 +10123,7 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
             Full = @(Split-ListText $m.NewFull.Text); Change = @(Split-ListText $m.NewChange.Text); Read = @(Split-ListText $m.NewRead.Text)
             Ntfs = (Test-Checked $m.NewNtfs); CreateFolder = (Test-Checked $m.NewCreate)
         }
-        if (-not (Confirm-Action -Text ("Utworzyć udział {0} -> {1}?" -f $name, $path) -Items $targets -ConfirmText 'Utwórz')) { return }
+        $targets = @(Confirm-Action -Text ("Utworzyć udział {0} -> {1}?" -f $name, $path) -Items $targets -ConfirmText 'Utwórz' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name 'Tworzenie udziału' -Targets $targets -Output Log -Parameters $params -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
             param($P)
             if (-not (Test-Path -LiteralPath $P.Path)) {
@@ -9534,6 +10160,1183 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
             [pscustomobject]@{ 'Udział' = $P.Name; 'Ścieżka' = $P.Path; 'Wynik' = "Utworzono$ntfs" }
         }
     } | Out-Null
+}
+#endregion
+
+#region Zarządzanie zdalne: analiza wydajności (co obciąża komputer lub serwer)
+# Pomiar na komputerze docelowym: kilka próbek surowych liczników wydajności (klasy Win32_PerfRawData_* - nazwy
+# niezależne od języka systemu) w zadanym oknie czasu. Z różnic między próbkami liczone są prawdziwe średnie
+# i wartości szczytowe (pojedynczy odczyt liczników sformatowanych bywa mylący, a opóźnienia dysku w klasach
+# sformatowanych są zaokrąglane do pełnych sekund). Wynik to płaskie obiekty z polem __kind:
+#   summary (jeden na komputer), proc (procesy z czołówki), disk (woluminy), nic (karty sieciowe), event (zdarzenia).
+$script:PerfAnalysisScript = {
+    param($P)
+    $ErrorActionPreference = 'Stop'
+    $state = @{ Missing = New-Object System.Collections.ArrayList }
+    function Get-Raw([string]$Class, [string]$Filter = '') {
+        try {
+            if ($Filter) { return @(Get-CimInstance -ClassName $Class -Filter $Filter -ErrorAction Stop) }
+            return @(Get-CimInstance -ClassName $Class -ErrorAction Stop)
+        }
+        catch {
+            if (-not $state.Missing.Contains($Class)) { [void]$state.Missing.Add($Class) }
+            return @()
+        }
+    }
+    function Get-Delta($a, $b, [string]$Prop) {
+        if ($null -eq $a -or $null -eq $b) { return 0.0 }
+        $d = [double]$b.$Prop - [double]$a.$Prop
+        # Liczniki 32-bitowe się przekręcają
+        if ($d -lt 0 -and [double]$a.$Prop -lt 4294967296) { $d += 4294967296 }
+        return $d
+    }
+    function Get-Rate($a, $b, [string]$Prop) {
+        # PERF_COUNTER_COUNTER / BULK_COUNT: zdarzenia na sekundę
+        if ($null -eq $a -or $null -eq $b) { return 0.0 }
+        $dt = (Get-Delta $a $b 'Timestamp_PerfTime') / [double]$b.Frequency_PerfTime
+        if ($dt -le 0) { return 0.0 }
+        return (Get-Delta $a $b $Prop) / $dt
+    }
+    function Get-Pct100ns($a, $b, [string]$Prop) {
+        # PERF_100NSEC_TIMER: procent czasu
+        if ($null -eq $a -or $null -eq $b) { return 0.0 }
+        $dt = Get-Delta $a $b 'Timestamp_Sys100NS'
+        if ($dt -le 0) { return 0.0 }
+        return 100.0 * (Get-Delta $a $b $Prop) / $dt
+    }
+    function Get-AvgTimer($a, $b, [string]$Prop) {
+        # PERF_AVERAGE_TIMER: sekundy na operację
+        if ($null -eq $a -or $null -eq $b) { return 0.0 }
+        $base = Get-Delta $a $b ($Prop + '_Base')
+        if ($base -le 0) { return 0.0 }
+        return ((Get-Delta $a $b $Prop) / [double]$b.Frequency_PerfTime) / $base
+    }
+    function Get-PctBase($a, $b, [string]$Prop) {
+        # PERF_PRECISION_100NS_TIMER z bazą (np. % czasu bezczynności dysku)
+        if ($null -eq $a -or $null -eq $b) { return $null }
+        $base = Get-Delta $a $b ($Prop + '_Base')
+        if ($base -le 0) { return $null }
+        return 100.0 * (Get-Delta $a $b $Prop) / $base
+    }
+    function Get-Clamp([double]$v, [double]$lo = 0, [double]$hi = 100) { return [Math]::Min($hi, [Math]::Max($lo, $v)) }
+    function Get-ByName($list, [string]$Name) { foreach ($x in $list) { if ([string]$x.Name -eq $Name) { return $x } }; return $null }
+
+    $duration = [Math]::Max(2, [int]$P.Duration)
+    $interval = [Math]::Max(1, [Math]::Min([int]$P.Interval, $duration))
+    $top = [Math]::Max(1, [int]$P.Top)
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    $cores = [Math]::Max(1, [int]$cs.NumberOfLogicalProcessors)
+    $totalMB = [Math]::Round([double]$os.TotalVisibleMemorySize / 1KB)
+
+    $take = {
+        @{
+            Cpu  = @(Get-Raw 'Win32_PerfRawData_PerfOS_Processor' "Name='_Total'") | Select-Object -First 1
+            Sys  = @(Get-Raw 'Win32_PerfRawData_PerfOS_System') | Select-Object -First 1
+            Mem  = @(Get-Raw 'Win32_PerfRawData_PerfOS_Memory') | Select-Object -First 1
+            Disk = @(Get-Raw 'Win32_PerfRawData_PerfDisk_LogicalDisk' | Where-Object { $_.Name -ne '_Total' })
+            Nic  = @(Get-Raw 'Win32_PerfRawData_Tcpip_NetworkInterface' | Where-Object { $_.Name -notmatch 'isatap|teredo|6to4|loopback|pseudo' })
+            Tcp  = @(Get-Raw 'Win32_PerfRawData_Tcpip_TCPv4') | Select-Object -First 1
+            Tcp6 = @(Get-Raw 'Win32_PerfRawData_Tcpip_TCPv6') | Select-Object -First 1
+        }
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $p0 = @(Get-Raw 'Win32_PerfRawData_PerfProc_Process')
+    $samples = New-Object System.Collections.ArrayList
+    [void]$samples.Add((& $take))
+    $count = [Math]::Max(1, [int][Math]::Ceiling($duration / [double]$interval))
+    for ($i = 0; $i -lt $count; $i++) {
+        Start-Sleep -Seconds $interval
+        [void]$samples.Add((& $take))
+    }
+    $p1 = @(Get-Raw 'Win32_PerfRawData_PerfProc_Process')
+    $measured = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+    $first = $samples[0]
+    $last = $samples[$samples.Count - 1]
+    $pairs = @(for ($i = 1; $i -lt $samples.Count; $i++) { , @($samples[$i - 1], $samples[$i]) })
+
+    # --- procesor
+    $cpuAvg = Get-Clamp (100 - (Get-Pct100ns $first.Cpu $last.Cpu 'PercentProcessorTime'))
+    $cpuMax = 0.0
+    foreach ($pr in $pairs) { $cpuMax = [Math]::Max($cpuMax, (Get-Clamp (100 - (Get-Pct100ns $pr[0].Cpu $pr[1].Cpu 'PercentProcessorTime')))) }
+    $kernel = Get-Clamp (Get-Pct100ns $first.Cpu $last.Cpu 'PercentPrivilegedTime')
+    $irq = Get-Clamp ((Get-Pct100ns $first.Cpu $last.Cpu 'PercentInterruptTime') + (Get-Pct100ns $first.Cpu $last.Cpu 'PercentDPCTime'))
+    $queues = @($samples | ForEach-Object { if ($_.Sys) { [double]$_.Sys.ProcessorQueueLength } })
+    $queueAvg = if ($queues.Count) { ($queues | Measure-Object -Average).Average } else { 0 }
+    $queueMax = if ($queues.Count) { ($queues | Measure-Object -Maximum).Maximum } else { 0 }
+    $ctx = Get-Rate $first.Sys $last.Sys 'ContextSwitchesPersec'
+
+    # --- pamięć
+    $avail = @($samples | ForEach-Object { if ($_.Mem) { [double]$_.Mem.AvailableMBytes } })
+    $availMin = if ($avail.Count) { ($avail | Measure-Object -Minimum).Minimum } else { [double]$os.FreePhysicalMemory / 1KB }
+    $mem = $last.Mem
+    $commitPct = if ($mem -and [double]$mem.CommitLimit -gt 0) { 100.0 * [double]$mem.CommittedBytes / [double]$mem.CommitLimit } else { $null }
+    $hardFaults = Get-Rate $first.Mem $last.Mem 'PageReadsPersec'
+    $pagesPs = Get-Rate $first.Mem $last.Mem 'PagesPersec'
+
+    # --- dyski (woluminy)
+    $disks = foreach ($d1 in $last.Disk) {
+        $d0 = Get-ByName $first.Disk $d1.Name
+        if (-not $d0) { continue }
+        $reads = Get-Rate $d0 $d1 'DiskReadsPersec'
+        $writes = Get-Rate $d0 $d1 'DiskWritesPersec'
+        $maxLat = 0.0
+        $maxQueue = 0.0
+        foreach ($pr in $pairs) {
+            $a = Get-ByName $pr[0].Disk $d1.Name
+            $b = Get-ByName $pr[1].Disk $d1.Name
+            if ($a -and $b -and ((Get-Rate $a $b 'DiskTransfersPersec') -ge 1)) { $maxLat = [Math]::Max($maxLat, 1000 * (Get-AvgTimer $a $b 'AvgDisksecPerTransfer')) }
+            if ($b) { $maxQueue = [Math]::Max($maxQueue, [double]$b.CurrentDiskQueueLength) }
+        }
+        $idle = Get-PctBase $d0 $d1 'PercentIdleTime'
+        $dtSys = Get-Delta $d0 $d1 'Timestamp_Sys100NS'
+        $freePct = if ([double]$d1.PercentFreeSpace_Base -gt 0) { 100.0 * [double]$d1.PercentFreeSpace / [double]$d1.PercentFreeSpace_Base } else { $null }
+        [pscustomobject]@{
+            __kind     = 'disk'
+            Volume     = [string]$d1.Name
+            ReadMs     = [Math]::Round(1000 * (Get-AvgTimer $d0 $d1 'AvgDisksecPerRead'), 1)
+            WriteMs    = [Math]::Round(1000 * (Get-AvgTimer $d0 $d1 'AvgDisksecPerWrite'), 1)
+            AvgMs      = [Math]::Round(1000 * (Get-AvgTimer $d0 $d1 'AvgDisksecPerTransfer'), 1)
+            MaxMs      = [Math]::Round($maxLat, 1)
+            QueueAvg   = $(if ($dtSys -gt 0) { [Math]::Round((Get-Delta $d0 $d1 'AvgDiskQueueLength') / $dtSys, 2) } else { 0 })
+            QueueMax   = $maxQueue
+            BusyPct    = $(if ($null -ne $idle) { [Math]::Round((Get-Clamp (100 - $idle)), 0) } else { $null })
+            ReadsPs    = [Math]::Round($reads, 1)
+            WritesPs   = [Math]::Round($writes, 1)
+            ReadMBps   = [Math]::Round((Get-Rate $d0 $d1 'DiskReadBytesPersec') / 1MB, 2)
+            WriteMBps  = [Math]::Round((Get-Rate $d0 $d1 'DiskWriteBytesPersec') / 1MB, 2)
+            FreeGB     = [Math]::Round([double]$d1.FreeMegabytes / 1KB, 1)
+            FreePct    = $(if ($null -ne $freePct) { [Math]::Round($freePct, 1) } else { $null })
+        }
+    }
+    $disks = @($disks)
+
+    # --- sieć
+    $nics = foreach ($n1 in $last.Nic) {
+        $n0 = Get-ByName $first.Nic $n1.Name
+        if (-not $n0) { continue }
+        $bw = [double]$n1.CurrentBandwidth
+        $total = Get-Rate $n0 $n1 'BytesTotalPersec'
+        $utilMax = 0.0
+        $outQ = 0.0
+        foreach ($pr in $pairs) {
+            $a = Get-ByName $pr[0].Nic $n1.Name
+            $b = Get-ByName $pr[1].Nic $n1.Name
+            if ($a -and $b -and $bw -gt 0) { $utilMax = [Math]::Max($utilMax, 100.0 * 8 * (Get-Rate $a $b 'BytesTotalPersec') / $bw) }
+            if ($b) { $outQ = [Math]::Max($outQ, [double]$b.OutputQueueLength) }
+        }
+        if ($bw -le 0 -and $total -le 0) { continue }
+        [pscustomobject]@{
+            __kind      = 'nic'
+            Adapter     = [string]$n1.Name
+            SpeedMbps   = [Math]::Round($bw / 1e6)
+            UtilAvg     = $(if ($bw -gt 0) { [Math]::Round((Get-Clamp (100.0 * 8 * $total / $bw)), 1) } else { $null })
+            UtilMax     = $(if ($bw -gt 0) { [Math]::Round((Get-Clamp $utilMax), 1) } else { $null })
+            RecvMbps    = [Math]::Round(8 * (Get-Rate $n0 $n1 'BytesReceivedPersec') / 1e6, 2)
+            SentMbps    = [Math]::Round(8 * (Get-Rate $n0 $n1 'BytesSentPersec') / 1e6, 2)
+            OutQueueMax = $outQ
+            Errors      = (Get-Delta $n0 $n1 'PacketsReceivedErrors') + (Get-Delta $n0 $n1 'PacketsOutboundErrors')
+            Discards    = (Get-Delta $n0 $n1 'PacketsReceivedDiscarded') + (Get-Delta $n0 $n1 'PacketsOutboundDiscarded')
+            ErrorsTotal = [double]$n1.PacketsReceivedErrors + [double]$n1.PacketsOutboundErrors
+        }
+    }
+    $nics = @($nics)
+    $segs = Get-Rate $first.Tcp $last.Tcp 'SegmentsSentPersec'
+    $retr = Get-Rate $first.Tcp $last.Tcp 'SegmentsRetransmittedPersec'
+    $retrPct = if ($segs -ge 20) { [Math]::Round(100.0 * $retr / $segs, 2) } else { $null }
+    $tcpConn = $(if ($last.Tcp) { [int]$last.Tcp.ConnectionsEstablished } else { 0 }) + $(if ($last.Tcp6) { [int]$last.Tcp6.ConnectionsEstablished } else { 0 })
+
+    # --- procesy (średnio w całym oknie pomiaru)
+    $before = @{}
+    foreach ($pc in $p0) { $before[('{0}|{1}' -f $pc.Name, $pc.IDProcess)] = $pc }
+    $procs = foreach ($pc in $p1) {
+        if ($pc.Name -eq '_Total' -or $pc.Name -eq 'Idle' -or [int]$pc.IDProcess -eq 0) { continue }
+        $a = $before[('{0}|{1}' -f $pc.Name, $pc.IDProcess)]
+        if (-not $a) { continue }
+        # PERF_ELAPSED_TIME: wartość surowa to chwila startu procesu
+        $elapsed = if ([double]$pc.Frequency_Object -gt 0 -and [double]$pc.ElapsedTime -gt 0) { ([double]$pc.Timestamp_Object - [double]$pc.ElapsedTime) / [double]$pc.Frequency_Object } else { -1 }
+        [pscustomobject]@{
+            Name       = ([string]$pc.Name -replace '#\d+$', '')
+            Pid        = [int]$pc.IDProcess
+            Cpu        = (Get-Pct100ns $a $pc 'PercentProcessorTime') / $cores
+            PrivateMB  = [double]$pc.WorkingSetPrivate / 1MB
+            CommitMB   = [double]$pc.PrivateBytes / 1MB
+            ReadMBps   = (Get-Rate $a $pc 'IOReadBytesPersec') / 1MB
+            WriteMBps  = (Get-Rate $a $pc 'IOWriteBytesPersec') / 1MB
+            IoOps      = Get-Rate $a $pc 'IODataOperationsPersec'
+            Handles    = [int]$pc.HandleCount
+            Threads    = [int]$pc.ThreadCount
+            Faults     = Get-Rate $a $pc 'PageFaultsPersec'
+            Hours      = $(if ($elapsed -ge 0) { [Math]::Round($elapsed / 3600, 1) } else { $null })
+        }
+    }
+    $procs = @($procs)
+    $picked = [ordered]@{}
+    foreach ($spec in @(@('Cpu', 'CPU'), @('PrivateMB', 'pamięć'), @('IoTotal', 'I/O'))) {
+        $key = $spec[0]
+        $list = if ($key -eq 'IoTotal') { @($procs | Sort-Object { $_.ReadMBps + $_.WriteMBps } -Descending) } else { @($procs | Sort-Object $key -Descending) }
+        foreach ($pc in ($list | Select-Object -First $top)) {
+            $value = if ($key -eq 'IoTotal') { $pc.ReadMBps + $pc.WriteMBps } else { $pc.$key }
+            if ($value -le 0) { continue }
+            # Klucz tekstowy: liczba w OrderedDictionary byłaby indeksem pozycji
+            $pk = [string]$pc.Pid
+            if ($picked.Contains($pk)) { $picked[$pk].Reasons += $spec[1] }
+            else { $picked[$pk] = @{ P = $pc; Reasons = @($spec[1]) } }
+        }
+    }
+    $services = @{}
+    $details = @{}
+    if ($picked.Count -gt 0) {
+        try {
+            foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Filter "State='Running'" -ErrorAction Stop)) {
+                $k = [int]$s.ProcessId
+                if (-not $services.ContainsKey($k)) { $services[$k] = New-Object System.Collections.ArrayList }
+                [void]$services[$k].Add([string]$s.Name)
+            }
+        }
+        catch { }
+        $filter = (@($picked.Keys | ForEach-Object { "ProcessId=$_" }) -join ' OR ')
+        try {
+            foreach ($wp in @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop)) {
+                $owner = ''
+                try {
+                    $o = Invoke-CimMethod -InputObject $wp -MethodName GetOwner -ErrorAction Stop
+                    if ($o.User) { $owner = $(if ($o.Domain) { "$($o.Domain)\$($o.User)" } else { [string]$o.User }) }
+                }
+                catch { }
+                $details[[int]$wp.ProcessId] = @{ Owner = $owner; Cmd = [string]$wp.CommandLine }
+            }
+        }
+        catch { }
+    }
+    $procRows = foreach ($k in $picked.Keys) {
+        $pc = $picked[$k].P
+        $d = $details[[int]$k]
+        $cmd = if ($d) { $d.Cmd } else { '' }
+        [pscustomobject]@{
+            __kind    = 'proc'
+            Name      = $pc.Name
+            Pid       = $pc.Pid
+            Reasons   = ($picked[$k].Reasons -join ', ')
+            Cpu       = [Math]::Round($pc.Cpu, 1)
+            PrivateMB = [Math]::Round($pc.PrivateMB)
+            CommitMB  = [Math]::Round($pc.CommitMB)
+            ReadMBps  = [Math]::Round($pc.ReadMBps, 2)
+            WriteMBps = [Math]::Round($pc.WriteMBps, 2)
+            IoOps     = [Math]::Round($pc.IoOps, 1)
+            Handles   = $pc.Handles
+            Threads   = $pc.Threads
+            Faults    = [Math]::Round($pc.Faults)
+            Hours     = $pc.Hours
+            Owner     = $(if ($d) { $d.Owner } else { '' })
+            Services  = $(if ($services.ContainsKey([int]$k)) { (@($services[[int]$k]) -join ', ') } else { '' })
+            Command   = $(if ($cmd.Length -gt 400) { $cmd.Substring(0, 400) + '…' } else { $cmd })
+        }
+    }
+    $procRows = @($procRows)
+
+    # --- zdarzenia świadczące o problemach (dyski, pamięć, awarie)
+    $events = @()
+    if ([int]$P.EventHours -gt 0) {
+        $since = (Get-Date).AddHours( - [int]$P.EventHours)
+        $meaning = @{
+            '41'   = @('crit', 'Nieoczekiwany restart (zanik zasilania, zawieszenie, twardy reset)')
+            '6008' = @('crit', 'Poprzednie zamknięcie systemu było nieoczekiwane')
+            '1001' = @('crit', 'Błąd krytyczny systemu (niebieski ekran)')
+            '2004' = @('crit', 'Brak pamięci wirtualnej – w treści proces, który zużywał najwięcej')
+            '2013' = @('warn', 'Mało miejsca na dysku (usługa Serwer)')
+            '2019' = @('crit', 'Wyczerpana pula pamięci niestronicowanej (wyciek sterownika)')
+            '2020' = @('crit', 'Wyczerpana pula pamięci stronicowanej')
+            '7'    = @('crit', 'Uszkodzony blok na dysku')
+            '11'   = @('crit', 'Błąd kontrolera dysku')
+            '51'   = @('crit', 'Błąd podczas stronicowania na dysk')
+            '129'  = @('warn', 'Reset urządzenia dyskowego (dysk / kontroler / SAN nie odpowiadał)')
+            '153'  = @('warn', 'Ponowione operacje I/O na dysku (opóźnienia, problemy ze ścieżką do macierzy)')
+            '55'   = @('crit', 'Uszkodzenie struktury systemu plików NTFS')
+            '98'   = @('warn', 'Wolumin wymaga sprawdzenia (chkdsk)')
+            '140'  = @('warn', 'NTFS nie zapisał danych (błąd I/O)')
+            '1000' = @('info', 'Awaria aplikacji')
+            '1002' = @('info', 'Aplikacja przestała odpowiadać (zawieszenie)')
+        }
+        $queries = @(
+            @{ LogName = 'System'; Id = @(41, 6008, 1001, 2004, 2013, 2019, 2020, 7, 11, 51, 129, 153, 55, 98, 140); StartTime = $since }
+            @{ LogName = 'Application'; Id = @(1000, 1002); StartTime = $since }
+        )
+        $found = foreach ($q in $queries) { try { Get-WinEvent -FilterHashtable $q -MaxEvents 150 -ErrorAction Stop } catch { } }
+        $events = foreach ($e in @($found | Sort-Object TimeCreated -Descending | Select-Object -First 100)) {
+            $id = [string]$e.Id
+            $prov = [string]$e.ProviderName
+            # Te same numery mają też inni dostawcy - bierzemy tylko znane źródła
+            $okSource = switch ($id) {
+                '41' { $prov -like '*Kernel-Power' }
+                '6008' { $prov -eq 'EventLog' }
+                '1001' { $prov -like '*WER-SystemErrorReporting' -or $prov -eq 'BugCheck' }
+                '2004' { $prov -like '*Resource-Exhaustion-Detector' }
+                { @('2013', '2019', '2020') -contains $_ } { $prov -eq 'srv' -or $prov -like '*SMBServer*' }
+                { @('7', '11', '51', '153') -contains $_ } { $prov -eq 'disk' -or $prov -like 'stor*' -or $prov -like '*Disk*' }
+                '129' { $true }
+                { @('55', '98', '140') -contains $_ } { $prov -like '*Ntfs*' }
+                '1000' { $prov -eq 'Application Error' }
+                '1002' { $prov -eq 'Application Hang' }
+                default { $false }
+            }
+            if (-not $okSource) { continue }
+            $msg = ''
+            try { $msg = [string]$e.Message } catch { }
+            if (-not $msg) { $msg = (@($e.Properties | ForEach-Object { [string]$_.Value } | Where-Object { $_ }) -join ' | ') }
+            $msg = ($msg -replace '\s+', ' ').Trim()
+            [pscustomobject]@{
+                __kind  = 'event'
+                Time    = $e.TimeCreated
+                Log     = [string]$e.LogName
+                Source  = $prov
+                Id      = [int]$e.Id
+                Tone    = $meaning[$id][0]
+                Meaning = $meaning[$id][1]
+                Message = $(if ($msg.Length -gt 400) { $msg.Substring(0, 400) + '…' } else { $msg })
+            }
+        }
+        $events = @($events)
+    }
+
+    $topBy = {
+        param($key, $fmt)
+        $pc = @($procRows | Sort-Object $key -Descending | Select-Object -First 1)
+        if ($pc.Count -and [double]$pc[0].$key -gt 0) { & $fmt $pc[0] } else { '' }
+    }
+    [pscustomobject]@{
+        __kind        = 'summary'
+        Cores         = $cores
+        RamGB         = [Math]::Round($totalMB / 1KB, 1)
+        UptimeDays    = [Math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+        Seconds       = $measured
+        Samples       = $samples.Count
+        CpuAvg        = [Math]::Round($cpuAvg, 1)
+        CpuMax        = [Math]::Round($cpuMax, 1)
+        KernelPct     = [Math]::Round($kernel, 1)
+        IrqPct        = [Math]::Round($irq, 1)
+        QueuePerCore  = [Math]::Round($queueAvg / $cores, 2)
+        QueueMax      = $queueMax
+        CtxPerSec     = [Math]::Round($ctx)
+        Processes     = $(if ($last.Sys) { [int]$last.Sys.Processes } else { $p1.Count })
+        Threads       = $(if ($last.Sys) { [int]$last.Sys.Threads } else { $null })
+        TotalMB       = $totalMB
+        AvailMB       = [Math]::Round($availMin)
+        MemUsedPct    = $(if ($totalMB -gt 0) { [Math]::Round(100 - 100.0 * $availMin / $totalMB, 1) } else { $null })
+        CommitPct     = $(if ($null -ne $commitPct) { [Math]::Round($commitPct, 1) } else { $null })
+        HardFaults    = [Math]::Round($hardFaults)
+        PagesPs       = [Math]::Round($pagesPs)
+        PoolNpMB      = $(if ($mem) { [Math]::Round([double]$mem.PoolNonpagedBytes / 1MB) } else { $null })
+        TcpConn       = $tcpConn
+        RetransPct    = $retrPct
+        TopCpu        = (& $topBy 'Cpu' { param($pc) '{0} ({1}%)' -f $pc.Name, $pc.Cpu })
+        TopMem        = (& $topBy 'PrivateMB' { param($pc) '{0} ({1:N1} GB)' -f $pc.Name, ($pc.PrivateMB / 1KB) })
+        TopIo         = $(
+            $io = @($procRows | Sort-Object { $_.ReadMBps + $_.WriteMBps } -Descending | Select-Object -First 1)
+            if ($io.Count -and ($io[0].ReadMBps + $io[0].WriteMBps) -gt 0) { '{0} ({1:N1} MB/s)' -f $io[0].Name, ($io[0].ReadMBps + $io[0].WriteMBps) } else { '' })
+        Missing       = (@($state.Missing) -join ', ')
+    }
+    $procRows
+    $disks
+    $nics
+    $events
+}
+
+$script:PerfViews = @('Podsumowanie', 'Procesy', 'Dyski', 'Sieć', 'Zdarzenia')
+
+function Get-PerfVerdict {
+    <#
+        Ocena wyników pomiaru jednego komputera. Zwraca @{ Tone = ok|warn|crit; Findings = @(@{ Tone; Area; Text }) }.
+        Progi: typowe zalecenia dla Windows Server (np. opóźnienie dysku > 20 ms, kolejka procesora > 2 na rdzeń).
+    #>
+    param($Summary, [object[]]$Disks = @(), [object[]]$Nics = @(), [object[]]$Processes = @(), [object[]]$Events = @())
+    $s = $Summary
+    $f = New-Object System.Collections.ArrayList
+    $add = { param($tone, $area, $text) [void]$f.Add(@{ Tone = $tone; Area = $area; Text = $text }) }
+    $topCpu = @($Processes | Sort-Object { [double]$_.Cpu } -Descending | Select-Object -First 2 | Where-Object { [double]$_.Cpu -ge 5 } | ForEach-Object { '{0} {1}%' -f $_.Name, [Math]::Round([double]$_.Cpu) })
+    $topMem = @($Processes | Sort-Object { [double]$_.PrivateMB } -Descending | Select-Object -First 2 | ForEach-Object { '{0} {1:N1} GB' -f $_.Name, ([double]$_.PrivateMB / 1KB) })
+    $topIo = @($Processes | Sort-Object { [double]$_.ReadMBps + [double]$_.WriteMBps } -Descending | Select-Object -First 2 | Where-Object { ([double]$_.ReadMBps + [double]$_.WriteMBps) -ge 0.5 } | ForEach-Object { '{0} {1:N1} MB/s' -f $_.Name, ([double]$_.ReadMBps + [double]$_.WriteMBps) })
+    $who = { param($list) if (@($list).Count) { ' – ' + (@($list) -join ', ') } else { '' } }
+
+    # Procesor
+    $cpuTone = if ([double]$s.CpuAvg -ge 90) { 'crit' } elseif ([double]$s.CpuAvg -ge 75 -or ([double]$s.CpuMax -ge 98 -and [double]$s.CpuAvg -ge 50)) { 'warn' } else { '' }
+    $qTone = if ([double]$s.QueuePerCore -ge 5) { 'crit' } elseif ([double]$s.QueuePerCore -ge 2 -and [double]$s.CpuAvg -ge 50) { 'warn' } else { '' }
+    if ($cpuTone -or $qTone) {
+        $tone = if ($cpuTone -eq 'crit' -or $qTone -eq 'crit') { 'crit' } else { 'warn' }
+        & $add $tone 'Procesor' ('procesor: średnio {0:N0}% (szczyt {1:N0}%), kolejka {2:N1} na rdzeń{3}' -f [double]$s.CpuAvg, [double]$s.CpuMax, [double]$s.QueuePerCore, (& $who $topCpu))
+    }
+    if ([double]$s.KernelPct -ge 30 -and [double]$s.CpuAvg -ge 40) { & $add 'warn' 'Procesor' ('procesor: {0:N0}% czasu w trybie jądra – sterowniki, antywirus, intensywne I/O' -f [double]$s.KernelPct) }
+    if ([double]$s.IrqPct -ge 15) { & $add 'warn' 'Procesor' ('procesor: przerwania i DPC {0:N0}% – sterownik karty sieciowej / dysku albo sprzęt' -f [double]$s.IrqPct) }
+
+    # Pamięć
+    $availPct = if ([double]$s.TotalMB -gt 0) { 100.0 * [double]$s.AvailMB / [double]$s.TotalMB } else { 100 }
+    $memTone = if ($availPct -lt 5 -or [double]$s.CommitPct -ge 95) { 'crit' } elseif ($availPct -lt 10 -or [double]$s.CommitPct -ge 85) { 'warn' } else { '' }
+    if ($memTone) { & $add $memTone 'Pamięć' ('pamięć: dostępne {0:N0} MB ({1:N0}%), zadeklarowana {2:N0}% limitu{3}' -f [double]$s.AvailMB, $availPct, [double]$s.CommitPct, (& $who $topMem)) }
+    if ([double]$s.HardFaults -ge 100 -and $availPct -lt 15) { & $add 'warn' 'Pamięć' ('pamięć: stronicowanie, {0:N0} odczytów stron/s z dysku przy małej ilości wolnej pamięci' -f [double]$s.HardFaults) }
+
+    # Dyski
+    foreach ($d in $Disks) {
+        $busy = ([double]$d.ReadsPs + [double]$d.WritesPs) -ge 5
+        $lat = [Math]::Max([double]$d.ReadMs, [double]$d.WriteMs)
+        $parts = @()
+        $tone = ''
+        if ($busy -and $lat -ge 50) { $tone = 'crit'; $parts += ('opóźnienie {0:N0} ms (odczyt {1:N0} / zapis {2:N0})' -f $lat, [double]$d.ReadMs, [double]$d.WriteMs) }
+        elseif ($busy -and $lat -ge 20) { $tone = 'warn'; $parts += ('opóźnienie {0:N0} ms (odczyt {1:N0} / zapis {2:N0})' -f $lat, [double]$d.ReadMs, [double]$d.WriteMs) }
+        if ([double]$d.QueueAvg -ge 8) { $tone = 'crit'; $parts += ('kolejka {0:N1}' -f [double]$d.QueueAvg) }
+        elseif ([double]$d.QueueAvg -ge 2) { if (-not $tone) { $tone = 'warn' }; $parts += ('kolejka {0:N1}' -f [double]$d.QueueAvg) }
+        if ($parts.Count) { & $add $tone 'Dysk' ('dysk {0}: {1}{2}' -f $d.Volume, ($parts -join ', '), (& $who $topIo)) }
+        if ($null -ne $d.FreePct -and [string]$d.Volume -match '^[A-Z]:$') {
+            if ([double]$d.FreePct -lt 5) { & $add 'crit' 'Dysk' ('dysk {0}: wolne tylko {1:N1}% ({2:N1} GB)' -f $d.Volume, [double]$d.FreePct, [double]$d.FreeGB) }
+            elseif ([double]$d.FreePct -lt 10) { & $add 'warn' 'Dysk' ('dysk {0}: wolne {1:N1}% ({2:N1} GB)' -f $d.Volume, [double]$d.FreePct, [double]$d.FreeGB) }
+        }
+    }
+
+    # Sieć
+    foreach ($n in $Nics) {
+        $parts = @()
+        $tone = ''
+        if ($null -ne $n.UtilMax -and [double]$n.UtilMax -ge 90) { $tone = 'crit'; $parts += ('wykorzystanie do {0:N0}% z {1} Mb/s' -f [double]$n.UtilMax, $n.SpeedMbps) }
+        elseif ($null -ne $n.UtilMax -and [double]$n.UtilMax -ge 70) { $tone = 'warn'; $parts += ('wykorzystanie do {0:N0}% z {1} Mb/s' -f [double]$n.UtilMax, $n.SpeedMbps) }
+        if ([double]$n.OutQueueMax -ge 2) { if (-not $tone) { $tone = 'warn' }; $parts += ('kolejka wyjściowa {0}' -f $n.OutQueueMax) }
+        if ([double]$n.Errors -gt 0 -or [double]$n.Discards -gt 0) { if (-not $tone) { $tone = 'warn' }; $parts += ('błędy {0}, odrzucone {1} w czasie pomiaru' -f $n.Errors, $n.Discards) }
+        if ($parts.Count) { & $add $tone 'Sieć' ('sieć {0}: {1}' -f $n.Adapter, ($parts -join ', ')) }
+    }
+    if ($null -ne $s.RetransPct -and [double]$s.RetransPct -ge 5) { & $add 'crit' 'Sieć' ('sieć: retransmisje TCP {0:N1}% – utrata pakietów w sieci' -f [double]$s.RetransPct) }
+    elseif ($null -ne $s.RetransPct -and [double]$s.RetransPct -ge 2) { & $add 'warn' 'Sieć' ('sieć: retransmisje TCP {0:N1}%' -f [double]$s.RetransPct) }
+
+    # Dziennik zdarzeń
+    $bad = @($Events | Where-Object { $_.Tone -eq 'crit' -or $_.Tone -eq 'warn' })
+    if ($bad.Count) {
+        $groups = @($bad | Group-Object Id | Sort-Object Count -Descending | ForEach-Object { '{0}× {1} ({2})' -f $_.Count, $_.Group[0].Meaning, $_.Name })
+        & $add $(if (@($bad | Where-Object { $_.Tone -eq 'crit' }).Count) { 'crit' } else { 'warn' }) 'Zdarzenia' ('dziennik: ' + ((@($groups | Select-Object -First 3)) -join '; '))
+    }
+    $apps = @($Events | Where-Object { $_.Tone -eq 'info' })
+    if ($apps.Count) { & $add 'info' 'Zdarzenia' ('dziennik: awarie / zawieszenia aplikacji: {0}' -f $apps.Count) }
+    if ($s.Missing) { & $add 'warn' 'Liczniki' ('liczniki: brak {0} – odbuduj je poleceniem lodctr /r' -f $s.Missing) }
+
+    $tone = 'ok'
+    if (@($f | Where-Object { $_.Tone -eq 'crit' }).Count) { $tone = 'crit' } elseif (@($f | Where-Object { $_.Tone -eq 'warn' }).Count) { $tone = 'warn' }
+    $order = @{ crit = 0; warn = 1; info = 2 }
+    return @{ Tone = $tone; Findings = @($f | Sort-Object { $order[$_.Tone] }) }
+}
+
+function ConvertTo-PerfRows {
+    # Wiersze tabeli dla widoku (0 Podsumowanie, 1 Procesy, 2 Dyski, 3 Sieć, 4 Zdarzenia) z danych jednego komputera
+    param([hashtable]$Data, [int]$View)
+    $s = $Data.Summary
+    switch ($View) {
+        0 {
+            $v = $Data.Verdict
+            $label = @{ ok = 'OK'; warn = 'Do sprawdzenia'; crit = 'Przeciążenie' }[$v.Tone]
+            $text = if (@($v.Findings | Where-Object { $_.Tone -ne 'info' }).Count) { (@($v.Findings | ForEach-Object { $_.Text }) -join '; ') } elseif (@($v.Findings).Count) { 'Bez przeciążenia; ' + (@($v.Findings | ForEach-Object { $_.Text }) -join '; ') } else { 'Brak oznak przeciążenia w czasie pomiaru.' }
+            $slow = @($Data.Disks | Where-Object { ([double]$_.ReadsPs + [double]$_.WritesPs) -ge 1 } | Sort-Object { [Math]::Max([double]$_.ReadMs, [double]$_.WriteMs) } -Descending | Select-Object -First 1)
+            $net = @($Data.Nics | Where-Object { $null -ne $_.UtilMax } | Sort-Object { [double]$_.UtilMax } -Descending | Select-Object -First 1)
+            $ev = @($Data.Events)
+            return ([pscustomobject][ordered]@{
+                    'Ocena'                  = $label
+                    'Wnioski'                = $text
+                    'CPU % śr.'              = $s.CpuAvg
+                    'CPU % szczyt'           = $s.CpuMax
+                    'Kolejka CPU / rdzeń'    = $s.QueuePerCore
+                    'Jądro %'                = $s.KernelPct
+                    'Przerwania + DPC %'     = $s.IrqPct
+                    'Pamięć zajęta %'        = $s.MemUsedPct
+                    'Dostępna MB'            = $s.AvailMB
+                    'Zadeklarowana %'        = $s.CommitPct
+                    'Odczyty stron/s'        = $s.HardFaults
+                    'Najwolniejszy dysk'     = $(if ($slow.Count) { $slow[0].Volume } else { '' })
+                    'Opóźnienie dysku ms'    = $(if ($slow.Count) { [Math]::Max([double]$slow[0].ReadMs, [double]$slow[0].WriteMs) } else { $null })
+                    'Kolejka dysku'          = $(if ($slow.Count) { $slow[0].QueueAvg } else { $null })
+                    'Sieć % szczyt'          = $(if ($net.Count) { $net[0].UtilMax } else { $null })
+                    'Retransmisje TCP %'     = $s.RetransPct
+                    'Połączenia TCP'         = $s.TcpConn
+                    'Najwięcej CPU'          = $s.TopCpu
+                    'Najwięcej pamięci'      = $s.TopMem
+                    'Najwięcej I/O'          = $s.TopIo
+                    'Zdarzenia'              = $(if ($ev.Count) { '{0} (krytyczne: {1})' -f $ev.Count, @($ev | Where-Object { $_.Tone -eq 'crit' }).Count } else { '' })
+                    'Procesy / wątki'        = '{0} / {1}' -f $s.Processes, $s.Threads
+                    'Rdzenie'                = $s.Cores
+                    'RAM GB'                 = $s.RamGB
+                    'Czas pracy (dni)'       = $s.UptimeDays
+                    'Pomiar (s)'             = $s.Seconds
+                    '__tone'                 = $v.Tone
+                })
+        }
+        1 {
+            return @($Data.Processes | Sort-Object { [double]$_.Cpu } -Descending | ForEach-Object {
+                    [pscustomobject][ordered]@{
+                        'Proces' = $_.Name; 'PID' = $_.Pid; 'Powód' = $_.Reasons; 'CPU %' = $_.Cpu; 'Pamięć prywatna MB' = $_.PrivateMB; 'Zadeklarowana MB' = $_.CommitMB
+                        'Odczyt MB/s' = $_.ReadMBps; 'Zapis MB/s' = $_.WriteMBps; 'Operacje I/O/s' = $_.IoOps; 'Uchwyty' = $_.Handles; 'Wątki' = $_.Threads
+                        'Błędy stron/s' = $_.Faults; 'Działa (h)' = $_.Hours; 'Użytkownik' = $_.Owner; 'Usługi' = $_.Services; 'Wiersz polecenia' = $_.Command
+                        '__flag' = $(if ([double]$_.Cpu -ge 50) { 'crit' } elseif ([double]$_.Cpu -ge 20) { 'warn' } else { '' })
+                    }
+                })
+        }
+        2 {
+            return @($Data.Disks | Sort-Object Volume | ForEach-Object {
+                    $d = $_
+                    $vd = Get-PerfVerdict -Summary $s -Disks @($d)
+                    $own = @($vd.Findings | Where-Object { $_.Area -eq 'Dysk' })
+                    [pscustomobject][ordered]@{
+                        'Wolumin' = $d.Volume; 'Ocena' = $(if ($own.Count) { @{ warn = 'Uwaga'; crit = 'Problem' }[$own[0].Tone] } else { 'OK' })
+                        'Odczyt ms' = $d.ReadMs; 'Zapis ms' = $d.WriteMs; 'Szczyt ms' = $d.MaxMs; 'Kolejka śr.' = $d.QueueAvg; 'Kolejka maks.' = $d.QueueMax; 'Zajętość %' = $d.BusyPct
+                        'Odczyty/s' = $d.ReadsPs; 'Zapisy/s' = $d.WritesPs; 'Odczyt MB/s' = $d.ReadMBps; 'Zapis MB/s' = $d.WriteMBps; 'Wolne GB' = $d.FreeGB; 'Wolne %' = $d.FreePct
+                        '__tone' = $(if ($own.Count) { $own[0].Tone } else { 'ok' })
+                    }
+                })
+        }
+        3 {
+            $rows = @($Data.Nics | Sort-Object Adapter | ForEach-Object {
+                    $n = $_
+                    $vn = Get-PerfVerdict -Summary @{ CpuAvg = 0; CpuMax = 0; QueuePerCore = 0; KernelPct = 0; IrqPct = 0; TotalMB = 1; AvailMB = 1; CommitPct = 0; HardFaults = 0; RetransPct = $null; Missing = '' } -Nics @($n)
+                    $own = @($vn.Findings | Where-Object { $_.Area -eq 'Sieć' })
+                    [pscustomobject][ordered]@{
+                        'Karta' = $n.Adapter; 'Ocena' = $(if ($own.Count) { @{ warn = 'Uwaga'; crit = 'Problem' }[$own[0].Tone] } else { 'OK' })
+                        'Prędkość Mb/s' = $n.SpeedMbps; 'Wykorzystanie % śr.' = $n.UtilAvg; 'Wykorzystanie % szczyt' = $n.UtilMax; 'Odbiór Mb/s' = $n.RecvMbps; 'Wysyłanie Mb/s' = $n.SentMbps
+                        'Kolejka wyjściowa' = $n.OutQueueMax; 'Błędy (pomiar)' = $n.Errors; 'Odrzucone (pomiar)' = $n.Discards; 'Błędy od startu' = $n.ErrorsTotal
+                        '__tone' = $(if ($own.Count) { $own[0].Tone } else { 'ok' })
+                    }
+                })
+            return $rows
+        }
+        4 {
+            return @($Data.Events | ForEach-Object {
+                    [pscustomobject][ordered]@{
+                        'Czas' = $_.Time; 'Ocena' = @{ crit = 'Krytyczne'; warn = 'Ostrzeżenie'; info = 'Aplikacja' }[[string]$_.Tone]; 'Znaczenie' = $_.Meaning; 'Dziennik' = $_.Log; 'Źródło' = $_.Source; 'ID' = $_.Id; 'Komunikat' = $_.Message
+                        '__tone' = $(if ($_.Tone -eq 'info') { 'info' } else { [string]$_.Tone })
+                    }
+                })
+        }
+    }
+}
+
+function Show-PerfView {
+    # Przebudowuje tabelę z zapamiętanych wyników pomiaru (zmiana widoku nie wymaga ponownego pomiaru)
+    param([hashtable]$Module)
+    $m = $Module
+    $view = [Math]::Max(0, (Get-SegmentIndex $m.ViewSwitch))
+    Reset-ResultTable -Module $m
+    $m.PillColumns = @('Ocena')
+    foreach ($name in @($m.Data.Perf.Keys | Sort-Object)) {
+        $rows = @(ConvertTo-PerfRows -Data $m.Data.Perf[$name] -View $view)
+        if ($rows.Count) { Add-ResultRows -Module $m -Computer $name -Objects $rows }
+    }
+    foreach ($name in @($m.Data.PerfErrors.Keys | Sort-Object)) {
+        # Komputer bez wyników - komunikat w pierwszej kolumnie bieżącego widoku
+        $err = if ($view -eq 0) { [pscustomobject]@{ 'Ocena' = 'Błąd'; 'Wnioski' = $m.Data.PerfErrors[$name]; '__tone' = 'crit' } }
+        else { [pscustomobject]@{ (@('', 'Proces', 'Wolumin', 'Karta', 'Znaczenie')[$view]) = ('Błąd pomiaru: ' + $m.Data.PerfErrors[$name]); '__flag' = 'crit' } }
+        Add-ResultRows -Module $m -Computer $name -Objects @($err)
+    }
+    $m.ResultHint = @(
+        'Jeden wiersz na komputer – kolor oceny i wnioski wskazują wąskie gardło'
+        'Procesy z czołówki CPU, pamięci i I/O (średnio w czasie pomiaru; CPU w % całego komputera)'
+        'Woluminy: opóźnienia odczytu/zapisu (powyżej 20 ms – wolno, 50 ms – bardzo wolno), kolejka i przepustowość'
+        'Karty sieciowe: wykorzystanie łącza, kolejka wyjściowa, błędy i odrzucone pakiety'
+        'Zdarzenia świadczące o problemach z dyskami, pamięcią i stabilnością (z wybranego okresu)'
+    )[$view]
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+    $counts = @{ ok = 0; warn = 0; crit = 0 }
+    foreach ($d in $m.Data.Perf.Values) { $counts[$d.Verdict.Tone]++ }
+    Set-StatTile -Module $m -Key 'ok' -Value ([string]$counts.ok) -Tone $(if ($counts.ok) { 'ok' } else { '' })
+    Set-StatTile -Module $m -Key 'warn' -Value ([string]$counts.warn) -Tone $(if ($counts.warn) { 'warn' } else { '' })
+    Set-StatTile -Module $m -Key 'crit' -Value ([string]($counts.crit + $m.Data.PerfErrors.Count)) -Tone $(if ($counts.crit + $m.Data.PerfErrors.Count) { 'crit' } else { '' })
+}
+
+function Start-PerfMeasurement {
+    param([hashtable]$Module, [string[]]$Targets)
+    $m = $Module
+    $m.Data.LastTargets = @($Targets)
+    $params = @{ Duration = (Get-Num $m.Duration); Interval = (Get-Num $m.Interval); Top = (Get-Num $m.Top); EventHours = (Get-Num $m.EventHours) }
+    $m.Data.Perf = @{}
+    $m.Data.PerfErrors = @{}
+    Start-HostOperation -Module $m -Name 'Analiza wydajności' -Targets $Targets -Output None -Parameters $params -ScriptBlock $script:PerfAnalysisScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { $m.Data.PerfErrors[$r.Target] = ((@($r.Errors | Select-Object -Unique)) -join ' | '); Show-PerfView -Module $m; return }
+        $all = @($r.Data)
+        $kind = { param($k) @($all | Where-Object { $_.__kind -eq $k }) }
+        $summary = @(& $kind 'summary') | Select-Object -First 1
+        if (-not $summary) { $m.Data.PerfErrors[$r.Target] = 'Brak wyników pomiaru.'; Show-PerfView -Module $m; return }
+        $data = @{ Summary = $summary; Processes = @(& $kind 'proc'); Disks = @(& $kind 'disk'); Nics = @(& $kind 'nic'); Events = @(& $kind 'event') }
+        $data.Verdict = Get-PerfVerdict -Summary $summary -Disks $data.Disks -Nics $data.Nics -Processes $data.Processes -Events $data.Events
+        $m.Data.Perf[$r.Target] = $data
+        $level = @{ ok = 'OK'; warn = 'WARN'; crit = 'WARN' }[$data.Verdict.Tone]
+        $main = @($data.Verdict.Findings | Select-Object -First 2 | ForEach-Object { $_.Text })
+        Write-Log ("[{0}] {1}" -f $r.Target, $(if ($main.Count) { $main -join '; ' } else { 'bez oznak przeciążenia' })) $level
+        Show-PerfView -Module $m
+    } -OnComplete {
+        param($m)
+        if (Test-Checked $m.Monitor) {
+            if (-not $m.Data['MonitorTimer']) {
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromSeconds(1)
+                $t.Tag = $m
+                $t.add_Tick({
+                        param($s, $e)
+                        $s.Stop()
+                        $mm = $s.Tag
+                        if ((Test-Checked $mm.Monitor) -and -not $mm.Busy -and @($mm.Data.LastTargets).Count) { Invoke-UiAction -Module $mm -Action { param($m) Start-PerfMeasurement -Module $m -Targets $m.Data.LastTargets } }
+                    })
+                $m.Data.MonitorTimer = $t
+            }
+            $m.Data.MonitorTimer.Start()
+        }
+    }
+}
+
+function Initialize-PerfModule {
+    param([hashtable]$Module)
+    $m = $Module
+    $m.PillColumns = @('Ocena')
+    $m.Data.Perf = @{}
+    $m.Data.PerfErrors = @{}
+    $m.Data.LastTargets = @()
+    $m.Data.MonitorTimer = $null
+    $row = Add-ToolbarRow -Module $m -Title 'Pomiar'
+    Add-Label -Parent $row -Text 'Czas (s)' | Out-Null
+    $m.Duration = Add-Numeric -Parent $row -Value 10 -Minimum 2 -Maximum 600 -Width 60
+    Add-Label -Parent $row -Text 'Próbka co (s)' | Out-Null
+    $m.Interval = Add-Numeric -Parent $row -Value 2 -Minimum 1 -Maximum 60 -Width 50
+    Add-Label -Parent $row -Text 'Procesy (czołówka)' | Out-Null
+    $m.Top = Add-Numeric -Parent $row -Value 8 -Minimum 1 -Maximum 40 -Width 50
+    Add-Label -Parent $row -Text 'Zdarzenia z ostatnich (h)' | Out-Null
+    $m.EventHours = Add-Numeric -Parent $row -Value 24 -Minimum 0 -Maximum 720 -Width 60
+    $m.Monitor = Add-CheckBox -Parent $row -Text 'Monitoruj (powtarzaj pomiar)' -ToolTip 'Po zakończeniu pomiaru od razu zaczyna następny – do odznaczenia albo «Przerwij»'
+    Add-Button -Parent $row -Text 'Zmierz' -Icon 'E9D2' -Module $m -Primary -OnClick {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        Start-PerfMeasurement -Module $m -Targets $targets
+    } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Widok'
+    $m.ViewSwitch = Add-Segmented -Parent $row2 -Items $script:PerfViews -Module $m -OnChange { param($m) Show-PerfView -Module $m }
+    Add-Label -Parent $row2 -Text 'Widok można zmieniać po pomiarze – dane nie są mierzone ponownie. CPU, dyski i sieć: średnie i szczyty z całego okna pomiaru.' -Hint -MaxWidth 560 | Out-Null
+    Add-StatTile -Module $m -Key 'ok' -Label 'Bez przeciążenia' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'warn' -Label 'Do sprawdzenia' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'crit' -Label 'Przeciążone / błąd' -Icon 'EA39' | Out-Null
+    Add-RowAction -Module $m -Text 'Zakończ proces…' -Icon 'E711' -Danger -Action {
+        param($m, $rows)
+        $items = @($rows | Where-Object { (Get-ObjectValue $_ 'PID') } | ForEach-Object { '{0}: {1} (PID {2})' -f (Get-ObjectValue $_ 'Komputer'), (Get-ObjectValue $_ 'Proces'), (Get-ObjectValue $_ 'PID') })
+        if ($items.Count -eq 0) { Show-Warning 'Przełącz widok na «Procesy» i zaznacz procesy do zakończenia.'; return }
+        $chosen = @(Confirm-Action -Text 'Zakończyć wybrane procesy? Niezapisane dane w tych programach zostaną utracone.' -Items $items -ConfirmText 'Zakończ procesy' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $sel = @($rows | Where-Object { (Get-ObjectValue $_ 'PID') })
+        $per = @{}
+        foreach ($i in $chosen) {
+            $c = [string](Get-ObjectValue $sel[$i] 'Komputer')
+            if (-not $per.ContainsKey($c)) { $per[$c] = @{ Pids = @() } }
+            $per[$c].Pids += [int](Get-ObjectValue $sel[$i] 'PID')
+        }
+        Start-HostOperation -Module $m -Name 'Kończenie procesów' -Targets @($per.Keys) -PerTarget $per -Output Log -ScriptBlock {
+            param($P)
+            foreach ($id in $P.Pids) {
+                try { $proc = Get-Process -Id $id -ErrorAction Stop; $name = $proc.ProcessName; Stop-Process -Id $id -Force -ErrorAction Stop; "Zakończono $name (PID $id)." }
+                catch { "Błąd: PID $id – $($_.Exception.Message)" }
+            }
+        }
+    }
+    $m.EmptyHint = 'Zaznacz komputery i kliknij «Zmierz». Pomiar trwa tyle, ile ustawiono (domyślnie 10 s); zaznacz «Monitoruj», aby obserwować serwer na bieżąco.'
+}
+#endregion
+
+#region Zarządzanie zdalne: logi aplikacji z wielu komputerów (oś czasu, porównanie, pliki)
+# Blok na komputerze docelowym: znajduje pliki logów wg ścieżki/maski, czyta koniec pliku (bez blokowania pliku
+# zapisywanego przez aplikację), rozpoznaje format daty w liniach, skleja linie bez daty (np. stos wywołań)
+# z poprzednim wpisem i zwraca wpisy z zadanego zakresu (ostatnie N wpisów albo okno czasu).
+# Wynik: __kind = 'line' (wpis) i 'file' (informacja o pliku).
+$script:LogReadScript = {
+    param($P)
+    $ErrorActionPreference = 'Stop'
+    $spec = [Environment]::ExpandEnvironmentVariables(([string]$P.Path).Trim().Trim('"'))
+    $maxBytes = [long]([Math]::Max(1, [int]$P.MaxMB)) * 1MB
+    $maxEntries = [Math]::Max(10, [int]$P.MaxLines)
+    $dir = $spec
+    $masks = @('*.log', '*.txt')
+    if ($spec -match '[\*\?]') {
+        $dir = Split-Path -Path $spec -Parent
+        $masks = @((Split-Path -Path $spec -Leaf) -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    elseif (Test-Path -LiteralPath $spec -PathType Leaf) {
+        $dir = Split-Path -Path $spec -Parent
+        $masks = @(Split-Path -Path $spec -Leaf)
+    }
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) {
+        return [pscustomobject]@{ __kind = 'file'; Path = $spec; SizeKB = $null; Modified = $null; Encoding = ''; Range = ''; Entries = 0; TimeFormat = ''; Note = 'Folder nie istnieje albo brak dostępu' }
+    }
+    $now = Get-Date
+    $since = $null
+    $until = $null
+    switch ([string]$P.Mode) {
+        'Minutes' { $since = $now.AddMinutes( - [int]$P.Value) }
+        'Hours' { $since = $now.AddHours( - [int]$P.Value) }
+        'Range' { if ($P.From) { $since = [datetime]$P.From }; if ($P.To) { $until = [datetime]$P.To } }
+    }
+    $found = @{}
+    foreach ($mask in $masks) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter $mask -File -Recurse:([bool]$P.Recurse) -ErrorAction SilentlyContinue)) { $found[$f.FullName] = $f }
+    }
+    $files = @($found.Values | Sort-Object LastWriteTime -Descending)
+    if ($since) { $files = @($files | Where-Object { $_.LastWriteTime -ge $since }) }
+    if ($P.Files -eq 'Newest') { $files = @($files | Select-Object -First 1) } else { $files = @($files | Select-Object -First ([Math]::Max(1, [int]$P.MaxFiles))) }
+    if ($files.Count -eq 0) {
+        return [pscustomobject]@{ __kind = 'file'; Path = (Join-Path $dir ($masks -join ';')); SizeKB = $null; Modified = $null; Encoding = ''; Range = ''; Entries = 0; TimeFormat = ''; Note = $(if ($since) { 'Brak plików zmienionych w wybranym okresie' } else { 'Brak plików pasujących do maski' }) }
+    }
+
+    # Formaty dat na początku linii (w pierwszych 60 znakach); kolejność grup: rok, miesiąc, dzień, godz., min, s, ułamek
+    $months = @{ jan = 1; feb = 2; mar = 3; apr = 4; may = 5; jun = 6; jul = 7; aug = 8; sep = 9; oct = 10; nov = 11; dec = 12 }
+    $formats = @(
+        @{ Name = 'RRRR-MM-DD gg:mm:ss'; Rx = [regex]'^.{0,60}?(?<y>\d{4})-(?<mo>\d{2})-(?<d>\d{2})[ T](?<h>\d{2}):(?<mi>\d{2}):(?<s>\d{2})(?:[\.,](?<f>\d{1,7}))?' }
+        @{ Name = 'RRRR/MM/DD gg:mm:ss'; Rx = [regex]'^.{0,60}?(?<y>\d{4})/(?<mo>\d{2})/(?<d>\d{2})[ T](?<h>\d{2}):(?<mi>\d{2}):(?<s>\d{2})(?:[\.,](?<f>\d{1,7}))?' }
+        @{ Name = 'DD.MM.RRRR gg:mm:ss'; Rx = [regex]'^.{0,60}?(?<d>\d{2})\.(?<mo>\d{2})\.(?<y>\d{4})[ T,]+(?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})(?:[\.,](?<f>\d{1,7}))?' }
+        @{ Name = 'MM/DD/RRRR gg:mm:ss'; Rx = [regex]'^.{0,60}?(?<mo>\d{1,2})/(?<d>\d{1,2})/(?<y>\d{4})[ T](?<h>\d{1,2}):(?<mi>\d{2}):(?<s>\d{2})(?:[\.,](?<f>\d{1,7}))?(?:\s*(?<ap>[AP]M))?' }
+        @{ Name = 'DD/Mon/RRRR:gg:mm:ss'; Rx = [regex]'^.{0,60}?(?<d>\d{2})/(?<mon>[A-Za-z]{3})/(?<y>\d{4}):(?<h>\d{2}):(?<mi>\d{2}):(?<s>\d{2})' }
+    )
+    $toDate = {
+        param($m)
+        try {
+            $mo = if ($m.Groups['mon'].Success) { $months[$m.Groups['mon'].Value.ToLowerInvariant()] } else { [int]$m.Groups['mo'].Value }
+            $h = [int]$m.Groups['h'].Value
+            if ($m.Groups['ap'].Success) { if ($m.Groups['ap'].Value -eq 'PM' -and $h -lt 12) { $h += 12 } elseif ($m.Groups['ap'].Value -eq 'AM' -and $h -eq 12) { $h = 0 } }
+            $dt = New-Object DateTime ([int]$m.Groups['y'].Value), $mo, ([int]$m.Groups['d'].Value), $h, ([int]$m.Groups['mi'].Value), ([int]$m.Groups['s'].Value)
+            if ($m.Groups['f'].Success) { $dt = $dt.AddTicks([long]($m.Groups['f'].Value.PadRight(7, '0'))) }
+            return $dt
+        }
+        catch { return $null }
+    }
+    $levelOf = {
+        param([string]$line)
+        $head = if ($line.Length -gt 240) { $line.Substring(0, 240) } else { $line }
+        if ($head -match '(?i)\b(fatal|critical|crit|krytyczn\w*)\b') { return 'Krytyczny' }
+        if ($head -match '(?i)\b(error|err|exception|failed|failure|błąd|blad)\b') { return 'Błąd' }
+        if ($head -match '(?i)\b(warn|warning|ostrzeżenie)\b') { return 'Ostrzeżenie' }
+        if ($head -match '(?i)\b(debug|trace|verbose|dbg)\b') { return 'Debug' }
+        return 'Info'
+    }
+    $include = [string]$P.Include
+    $exclude = [string]$P.Exclude
+    $test = {
+        param([string]$text, [string]$level)
+        if ($P.ErrorsOnly -and @('Krytyczny', 'Błąd', 'Ostrzeżenie') -notcontains $level -and $text -notmatch '(?i)exception') { return $false }
+        if ($include) {
+            if ($P.Regex) { if ($text -notmatch $include) { return $false } }
+            elseif ($text.IndexOf($include, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+        }
+        if ($exclude) {
+            if ($P.Regex) { if ($text -match $exclude) { return $false } }
+            elseif ($text.IndexOf($exclude, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $false }
+        }
+        return $true
+    }
+
+    $all = New-Object System.Collections.ArrayList
+    foreach ($file in $files) {
+        $note = ''
+        $encName = ''
+        $partial = $false
+        $lines = @()
+        try {
+            $fs = New-Object System.IO.FileStream($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try {
+                $len = $fs.Length
+                $headBytes = New-Object byte[] 4
+                $n = $fs.Read($headBytes, 0, 4)
+                $enc = $null
+                $bom = 0
+                if ($n -ge 3 -and $headBytes[0] -eq 0xEF -and $headBytes[1] -eq 0xBB -and $headBytes[2] -eq 0xBF) { $enc = New-Object System.Text.UTF8Encoding $false; $bom = 3 }
+                elseif ($n -ge 2 -and $headBytes[0] -eq 0xFF -and $headBytes[1] -eq 0xFE) { $enc = [System.Text.Encoding]::Unicode; $bom = 2 }
+                elseif ($n -ge 2 -and $headBytes[0] -eq 0xFE -and $headBytes[1] -eq 0xFF) { $enc = [System.Text.Encoding]::BigEndianUnicode; $bom = 2 }
+                $start = [Math]::Max([long]$bom, $len - $maxBytes)
+                $wide = ($enc -and $enc.GetByteCount('a') -eq 2)
+                if ($wide -and (($start - $bom) % 2) -ne 0) { $start++ }
+                $partial = ($start -gt $bom)
+                $count = [int]($len - $start)
+                $buf = New-Object byte[] $count
+                $fs.Position = $start
+                $read = 0
+                while ($read -lt $count) { $r = $fs.Read($buf, $read, $count - $read); if ($r -le 0) { break }; $read += $r }
+            }
+            finally { $fs.Dispose() }
+            # Początek od środka pliku: pomijamy niepełną pierwszą linię (do pierwszego znaku końca linii)
+            $offset = 0
+            if ($partial) {
+                if ($wide) { for ($i = 0; $i + 1 -lt $read; $i += 2) { if (($buf[$i] -eq 10 -and $buf[$i + 1] -eq 0) -or ($buf[$i] -eq 0 -and $buf[$i + 1] -eq 10)) { $offset = $i + 2; break } } }
+                else { $i = [Array]::IndexOf($buf, [byte]10); if ($i -ge 0 -and $i -lt $read) { $offset = $i + 1 } }
+            }
+            if (-not $enc) {
+                try { $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($buf, $offset, $read - $offset); $encName = 'UTF-8' }
+                catch {
+                    $ansi = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage)
+                    $text = $ansi.GetString($buf, $offset, $read - $offset)
+                    $encName = $ansi.WebName
+                }
+            }
+            else { $text = $enc.GetString($buf, $offset, $read - $offset); $encName = $enc.WebName }
+            $lines = $text -split "\r?\n"
+        }
+        catch {
+            [void]$all.Add([pscustomobject]@{ __kind = 'file'; Path = $file.FullName; SizeKB = [Math]::Round($file.Length / 1KB); Modified = $file.LastWriteTime; Encoding = ''; Range = ''; Entries = 0; TimeFormat = ''; Note = 'Nie można odczytać: ' + $_.Exception.Message })
+            continue
+        }
+        # Format daty: ten, który pasuje do największej liczby z pierwszych niepustych linii
+        $fmt = $null
+        $best = 0
+        $probe = @($lines | Where-Object { $_.Trim() } | Select-Object -First 60)
+        foreach ($f in $formats) {
+            $hits = @($probe | Where-Object { $f.Rx.IsMatch($_) }).Count
+            if ($hits -gt $best) { $best = $hits; $fmt = $f }
+        }
+        $entries = New-Object System.Collections.ArrayList
+        $cont = New-Object System.Collections.ArrayList
+        $truncated = $false
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            $line = $lines[$i]
+            if (-not $line.Trim()) { continue }
+            $ts = $null
+            $head = $line
+            if ($fmt) {
+                $mt = $fmt.Rx.Match($line)
+                if ($mt.Success) {
+                    $ts = & $toDate $mt
+                    # Treść bez daty (jest w osobnej kolumnie) - z zachowaniem tego, co stało przed datą (np. poziom)
+                    $core = @('y', 'mo', 'd', 'mon' | ForEach-Object { $mt.Groups[$_] } | Where-Object { $_.Success } | ForEach-Object { $_.Index } | Measure-Object -Minimum).Minimum
+                    $head = ($line.Substring(0, [int]$core) + ' ' + $line.Substring($mt.Index + $mt.Length)) -replace '^\s*[\[\(]?\s*[\]\)]?\s*[-|:,]?\s*', ''
+                }
+                if ($null -eq $ts) {
+                    # Linia bez daty: ciąg dalszy wpisu powyżej (stos wywołań, wielowierszowy komunikat)
+                    if ($cont.Count -lt 300) { $cont.Insert(0, $line) }
+                    continue
+                }
+            }
+            $textOut = if ($cont.Count) { $line + "`n" + ((@($cont)) -join "`n") } else { $line }
+            $message = if ($cont.Count) { $head + "`n" + ((@($cont)) -join "`n") } else { $head }
+            $cont.Clear()
+            if ($since -and $ts -and $ts -lt $since) { break }
+            if ($until -and $ts -and $ts -gt $until) { continue }
+            $level = & $levelOf $line
+            if (-not (& $test $textOut $level)) { continue }
+            if ($textOut.Length -gt 8000) { $textOut = $textOut.Substring(0, 8000) + '…' }
+            if ($message.Length -gt 8000) { $message = $message.Substring(0, 8000) + '…' }
+            [void]$entries.Add([pscustomobject]@{
+                    __kind = 'line'; File = $file.Name; Path = $file.FullName; Line = $(if ($partial) { $null } else { $i + 1 }); Time = $ts; Level = $level; Text = $textOut; Message = $message
+                })
+            if ($P.Mode -eq 'Lines' -and $entries.Count -ge [int]$P.Value) { break }
+            if ($entries.Count -ge $maxEntries) { $truncated = $true; break }
+        }
+        $entries.Reverse()
+        foreach ($e in $entries) { [void]$all.Add($e) }
+        $range = if ($partial) { 'ostatnie {0} MB' -f [Math]::Round($maxBytes / 1MB) } else { 'cały plik' }
+        if ($truncated) { $note = "osiągnięto limit $maxEntries wpisów – pokazano najnowsze" }
+        [void]$all.Add([pscustomobject]@{
+                __kind = 'file'; Path = $file.FullName; SizeKB = [Math]::Round($file.Length / 1KB); Modified = $file.LastWriteTime; Encoding = $encName; Range = $range; Entries = $entries.Count
+                TimeFormat = $(if ($fmt) { $fmt.Name } else { 'nie rozpoznano – kolejność z pliku' }); Note = $note
+            })
+    }
+    # Limit na komputer: najnowsze wpisy ze wszystkich plików
+    $lineObjs = @($all | Where-Object { $_.__kind -eq 'line' })
+    if ($lineObjs.Count -gt $maxEntries) {
+        $keep = @($lineObjs | Sort-Object @{ Expression = { if ($_.Time) { $_.Time } else { [datetime]::MinValue } } } -Descending | Select-Object -First $maxEntries)
+        $lineObjs = $keep
+    }
+    $lineObjs
+    @($all | Where-Object { $_.__kind -eq 'file' })
+}
+
+$script:LogLevelOrder = @{ 'Krytyczny' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Info' = 3; 'Debug' = 4 }
+$script:LogViews = @('Oś czasu', 'Porównanie komputerów', 'Pliki')
+
+function Get-LogPattern {
+    # Wzorzec komunikatu do porównania między komputerami: bez dat, godzin, liczb, identyfikatorów GUID,
+    # wartości szesnastkowych i adresów IP (te same zdarzenia z różnymi parametrami dają ten sam wzorzec)
+    param([string]$Text)
+    $t = ($Text -split "`n")[0]
+    $t = $t -replace '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<guid>'
+    $t = $t -replace '\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b', '<ip>'
+    $t = $t -replace '\d{4}[-/.]\d{2}[-/.]\d{2}[ T]?(\d{1,2}:\d{2}(:\d{2})?([\.,]\d+)?)?(Z|[+-]\d{2}:?\d{2})?', ' '
+    $t = $t -replace '\d{1,2}[./]\d{1,2}[./]\d{2,4}', ' '
+    $t = $t -replace '\d{1,2}:\d{2}(:\d{2})?([\.,]\d+)?\s*(AM|PM)?', ' '
+    $t = $t -replace '(?i)\b0x[0-9a-f]+\b', '<hex>'
+    $t = $t -replace '(?i)\b[0-9a-f]{12,}\b', '<hex>'
+    $t = $t -replace '\d+', '#'
+    $t = ($t -replace '\s+', ' ').Trim(' ', '-', '|', ':', '[', ']')
+    if ($t.Length -gt 260) { $t = $t.Substring(0, 260) + '…' }
+    return $t
+}
+
+function Get-LogFirstLine([string]$Text) {
+    $first = ($Text -split "`n")[0]
+    $more = @($Text -split "`n").Count - 1
+    if ($more -gt 0) { return ('{0}   ⏎ +{1} linii' -f $first, $more) }
+    return $first
+}
+
+function Show-LogView {
+    param([hashtable]$Module)
+    $m = $Module
+    $view = [Math]::Max(0, (Get-SegmentIndex $m.ViewSwitch))
+    Reset-ResultTable -Module $m
+    $computers = @($m.Data.Logs.Keys | Sort-Object)
+    $allLines = New-Object System.Collections.ArrayList
+    foreach ($c in $computers) { foreach ($l in $m.Data.Logs[$c].Lines) { [void]$allLines.Add(@{ C = $c; L = $l; P = $null }) } }
+    if ($view -le 1 -or $m.Data.Pattern) { foreach ($x in $allLines) { $x.P = Get-LogPattern ([string]$x.L.Message) } }
+    $tones = @{ 'Krytyczny' = 'crit'; 'Błąd' = 'crit'; 'Ostrzeżenie' = 'warn'; 'Info' = ''; 'Debug' = 'info' }
+    $patternActive = [bool]$m.Data.Pattern
+    $m.ClearPattern.Visibility = $(if ($patternActive -and $view -eq 0) { 'Visible' } else { 'Collapsed' })
+    switch ($view) {
+        0 {
+            $items = @($allLines)
+            if ($patternActive) { $items = @($items | Where-Object { $_.P -eq $m.Data.Pattern }) }
+            $sorted = @($items | Sort-Object @{ Expression = { if ($_.L.Time) { [datetime]$_.L.Time } else { [datetime]::MaxValue } } }, @{ Expression = { $_.C } })
+            $rows = foreach ($x in $sorted) {
+                $l = $x.L
+                [pscustomobject][ordered]@{
+                    'Czas'     = $(if ($l.Time) { ([datetime]$l.Time).ToString('yyyy-MM-dd HH:mm:ss.fff') } else { '' })
+                    'Komputer' = $x.C
+                    'Poziom'   = $l.Level
+                    'Treść'    = [string]$l.Message
+                    'Plik'     = $l.File
+                    'Linia'    = $l.Line
+                    'Ścieżka'  = $l.Path
+                    '__tone'   = $tones[[string]$l.Level]
+                }
+            }
+            $rows = @($rows)
+            if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+            $m.ResultHint = $(if ($patternActive) { "Tylko wpisy wzorca: $($m.Data.Pattern)" } else { 'Wpisy ze wszystkich komputerów w kolejności czasu • wielowierszowe wpisy (stos wywołań) w całości w panelu szczegółów' })
+        }
+        1 {
+            $groups = @{}
+            foreach ($x in $allLines) {
+                $key = [string]$x.L.Level + '|' + $x.P
+                if (-not $groups.ContainsKey($key)) { $groups[$key] = @{ Level = [string]$x.L.Level; Pattern = $x.P; Per = @{}; First = $null; Last = $null; Example = [string]$x.L.Message; Total = 0 } }
+                $g = $groups[$key]
+                $g.Total++
+                $g.Per[$x.C] = 1 + $(if ($g.Per.ContainsKey($x.C)) { $g.Per[$x.C] } else { 0 })
+                if ($x.L.Time) {
+                    $t = [datetime]$x.L.Time
+                    if (-not $g.First -or $t -lt $g.First) { $g.First = $t }
+                    if (-not $g.Last -or $t -gt $g.Last) { $g.Last = $t }
+                }
+            }
+            $n = $computers.Count
+            $ordered = @($groups.Values | Sort-Object @{ Expression = { $script:LogLevelOrder[$_.Level] } }, @{ Expression = { $_.Per.Count } }, @{ Expression = { $_.Total }; Descending = $true })
+            $rows = foreach ($g in $ordered) {
+                $k = $g.Per.Count
+                $scope = if ($k -eq $n -and $n -gt 1) { "wszystkie ($k/$n)" } elseif ($k -eq 1) { 'tylko ' + @($g.Per.Keys)[0] } else { "część ($k/$n)" }
+                            $o = [ordered]@{ 'Zasięg' = $scope; 'Poziom' = $g.Level; 'Wzorzec' = $g.Pattern; 'Razem' = $g.Total }
+                foreach ($c in $computers) { $o[$c] = $(if ($g.Per.ContainsKey($c)) { $g.Per[$c] } else { 0 }) }
+                $o['Pierwsze'] = $(if ($g.First) { $g.First.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
+                $o['Ostatnie'] = $(if ($g.Last) { $g.Last.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
+                $o['Przykład'] = $g.Example
+                # Kolor: komunikat wszędzie - niebieski; błąd / ostrzeżenie nie wszędzie - czerwony / żółty; zwykłe informacje - bez koloru
+                $o['__tone'] = $(if ($k -eq $n -and $n -gt 1) { 'info' } elseif (@('Krytyczny', 'Błąd') -contains $g.Level) { 'crit' } elseif ($g.Level -eq 'Ostrzeżenie') { 'warn' } else { '' })
+                $o['__pattern'] = $g.Pattern
+                [pscustomobject]$o
+            }
+            $rows = @($rows)
+            if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+            $m.ResultHint = 'Te same komunikaty (bez dat, liczb i identyfikatorów) zliczone na każdym komputerze • «tylko …» / «część» – dzieje się nie wszędzie • prawy przycisk: wystąpienia na osi czasu'
+        }
+        2 {
+            foreach ($c in $computers) {
+                $rows = @($m.Data.Logs[$c].Files | ForEach-Object {
+                        [pscustomobject][ordered]@{
+                            'Plik' = $_.Path; 'Rozmiar KB' = $_.SizeKB; 'Zmieniony' = $(if ($_.Modified) { ([datetime]$_.Modified).ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
+                            'Wpisy' = $_.Entries; 'Odczyt' = $_.Range; 'Kodowanie' = $_.Encoding; 'Format daty' = $_.TimeFormat; 'Uwagi' = $_.Note
+                            '__flag' = $(if ($_.Note -and [int]$_.Entries -eq 0) { 'warn' } else { '' })
+                        }
+                    })
+                if ($rows.Count) { Add-ResultRows -Module $m -Computer $c -Objects $rows }
+            }
+            $m.ResultHint = 'Pliki przeczytane na każdym komputerze: rozmiar, data zmiany, rozpoznane kodowanie i format daty'
+        }
+    }
+    foreach ($c in @($m.Data.LogErrors.Keys | Sort-Object)) {
+        $col = @('Treść', 'Wzorzec', 'Plik')[$view]
+        $o = [ordered]@{}
+        if ($view -le 1) { $o['Komputer'] = $c }
+        $o[$col] = 'Błąd odczytu: ' + $m.Data.LogErrors[$c]
+        $o['__flag'] = 'crit'
+        Add-ResultRows -Module $m -Computer $(if ($view -eq 2) { $c } else { '' }) -Objects @([pscustomobject]$o) -TargetColumn $(if ($view -eq 2) { 'Komputer' } else { '' })
+    }
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+    $lines = @($allLines)
+    Set-StatTile -Module $m -Key 'lines' -Value ([string]$lines.Count)
+    $err = @($lines | Where-Object { @('Krytyczny', 'Błąd') -contains [string]$_.L.Level }).Count
+    $warn = @($lines | Where-Object { [string]$_.L.Level -eq 'Ostrzeżenie' }).Count
+    Set-StatTile -Module $m -Key 'errors' -Value ([string]$err) -Tone $(if ($err) { 'crit' } else { '' })
+    Set-StatTile -Module $m -Key 'warns' -Value ([string]$warn) -Tone $(if ($warn) { 'warn' } else { '' })
+    $partialCount = 0
+    if ($computers.Count -gt 1) {
+        $seen = @{}
+        foreach ($x in $lines) {
+            if (@('Krytyczny', 'Błąd', 'Ostrzeżenie') -notcontains [string]$x.L.Level) { continue }
+            $p = if ($x.P) { $x.P } else { Get-LogPattern ([string]$x.L.Message) }
+            if (-not $seen.ContainsKey($p)) { $seen[$p] = @{} }
+            $seen[$p][$x.C] = $true
+        }
+        $partialCount = @($seen.Values | Where-Object { $_.Count -lt $computers.Count }).Count
+    }
+    Set-StatTile -Module $m -Key 'partial' -Value ([string]$partialCount) -Tone $(if ($partialCount) { 'warn' } else { '' })
+}
+
+function Get-LogQuery {
+    # Parametry odczytu z panelu; $null, gdy dane są niepoprawne (komunikat już pokazany)
+    param([hashtable]$Module)
+    $m = $Module
+    $path = $m.Path.Text.Trim().Trim('"')
+    if (-not $path) { Show-Warning 'Podaj ścieżkę do pliku, folderu albo maskę, np. C:\ProgramData\Firma\Aplikacja\Logs\*.log'; return $null }
+    $mode = @('Lines', 'Minutes', 'Hours', 'Range')[$m.Range.SelectedIndex]
+    $q = @{
+        Path = $path; Recurse = (Test-Checked $m.Recurse); Files = @('Newest', 'All')[$m.Files.SelectedIndex]; Mode = $mode; Value = (Get-Num $m.Value)
+        From = $null; To = $null; Include = $m.Include.Text.Trim(); Exclude = $m.Exclude.Text.Trim(); Regex = (Test-Checked $m.Regex); ErrorsOnly = (Test-Checked $m.ErrorsOnly)
+        MaxLines = (Get-Num $m.MaxLines); MaxMB = 20; MaxFiles = 30
+    }
+    if ($mode -eq 'Range') {
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        foreach ($k in 'From', 'To') {
+            $box = if ($k -eq 'From') { $m.From } else { $m.To }
+            $t = $box.Text.Trim()
+            if (-not $t) { continue }
+            $d = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact($t, [string[]]@('yyyy-MM-dd HH:mm:ss', 'yyyy-MM-dd HH:mm', 'yyyy-MM-dd'), $culture, 'None', [ref]$d)) { Show-Warning "Data «$t»: użyj formatu RRRR-MM-DD gg:mm, np. 2026-10-02 14:30."; return $null }
+            $q[$k] = $d
+        }
+        if (-not $q.From -and -not $q.To) { Show-Warning 'Podaj początek i/lub koniec przedziału.'; return $null }
+    }
+    if ($q.Regex) {
+        foreach ($rx in @($q.Include, $q.Exclude) | Where-Object { $_ }) {
+            try { [void][regex]::new($rx) } catch { Show-Warning "Niepoprawne wyrażenie regularne «$rx»: $($_.Exception.Message)"; return $null }
+        }
+    }
+    return $q
+}
+
+function Start-LogRead {
+    param([hashtable]$Module, [string[]]$Targets, [hashtable]$Query)
+    $m = $Module
+    $m.Data.LastTargets = @($Targets)
+    $m.Data.LastQuery = $Query
+    $m.Data.Logs = @{}
+    $m.Data.LogErrors = @{}
+    $recent = @(@($Query.Path) + @(Get-ModuleSetting -Module $m -Name 'Paths' -Default @()) | Where-Object { $_ } | Select-Object -Unique | Select-Object -First 12)
+    Set-ModuleSetting -Module $m -Name 'Paths' -Value $recent
+    Start-HostOperation -Module $m -Name 'Logi' -Targets $Targets -Output None -Parameters $Query -ScriptBlock $script:LogReadScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { $m.Data.LogErrors[$r.Target] = ((@($r.Errors | Select-Object -Unique)) -join ' | ') }
+        else {
+            $all = @($r.Data)
+            $m.Data.Logs[$r.Target] = @{ Lines = @($all | Where-Object { $_.__kind -eq 'line' }); Files = @($all | Where-Object { $_.__kind -eq 'file' }) }
+        }
+        Show-LogView -Module $m
+    } -OnComplete {
+        param($m)
+        $total = 0
+        foreach ($v in $m.Data.Logs.Values) { $total += @($v.Lines).Count }
+        Write-Log ("Logi: {0} wpisów z {1} komputer(ów)." -f $total, $m.Data.Logs.Count) 'OK'
+        if (Test-Checked $m.Follow) {
+            if (-not $m.Data['FollowTimer']) {
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromSeconds(15)
+                $t.Tag = $m
+                $t.add_Tick({
+                        param($s, $e)
+                        $s.Stop()
+                        $mm = $s.Tag
+                        if ((Test-Checked $mm.Follow) -and -not $mm.Busy -and @($mm.Data.LastTargets).Count) { Invoke-UiAction -Module $mm -Action { param($m) Start-LogRead -Module $m -Targets $m.Data.LastTargets -Query $m.Data.LastQuery } }
+                    })
+                $m.Data.FollowTimer = $t
+            }
+            $m.Data.FollowTimer.Start()
+        }
+    }
+}
+
+Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'AppLogs' -Title 'Logi aplikacji' -Icon 'E7C3' -Badge 'nowe' `
+    -Description 'Pliki logów aplikacji (np. w ProgramData) z wielu komputerów naraz: wspólna oś czasu, porównanie komunikatów między komputerami (czy dzieje się wszędzie, czy na jednym), filtrowanie i śledzenie na bieżąco.' -Build {
+    param($m)
+    $m.PillColumns = @('Poziom', 'Zasięg')
+    $m.Data.Logs = @{}
+    $m.Data.LogErrors = @{}
+    $m.Data.Pattern = ''
+    $m.Data.LastTargets = @()
+    $m.Data.LastQuery = $null
+    $m.Data.FollowTimer = $null
+    $row = Add-ToolbarRow -Module $m -Title 'Pliki'
+    $m.Path = Add-TextBox -Parent $row -Width 470 -Placeholder 'np. %ProgramData%\Firma\Aplikacja\Logs\*.log  albo folder / plik'
+    $m.Path.Text = [string](@(Get-ModuleSetting -Module $m -Name 'Paths' -Default @()) | Select-Object -First 1)
+    Add-Button -Parent $row -Text 'Przeglądaj…' -Icon 'E8B7' -Module $m -AlwaysEnabled -ToolTip 'Foldery na pierwszym zaznaczonym komputerze' -OnClick {
+        param($m)
+        $first = @(Get-TargetComputers) | Select-Object -First 1
+        if (-not $first) { return }
+        $current = $m.Path.Text.Trim()
+        $dir = if ($current -match '[\*\?]') { Split-Path -Path $current -Parent } else { $current }
+        $folder = Select-RemoteFolder -Computer $first -Selected $dir -Title "Folder logów na komputerze $first"
+        if ($folder) { $m.Path.Text = (Join-Path $folder '*.log') }
+    } | Out-Null
+    Add-Button -Parent $row -Text '' -Icon 'E81C' -Module $m -AlwaysEnabled -ToolTip 'Ostatnio używane ścieżki' -OnClick {
+        param($m)
+        $recent = @(Get-ModuleSetting -Module $m -Name 'Paths' -Default @())
+        if ($recent.Count -eq 0) { Show-Message -Text 'Brak zapamiętanych ścieżek – pojawią się po pierwszym odczycie.' -Title 'Ostatnie ścieżki'; return }
+        $pick = Show-FormDialog -Title 'Ostatnie ścieżki' -Icon 'E81C' -Fields @(@{ Key = 'P'; Label = 'Ścieżka'; Type = 'Combo'; Items = $recent; Value = $recent[0] })
+        if ($pick) { $m.Path.Text = $pick.P }
+    } | Out-Null
+    $m.Recurse = Add-CheckBox -Parent $row -Text 'Podfoldery'
+    Add-Label -Parent $row -Text 'Pliki' | Out-Null
+    $m.Files = Add-ComboBox -Parent $row -Items @('najnowszy', 'wszystkie pasujące') -Width 170
+    $row2 = Add-ToolbarRow -Module $m -Title 'Zakres'
+    $m.Range = Add-ComboBox -Parent $row2 -Items @('ostatnie wpisy (liczba)', 'ostatnie minuty', 'ostatnie godziny', 'przedział od – do') -Width 210
+    $m.Value = Add-Numeric -Parent $row2 -Value 200 -Minimum 1 -Maximum 100000 -Width 80
+    $m.From = Add-TextBox -Parent $row2 -Width 150 -Placeholder 'od RRRR-MM-DD gg:mm'
+    $m.To = Add-TextBox -Parent $row2 -Width 150 -Placeholder 'do (puste = teraz)'
+    Register-ControlHandler -Control $m.Range -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        $isRange = ($m.Range.SelectedIndex -eq 3)
+        $m.From.IsEnabled = $isRange
+        $m.To.IsEnabled = $isRange
+        $m.Value.IsEnabled = -not $isRange
+        if (-not $isRange) { $m.Value.Text = [string](@(200, 30, 4)[$m.Range.SelectedIndex]) }
+    }
+    $m.From.IsEnabled = $false
+    $m.To.IsEnabled = $false
+    Add-Label -Parent $row2 -Text '   Limit wpisów na komputer' | Out-Null
+    $m.MaxLines = Add-Numeric -Parent $row2 -Value 3000 -Minimum 10 -Maximum 50000 -Width 80
+    $row3 = Add-ToolbarRow -Module $m -Title 'Filtr'
+    $m.Include = Add-TextBox -Parent $row3 -Width 230 -Placeholder 'zawiera (np. timeout)'
+    $m.Exclude = Add-TextBox -Parent $row3 -Width 200 -Placeholder 'pomiń wpisy zawierające'
+    $m.Regex = Add-CheckBox -Parent $row3 -Text 'Wyrażenia regularne'
+    $m.ErrorsOnly = Add-CheckBox -Parent $row3 -Text 'Tylko błędy i ostrzeżenia'
+    $row4 = Add-ToolbarRow -Module $m -Title 'Widok'
+    $m.ViewSwitch = Add-Segmented -Parent $row4 -Items $script:LogViews -Module $m -OnChange { param($m) Show-LogView -Module $m }
+    Add-Button -Parent $row4 -Text 'Wczytaj logi' -Icon 'E896' -Module $m -Primary -OnClick {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $q = Get-LogQuery -Module $m
+        if (-not $q) { return }
+        $m.Data.Pattern = ''
+        Start-LogRead -Module $m -Targets $targets -Query $q
+    } | Out-Null
+    $m.Follow = Add-CheckBox -Parent $row4 -Text 'Śledź (odświeżaj co 15 s)'
+    $m.ClearPattern = Add-Button -Parent $row4 -Text 'Pokaż wszystkie wpisy' -Icon 'E894' -Module $m -AlwaysEnabled -ToolTip 'Usuń filtr wzorca z osi czasu' -OnClick {
+        param($m)
+        $m.Data.Pattern = ''
+        Show-LogView -Module $m
+    }
+    $m.ClearPattern.Visibility = 'Collapsed'
+    Add-StatTile -Module $m -Key 'lines' -Label 'Wpisy' -Icon 'E8A5' | Out-Null
+    Add-StatTile -Module $m -Key 'errors' -Label 'Błędy' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'warns' -Label 'Ostrzeżenia' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'partial' -Label 'Błędy nie na wszystkich' -Icon 'E9D9' | Out-Null
+    Add-RowAction -Module $m -Text 'Pokaż wystąpienia na osi czasu' -Icon 'E81C' -Action {
+        param($m, $rows)
+        $r = $rows[0]
+        $pattern = [string](Get-ObjectValue $r '__pattern')
+        if (-not $pattern) { $text = [string](Get-ObjectValue $r 'Treść'); if ($text -and $text -notlike 'Błąd odczytu*') { $pattern = Get-LogPattern $text } }
+        if (-not $pattern) { return }
+        $m.Data.Pattern = $pattern
+        Set-SegmentIndex $m.ViewSwitch 0
+        Show-LogView -Module $m
+    }
+    $m.EmptyHint = 'Podaj ścieżkę logów (np. %ProgramData%\Firma\App\Logs\*.log), zaznacz komputery i kliknij «Wczytaj logi». «Porównanie komputerów» pokaże, czy dany komunikat występuje wszędzie, czy tylko na części maszyn.'
 }
 #endregion
 
@@ -9764,7 +11567,6 @@ function Get-LdapDate {
 function Register-GroupMembershipModule {
     # Członkostwo w grupach - wspólny moduł dla użytkowników, komputerów i grup (zagnieżdżanie)
     param([string]$Workspace, [ValidateSet('User', 'Computer', 'Group')][string]$Kind, [string]$Key, [string]$Category, [string]$Title = 'Członkostwo w grupach')
-    $title = $Title
     $desc = switch ($Kind) {
         'User' { 'Grupy zaznaczonych kont (bezpośrednie i zagnieżdżone), dodawanie do grup, usuwanie z zaznaczonych grup i kopiowanie członkostwa z konta wzorcowego.' }
         'Computer' { 'Grupy zaznaczonych kont komputerów (bezpośrednie i zagnieżdżone), dodawanie do grup i usuwanie z zaznaczonych grup.' }
@@ -9825,7 +11627,7 @@ function Register-GroupMembershipModule {
                 if (-not $Groups) { return }
             }
             $names = @($Groups | ForEach-Object { $_.Name })
-            if (-not (Confirm-Action -Text ("Dodać {0} obiekt(ów) do grup: {1}?" -f $targets.Count, ($names -join ', ')) -Items $targets -ConfirmText 'Dodaj do grup')) { return }
+            $targets = @(Confirm-Action -Text ("Dodać wybrane obiekty do grup: {0}?" -f ($names -join ', ')) -Items $targets -ConfirmText 'Dodaj do grup' -Select); if ($targets.Count -eq 0) { return }
             Start-AdOperation -Module $m -Name 'Dodawanie do grup' -Targets $targets -TargetColumn $m.Data.Column -Output Log -Parameters @{ Groups = @($Groups | ForEach-Object { $_.DN }); Kind = $m.Target } -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
                 $obj = switch ($P.Kind) { 'User' { Get-ADUser -Identity $Target @ad } 'Group' { Get-ADGroup -Identity $Target @ad } default { Get-ADComputer -Identity $Target @ad } }
                 foreach ($g in $P.Groups) {
@@ -9895,7 +11697,7 @@ function Register-GroupMembershipModule {
             Show-Toast "Skopiowano nazw grup: $($names.Count)" 'ok'
         }
     }
-    Register-Module -Workspace $Workspace -Category $Category -Key $Key -Title $title -Icon 'E902' -Description $desc -Build $build
+    Register-Module -Workspace $Workspace -Category $Category -Key $Key -Title $Title -Icon 'E902' -Description $desc -Build $build
 }
 #endregion
 
@@ -10018,7 +11820,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserPassword' -Titl
             NeverOn     = 'Ustawić «hasło nigdy nie wygasa»? Obniża to bezpieczeństwo – stosuj tylko dla kont usług.'
             NeverOff    = 'Wyłączyć «hasło nigdy nie wygasa»? Hasła mogą od razu wygasnąć, jeśli są starsze niż zasady domeny.'
         }[$Op]
-        if (-not (Confirm-Action -Text $text -Items $targets -ConfirmText 'Wykonaj' -Danger:($Op -eq 'NeverOn'))) { return }
+        $targets = @(Confirm-Action -Text $text -Items $targets -ConfirmText 'Wykonaj' -Danger:($Op -eq 'NeverOn') -Select); if ($targets.Count -eq 0) { return }
         Start-AdOperation -Module $m -Name "Hasła – $Op" -Targets $targets -TargetColumn 'Login' -Output Log -Parameters @{ Op = $Op } -ScriptBlock {
             switch ($P.Op) {
                 'Unlock' { Unlock-ADAccount -Identity $Target @ad; 'Odblokowano.' }
@@ -10037,7 +11839,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserPassword' -Titl
         if (-not $targets) { return }
         $opt = Show-PasswordDialog -Subtitle ("Konta: {0}{1}" -f (($targets | Select-Object -First 5) -join ', '), $(if ($targets.Count -gt 5) { " i $($targets.Count - 5) więcej" } else { '' })) -Count $targets.Count
         if (-not $opt) { return }
-        if (-not (Confirm-Action -Text "Zresetować hasło $($targets.Count) kont(a)?" -Items $targets -ConfirmText 'Resetuj hasła' -Danger)) { return }
+        $targets = @(Confirm-Action -Text "Zresetować hasło wybranych kont?" -Items $targets -ConfirmText 'Resetuj hasła' -Danger -Select); if ($targets.Count -eq 0) { return }
         $per = @{}
         foreach ($t in $targets) {
             $per[$t] = @{
@@ -10132,25 +11934,25 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserState' -Title '
                     $params.Note = ('Wyłączone {0:yyyy-MM-dd} przez {1}{2}' -f (Get-Date), $env:USERNAME, $(if ($reason) { ": $reason" } else { '' }))
                 }
                 $params.MoveTo = $m.DisabledOu.Text.Trim()
-                $text = "Wyłączyć $($targets.Count) kont(a)?"
+                $text = 'Wyłączyć wybrane konta?'
                 if ($params.Note) { $text += "`r`nOpis zostanie poprzedzony: «$($params.Note)»" }
                 if ($params.MoveTo) { $text += "`r`nKonta zostaną przeniesione do: $($params.MoveTo)" }
-                if (-not (Confirm-Action -Text $text -Items $targets -ConfirmText 'Wyłącz konta' -Danger)) { return }
+                $targets = @(Confirm-Action -Text $text -Items $targets -ConfirmText 'Wyłącz konta' -Danger -Select); if ($targets.Count -eq 0) { return }
             }
-            'Enable' { if (-not (Confirm-Action -Text "Włączyć $($targets.Count) kont(a)?" -Items $targets -ConfirmText 'Włącz konta')) { return } }
+            'Enable' { $targets = @(Confirm-Action -Text "Włączyć wybrane konta?" -Items $targets -ConfirmText 'Włącz konta' -Select); if ($targets.Count -eq 0) { return } }
             'Expire' {
                 $date = [datetime]::MinValue
                 if (-not [datetime]::TryParseExact($m.ExpireDate.Text.Trim(), 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$date)) { Show-Warning 'Podaj datę w formacie RRRR-MM-DD, np. 2026-12-31.'; return }
                 # Konto wygasa z końcem wskazanego dnia (AD przechowuje początek następnego dnia)
                 $params.Date = $date.AddDays(1)
-                if (-not (Confirm-Action -Text ("Ustawić wygaśnięcie kont z końcem dnia {0:yyyy-MM-dd}?" -f $date) -Items $targets -ConfirmText 'Ustaw')) { return }
+                $targets = @(Confirm-Action -Text ("Ustawić wygaśnięcie kont z końcem dnia {0:yyyy-MM-dd}?" -f $date) -Items $targets -ConfirmText 'Ustaw' -Select); if ($targets.Count -eq 0) { return }
             }
-            'ClearExpire' { if (-not (Confirm-Action -Text 'Usunąć datę wygaśnięcia kont (konta nie będą wygasać)?' -Items $targets -ConfirmText 'Usuń datę')) { return } }
+            'ClearExpire' { $targets = @(Confirm-Action -Text 'Usunąć datę wygaśnięcia kont (konta nie będą wygasać)?' -Items $targets -ConfirmText 'Usuń datę' -Select); if ($targets.Count -eq 0) { return } }
             'Move' {
                 $ou = Select-OrganizationalUnit -Title 'Docelowa jednostka dla kont'
                 if (-not $ou) { return }
                 $params.MoveTo = $ou
-                if (-not (Confirm-Action -Text "Przenieść konta do:`r`n$ou ?" -Items $targets -ConfirmText 'Przenieś')) { return }
+                $targets = @(Confirm-Action -Text "Przenieść konta do:`r`n$ou ?" -Items $targets -ConfirmText 'Przenieś' -Select); if ($targets.Count -eq 0) { return }
             }
         }
         Start-AdOperation -Module $m -Name "Stan konta – $Op" -Targets $targets -TargetColumn 'Login' -Output Log -Parameters $params -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
@@ -10244,7 +12046,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserAttributes' -Ti
         $attr = $script:UserAttributes[$m.Attr.SelectedIndex].Name
         $value = $m.Value.Text.Trim()
         if (-not $value) { Show-Warning 'Wpisz wartość (aby usunąć wartość, użyj «Wyczyść»).'; return }
-        if (-not (Confirm-Action -Text "Ustawić atrybut $attr = «$value» dla $($targets.Count) kont(a)?" -Items $targets -ConfirmText 'Ustaw')) { return }
+        $targets = @(Confirm-Action -Text "Ustawić atrybut $attr = «$value» dla wybranych kont?" -Items $targets -ConfirmText 'Ustaw' -Select); if ($targets.Count -eq 0) { return }
         Start-AdOperation -Module $m -Name "Zmiana $attr" -Targets $targets -TargetColumn 'Login' -Output Log -Parameters @{ Attr = $attr; Value = $value } -ScriptBlock {
             $u = Get-ADUser -Identity $Target -Properties GivenName, Surname, DisplayName @ad
             $v = $P.Value.Replace('{login}', $u.SamAccountName).Replace('{imie}', [string]$u.GivenName).Replace('{nazwisko}', [string]$u.Surname).Replace('{nazwa}', [string]$u.DisplayName)
@@ -10258,7 +12060,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserAttributes' -Ti
         $targets = @(Get-TargetUsers)
         if (-not $targets) { return }
         $attr = $script:UserAttributes[$m.Attr.SelectedIndex].Name
-        if (-not (Confirm-Action -Text "Wyczyścić atrybut $attr dla $($targets.Count) kont(a)?" -Items $targets -ConfirmText 'Wyczyść' -Danger)) { return }
+        $targets = @(Confirm-Action -Text "Wyczyścić atrybut $attr dla wybranych kont?" -Items $targets -ConfirmText 'Wyczyść' -Danger -Select); if ($targets.Count -eq 0) { return }
         Start-AdOperation -Module $m -Name "Czyszczenie $attr" -Targets $targets -TargetColumn 'Login' -Output Log -Parameters @{ Attr = $attr } -ScriptBlock {
             Set-ADUser -Identity $Target -Clear $P.Attr @ad
             "Wyczyszczono $($P.Attr)."
@@ -10571,7 +12373,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
                 $question = "Przenieść konta komputerów do:`r`n$ou ?"
             }
         }
-        if (-not (Confirm-Action -Text $question -Items $targets -ConfirmText $(if ($Op -eq 'Delete') { 'Usuń konta' } else { 'Wykonaj' }) -Danger:$danger)) { return }
+        $targets = @(Confirm-Action -Text $question -Items $targets -ConfirmText $(if ($Op -eq 'Delete') { 'Usuń konta' } else { 'Wykonaj' }) -Danger:$danger -Select); if ($targets.Count -eq 0) { return }
         $m.Data.LastOp = $Op
         Start-AdOperation -Module $m -Name "Konto komputera – $Op" -Targets $targets -TargetColumn 'Komputer' -Output Log -Parameters $params -OnComplete { param($m) if ($m.Data.LastOp -ne 'Delete') { & $m.Actions.List $m } } -ScriptBlock {
             $c = Get-ADComputer -Identity $Target @ad
@@ -10629,7 +12431,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
             $cred = Show-CredentialDialog -Message 'Naprawa kanału zaufania wymaga poświadczeń domenowych z prawem resetu konta komputera (nie przechodzą przez WinRM automatycznie).'
             if (-not $cred) { return }
         }
-        if (-not (Confirm-Action -Text "Naprawić kanał zaufania (Test-ComputerSecureChannel -Repair)?" -Items $targets -ConfirmText 'Napraw')) { return }
+        $targets = @(Confirm-Action -Text "Naprawić kanał zaufania (Test-ComputerSecureChannel -Repair)?" -Items $targets -ConfirmText 'Napraw' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name 'Naprawa kanału zaufania' -Targets $targets -Output Log -Parameters @{ Credential = $cred; Server = [string]$script:Settings.DomainController } -ScriptBlock {
             param($P)
             $tp = @{ Repair = $true; Credential = $P.Credential; ErrorAction = 'Stop' }
@@ -10661,7 +12463,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
         $names = @(Read-NameList $text | ForEach-Object { $_.ToUpperInvariant() })
         $ou = Select-OrganizationalUnit -Title 'Jednostka dla nowych kont komputerów'
         if (-not $ou) { return }
-        if (-not (Confirm-Action -Text "Utworzyć konta komputerów w:`r`n$ou ?" -Items $names -ConfirmText 'Utwórz')) { return }
+        $names = @(Confirm-Action -Text "Utworzyć konta komputerów w:`r`n$ou ?" -Items $names -ConfirmText 'Utwórz' -Select); if ($names.Count -eq 0) { return }
         Start-AdOperation -Module $m -Name 'Tworzenie kont komputerów' -Targets $names -TargetColumn 'Komputer' -Output Log -Parameters @{ Path = $ou } -ScriptBlock {
             New-ADComputer -Name $Target -SamAccountName "$Target`$" -Path $P.Path -Enabled $true @ad
             "Utworzono w $($P.Path)."
@@ -10741,7 +12543,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Hasła i klucze' -Key 'Laps'
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        if (-not (Confirm-Action -Text "Wymusić zmianę hasła LAPS (ustawienie wygaśnięcia na teraz)?" -Items $targets -ConfirmText 'Wymuś zmianę')) { return }
+        $targets = @(Confirm-Action -Text "Wymusić zmianę hasła LAPS (ustawienie wygaśnięcia na teraz)?" -Items $targets -ConfirmText 'Wymuś zmianę' -Select); if ($targets.Count -eq 0) { return }
         Start-AdOperation -Module $m -Name 'LAPS – wymuszenie zmiany' -Targets $targets -TargetColumn 'Komputer' -Output Log -Parameters @{ ProcessNow = (Test-Checked $m.ProcessNow) } -ScriptBlock {
             $name = ($Target -split '\.')[0]
             $c = Get-ADComputer -Identity $name -Properties 'msLAPS-PasswordExpirationTime', 'msLAPS-EncryptedPassword', 'msLAPS-Password', 'ms-Mcs-AdmPwdExpirationTime', 'ms-Mcs-AdmPwd' @ad
@@ -11289,11 +13091,11 @@ function Invoke-GroupChange {
         'ProtectOff' { $params.Op = 'Protect'; $params.Value = $false; $confirmText = 'Wyłączyć ochronę przed przypadkowym usunięciem?' }
         'Delete' {
             $danger = $true
-            $confirmText = "Usunąć $($groups.Count) grup(ę)? Tej operacji nie można cofnąć – członkostwa i uprawnienia nadane grupie przepadną. Grupy systemowe, uprzywilejowane i chronione zostaną pominięte."
+            $confirmText = "Usunąć wybrane grupy? Tej operacji nie można cofnąć – członkostwa i uprawnienia nadane grupie przepadną. Grupy systemowe, uprzywilejowane i chronione zostaną pominięte."
         }
     }
     $label = if ($Op -eq 'Delete') { 'Usuń grupy' } else { 'Wykonaj' }
-    if (-not (Confirm-Action -Text $confirmText -Items $groups -ConfirmText $label -Danger:$danger)) { return }
+    $groups = @(Confirm-Action -Text $confirmText -Items $groups -ConfirmText $label -Danger:$danger -Select); if ($groups.Count -eq 0) { return }
     $Module.Data.ChangeOp = $params.Op
     Start-AdOperation -Module $Module -Name "Grupy – $($params.Op)" -Targets $groups -TargetColumn 'Grupa' -Output Log -Parameters $params -ScriptBlock $script:GroupChangeScript -OnResult {
         param($m, $r)
@@ -12034,6 +13836,10 @@ Register-Module -Workspace 'AdGroups' -Category 'Tworzenie' -Key 'GroupCreate' -
         if ($m.Data.Stale) { Start-GroupPlanCheck -Module $m -ThenCreate; return }
         $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Gotowe do utworzenia' })
         if ($rows.Count -eq 0) { Show-Message -Text 'Brak grup gotowych do utworzenia. Popraw wiersze z błędami lub konfliktami i sprawdź ponownie.' -Title 'Brak zmian'; return }
+        $items = @($rows | ForEach-Object { '{0}  ({1}, {2})' -f $_['Nazwa'], $_['Zakres'], (Get-RdnValue ([string]$_['OU'])) })
+        $chosen = @(Confirm-Action -Text 'Utworzyć wybrane grupy?' -Items $items -ConfirmText 'Utwórz grupy' -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $rows = @($chosen | ForEach-Object { $rows[$_] })
         $per = @{}
         foreach ($r in $rows) {
             $per[[string]$r['__id']] = @{
@@ -12042,8 +13848,6 @@ Register-Module -Workspace 'AdGroups' -Category 'Tworzenie' -Key 'GroupCreate' -
                 ManagedBy = ([string]$r['Zarządca']).Trim(); Protect = (Test-Checked $m.Protect)
             }
         }
-        $items = @($rows | ForEach-Object { '{0}  ({1}, {2})' -f $_['Nazwa'], $_['Zakres'], (Get-RdnValue ([string]$_['OU'])) })
-        if (-not (Confirm-Action -Text "Utworzyć $($rows.Count) grup(y)?" -Items $items -ConfirmText 'Utwórz grupy')) { return }
         foreach ($r in $rows) { Set-RowState -Module $m -Row $r -State 'Tworzenie…' -Tone '' }
         Start-AdOperation -Module $m -Name 'Tworzenie grup' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:GroupCreateScript -OnResult {
             param($m, $r)
@@ -13053,27 +14857,23 @@ function Export-GroupTreeHtml {
 }
 
 function ConvertTo-GroupTreeHtml {
-    # Raport HTML drzewa (rozwijane gałęzie, wyszukiwanie, rozwiń/zwiń wszystko) z wierszy tabeli w kolejności drzewa
+    # Raport HTML drzewa (rozwijane gałęzie, wyszukiwanie, kopiowanie i otwieranie gałęzi w osobnym oknie)
+    # z wierszy tabeli w kolejności drzewa; wspólne style i skrypt raportów - 32-htmlreport.ps1
     param([object[]]$Rows)
-    $rows = @($Rows)
+    $treeRows = @($Rows)
     $enc = { param($t) ConvertTo-HtmlText $t }
+    $acts = '<span class="acts"><button data-act="copy-node" title="Kopiuj gałąź (wcięty tekst)">⧉</button><button data-act="open-node" title="Otwórz gałąź w osobnym oknie">↗</button></span>'
+    $leafActs = '<span class="acts"><button data-act="copy-node" title="Kopiuj">⧉</button></span>'
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><title>Drzewo grup</title><style>')
-    [void]$sb.Append('body{margin:0;padding:28px;background:#0F1318;color:#E4E8EF;font:14px/1.5 "Segoe UI",system-ui,sans-serif}h1{font-size:22px;margin:0 0 4px}.meta{color:#8791A5;margin-bottom:18px}')
-    [void]$sb.Append('.bar{position:sticky;top:0;z-index:5;background:#161B22;border:1px solid #242B36;border-radius:10px;padding:12px;margin-bottom:16px;display:flex;gap:10px;align-items:center}')
-    [void]$sb.Append('input{flex:0 0 340px;background:#1B212A;color:#E4E8EF;border:1px solid #2A323F;border-radius:7px;padding:8px 10px;font:inherit}button{background:#3E6FE0;color:#fff;border:0;border-radius:7px;padding:8px 14px;font:inherit;cursor:pointer}button.g{background:#1E252F;color:#C9D0DC}')
-    [void]$sb.Append('details{margin-left:22px}details.root{margin:6px 0;background:#161B22;border:1px solid #242B36;border-radius:10px;padding:6px 10px}summary{cursor:pointer;padding:3px 4px;border-radius:6px;list-style:none}summary::-webkit-details-marker{display:none}')
-    [void]$sb.Append('summary::before{content:"▸";display:inline-block;width:16px;color:#8791A5}details[open]>summary::before{content:"▾";color:#8CB0FF}summary:hover{background:#1D2430}.leaf{margin-left:38px;padding:2px 4px;color:#AEB6C4}')
-    [void]$sb.Append('.k{display:inline-block;font-size:11px;padding:0 7px;border-radius:8px;background:#1A2640;color:#8CC0FF;margin-left:8px}.d{color:#7B8496;font-style:italic;margin-left:8px}.w{color:#FF7A86;margin-left:8px}.m{color:#5E6779}.hit{background:#2E2616 !important;outline:1px solid #FFC46B}')
-    [void]$sb.Append('</style><script>function all(s){document.querySelectorAll("details").forEach(function(d){d.open=s})}')
-    [void]$sb.Append('function find(){var q=document.getElementById("q").value.toLowerCase();document.querySelectorAll(".hit").forEach(function(e){e.classList.remove("hit")});if(!q)return;all(false);document.querySelectorAll("summary,.leaf").forEach(function(e){if(e.textContent.toLowerCase().indexOf(q)>=0){e.classList.add("hit");var p=e.parentElement;while(p&&p.tagName==="DETAILS"){p.open=true;p=p.parentElement}}})}</script></head><body>')
-    [void]$sb.Append('<h1>Drzewo zagnieżdżeń grup</h1><div class="meta">').Append((& $enc ('Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2} • wierszy: {3}' -f $script:AppVersion, (Get-Date), $env:USERNAME, $rows.Count))).Append('</div>')
-    [void]$sb.Append('<div class="bar"><input id="q" placeholder="Szukaj grupy lub konta…" onkeyup="find()"><button onclick="all(true)">Rozwiń wszystko</button><button class="g" onclick="all(false)">Zwiń wszystko</button></div>')
+    [void]$sb.Append((Get-ReportHead -Title 'Drzewo zagnieżdżeń grup' -Meta ('Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2} • wierszy: {3}' -f $script:AppVersion, (Get-Date), $env:USERNAME, $treeRows.Count)))
+    $roots = @($treeRows | Where-Object { [int]$_['Poziom'] -eq 0 }).Count
+    [void]$sb.Append((Get-ReportBar -Mode 'tree' -Placeholder 'Szukaj grupy lub konta…' -Buttons @('expand', 'collapse', 'print') -Count $roots))
+    [void]$sb.Append('<div class="tree">')
     $open = 0
-    for ($i = 0; $i -lt $rows.Count; $i++) {
-        $r = $rows[$i]
+    for ($i = 0; $i -lt $treeRows.Count; $i++) {
+        $r = $treeRows[$i]
         $level = [int]$r['Poziom']
-        $nextLevel = if ($i + 1 -lt $rows.Count) { [int]$rows[$i + 1]['Poziom'] } else { 0 }
+        $nextLevel = if ($i + 1 -lt $treeRows.Count) { [int]$treeRows[$i + 1]['Poziom'] } else { 0 }
         while ($open -gt $level) { [void]$sb.Append('</details>'); $open-- }
         $name = (& $enc ([string]$r['Drzewo'] -replace '^[\s│├└─]+', ''))
         $extra = ''
@@ -13083,16 +14883,17 @@ function ConvertTo-GroupTreeHtml {
         if ([string]$r['Uwagi']) { $extra += '<span class="w">⚠ ' + (& $enc $r['Uwagi']) + '</span>' }
         if ($nextLevel -gt $level) {
             $cls = if ($level -eq 0) { ' class="root"' } else { '' }
-            [void]$sb.Append("<details$cls><summary>").Append($name).Append($extra).Append('</summary>')
+            [void]$sb.Append("<details$cls><summary>").Append($name).Append($extra).Append($acts).Append('</summary>')
             $open = $level + 1
         }
         else {
-            if ($level -eq 0) { [void]$sb.Append('<details class="root"><summary>').Append($name).Append($extra).Append(' <span class="m">(bez zagnieżdżeń)</span></summary></details>') }
-            else { [void]$sb.Append('<div class="leaf">').Append($name).Append($extra).Append('</div>') }
+            if ($level -eq 0) { [void]$sb.Append('<details class="root"><summary>').Append($name).Append($extra).Append(' <span class="m">(bez zagnieżdżeń)</span>').Append($acts).Append('</summary></details>') }
+            else { [void]$sb.Append('<div class="leaf">').Append($name).Append($extra).Append($leafActs).Append('</div>') }
         }
     }
     while ($open -gt 0) { [void]$sb.Append('</details>'); $open-- }
-    [void]$sb.Append('</body></html>')
+    [void]$sb.Append('</div>')
+    [void]$sb.Append((Get-ReportTail))
     return $sb.ToString()
 }
 
@@ -13361,42 +15162,43 @@ function Get-ProfileValue([hashtable]$UserProfile, [string]$Key) {
     return (New-UserProfile)[$Key]
 }
 
-function Set-UserProfileControls {
-    param([hashtable]$Module, [hashtable]$UserProfile)
-    $m = $Module
-    $m.Data.Loading = $true
-    try {
-        $m.Ou.Text = [string](Get-ProfileValue $UserProfile 'Ou')
-        $m.Upn.Text = [string](Get-ProfileValue $UserProfile 'Upn')
-        $m.MailDomain.Text = [string](Get-ProfileValue $UserProfile 'MailDomain')
-        $m.SetMail.IsChecked = [bool](Get-ProfileValue $UserProfile 'SetMail')
-        $keys = @($script:LoginFormatLabels.Keys)
-        $m.LoginFormat.SelectedIndex = [Math]::Max(0, [array]::IndexOf($keys, [string](Get-ProfileValue $UserProfile 'LoginFormat')))
-        $m.DisplayFormat.Text = [string](Get-ProfileValue $UserProfile 'DisplayFormat')
-        $m.Description.Text = [string](Get-ProfileValue $UserProfile 'Description')
-        $m.Company.Text = [string](Get-ProfileValue $UserProfile 'Company')
-        $m.Department.Text = [string](Get-ProfileValue $UserProfile 'Department')
-        $m.City.Text = [string](Get-ProfileValue $UserProfile 'City')
-        $m.Groups.Text = (@(Get-ProfileValue $UserProfile 'Groups') -join '; ')
-        $m.Enabled.IsChecked = [bool](Get-ProfileValue $UserProfile 'Enabled')
-        $m.MustChange.IsChecked = [bool](Get-ProfileValue $UserProfile 'MustChange')
-        $m.NumberLogins.IsChecked = [bool](Get-ProfileValue $UserProfile 'NumberLogins')
-        $m.PwdLength.Text = [string](Get-ProfileValue $UserProfile 'PasswordLength')
-        $m.ExpireDays.Text = [string](Get-ProfileValue $UserProfile 'ExpireDays')
-    }
-    finally { $m.Data.Loading = $false }
+function ConvertTo-CompleteUserProfile {
+    # Kopia profilu z wartościami domyślnymi dla brakujących pól (profil z wcześniejszej wersji programu)
+    param([hashtable]$UserProfile)
+    $full = New-UserProfile
+    foreach ($k in @($full.Keys)) { $full[$k] = Get-ProfileValue $UserProfile $k }
+    $full.Groups = @($full.Groups | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $full.Upn = ([string]$full.Upn).Trim().TrimStart('@')
+    $full.MailDomain = ([string]$full.MailDomain).Trim().TrimStart('@')
+    if (@($script:LoginFormatLabels.Keys) -notcontains [string]$full.LoginFormat) { $full.LoginFormat = 'i.nazwisko' }
+    return $full
 }
 
-function Get-UserProfileFromControls {
-    param([hashtable]$Module, [string]$Name)
-    $m = $Module
-    return @{
-        Name = $Name; Ou = $m.Ou.Text.Trim(); Upn = $m.Upn.Text.Trim().TrimStart('@'); MailDomain = $m.MailDomain.Text.Trim().TrimStart('@'); SetMail = (Test-Checked $m.SetMail)
-        LoginFormat = @($script:LoginFormatLabels.Keys)[[Math]::Max(0, $m.LoginFormat.SelectedIndex)]; DisplayFormat = $m.DisplayFormat.Text.Trim()
-        Description = $m.Description.Text.Trim(); Company = $m.Company.Text.Trim(); Department = $m.Department.Text.Trim(); City = $m.City.Text.Trim()
-        Groups = @(Split-ListText $m.Groups.Text); Enabled = (Test-Checked $m.Enabled); MustChange = (Test-Checked $m.MustChange); NumberLogins = (Test-Checked $m.NumberLogins)
-        PasswordLength = (Get-Num $m.PwdLength); ExpireDays = (Get-Num $m.ExpireDays)
-    }
+function Get-SelectedUserProfile {
+    param([hashtable]$Module)
+    $profiles = @(Get-UserProfiles)
+    $i = [Math]::Max(0, [Math]::Min($Module.Profile.SelectedIndex, $profiles.Count - 1))
+    return (ConvertTo-CompleteUserProfile $profiles[$i])
+}
+
+function Get-UserProfileSummary {
+    # Jedna linia z najważniejszymi ustawieniami profilu (pod listą profili)
+    param([hashtable]$UserProfile)
+    $p = ConvertTo-CompleteUserProfile $UserProfile
+    $parts = @()
+    $parts += 'OU: ' + $(if ($p.Ou) { (@($p.Ou -split '(?<!\\),' | Where-Object { $_ -match '^(OU|CN)=' } | ForEach-Object { $_ -replace '^[^=]+=', '' }) -join ' ‹ ') } else { '(nie ustawiono)' })
+    $parts += 'UPN: ' + $(if ($p.Upn) { '@' + $p.Upn } else { '(brak sufiksu)' })
+    $parts += 'login: ' + [string]$p.LoginFormat
+    $parts += 'nazwa: ' + [string]$p.DisplayFormat
+    if ($p.SetMail) { $parts += 'e-mail: login@' + $(if ($p.MailDomain) { $p.MailDomain } elseif ($p.Upn) { $p.Upn } else { '?' }) }
+    $acct = @($(if ($p.Enabled) { 'włączone' } else { 'wyłączone' }))
+    if ($p.MustChange) { $acct += 'zmiana hasła' }
+    $acct += "hasło $($p.PasswordLength) zn."
+    if ([int]$p.ExpireDays -gt 0) { $acct += "wygasa po $($p.ExpireDays) dn." }
+    $parts += 'konto: ' + ($acct -join ', ')
+    $groups = @($p.Groups)
+    if ($groups.Count) { $parts += "grupy ($($groups.Count)): " + ((@($groups | Select-Object -First 3)) -join ', ') + $(if ($groups.Count -gt 3) { ', …' } else { '' }) }
+    return ($parts -join '   •   ')
 }
 
 function Update-UserProfileList {
@@ -13412,7 +15214,276 @@ function Update-UserProfileList {
         $m.Profile.SelectedIndex = $idx
     }
     finally { $m.Data.Loading = $false }
-    Set-UserProfileControls -Module $m -UserProfile $profiles[$m.Profile.SelectedIndex]
+    $m.ProfileSummary.Text = Get-UserProfileSummary $profiles[$m.Profile.SelectedIndex]
+}
+
+function Set-UserPlanProfile {
+    # Nowy profil dla podglądu: przelicza pola automatyczne, a OU, opis, dział i miasto - jeśli pochodzą z poprzedniego profilu
+    param([hashtable]$Module, [hashtable]$UserProfile)
+    $m = $Module
+    $old = $m.Data.Profile
+    $m.Data.Profile = ConvertTo-CompleteUserProfile $UserProfile
+    $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -notlike 'Utworzono*' })
+    if (-not $old -or $rows.Count -eq 0) { return }
+    $new = $m.Data.Profile
+    $m.Loading = $true
+    try {
+        foreach ($row in $rows) {
+            if ([string]$row['OU'] -eq [string]$old.Ou) { Set-ResultValue -Module $m -Row $row -Column 'OU' -Value $new.Ou }
+            if ([string]$row['Dział'] -eq [string]$old.Department) { Set-ResultValue -Module $m -Row $row -Column 'Dział' -Value $new.Department }
+            if ([string]$row['Miasto'] -eq [string]$old.City) { Set-ResultValue -Module $m -Row $row -Column 'Miasto' -Value $new.City }
+            $vals = @{ First = [string]$row['Imię']; Last = [string]$row['Nazwisko']; Login = [string]$row['Login']; Number = [string]$row['Numer']; Department = [string]$row['Dział']; City = [string]$row['Miasto']; Title = [string]$row['Stanowisko'] }
+            $oldDesc = if ($old.Description) { Expand-Template $old.Description (Get-UserTokens -Row $vals -ProfileName $old.Name) } else { '' }
+            if ([string]$row['Opis'] -eq $oldDesc) { Set-ResultValue -Module $m -Row $row -Column 'Opis' -Value $(if ($new.Description) { Expand-Template $new.Description (Get-UserTokens -Row $vals -ProfileName $new.Name) } else { '' }) }
+            Update-UserComputedFields -Module $m -Row $row
+            Set-RowState -Module $m -Row $row -State 'Zmieniono – sprawdź' -Tone 'warn'
+        }
+    }
+    finally { $m.Loading = $false }
+    $m.Data.Stale = $true
+    & $m.Actions.Stats $m
+    Show-Toast "Podgląd przeliczono według profilu «$($new.Name)» – kliknij «Sprawdź», aby zweryfikować w AD." 'info' 6
+}
+
+$script:ProfileEditorXaml = @'
+<ScrollViewer MaxHeight="600" VerticalScrollBarVisibility="Auto">
+  <StackPanel Margin="0,0,10,0">
+    <StackPanel.Resources>
+      <Style x:Key="PeHdr" TargetType="TextBlock">
+        <Setter Property="Foreground" Value="#6E86B8"/><Setter Property="FontSize" Value="11"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Margin" Value="0,12,0,8"/>
+      </Style>
+      <Style x:Key="PeLbl" TargetType="TextBlock">
+        <Setter Property="Foreground" Value="#8791A5"/><Setter Property="FontSize" Value="12"/><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Margin" Value="0,0,10,0"/>
+      </Style>
+      <Style x:Key="PeHint" TargetType="TextBlock">
+        <Setter Property="Foreground" Value="#6B7487"/><Setter Property="FontSize" Value="11.5"/><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Margin" Value="150,-3,0,8"/>
+      </Style>
+    </StackPanel.Resources>
+    <TextBlock Text="PROFIL" Style="{StaticResource PeHdr}" Margin="0,0,0,8"/>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Nazwa profilu" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peName" Grid.Column="1" Tag="np. Pracownik, Student, Wykładowca"/>
+    </Grid>
+    <TextBlock Text="MIEJSCE W ACTIVE DIRECTORY" Style="{StaticResource PeHdr}"/>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <TextBlock Text="Jednostka (OU)" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peOu" Grid.Column="1" Tag="OU=Pracownicy,DC=firma,DC=local"/>
+      <Button x:Name="peOuPick" Grid.Column="2" Margin="6,0,0,0" Padding="9,4" ToolTip="Wybierz jednostkę z drzewa domeny"/>
+    </Grid>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <TextBlock Text="Sufiks UPN  @" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peUpn" Grid.Column="1" Tag="firma.pl"/>
+      <Button x:Name="peUpnPick" Grid.Column="2" Margin="6,0,0,0" Padding="9,4" ToolTip="Sufiksy UPN z lasu Active Directory"/>
+    </Grid>
+    <TextBlock Text="KONWENCJE NAZW" Style="{StaticResource PeHdr}"/>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Format loginu" Style="{StaticResource PeLbl}"/>
+      <ComboBox x:Name="peLogin" Grid.Column="1"/>
+    </Grid>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Nazwa wyświetlana" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peDisplay" Grid.Column="1" Tag="{}{Imię} {Nazwisko}"/>
+    </Grid>
+    <TextBlock Style="{StaticResource PeHint}" Text="Pola: {Imię} {Nazwisko} {Login} {Numer} {Profil} {Dział} {Miasto} {Stanowisko} – także w opisie."/>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Adres e-mail" Style="{StaticResource PeLbl}"/>
+      <CheckBox x:Name="peSetMail" Grid.Column="1" Content="login@" Margin="0,0,10,0"/>
+      <TextBox x:Name="peMailDomain" Grid.Column="2" Tag="domena (puste = jak sufiks UPN)"/>
+    </Grid>
+    <TextBlock Text="KONTO" Style="{StaticResource PeHdr}"/>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Stan i hasło" Style="{StaticResource PeLbl}"/>
+      <WrapPanel Grid.Column="1">
+        <CheckBox x:Name="peEnabled" Content="Konto włączone" Margin="0,4,16,4"/>
+        <CheckBox x:Name="peMustChange" Content="Zmiana hasła przy pierwszym logowaniu" Margin="0,4,16,4"/>
+        <CheckBox x:Name="peNumber" Content="Numeruj zajęte loginy (jan.kowalski1)" Margin="0,4,16,4"/>
+      </WrapPanel>
+    </Grid>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="70"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="80"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Długość hasła" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peLen" Grid.Column="1"/>
+      <TextBlock Grid.Column="2" Text="Wygasa po (dni)" Style="{StaticResource PeLbl}" Margin="16,0,10,0"/>
+      <TextBox x:Name="peExpire" Grid.Column="3"/>
+      <TextBlock Grid.Column="4" Text="0 = nigdy" Style="{StaticResource PeLbl}" Margin="10,0,0,0" Foreground="#6B7487"/>
+    </Grid>
+    <TextBlock Text="ATRYBUTY DOMYŚLNE" Style="{StaticResource PeHdr}"/>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Opis" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peDesc" Grid.Column="1" Tag="np. {Profil} – {Dział}"/>
+    </Grid>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Firma" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peCompany" Grid.Column="1"/>
+      <TextBlock Grid.Column="3" Text="Dział" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peDept" Grid.Column="4" Tag="gdy brak w danych"/>
+    </Grid>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <TextBlock Text="Miasto" Style="{StaticResource PeLbl}"/>
+      <TextBox x:Name="peCity" Grid.Column="1" Tag="gdy brak w danych"/>
+    </Grid>
+    <TextBlock Text="GRUPY" Style="{StaticResource PeHdr}"/>
+    <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text="Członkostwo nowych kont" Style="{StaticResource PeLbl}"/>
+        <Button x:Name="peGroupsPick" Margin="0,8,10,0" Padding="9,4" HorizontalAlignment="Left"/>
+      </StackPanel>
+      <TextBox x:Name="peGroups" Grid.Column="1" Style="{StaticResource MultiText}" Height="84" Tag="po jednej grupie w wierszu (sAMAccountName)"/>
+    </Grid>
+    <Border Style="{StaticResource Card}" Padding="12,9" Margin="0,8,0,0">
+      <StackPanel>
+        <TextBlock Text="PRZYKŁAD – Jan Kowalski, numer 12345" Foreground="#6E86B8" FontSize="11" FontWeight="SemiBold" Margin="0,0,0,5"/>
+        <TextBlock x:Name="pePreview" Foreground="#C9D0DC" TextWrapping="Wrap" LineHeight="19"/>
+      </StackPanel>
+    </Border>
+  </StackPanel>
+</ScrollViewer>
+'@
+
+function Get-UserProfileEditorValues($Window) {
+    $f = { param($n) $Window.FindName($n) }
+    $num = {
+        param($n, $default)
+        $v = 0
+        if ([int]::TryParse((& $f $n).Text.Trim(), [ref]$v)) { return $v }
+        return $default
+    }
+    return @{
+        Name = (& $f 'peName').Text.Trim(); Ou = (& $f 'peOu').Text.Trim(); Upn = (& $f 'peUpn').Text.Trim().TrimStart('@')
+        MailDomain = (& $f 'peMailDomain').Text.Trim().TrimStart('@'); SetMail = ((& $f 'peSetMail').IsChecked -eq $true)
+        LoginFormat = @($script:LoginFormatLabels.Keys)[[Math]::Max(0, (& $f 'peLogin').SelectedIndex)]; DisplayFormat = (& $f 'peDisplay').Text.Trim()
+        Description = (& $f 'peDesc').Text.Trim(); Company = (& $f 'peCompany').Text.Trim(); Department = (& $f 'peDept').Text.Trim(); City = (& $f 'peCity').Text.Trim()
+        Groups = @((& $f 'peGroups').Text -split '[\r\n;,]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+        Enabled = ((& $f 'peEnabled').IsChecked -eq $true); MustChange = ((& $f 'peMustChange').IsChecked -eq $true); NumberLogins = ((& $f 'peNumber').IsChecked -eq $true)
+        PasswordLength = (& $num 'peLen' -1); ExpireDays = (& $num 'peExpire' -1)
+    }
+}
+
+function Update-UserProfileEditorPreview($Window) {
+    $p = Get-UserProfileEditorValues $Window
+    $vals = @{ First = 'Jan'; Last = 'Kowalski'; Number = '12345'; Department = $p.Department; City = $p.City; Title = '' }
+    $vals.Login = Get-LoginFromName -First 'Jan' -Last 'Kowalski' -Format $p.LoginFormat -Number '12345'
+    $tokens = Get-UserTokens -Row $vals -ProfileName $p.Name
+    $display = Expand-Template $(if ($p.DisplayFormat) { $p.DisplayFormat } else { '{Imię} {Nazwisko}' }) $tokens
+    $domain = if ($p.MailDomain) { $p.MailDomain } else { $p.Upn }
+    $lines = @(
+        "Login: $($vals.Login)     Nazwa wyświetlana: $display"
+        'UPN: ' + $(if ($p.Upn) { "$($vals.Login)@$($p.Upn)" } else { '(brak – podaj sufiks UPN)' }) + '     E-mail: ' + $(if ($p.SetMail -and $domain) { "$($vals.Login)@$domain" } elseif ($p.SetMail) { '(brak domeny)' } else { '(nie ustawiany)' })
+    )
+    if ($p.Description) { $lines += 'Opis: ' + (Expand-Template $p.Description $tokens) }
+    $lines += 'Konto ' + $(if ($p.Enabled) { 'włączone' } else { 'wyłączone' }) + $(if ($p.MustChange) { ', zmiana hasła przy logowaniu' } else { '' }) + $(if (@($p.Groups).Count) { "; grupy: $(@($p.Groups) -join ', ')" } else { '' })
+    $Window.FindName('pePreview').Text = ($lines -join "`r`n")
+}
+
+$script:ProfileEditorEvents = @{
+    Changed    = { param($s, $e) $w = [System.Windows.Window]::GetWindow($s); if ($w) { Update-UserProfileEditorPreview $w } }
+    OuPick     = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        $box = $w.FindName('peOu')
+        $dn = $null
+        try { $dn = Select-OrganizationalUnit -Title 'Jednostka dla nowych kont' -Selected $box.Text.Trim() } catch { Show-Error 'Nie można wczytać jednostek organizacyjnych.' $_ }
+        if ($dn) { $box.Text = $dn }
+    }
+    UpnPick    = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        if (-not (Test-AdAvailable)) { return }
+        try {
+            Import-AdModule
+            $ad = Get-AdSplat
+            $forest = Invoke-WithWaitCursor { Get-ADForest @ad }
+            $suffixes = @(@($forest.RootDomain) + @($forest.Domains) + @($forest.UPNSuffixes) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+            $pick = Show-FormDialog -Title 'Sufiks UPN' -Icon 'E721' -Fields @(@{ Key = 'S'; Label = 'Sufiks'; Type = 'Combo'; Items = $suffixes; Value = $w.FindName('peUpn').Text })
+            if ($pick) { $w.FindName('peUpn').Text = $pick.S }
+        }
+        catch { Show-Error 'Nie udało się pobrać sufiksów UPN.' $_ }
+    }
+    GroupsPick = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        $groups = Select-AdGroups -Title 'Grupy dla nowych kont'
+        if (-not $groups) { return }
+        $box = $w.FindName('peGroups')
+        $current = @($box.Text -split '[\r\n;,]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $box.Text = ((@($current) + @($groups | ForEach-Object { $_.Sam } | Where-Object { $current -notcontains $_ })) -join "`r`n")
+    }
+}
+
+function Show-UserProfileEditor {
+    <#
+        Konfigurator profilu tworzenia kont w osobnym oknie. -TakenNames: nazwy innych profili (nazwa musi być unikalna).
+        Zwraca kompletny profil (hashtable) albo $null po anulowaniu.
+    #>
+    param([Parameter(Mandatory)][hashtable]$UserProfile, [string[]]$TakenNames = @(), [string]$Title = 'Profil tworzenia kont', [string]$OkText = 'Zapisz profil')
+    $p = ConvertTo-CompleteUserProfile $UserProfile
+    $w = New-Dialog -Title $Title -Subtitle 'Ustawienia stosowane do nowych kont. Wartości z wklejonych danych (np. Dział, Login) mają pierwszeństwo przed domyślnymi.' `
+        -Body $script:ProfileEditorXaml -Icon 'E8FA' -OkText $OkText -Width 720 -Resizable -Validate {
+        param($w)
+        $v = Get-UserProfileEditorValues $w
+        if (-not $v.Name) { Show-Warning 'Podaj nazwę profilu.'; return $false }
+        if (@($w.Tag.TakenNames | Where-Object { $_ -eq $v.Name }).Count) { Show-Warning "Profil «$($v.Name)» już istnieje – wybierz inną nazwę."; return $false }
+        if ($v.PasswordLength -lt 8 -or $v.PasswordLength -gt 64) { Show-Warning 'Długość hasła: od 8 do 64 znaków.'; return $false }
+        if ($v.ExpireDays -lt 0 -or $v.ExpireDays -gt 3650) { Show-Warning 'Wygaśnięcie: liczba dni od 0 (nigdy) do 3650.'; return $false }
+        if ($v.Ou -and $v.Ou -notmatch '^(OU|CN)=.+DC=') { Show-Warning 'Jednostka musi być podana jako DN, np. OU=Pracownicy,DC=firma,DC=local (albo wybrana przyciskiem obok pola).'; return $false }
+        return $true
+    }
+    $w.Tag.TakenNames = @($TakenNames | Where-Object { $_ })
+    $f = { param($n) $w.FindName($n) }
+    (& $f 'peName').Text = [string]$p.Name
+    (& $f 'peOu').Text = [string]$p.Ou
+    (& $f 'peUpn').Text = [string]$p.Upn
+    foreach ($label in $script:LoginFormatLabels.Values) { [void](& $f 'peLogin').Items.Add($label) }
+    (& $f 'peLogin').SelectedIndex = [Math]::Max(0, [array]::IndexOf(@($script:LoginFormatLabels.Keys), [string]$p.LoginFormat))
+    (& $f 'peDisplay').Text = [string]$p.DisplayFormat
+    (& $f 'peSetMail').IsChecked = [bool]$p.SetMail
+    (& $f 'peMailDomain').Text = [string]$p.MailDomain
+    (& $f 'peEnabled').IsChecked = [bool]$p.Enabled
+    (& $f 'peMustChange').IsChecked = [bool]$p.MustChange
+    (& $f 'peNumber').IsChecked = [bool]$p.NumberLogins
+    (& $f 'peLen').Text = [string]$p.PasswordLength
+    (& $f 'peExpire').Text = [string]$p.ExpireDays
+    (& $f 'peDesc').Text = [string]$p.Description
+    (& $f 'peCompany').Text = [string]$p.Company
+    (& $f 'peDept').Text = [string]$p.Department
+    (& $f 'peCity').Text = [string]$p.City
+    (& $f 'peGroups').Text = (@($p.Groups) -join "`r`n")
+    (& $f 'peOuPick').Content = New-IconContent -Text '' -Icon 'E8B7'
+    (& $f 'peUpnPick').Content = New-IconContent -Text '' -Icon 'E721'
+    (& $f 'peGroupsPick').Content = New-IconContent -Text 'Wybierz z AD…' -Icon 'E710' -IconSize 11
+    (& $f 'peOuPick').add_Click($script:ProfileEditorEvents.OuPick)
+    (& $f 'peUpnPick').add_Click($script:ProfileEditorEvents.UpnPick)
+    (& $f 'peGroupsPick').add_Click($script:ProfileEditorEvents.GroupsPick)
+    foreach ($n in 'peName', 'peUpn', 'peDisplay', 'peMailDomain', 'peDesc', 'peDept', 'peCity', 'peGroups') { (& $f $n).add_TextChanged($script:ProfileEditorEvents.Changed) }
+    (& $f 'peLogin').add_SelectionChanged($script:ProfileEditorEvents.Changed)
+    foreach ($n in 'peSetMail', 'peEnabled', 'peMustChange') {
+        (& $f $n).add_Checked($script:ProfileEditorEvents.Changed)
+        (& $f $n).add_Unchecked($script:ProfileEditorEvents.Changed)
+    }
+    Update-UserProfileEditorPreview $w
+    if (-not (Invoke-Dialog $w)) { return $null }
+    return (ConvertTo-CompleteUserProfile (Get-UserProfileEditorValues $w))
+}
+
+function Edit-UserProfile {
+    # -Mode Edit (bieżący profil), New (nowy na bazie bieżącego), Copy (kopia bieżącego)
+    param([hashtable]$Module, [ValidateSet('Edit', 'New', 'Copy')][string]$Mode = 'Edit')
+    $m = $Module
+    $profiles = @(Get-UserProfiles)
+    $i = [Math]::Max(0, $m.Profile.SelectedIndex)
+    $base = ConvertTo-CompleteUserProfile $profiles[$i]
+    $others = @(for ($j = 0; $j -lt $profiles.Count; $j++) { if ($Mode -ne 'Edit' -or $j -ne $i) { [string]$profiles[$j].Name } })
+    switch ($Mode) {
+        'Edit' { $edited = Show-UserProfileEditor -UserProfile $base -TakenNames $others -Title "Profil «$($base.Name)»" }
+        'New' { $base.Name = ''; $edited = Show-UserProfileEditor -UserProfile $base -TakenNames $others -Title 'Nowy profil' -OkText 'Utwórz profil' }
+        'Copy' { $base.Name = "$($base.Name) (kopia)"; $edited = Show-UserProfileEditor -UserProfile $base -TakenNames $others -Title 'Kopia profilu' -OkText 'Utwórz profil' }
+    }
+    if (-not $edited) { return }
+    if ($Mode -eq 'Edit') { $profiles[$i] = $edited } else { $profiles = @($profiles) + @($edited) }
+    $script:Settings.UserProfiles = @($profiles)
+    Export-Settings
+    Update-UserProfileList -Module $m -Select $edited.Name
+    Show-Toast "Zapisano profil «$($edited.Name)»." 'ok'
+    Set-UserPlanProfile -Module $m -UserProfile $edited
 }
 
 function Get-UserTokens {
@@ -13625,6 +15696,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
     $m.SecretColumns = @('Hasło')
     $m.EditableColumns = @('Imię', 'Nazwisko', 'Numer', 'Login', 'Nazwa wyświetlana', 'UPN', 'E-mail', 'Dział', 'Stanowisko', 'Miasto', 'Opis', 'OU')
     $m.Data.Stale = $true
+    $m.Data.Profile = $null
     $m.Data.ThenCreate = $false
     $m.Data.Loading = $false
     $m.OnCellEdit = {
@@ -13641,48 +15713,18 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
     }
 
     $row = Add-ToolbarRow -Module $m -Title 'Profil'
-    $m.Profile = Add-ComboBox -Parent $row -Width 220
+    $m.Profile = Add-ComboBox -Parent $row -Width 240
     Register-ControlHandler -Control $m.Profile -EventName 'SelectionChanged' -Module $m -Action {
         param($m)
         if ($m.Data.Loading -or $m.Profile.SelectedIndex -lt 0) { return }
-        $profiles = @(Get-UserProfiles)
-        Set-UserProfileControls -Module $m -UserProfile $profiles[$m.Profile.SelectedIndex]
+        $p = Get-SelectedUserProfile -Module $m
+        $m.ProfileSummary.Text = Get-UserProfileSummary $p
+        Set-UserPlanProfile -Module $m -UserProfile $p
     }
-    Add-Button -Parent $row -Text 'Zapisz profil' -Icon 'E74E' -Module $m -AlwaysEnabled -ToolTip 'Zapisuje bieżące ustawienia w wybranym profilu' -OnClick {
-        param($m)
-        $profiles = @(Get-UserProfiles)
-        $i = $m.Profile.SelectedIndex
-        $profiles[$i] = Get-UserProfileFromControls -Module $m -Name ([string]$profiles[$i].Name)
-        $script:Settings.UserProfiles = $profiles
-        Export-Settings
-        Show-Toast "Zapisano profil «$($profiles[$i].Name)»." 'ok'
-    } | Out-Null
-    Add-Button -Parent $row -Text 'Nowy…' -Icon 'E710' -Module $m -AlwaysEnabled -ToolTip 'Nowy profil z bieżących ustawień' -OnClick {
-        param($m)
-        $name = Show-InputDialog -Title 'Nowy profil' -Prompt 'Nazwa profilu (np. Pracownik, Student, Wykładowca). Profil zapamięta bieżące ustawienia.' -Icon 'E8FA' -Validate {
-            param($t)
-            if (-not $t.Trim()) { return 'Podaj nazwę.' }
-            if (@(Get-UserProfiles | Where-Object { [string]$_.Name -eq $t.Trim() }).Count) { return 'Profil o tej nazwie już istnieje.' }
-            return ''
-        }
-        if (-not $name) { return }
-        $script:Settings.UserProfiles = @(Get-UserProfiles) + @(Get-UserProfileFromControls -Module $m -Name $name.Trim())
-        Export-Settings
-        Update-UserProfileList -Module $m -Select $name.Trim()
-    } | Out-Null
+    Add-Button -Parent $row -Text 'Edytuj profil…' -Icon 'E70F' -Module $m -AlwaysEnabled -ToolTip 'Konfigurator profilu: OU, sufiks UPN, format loginu i nazwy, ustawienia konta, atrybuty i grupy' -OnClick { param($m) Edit-UserProfile -Module $m -Mode Edit } | Out-Null
+    Add-Button -Parent $row -Text 'Nowy…' -Icon 'E710' -Module $m -AlwaysEnabled -ToolTip 'Nowy profil (na bazie bieżącego)' -OnClick { param($m) Edit-UserProfile -Module $m -Mode New } | Out-Null
     Add-MenuButton -Parent $row -Text 'Więcej' -Module $m -Items @(
-        @{ Text = 'Zmień nazwę profilu…'; Icon = 'E8AC'; Action = {
-                param($m)
-                $profiles = @(Get-UserProfiles)
-                $i = $m.Profile.SelectedIndex
-                $name = Show-InputDialog -Title 'Nazwa profilu' -Prompt 'Nowa nazwa profilu.' -Default ([string]$profiles[$i].Name) -Icon 'E8AC'
-                if (-not $name -or -not $name.Trim()) { return }
-                $profiles[$i].Name = $name.Trim()
-                $script:Settings.UserProfiles = $profiles
-                Export-Settings
-                Update-UserProfileList -Module $m -Select $name.Trim()
-            }
-        }
+        @{ Text = 'Duplikuj profil…'; Icon = 'E8C8'; Action = { param($m) Edit-UserProfile -Module $m -Mode Copy } }
         @{ Text = 'Usuń profil'; Icon = 'E74D'; Danger = $true; Action = {
                 param($m)
                 $profiles = @(Get-UserProfiles)
@@ -13691,6 +15733,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
                 $script:Settings.UserProfiles = @(for ($j = 0; $j -lt $profiles.Count; $j++) { if ($j -ne $i) { $profiles[$j] } })
                 Export-Settings
                 Update-UserProfileList -Module $m
+                Set-UserPlanProfile -Module $m -UserProfile (Get-SelectedUserProfile -Module $m)
             }
         }
         '-'
@@ -13722,55 +15765,9 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
             }
         }
     ) | Out-Null
-
-    $row2 = Add-ToolbarRow -Module $m -Title 'Miejsce'
-    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 400 -Placeholder 'OU dla nowych kont' -DialogTitle 'Jednostka dla nowych kont'
-    Add-Label -Parent $row2 -Text 'Sufiks UPN  @' | Out-Null
-    $m.Upn = Add-TextBox -Parent $row2 -Width 180 -Placeholder 'firma.pl'
-    Add-MenuButton -Parent $row2 -Text '' -Icon 'E721' -Module $m -ToolTip 'Sufiksy UPN z lasu AD' -Items @(
-        @{ Text = 'Pobierz sufiksy z Active Directory'; Icon = 'E896'; Action = {
-                param($m)
-                if (-not (Test-AdAvailable)) { return }
-                Import-AdModule
-                $ad = Get-AdSplat
-                $forest = Invoke-WithWaitCursor { Get-ADForest @ad }
-                $suffixes = @(@($forest.RootDomain) + @($forest.Domains) + @($forest.UPNSuffixes) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
-                $pick = Show-FormDialog -Title 'Sufiks UPN' -Icon 'E721' -Fields @(@{ Key = 'S'; Label = 'Sufiks'; Type = 'Combo'; Items = $suffixes; Value = $m.Upn.Text })
-                if ($pick) { $m.Upn.Text = $pick.S }
-            }
-        }
-    ) | Out-Null
-    $row3 = Add-ToolbarRow -Module $m -Title 'Konwencje'
-    Add-Label -Parent $row3 -Text 'Login' | Out-Null
-    $m.LoginFormat = Add-ComboBox -Parent $row3 -Items @($script:LoginFormatLabels.Values) -Width 230
-    Add-Label -Parent $row3 -Text 'Nazwa' | Out-Null
-    $m.DisplayFormat = Add-TextBox -Parent $row3 -Width 220 -Placeholder '{Imię} {Nazwisko}'
-    $m.DisplayFormat.ToolTip = 'Pola: {Imię}, {Nazwisko}, {Login}, {Numer}, {Profil}, {Dział}, {Miasto}, {Stanowisko}'
-    $m.SetMail = Add-CheckBox -Parent $row3 -Text 'E-mail = login@' -Checked $true
-    $m.MailDomain = Add-TextBox -Parent $row3 -Width 150 -Placeholder 'domena (jak UPN)'
-    $row4 = Add-ToolbarRow -Module $m -Title 'Konto'
-    $m.Enabled = Add-CheckBox -Parent $row4 -Text 'Włączone' -Checked $true
-    $m.MustChange = Add-CheckBox -Parent $row4 -Text 'Zmiana hasła przy logowaniu'
-    $m.NumberLogins = Add-CheckBox -Parent $row4 -Text 'Numeruj zajęte loginy' -Checked $true -ToolTip 'jan.kowalski zajęty -> jan.kowalski1 (tylko loginy generowane z imienia i nazwiska)'
-    Add-Label -Parent $row4 -Text 'Długość hasła' | Out-Null
-    $m.PwdLength = Add-Numeric -Parent $row4 -Value 12 -Minimum 8 -Maximum 64 -Width 60
-    Add-Label -Parent $row4 -Text 'Wygasa po (dni, 0 = nigdy)' | Out-Null
-    $m.ExpireDays = Add-Numeric -Parent $row4 -Value 0 -Minimum 0 -Maximum 3650 -Width 70
-    $row5 = Add-ToolbarRow -Module $m -Title 'Atrybuty'
-    $m.Description = Add-TextBox -Parent $row5 -Width 220 -Placeholder 'Opis (pola jak w nazwie)'
-    $m.Company = Add-TextBox -Parent $row5 -Width 150 -Placeholder 'Firma'
-    $m.Department = Add-TextBox -Parent $row5 -Width 150 -Placeholder 'Dział (domyślny)'
-    $m.City = Add-TextBox -Parent $row5 -Width 140 -Placeholder 'Miasto (domyślne)'
-    $row6 = Add-ToolbarRow -Module $m -Title 'Grupy'
-    $m.Groups = Add-TextBox -Parent $row6 -Width 460 -Placeholder 'grupy dla nowych kont, rozdzielone średnikiem'
-    Add-Button -Parent $row6 -Text '' -Icon 'E710' -Module $m -AlwaysEnabled -ToolTip 'Wybierz grupy z AD' -OnClick {
-        param($m)
-        $groups = Select-AdGroups -Title 'Grupy dla nowych kont'
-        if (-not $groups) { return }
-        $current = @(Split-ListText $m.Groups.Text)
-        $m.Groups.Text = ((@($current) + @($groups | ForEach-Object { $_.Sam } | Where-Object { $current -notcontains $_ })) -join '; ')
-    } | Out-Null
-    $m.Input = Add-StretchTextBox -Module $m -Title 'Dane' -Multiline -Height 110 -Placeholder "Imię [TAB] Nazwisko [TAB] Numer – wklej z Excela. Z nagłówkiem można podać też: Login, E-mail, Hasło, Dział, Stanowisko, Miasto, Opis.`r`nJan [TAB] Kowalski`r`nAnna [TAB] Nowak [TAB] 12345"
+    $rowSum = Add-ToolbarRow -Module $m -Title ' '
+    $m.ProfileSummary = Add-Label -Parent $rowSum -Text '' -Hint -MaxWidth 1150
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Dane' -Multiline -Height 120 -Placeholder "Imię [TAB] Nazwisko [TAB] Numer – wklej z Excela. Z nagłówkiem można podać też: Login, E-mail, Hasło, Dział, Stanowisko, Miasto, Opis.`r`nJan [TAB] Kowalski`r`nAnna [TAB] Nowak [TAB] 12345"
 
     $m.Actions.Stats = {
         param($m)
@@ -13786,8 +15783,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
         param($m)
         $text = $m.Input.Text
         if (-not $text.Trim()) { Show-Warning 'Wklej lub wpisz dane kont w polu «Dane» (Imię [TAB] Nazwisko).'; return }
-        $profileName = if ($m.Profile.SelectedIndex -ge 0) { [string]$m.Profile.SelectedItem } else { 'Domyślny' }
-        $prof = Get-UserProfileFromControls -Module $m -Name $profileName
+        $prof = Get-SelectedUserProfile -Module $m
         $m.Data.Profile = $prof
         $t = ConvertFrom-PastedTable -Text $text -Headers $script:UserPasteHeaders -Order @('First', 'Last', 'Number', 'Login', 'Mail', 'Department', 'Title', 'City')
         Reset-ResultTable -Module $m
@@ -13831,6 +15827,13 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
         if ($rows.Count -eq 0) { Show-Message -Text 'Brak kont gotowych do utworzenia. Popraw wiersze z błędami i sprawdź ponownie.' -Title 'Brak zmian'; return }
         $prof = $m.Data.Profile
         $expire = if ([int]$prof.ExpireDays -gt 0) { (Get-Date).Date.AddDays([int]$prof.ExpireDays + 1) } else { $null }
+        $items = @($rows | ForEach-Object { '{0}  ({1})' -f $_['Nazwa wyświetlana'], $_['Login'] })
+        $text = "Utworzyć wybrane konta w profilu «$($prof.Name)»?"
+        if (@($prof.Groups).Count) { $text += "`r`nGrupy: $(@($prof.Groups) -join ', ')" }
+        if (-not $prof.Enabled) { $text += "`r`nKonta zostaną utworzone jako wyłączone." }
+        $chosen = @(Confirm-Action -Text $text -Items $items -ConfirmText 'Utwórz konta' -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $rows = @($chosen | ForEach-Object { $rows[$_] })
         $per = @{}
         foreach ($r in $rows) {
             $per[([string]$r['Login']).Trim()] = @{
@@ -13840,11 +15843,6 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
                 Expire = $expire; Groups = @($prof.Groups)
             }
         }
-        $items = @($rows | ForEach-Object { '{0}  ({1})' -f $_['Nazwa wyświetlana'], $_['Login'] })
-        $text = "Utworzyć $($rows.Count) kont(a) w profilu «$($prof.Name)»?"
-        if (@($prof.Groups).Count) { $text += "`r`nGrupy: $(@($prof.Groups) -join ', ')" }
-        if (-not $prof.Enabled) { $text += "`r`nKonta zostaną utworzone jako wyłączone." }
-        if (-not (Confirm-Action -Text $text -Items $items -ConfirmText 'Utwórz konta')) { return }
         foreach ($r in $rows) { Set-RowState -Module $m -Row $r -State 'Tworzenie…' -Tone '' }
         Start-AdOperation -Module $m -Name 'Tworzenie kont' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:UserCreateScript -OnResult {
             param($m, $r)
@@ -13904,7 +15902,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
     }
     Add-RowAction -Module $m -Text 'Nowe hasło' -Icon 'E8D7' -Action {
         param($m, $rows)
-        foreach ($r in $rows) { if ([string](Get-ObjectValue $r 'Stan') -notlike 'Utworzono*') { Set-ResultValue -Module $m -Row $r -Column 'Hasło' -Value (New-RandomPassword -Length (Get-Num $m.PwdLength)) } }
+        foreach ($r in $rows) { if ([string](Get-ObjectValue $r 'Stan') -notlike 'Utworzono*') { Set-ResultValue -Module $m -Row $r -Column 'Hasło' -Value (New-RandomPassword -Length $(if ($m.Data.Profile) { [int]$m.Data.Profile.PasswordLength } else { 12 })) } }
         Show-Toast 'Wygenerowano nowe hasła (dla kont jeszcze nieutworzonych).' 'ok'
     }
     Add-RowAction -Module $m -Text 'Usuń wiersze z podglądu' -Icon 'E74D' -Action { param($m, $rows) Remove-ResultRows -Module $m -Rows $rows; & $m.Actions.Stats $m }
@@ -13913,7 +15911,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserCr
     Add-StatTile -Module $m -Key 'exists' -Label 'Już istnieją' -Icon 'E73A' | Out-Null
     Add-StatTile -Module $m -Key 'bad' -Label 'Błędy i konflikty' -Icon 'E7BA' | Out-Null
     $m.ResultHint = 'Kolumny z ołówkiem można poprawić • hasła są ukryte («Pokaż poufne», «Kopiuj dane logowania»)'
-    $m.EmptyHint = 'Wybierz profil, wklej dane (Wklej ze schowka) i kliknij «Sprawdź» (F5). Popraw wiersze w tabeli, a potem «Utwórz konta».'
+    $m.EmptyHint = 'Wybierz profil (ustawienia: «Edytuj profil…»), wklej dane (Wklej ze schowka) i kliknij «Sprawdź» (F5). Popraw wiersze w tabeli, a potem «Utwórz konta».'
     Update-UserProfileList -Module $m
 }
 #endregion
@@ -14205,6 +16203,10 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserIm
         if ($m.Data.Mode -ne 'Diff') { Show-Warning 'Najpierw kliknij «Podgląd zmian».'; return }
         $rows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Do zmiany', 'Do wyczyszczenia') -contains [string](Get-ObjectValue $_ 'Stan') })
         if ($rows.Count -eq 0) { Show-Message -Text 'Podgląd nie zawiera zmian do wykonania.' -Title 'Brak zmian'; return }
+        $items = @($rows | ForEach-Object { '{0}: {1}  «{2}» → «{3}»' -f $_['Login'], $_['Atrybut'], $_['Obecna wartość'], $_['Nowa wartość'] })
+        $chosen = @(Confirm-Action -Text 'Zastosować wybrane zmiany? Przed zmianą zostanie zapisany plik cofania.' -Items $items -ConfirmText 'Zastosuj zmiany' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $rows = @($chosen | ForEach-Object { $rows[$_] })
         $per = @{}
         $snapshot = New-Object System.Collections.ArrayList
         foreach ($g in ($rows | Group-Object { [string]$_['Login'] })) {
@@ -14224,13 +16226,12 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserIm
             $per[$g.Name] = @{ Dn = [string]$first['__dn']; Replace = $replace; Clear = $clear }
             [void]$snapshot.Add([ordered]@{ Sam = $g.Name; Dn = [string]$first['__dn']; Changes = $changes })
         }
-        $items = @($rows | ForEach-Object { '{0}: {1}  «{2}» → «{3}»' -f $_['Login'], $_['Atrybut'], $_['Obecna wartość'], $_['Nowa wartość'] })
-        if (-not (Confirm-Action -Text "Zmienić $($rows.Count) wartości na $($per.Count) kontach? Przed zmianą zostanie zapisany plik cofania." -Items $items -ConfirmText 'Zastosuj zmiany' -Danger)) { return }
         $file = Join-Path (Get-DataFolder 'Rollback') ('Import_{0:yyyyMMdd_HHmmss}.json' -f (Get-Date))
         $doc = [ordered]@{ CreatedAt = (Get-Date).ToString('s'); CreatedBy = "$env:USERDOMAIN\$env:USERNAME"; Source = $(if ($m.Data.Csv) { [string]$m.Data.Csv.Path } else { '' }); Items = @($snapshot) }
         try { $doc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $file -Encoding UTF8 }
         catch { Show-Error 'Nie udało się zapisać pliku cofania – zmiany nie zostały wykonane.' $_; return }
         Write-Log "Zapisano plik cofania: $file" 'OK'
+        foreach ($r in $rows) { Set-RowState -Module $m -Row $r -State 'Zmienianie…' -Tone '' }
         Start-AdOperation -Module $m -Name 'Zmiana atrybutów' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock {
             if ($P.Replace.Count -gt 0) {
                 $rep = @{}
@@ -14241,7 +16242,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'UserIm
             'OK'
         } -OnResult {
             param($m, $r)
-            foreach ($row in @(Find-ResultRow -Module $m -Column 'Login' -Value $r.Target | Where-Object { @('Do zmiany', 'Do wyczyszczenia') -contains [string]$_['Stan'] })) {
+            foreach ($row in @(Find-ResultRow -Module $m -Column 'Login' -Value $r.Target | Where-Object { [string]$_['Stan'] -eq 'Zmienianie…' })) {
                 if ($r.Ok) { Set-RowState -Module $m -Row $row -State 'Zmieniono' -Tone 'ok' }
                 else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')) }
             }
@@ -14910,56 +16911,32 @@ function Start-ObjectReport {
 }
 
 function ConvertTo-ObjectReportHtml {
-    # Samodzielny raport HTML z kart obiektów (ciemny motyw programu, jasny przy wydruku)
+    # Samodzielny raport HTML z kart obiektów (ciemny motyw programu, jasny przy wydruku); wspólne style i skrypt - 32-htmlreport.ps1
     param([ValidateSet('User', 'Computer', 'Group')][string]$Kind, [object[]]$Items, [object[]]$Errors = @(), [switch]$Nested)
     $k = $script:ObjectReportKinds[$Kind]
     $enc = { param($t) ConvertTo-HtmlText $t }
     $toneClass = { param($t) switch ([string]$t) { 'ok' { 'ok' } 'warn' { 'warn' } 'crit' { 'crit' } 'info' { 'info' } default { 'mute' } } }
     $sb = New-Object System.Text.StringBuilder
     $title = "$($k.Title) – raport szczegółowy"
-    [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>').Append((& $enc $title)).Append('</title><style>')
-    [void]$sb.Append(':root{--bg:#0F1318;--card:#161B22;--card2:#1B212A;--line:#242B36;--line2:#222935;--text:#E4E8EF;--muted:#8791A5;--faint:#5E6779;--ok:#5EE3AE;--warn:#FFC46B;--crit:#FF7A86;--info:#8CC0FF;--accent:#3E6FE0}')
-    [void]$sb.Append('*{box-sizing:border-box}body{margin:0;padding:28px 32px;background:var(--bg);color:var(--text);font:13.5px/1.5 "Segoe UI",system-ui,sans-serif}a{color:var(--info);text-decoration:none}a:hover{text-decoration:underline}')
-    [void]$sb.Append('h1{font-size:24px;margin:0 0 4px}.meta{color:var(--muted);margin-bottom:18px}')
-    [void]$sb.Append('.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 18px;min-width:140px}.tile b{display:block;font-size:22px;font-weight:600}.tile span{color:var(--muted);font-size:12px}')
-    [void]$sb.Append('.tile.ok b{color:var(--ok)}.tile.warn b{color:var(--warn)}.tile.crit b{color:var(--crit)}.tile.info b{color:var(--info)}')
-    [void]$sb.Append('.bar{position:sticky;top:0;z-index:5;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}')
-    [void]$sb.Append('input{flex:0 1 380px;background:var(--card2);color:var(--text);border:1px solid #2A323F;border-radius:7px;padding:8px 10px;font:inherit}button{background:var(--accent);color:#fff;border:0;border-radius:7px;padding:8px 14px;font:inherit;cursor:pointer}button.g{background:#1E252F;color:#C9D0DC}.cnt{color:var(--muted);margin-left:auto}')
-    [void]$sb.Append('.box{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:auto}')
-    [void]$sb.Append('table{border-collapse:collapse;width:100%}th{background:#1B212A;color:var(--muted);text-align:left;font-weight:600;padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap;font-size:12.5px}td{padding:6px 12px;border-bottom:1px solid #1F2530;vertical-align:top}tr:nth-child(even) td{background:#181E26}')
-    [void]$sb.Append('.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:0 0 16px;scroll-margin-top:80px}')
-    [void]$sb.Append('.head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.head h2{margin:0;font-size:18px}.sub{color:var(--muted);margin-top:2px}.top{font-size:12px;color:var(--faint)}')
-    [void]$sb.Append('.pill{display:inline-block;padding:2px 11px;border-radius:10px;font-weight:600;font-size:12.5px;white-space:nowrap;background:#1E252F;color:#AEB6C4}.pill.ok{color:var(--ok);background:#15291F}.pill.warn{color:var(--warn);background:#2E2616}.pill.crit{color:var(--crit);background:#2E1A1E}.pill.info{color:var(--info);background:#1A2640}')
-    [void]$sb.Append('.chips{margin:10px 0 0}.chip{display:inline-block;font-size:11.5px;padding:1px 9px;border-radius:9px;margin:0 6px 4px 0;background:#1E252F;color:#C9D0DC}.chip.warn{background:#2E2616;color:var(--warn)}.chip.crit{background:#2E1A1E;color:var(--crit)}.chip.info{background:#1A2640;color:var(--info)}')
-    [void]$sb.Append('.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-top:14px}.sec{background:var(--card2);border:1px solid var(--line2);border-radius:10px;padding:10px 14px}')
-    [void]$sb.Append('.sec h3{margin:0 0 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}dl{display:grid;grid-template-columns:minmax(130px,42%) 1fr;gap:3px 12px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-word}dd.e{color:#3F4757}')
-    [void]$sb.Append('details{margin-top:12px;border:1px solid var(--line2);border-radius:10px;background:var(--card2);overflow:auto}summary{cursor:pointer;padding:9px 14px;font-weight:600;list-style:none}summary::-webkit-details-marker{display:none}summary::before{content:"▸";display:inline-block;width:16px;color:var(--muted)}details[open]>summary::before{content:"▾";color:var(--info)}')
-    [void]$sb.Append('.n{display:inline-block;margin-left:6px;padding:0 8px;border-radius:8px;background:#1A2640;color:var(--info);font-size:11.5px}.empty{padding:2px 14px 12px;color:var(--faint)}.note{padding:6px 14px 10px;color:var(--warn);font-size:12px}')
-    [void]$sb.Append('.errs{border-color:#4A2A32}.errs h2{color:var(--crit);font-size:15px;margin:0;padding:12px 14px}')
-    [void]$sb.Append('@media print{body{background:#fff;color:#111;padding:0;font-size:11.5px}.bar,.top{display:none}.tile,.card,.sec,details,.box{background:#fff !important;border-color:#bbb}.card{break-inside:avoid-page}th{background:#eee;color:#333}td{border-color:#ddd}tr:nth-child(even) td{background:#fff}')
-    [void]$sb.Append('dt,.sub,.meta,.tile span,.sec h3{color:#555}.pill,.chip,.n{border:1px solid #999;background:#fff !important;color:#111 !important}a{color:#111}.tile b{color:#111 !important}}')
-    [void]$sb.Append('</style><script>function all(s){document.querySelectorAll("details").forEach(function(d){d.open=s})}')
-    [void]$sb.Append('function find(){var q=document.getElementById("q").value.toLowerCase(),n=0;document.querySelectorAll(".card").forEach(function(c){var h=!q||c.textContent.toLowerCase().indexOf(q)>=0;c.style.display=h?"":"none";if(h)n++;var t=document.getElementById("t-"+c.id);if(t)t.style.display=h?"":"none"});document.getElementById("cnt").textContent=n}')
-    [void]$sb.Append('window.addEventListener("beforeprint",function(){all(true)})</script></head><body>')
-
-    # Nagłówek, kafelki ze stanami
     $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2}\{3} • {4}: {5}' -f $script:AppVersion, (Get-Date), $env:USERDOMAIN, $env:USERNAME, $k.Noun, $Items.Count
     if ($Nested) { $meta += ' • z zagnieżdżeniami' }
     if ($Errors.Count) { $meta += " • nie odczytano: $($Errors.Count)" }
-    [void]$sb.Append('<h1>').Append((& $enc $title)).Append('</h1><div class="meta">').Append((& $enc $meta)).Append('</div><div class="tiles">')
-    [void]$sb.Append('<div class="tile info"><b>').Append($Items.Count).Append('</b><span>').Append((& $enc $k.Title)).Append('</span></div>')
+    [void]$sb.Append((Get-ReportHead -Title $title -Meta $meta))
+
+    # Kafelki ze stanami
+    [void]$sb.Append('<div class="tiles"><div class="tile info"><b>').Append($Items.Count).Append('</b><span>').Append((& $enc $k.Title)).Append('</span></div>')
     foreach ($grp in ($Items | Group-Object State | Sort-Object Count -Descending)) {
         $tone = & $toneClass ($grp.Group[0].Tone)
         [void]$sb.Append('<div class="tile ').Append($tone).Append('"><b>').Append($grp.Count).Append('</b><span>').Append((& $enc $grp.Name)).Append('</span></div>')
     }
     if ($Errors.Count) { [void]$sb.Append('<div class="tile crit"><b>').Append($Errors.Count).Append('</b><span>Nie odczytano</span></div>') }
     [void]$sb.Append('</div>')
-    [void]$sb.Append('<div class="bar"><input id="q" placeholder="Szukaj (nazwa, login, dział, grupa…)" oninput="find()"><button onclick="all(true)">Rozwiń listy</button><button class="g" onclick="all(false)">Zwiń listy</button><button class="g" onclick="window.print()">Drukuj</button><span class="cnt">widoczne: <b id="cnt">').Append($Items.Count).Append('</b></span></div>')
+    [void]$sb.Append((Get-ReportBar -Mode 'cards' -Placeholder 'Szukaj (nazwa, login, dział, grupa…)' -Buttons @('expand', 'collapse', 'print') -Count $Items.Count))
 
     # Spis obiektów
     if ($Items.Count -gt 0) {
         $cols = @($Items[0].Toc.Keys)
-        [void]$sb.Append('<div class="box toc"><table><thead><tr><th>Lp</th>')
+        [void]$sb.Append('<div class="box toc"><table class="dt" id="toc" data-filters="no"><thead><tr><th>Lp</th>')
         foreach ($c in $cols) { [void]$sb.Append('<th>').Append((& $enc $c)).Append('</th>') }
         [void]$sb.Append('</tr></thead><tbody>')
         for ($i = 0; $i -lt $Items.Count; $i++) {
@@ -14978,11 +16955,13 @@ function ConvertTo-ObjectReportHtml {
     }
 
     # Karty
+    $listNo = 0
     for ($i = 0; $i -lt $Items.Count; $i++) {
         $it = $Items[$i]
         [void]$sb.Append('<section class="card" id="o').Append($i + 1).Append('"><div class="head"><div><h2>').Append((& $enc $it.Name)).Append('</h2>')
         if ($it.Sub) { [void]$sb.Append('<div class="sub">').Append((& $enc $it.Sub)).Append('</div>') }
-        [void]$sb.Append('</div><div style="text-align:right"><span class="pill ').Append((& $toneClass $it.Tone)).Append('">').Append((& $enc $it.State)).Append('</span><div class="top"><a href="#">↑ do góry</a></div></div></div>')
+        [void]$sb.Append('</div><div style="text-align:right"><span class="pill ').Append((& $toneClass $it.Tone)).Append('">').Append((& $enc $it.State)).Append('</span>')
+        [void]$sb.Append('<div class="cacts"><button data-act="copy-card" title="Kopiuj kartę jako tekst">⧉ Kopiuj</button><button data-act="open-card" title="Otwórz kartę w osobnym oknie">↗ Okno</button></div><div class="top"><a href="#">↑ do góry</a></div></div></div>')
         if (@($it.Chips).Count -gt 0) {
             [void]$sb.Append('<div class="chips">')
             foreach ($ch in $it.Chips) { [void]$sb.Append('<span class="chip ').Append((& $toneClass $ch.Tone)).Append('">').Append((& $enc $ch.Text)).Append('</span>') }
@@ -15002,10 +16981,12 @@ function ConvertTo-ObjectReportHtml {
         [void]$sb.Append('</div>')
         foreach ($list in $it.Lists) {
             $rows = @($list.Rows)
+            $listNo++
             [void]$sb.Append($(if ($rows.Count -le 50) { '<details open>' } else { '<details>' })).Append('<summary>').Append((& $enc $list.Title)).Append('<span class="n">').Append($list.Total).Append('</span></summary>')
             if ($rows.Count -eq 0) { [void]$sb.Append('<div class="empty">').Append((& $enc $list.Empty)).Append('</div></details>'); continue }
             $cols = @($rows[0].PSObject.Properties | ForEach-Object { $_.Name })
-            [void]$sb.Append('<table><thead><tr>')
+            if ($rows.Count -gt 15) { [void]$sb.Append('<div class="lf"><input data-table="l').Append($listNo).Append('" placeholder="Filtruj listę…"></div>') }
+            [void]$sb.Append('<table class="dt" id="l').Append($listNo).Append('"').Append($(if ($rows.Count -le 15) { ' data-filters="no"' } else { '' })).Append('><thead><tr>')
             foreach ($c in $cols) { [void]$sb.Append('<th>').Append((& $enc $c)).Append('</th>') }
             [void]$sb.Append('</tr></thead><tbody>')
             foreach ($r in $rows) {
@@ -15026,11 +17007,11 @@ function ConvertTo-ObjectReportHtml {
     }
 
     if ($Errors.Count) {
-        [void]$sb.Append('<div class="box errs"><h2>Nie udało się odczytać</h2><table><thead><tr><th>Obiekt</th><th>Błąd</th></tr></thead><tbody>')
+        [void]$sb.Append('<div class="box errs"><h2>Nie udało się odczytać</h2><table class="dt" data-filters="no"><thead><tr><th>Obiekt</th><th>Błąd</th></tr></thead><tbody>')
         foreach ($e in $Errors) { [void]$sb.Append('<tr><td>').Append((& $enc $e.Obiekt)).Append('</td><td>').Append((& $enc $e.Błąd)).Append('</td></tr>') }
         [void]$sb.Append('</tbody></table></div>')
     }
-    [void]$sb.Append('</body></html>')
+    [void]$sb.Append((Get-ReportTail))
     return $sb.ToString()
 }
 #endregion
@@ -15075,19 +17056,151 @@ function Select-FolderPath {
     return $dlg.SelectedPath
 }
 
+function Open-RemoteBrowseSession([string]$Computer) {
+    $sp = @{ ComputerName = $Computer; SessionOption = (New-SessionOption); ErrorAction = 'Stop' }
+    $cred = Get-EffectiveCredential
+    if ($cred) { $sp.Credential = $cred }
+    return New-PSSession @sp
+}
+
+function Get-RemoteFolderRoots($Session) {
+    # Dyski lokalne i udostępnione foldery komputera (ścieżki lokalne na tym komputerze)
+    Invoke-Command -Session $Session -ErrorAction Stop -ScriptBlock {
+        foreach ($d in @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3 OR DriveType=2' -ErrorAction SilentlyContinue)) {
+            $free = if ($d.Size) { ' – wolne {0:N0} z {1:N0} GB' -f ($d.FreeSpace / 1GB), ($d.Size / 1GB) } else { '' }
+            [pscustomobject]@{ Path = $d.DeviceID + '\'; Label = (('{0} {1}' -f $d.DeviceID, $d.VolumeName).Trim() + $free); Kind = 'drive' }
+        }
+        foreach ($s in @(Get-CimInstance -ClassName Win32_Share -Filter 'Type=0' -ErrorAction SilentlyContinue)) {
+            if ($s.Path) { [pscustomobject]@{ Path = $s.Path; Label = ('{0}  →  {1}' -f $s.Name, $s.Path); Kind = 'share' } }
+        }
+    }
+}
+
+function Get-RemoteFolderChildren($Session, [string]$Path) {
+    Invoke-Command -Session $Session -ArgumentList $Path -ErrorAction Stop -ScriptBlock {
+        param($p)
+        try {
+            Get-ChildItem -LiteralPath $p -Directory -Force -ErrorAction Stop | Sort-Object Name | ForEach-Object {
+                [pscustomobject]@{ Path = $_.FullName; Name = $_.Name; Link = [bool]($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint); Hidden = [bool]($_.Attributes -band [System.IO.FileAttributes]::Hidden) }
+            }
+        }
+        catch { [pscustomobject]@{ Error = $_.Exception.Message } }
+    }
+}
+
+$script:RemoteFolderEvents = @{
+    Expanded = {
+        param($s, $e)
+        try {
+            if (-not [object]::ReferenceEquals($e.OriginalSource, $s)) { return }
+            if ($s.Items.Count -ne 1 -or [string]$s.Items[0].Tag -ne '__dummy') { return }
+            $s.Items.Clear()
+            $win = [System.Windows.Window]::GetWindow($s)
+            $kids = @(Invoke-WithWaitCursor { Get-RemoteFolderChildren -Session $win.Tag.Session -Path ([string]$s.Tag) })
+            foreach ($k in $kids) {
+                if ($k.PSObject.Properties['Error'] -and $k.Error) {
+                    $ti = New-Object System.Windows.Controls.TreeViewItem
+                    $ti.Header = New-TreeHeader -Text ("Brak dostępu: " + $k.Error) -Icon 'E72E' -Color '#FF7A86'
+                    $ti.Tag = '__error'
+                    [void]$s.Items.Add($ti)
+                    continue
+                }
+                [void]$s.Items.Add((New-RemoteFolderItem -Path $k.Path -Text $k.Name -Icon $(if ($k.Link) { 'E71B' } else { 'E8B7' }) -Color $(if ($k.Hidden) { '#5E6779' } elseif ($k.Link) { '#FFC46B' } else { '#8791A5' }) -Expandable (-not $k.Link)))
+            }
+            if ($s.Items.Count -eq 0) {
+                $ti = New-Object System.Windows.Controls.TreeViewItem
+                $ti.Header = New-TreeHeader -Text '(brak podfolderów)' -Icon 'E8B7' -Color '#3A4352'
+                $ti.Tag = '__empty'
+                [void]$s.Items.Add($ti)
+            }
+        }
+        catch {
+            Write-Log "Przeglądanie folderów: $($_.Exception.Message)" 'ERROR'
+            $ti = New-Object System.Windows.Controls.TreeViewItem
+            $ti.Header = New-TreeHeader -Text ('Błąd: ' + $_.Exception.Message) -Icon 'E783' -Color '#FF7A86'
+            $ti.Tag = '__error'
+            [void]$s.Items.Add($ti)
+        }
+    }
+}
+
+function New-RemoteFolderItem {
+    param([string]$Path, [string]$Text, [string]$Icon = 'E8B7', [string]$Color = '#8791A5', [bool]$Expandable = $true)
+    $ti = New-Object System.Windows.Controls.TreeViewItem
+    $ti.Header = New-TreeHeader -Text $Text -Icon $Icon -Color $Color
+    $ti.Tag = $Path
+    if ($Expandable) {
+        $dummy = New-Object System.Windows.Controls.TreeViewItem
+        $dummy.Header = '…'
+        $dummy.Tag = '__dummy'
+        [void]$ti.Items.Add($dummy)
+        $ti.add_Expanded($script:RemoteFolderEvents.Expanded)
+    }
+    return $ti
+}
+
+function Select-RemoteFolder {
+    # Wybór folderu na innym komputerze (sesja WinRM na czas okna); zwraca ścieżkę lokalną na tym komputerze albo $null
+    param([Parameter(Mandatory)][string]$Computer, [string]$Selected = '', [string]$Title = 'Wybierz folder')
+    $session = $null
+    try { $session = Invoke-WithWaitCursor { Open-RemoteBrowseSession -Computer $Computer } }
+    catch { Show-Error "Nie można połączyć się z komputerem $Computer przez WinRM." $_; return $null }
+    try {
+        $roots = @()
+        try { $roots = @(Invoke-WithWaitCursor { Get-RemoteFolderRoots -Session $session }) }
+        catch { Show-Error "Nie można odczytać dysków komputera $Computer." $_; return $null }
+        $body = @'
+<Grid>
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto"/>
+    <RowDefinition Height="*"/>
+    <RowDefinition Height="Auto"/>
+  </Grid.RowDefinitions>
+  <TextBox x:Name="rfPath" Tag="Ścieżka lokalna na tym komputerze, np. D:\Dane" Margin="0,0,0,10"/>
+  <Border Grid.Row="1" Style="{StaticResource Card}" Padding="4">
+    <TreeView x:Name="rfTree" BorderThickness="0" Background="Transparent"/>
+  </Border>
+  <TextBlock x:Name="rfInfo" Grid.Row="2" Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="2,10,0,0"
+             Text="Rozwiń dysk lub udział, aby zobaczyć podfoldery (wczytywane na bieżąco). Żółta ikona – łącze (junction), szara – folder ukryty."/>
+</Grid>
+'@
+        $w = New-Dialog -Title $Title -Subtitle "Foldery na komputerze $Computer. Zaznacz folder albo wpisz ścieżkę – operacja wykona się na tym komputerze." -Body $body -Icon 'E838' -OkText 'Wybierz' -Width 620 -Height 680 -Resizable -Validate {
+            param($w)
+            if (-not $w.FindName('rfPath').Text.Trim()) { Show-Warning 'Zaznacz folder albo wpisz ścieżkę.'; return $false }
+            return $true
+        }
+        $w.Tag.Session = $session
+        $tree = $w.FindName('rfTree')
+        foreach ($r in $roots) { [void]$tree.Items.Add((New-RemoteFolderItem -Path $r.Path -Text $r.Label -Icon $(if ($r.Kind -eq 'share') { 'E8F9' } else { 'EDA2' }) -Color $(if ($r.Kind -eq 'share') { '#5EE3AE' } else { '#8CB0FF' }))) }
+        $w.FindName('rfPath').Text = $Selected
+        $tree.add_SelectedItemChanged({
+                param($s, $e)
+                $item = $s.SelectedItem
+                if ($item -and -not ([string]$item.Tag).StartsWith('__')) { [System.Windows.Window]::GetWindow($s).FindName('rfPath').Text = [string]$item.Tag }
+            })
+        if (-not (Invoke-Dialog $w)) { return $null }
+        return $w.FindName('rfPath').Text.Trim()
+    }
+    finally {
+        if ($session -is [System.Management.Automation.Runspaces.PSSession]) { try { Remove-PSSession -Session $session } catch { } }
+    }
+}
+
 function Add-FolderField {
-    # Pole ścieżki folderu z przyciskiem wyboru i polem komputera zdalnego (opcjonalnie)
+    # Pole ścieżki folderu z przyciskiem wyboru i polem komputera zdalnego (opcjonalnie).
+    # Gdy wpisano komputer, przycisk wyboru przegląda foldery na tym komputerze (WinRM).
     param([hashtable]$Module, [string]$Title = 'Folder', [string]$Remember = 'Path')
     $row = Add-ToolbarRow -Module $Module -Title $Title
     $box = Add-TextBox -Parent $row -Width 420 -Placeholder 'np. \\serwer\dane\Dział albo D:\Dane' -Text ([string](Get-ModuleSetting -Module $Module -Name $Remember -Default ''))
-    Add-Button -Parent $row -Text '' -Icon 'E838' -Module $Module -AlwaysEnabled -ToolTip 'Wybierz folder' -OnClick {
+    Add-Button -Parent $row -Text '' -Icon 'E838' -Module $Module -AlwaysEnabled -ToolTip 'Wybierz folder – na tym komputerze albo, gdy obok wpisano komputer, na nim (przez WinRM)' -OnClick {
         param($m)
-        $p = Select-FolderPath -Selected $m.Path.Text.Trim()
+        $comp = if ($m['Computer']) { $m.Computer.Text.Trim() } else { '' }
+        $p = if ($comp) { Select-RemoteFolder -Computer $comp -Selected $m.Path.Text.Trim() -Title "Folder na komputerze $comp" } else { Select-FolderPath -Selected $m.Path.Text.Trim() }
         if ($p) { $m.Path.Text = $p }
     } | Out-Null
     Add-Label -Parent $row -Text 'na komputerze' | Out-Null
     $computer = Add-TextBox -Parent $row -Width 150 -Placeholder 'lokalnie / UNC'
-    $computer.ToolTip = 'Opcjonalnie: serwer, na którym ścieżka jest lokalna (np. D:\Dane) – operacja wykona się na nim przez PowerShell Remoting (szybciej przy dużych drzewach)'
+    $computer.ToolTip = 'Opcjonalnie: serwer, na którym ścieżka jest lokalna (np. D:\Dane) – operacja wykona się na nim przez PowerShell Remoting (szybciej przy dużych drzewach), a przycisk wyboru folderu przegląda jego dyski'
     Register-ControlHandler -Control $box -EventName 'TextChanged' -Module $Module -Action { param($m, $s) Set-ModuleSetting -Module $m -Name 'Path' -Value $s.Text.Trim() }
     return @($box, $computer)
 }
@@ -15149,14 +17262,32 @@ function Get-ScopeLabel([int]$Inherit, [int]$Propagate) {
     }
 }
 $hidden = @($P.Hidden)
+# Oprócz wierszy z wpisami ACL zwracane są rekordy pomocnicze (właściwość __rec):
+#   item - każdy folder/plik: właściciel, wyłączone dziedziczenie, liczba wpisów jawnych/dziedziczonych (raport HTML drzewa),
+#   skip - element pominięty: brak dostępu do uprawnień lub zawartości, łącze (junction/symlink) - nie skanowane dalej.
+function New-DeniedRow([string]$Path, [string]$Element, [int]$Level, [string]$Text) {
+    [pscustomobject][ordered]@{ 'Ścieżka' = $Path; 'Element' = $Element; 'Poziom' = $Level; 'Tożsamość' = ''; 'Uprawnienia' = ''; 'Typ' = ''; 'Dziedziczone' = $null; 'Dotyczy' = ''; 'Dziedziczenie folderu' = ''; 'Właściciel' = ''; 'Uwagi' = $Text; '__tone' = 'crit' }
+}
 $emit = {
     param($Item, [int]$Level)
+    $element = if ($Item.PSIsContainer) { 'Folder' } else { 'Plik' }
     $acl = $null
     $owner = ''
-    try { $acl = Get-ItemAcl $Item -WithOwner; $owner = Get-AclOwner $acl } catch { }
-    if (-not $acl) { try { $acl = Get-ItemAcl $Item } catch { [pscustomobject][ordered]@{ 'Ścieżka' = $Item.FullName; 'Element' = $(if ($Item.PSIsContainer) { 'Folder' } else { 'Plik' }); 'Poziom' = $Level; 'Tożsamość' = ''; 'Uprawnienia' = ''; 'Typ' = ''; 'Dziedziczone' = $null; 'Dotyczy' = ''; 'Dziedziczenie folderu' = ''; 'Właściciel' = ''; 'Uwagi' = "Brak dostępu: $($_.Exception.Message)"; '__tone' = 'crit' }; return } }
+    $err = ''
+    try { $acl = Get-ItemAcl $Item -WithOwner; $owner = Get-AclOwner $acl } catch { $err = $_.Exception.Message }
+    if (-not $acl) { try { $acl = Get-ItemAcl $Item; $err = '' } catch { $err = $_.Exception.Message } }
+    if (-not $acl) {
+        [pscustomobject]@{ '__rec' = 'item'; Path = $Item.FullName; Element = $element; Level = $Level; Owner = ''; Protected = $false; Explicit = 0; Inherited = 0; Unresolved = 0; Denied = $true }
+        [pscustomobject]@{ '__rec' = 'skip'; Path = $Item.FullName; Level = $Level; Kind = 'acl'; Reason = "Brak dostępu do uprawnień: $err" }
+        if (-not $P.SkipDenied) { New-DeniedRow $Item.FullName $element $Level "Brak dostępu: $err" }
+        return
+    }
     $protected = $acl.AreAccessRulesProtected
-    foreach ($r in (Get-AclRules $acl)) {
+    $rules = Get-AclRules $acl
+    $exp = 0; $inh = 0; $uns = 0
+    foreach ($r in $rules) { if ($r.IsInherited) { $inh++ } else { $exp++ }; if ([string]$r.IdentityReference -match '^S-1-') { $uns++ } }
+    [pscustomobject]@{ '__rec' = 'item'; Path = $Item.FullName; Element = $element; Level = $Level; Owner = $owner; Protected = [bool]$protected; Explicit = $exp; Inherited = $inh; Unresolved = $uns; Denied = $false }
+    foreach ($r in $rules) {
         $id = [string]$r.IdentityReference
         if ($P.ExplicitOnly -and $r.IsInherited) { continue }
         if ($P.HideSystem) {
@@ -15167,7 +17298,7 @@ $emit = {
         if ($P.HideSids -and $id -match '^S-1-') { continue }
         [pscustomobject][ordered]@{
             'Ścieżka'               = $Item.FullName
-            'Element'               = $(if ($Item.PSIsContainer) { 'Folder' } else { 'Plik' })
+            'Element'               = $element
             'Poziom'                = $Level
             'Tożsamość'             = $id
             'Uprawnienia'           = Get-RightsLabel ([int]$r.FileSystemRights)
@@ -15182,12 +17313,14 @@ $emit = {
         }
     }
 }
+$reparse = [System.IO.FileAttributes]::ReparsePoint
 $root = Get-Item -LiteralPath $P.Path -Force -ErrorAction Stop
 & $emit $root $P.BaseLevel
 if ($P.RootOnly) {
     if ($P.Files) { foreach ($f in @(Get-ChildItem -LiteralPath $root.FullName -File -Force -ErrorAction SilentlyContinue)) { & $emit $f ($P.BaseLevel + 1) } }
     return
 }
+if ($root.Attributes -band $reparse) { [pscustomobject]@{ '__rec' = 'skip'; Path = $root.FullName; Level = $P.BaseLevel; Kind = 'link'; Reason = 'Łącze (junction / symlink) – zawartość nie była skanowana' }; return }
 $queue = New-Object System.Collections.Queue
 $queue.Enqueue(@($root, $P.BaseLevel))
 while ($queue.Count -gt 0) {
@@ -15197,9 +17330,18 @@ while ($queue.Count -gt 0) {
     if ($P.Depth -ge 0 -and $level -ge $P.Depth) { continue }
     $children = @()
     try { $children = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction Stop) }
-    catch { [pscustomobject][ordered]@{ 'Ścieżka' = $dir.FullName; 'Element' = 'Folder'; 'Poziom' = $level; 'Tożsamość' = ''; 'Uprawnienia' = ''; 'Typ' = ''; 'Dziedziczone' = $null; 'Dotyczy' = ''; 'Dziedziczenie folderu' = ''; 'Właściciel' = ''; 'Uwagi' = "Brak dostępu do zawartości: $($_.Exception.Message)"; '__tone' = 'crit' }; continue }
+    catch {
+        [pscustomobject]@{ '__rec' = 'skip'; Path = $dir.FullName; Level = $level; Kind = 'content'; Reason = "Brak dostępu do zawartości: $($_.Exception.Message)" }
+        if (-not $P.SkipDenied) { New-DeniedRow $dir.FullName 'Folder' $level "Brak dostępu do zawartości: $($_.Exception.Message)" }
+        continue
+    }
     foreach ($c in $children) {
-        if ($c.PSIsContainer) { & $emit $c ($level + 1); $queue.Enqueue(@($c, ($level + 1))) }
+        if ($c.PSIsContainer) {
+            & $emit $c ($level + 1)
+            # Łączy (np. «Application Data» w profilach) nie przechodzimy - prowadzą w inne miejsca lub w pętlę
+            if ($c.Attributes -band $reparse) { [pscustomobject]@{ '__rec' = 'skip'; Path = $c.FullName; Level = $level + 1; Kind = 'link'; Reason = 'Łącze (junction / symlink) – zawartość nie była skanowana' } }
+            else { $queue.Enqueue(@($c, ($level + 1))) }
+        }
         elseif ($P.Files) { & $emit $c ($level + 1) }
     }
 }
@@ -15271,6 +17413,136 @@ function Set-NtfsColumn {
     }
     finally { $Module.Loading = $false }
     Show-Toast ("«{0}»: {1} – zmieniono w {2} wierszach." -f $Column, $Value, $rows.Count) 'info'
+}
+
+function Save-NtfsTreeReport {
+    param([hashtable]$Module, [string]$Path)
+    $scan = $Module.Data.Scan
+    $entries = @(Get-ResultRowsAll -Module $Module | Where-Object { [string](Get-ObjectValue $_ 'Tożsamość') })
+    $html = ConvertTo-NtfsTreeHtml -Root $scan.Root -Computer $scan.Computer -Items @($scan.Items) -Entries $entries -Skipped @($scan.Skipped) -Filters $scan.Filters
+    [System.IO.File]::WriteAllText($Path, $html, (New-Object System.Text.UTF8Encoding($true)))
+    Write-Log ("Zapisano raport HTML uprawnień ({0} elementów): {1}" -f @($scan.Items).Count, $Path) 'OK' -Module $Module.Title
+    Show-Toast ("Zapisano raport: {0}" -f [System.IO.Path]::GetFileName($Path)) 'ok'
+}
+
+function ConvertTo-NtfsTreeHtml {
+    # Drzewo uprawnień: folder z jawnymi wpisami, wyłączonym dziedziczeniem albo bez dostępu jest pokazany z wpisami;
+    # gałąź, w której wszystko tylko dziedziczy, jest jednym wierszem «dziedziczy – zawartość tak samo (N)»,
+    # a opcja w raporcie («Pokaż foldery i wpisy dziedziczone») ją rozwija.
+    param([string]$Root, [string]$Computer = '', [object[]]$Items, [object[]]$Entries, [object[]]$Skipped = @(), [string]$Filters = '')
+    $enc = { param($t) ConvertTo-HtmlText $t }
+    $cmpr = [StringComparer]::OrdinalIgnoreCase
+    $nodes = New-Object 'System.Collections.Generic.Dictionary[string,hashtable]' ($cmpr)
+    $newNode = { param($path) @{ Path = $path; Rec = $null; Children = New-Object System.Collections.ArrayList; Entries = New-Object System.Collections.ArrayList; Skip = New-Object System.Collections.ArrayList; AllInherit = $true; Count = 0 } }
+    foreach ($it in $Items) { $p = [string]$it.Path; if (-not $nodes.ContainsKey($p)) { $nodes[$p] = & $newNode $p }; $nodes[$p].Rec = $it }
+    foreach ($e in $Entries) { $p = [string](Get-ObjectValue $e 'Ścieżka'); if ($nodes.ContainsKey($p)) { [void]$nodes[$p].Entries.Add($e) } }
+    foreach ($k in $Skipped) { $p = [string]$k.Path; if (-not $nodes.ContainsKey($p)) { $nodes[$p] = & $newNode $p }; [void]$nodes[$p].Skip.Add($k) }
+    # Rodzice: najbliższy przodek obecny w drzewie
+    $roots = New-Object System.Collections.ArrayList
+    foreach ($p in @($nodes.Keys | Sort-Object Length)) {
+        $parent = $null
+        $cur = $p
+        while ($true) {
+            $up = try { [System.IO.Path]::GetDirectoryName($cur) } catch { $null }
+            if (-not $up -or $up -eq $cur) { break }
+            if ($nodes.ContainsKey($up)) { $parent = $nodes[$up]; break }
+            $cur = $up
+        }
+        if ($parent) { [void]$parent.Children.Add($nodes[$p]) } else { [void]$roots.Add($nodes[$p]) }
+    }
+    # Od liści w górę: czy cała gałąź tylko dziedziczy, ile elementów zawiera
+    foreach ($p in @($nodes.Keys | Sort-Object Length -Descending)) {
+        $n = $nodes[$p]
+        $r = $n.Rec
+        $self = ($null -ne $r -and -not $r.Denied -and -not $r.Protected -and [int]$r.Explicit -eq 0 -and $n.Skip.Count -eq 0)
+        $count = 0
+        foreach ($c in $n.Children) { $count += 1 + $c.Count; if (-not $c.AllInherit) { $self = $false } }
+        $n.AllInherit = $self
+        $n.Count = $count
+    }
+    $folders = @($Items | Where-Object { [string]$_.Element -eq 'Folder' }).Count
+    $withExplicit = @($Items | Where-Object { [int]$_.Explicit -gt 0 }).Count
+    $protectedN = @($Items | Where-Object { $_.Protected }).Count
+    $unres = @($Items | Where-Object { [int]$_.Unresolved -gt 0 }).Count
+    $denied = @($Skipped | Where-Object { [string]$_.Kind -ne 'link' })
+    $links = @($Skipped | Where-Object { [string]$_.Kind -eq 'link' })
+
+    $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2}\{3} • {4}{5}' -f $script:AppVersion, (Get-Date), $env:USERDOMAIN, $env:USERNAME, $Root, $(if ($Computer) { " (na $Computer)" } else { '' })
+    if ($Filters) { $meta += " • $Filters" }
+    $extra = '.b{display:inline-block;font-size:11px;padding:0 7px;border-radius:8px;margin-left:8px;background:#1E252F;color:#C9D0DC}.b.info{background:#1A2640;color:#8CC0FF}.b.warn{background:#2E2616;color:#FFC46B}.b.crit{background:#2E1A1E;color:#FF7A86}' +
+        '.inh-sub,tr.inh-row{display:none}body.show-inh .inh-sub{display:block}body.show-inh tr.inh-row{display:table-row}.leaf.inh{color:#8791A5}.ents{margin:4px 0 8px 22px;border:1px solid #222935;border-radius:8px;overflow:auto;max-width:1100px}.ents td,.ents th{padding:4px 10px;font-size:12.5px}.own{color:#5E6779;font-size:12px;margin-left:8px}'
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append((Get-ReportHead -Title 'Uprawnienia NTFS – drzewo' -Meta $meta -ExtraCss $extra))
+    [void]$sb.Append('<div class="tiles"><div class="tile info"><b>').Append($Items.Count).Append('</b><span>Sprawdzone elementy (folderów: ').Append($folders).Append(')</span></div>')
+    [void]$sb.Append('<div class="tile info"><b>').Append($withExplicit).Append('</b><span>Z jawnymi wpisami</span></div>')
+    [void]$sb.Append('<div class="tile ').Append($(if ($protectedN) { 'warn' } else { '' })).Append('"><b>').Append($protectedN).Append('</b><span>Wyłączone dziedziczenie</span></div>')
+    [void]$sb.Append('<div class="tile ').Append($(if ($denied.Count) { 'crit' } else { '' })).Append('"><b>').Append($denied.Count).Append('</b><span>Brak dostępu (pominięte)</span></div>')
+    if ($unres) { [void]$sb.Append('<div class="tile warn"><b>').Append($unres).Append('</b><span>Z nierozwiązanymi SID</span></div>') }
+    [void]$sb.Append('</div>')
+    $toggle = '<label class="opt"><input type="checkbox" data-act="toggle" data-class="show-inh"> Pokaż foldery i wpisy dziedziczone</label>'
+    [void]$sb.Append((Get-ReportBar -Mode 'tree' -Placeholder 'Szukaj folderu lub konta…' -Buttons @('expand', 'collapse', 'print') -Extra $toggle))
+    [void]$sb.Append('<div class="tree">')
+
+    $acts = '<span class="acts"><button data-act="copy-node" title="Kopiuj gałąź (wcięty tekst)">⧉</button><button data-act="open-node" title="Otwórz gałąź w osobnym oknie">↗</button></span>'
+    $renderEntries = {
+        param($n, [bool]$all)
+        $rows = @($n.Entries)
+        if ($rows.Count -eq 0) { return '' }
+        $t = New-Object System.Text.StringBuilder
+        [void]$t.Append('<div class="ents"><table class="dt" data-filters="no"><thead><tr><th>Tożsamość</th><th>Uprawnienia</th><th>Typ</th><th>Dotyczy</th><th>Pochodzenie</th></tr></thead><tbody>')
+        foreach ($e in ($rows | Sort-Object { [string](Get-ObjectValue $_ 'Dziedziczone') -eq 'Tak' }, { [string](Get-ObjectValue $_ 'Tożsamość') })) {
+            $inh = ([string](Get-ObjectValue $e 'Dziedziczone') -eq 'Tak')
+            $cls = if ($inh -and -not $all) { ' class="inh-row"' } elseif ([string](Get-ObjectValue $e 'Typ') -eq 'Odmawiaj') { ' class="crit"' } else { '' }
+            [void]$t.Append("<tr$cls><td>").Append((& $enc (Get-ObjectValue $e 'Tożsamość'))).Append('</td><td>').Append((& $enc (Get-ObjectValue $e 'Uprawnienia'))).Append('</td><td>').Append((& $enc (Get-ObjectValue $e 'Typ')))
+            [void]$t.Append('</td><td>').Append((& $enc (Get-ObjectValue $e 'Dotyczy'))).Append('</td><td>').Append($(if ($inh) { 'dziedziczony' } else { '<b>jawny</b>' })).Append('</td></tr>')
+        }
+        [void]$t.Append('</tbody></table></div>')
+        return $t.ToString()
+    }
+    $render = $null
+    $render = {
+        param($n, [int]$depth)
+        $r = $n.Rec
+        $name = if ($depth -eq 0) { $n.Path } else { Split-Path -Path $n.Path -Leaf }
+        $badges = ''
+        if ($r -and [string]$r.Element -eq 'Plik') { $badges += '<span class="k">plik</span>' }
+        if (($r -and $r.Denied) -or @($n.Skip | Where-Object { [string]$_.Kind -ne 'link' }).Count) { $badges += '<span class="b crit">brak dostępu – pominięto</span>' }
+        if (@($n.Skip | Where-Object { [string]$_.Kind -eq 'link' }).Count) { $badges += '<span class="b">łącze – nie skanowano</span>' }
+        if ($r -and $r.Protected) { $badges += '<span class="b warn">dziedziczenie wyłączone</span>' }
+        if ($r -and [int]$r.Explicit -gt 0) { $badges += '<span class="b info">jawne wpisy: ' + [int]$r.Explicit + '</span>' }
+        if ($r -and [int]$r.Unresolved -gt 0) { $badges += '<span class="b warn">nierozwiązane SID: ' + [int]$r.Unresolved + '</span>' }
+        if ($r -and [string]$r.Owner -and ($depth -eq 0 -or $r.Protected -or [int]$r.Explicit -gt 0)) { $badges += '<span class="own">właściciel: ' + (& $enc $r.Owner) + '</span>' }
+        foreach ($k in $n.Skip) { if ([string]$k.Kind -ne 'link') { $badges += '<span class="d">' + (& $enc $k.Reason) + '</span>' } }
+        $out = New-Object System.Text.StringBuilder
+        if ($depth -gt 0 -and $n.AllInherit) {
+            $tail = if ($n.Count -gt 0) { ' – dziedziczy; zawartość tak samo (' + $n.Count + ')' } else { ' – dziedziczy' }
+            [void]$out.Append('<div class="leaf inh">').Append((& $enc $name)).Append('<span class="m">').Append($tail).Append('</span>').Append($badges).Append('</div>')
+            if ($n.Count -gt 0) {
+                [void]$out.Append('<div class="inh-sub" style="margin-left:22px">')
+                foreach ($c in ($n.Children | Sort-Object Path)) { [void]$out.Append((& $render $c ($depth + 1))) }
+                [void]$out.Append('</div>')
+            }
+            return $out.ToString()
+        }
+        $inheritsOnly = ($r -and -not $r.Denied -and -not $r.Protected -and [int]$r.Explicit -eq 0)
+        $cls = if ($depth -eq 0) { ' class="root" open' } else { ' open' }
+        [void]$out.Append("<details$cls><summary>").Append((& $enc $name)).Append($badges)
+        if ($inheritsOnly -and $depth -gt 0) { [void]$out.Append('<span class="m"> – dziedziczy</span>') }
+        [void]$out.Append($acts).Append('</summary>')
+        [void]$out.Append((& $renderEntries $n ($depth -eq 0)))
+        foreach ($c in ($n.Children | Sort-Object Path)) { [void]$out.Append((& $render $c ($depth + 1))) }
+        [void]$out.Append('</details>')
+        return $out.ToString()
+    }
+    foreach ($r in ($roots | Sort-Object Path)) { [void]$sb.Append((& $render $r 0)) }
+    [void]$sb.Append('</div>')
+    if ($denied.Count -gt 0 -or $links.Count -gt 0) {
+        [void]$sb.Append('<details class="box errs" open><summary>Pominięte miejsca<span class="n">').Append($denied.Count + $links.Count).Append('</span></summary><table class="dt"><thead><tr><th>Ścieżka</th><th>Przyczyna</th></tr></thead><tbody>')
+        foreach ($k in ($denied + $links | Sort-Object Path)) { [void]$sb.Append('<tr><td>').Append((& $enc $k.Path)).Append('</td><td>').Append((& $enc $k.Reason)).Append('</td></tr>') }
+        [void]$sb.Append('</tbody></table></details>')
+    }
+    [void]$sb.Append((Get-ReportTail))
+    return $sb.ToString()
 }
 
 Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsGrant' -Title 'Nadawanie uprawnień' -Icon 'E72E' -Badge 'nowe' `
@@ -15394,7 +17666,7 @@ Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsGrant'
             param($m, $r)
             if (-not $r.Ok) { $m.Data.LastError = (@($r.Errors)) -join "`r`n"; Invoke-Deferred -Module $m -Action { param($m) Show-Error 'Nie można odczytać uprawnień folderu.' $m.Data.LastError }; return }
             # Ścieżka, element i poziom są w tym oknie takie same dla wszystkich wierszy (folder jest w podtytule)
-            $m.Data.Popup = @($r.Data | Select-Object 'Tożsamość', 'Uprawnienia', 'Typ', 'Dziedziczone', 'Dotyczy', 'Dziedziczenie folderu', 'Właściciel', 'Uwagi', '__tone')
+            $m.Data.Popup = @($r.Data | Where-Object { $_ -and -not $_.PSObject.Properties['__rec'] } | Select-Object 'Tożsamość', 'Uprawnienia', 'Typ', 'Dziedziczone', 'Dotyczy', 'Dziedziczenie folderu', 'Właściciel', 'Uwagi', '__tone')
             Invoke-Deferred -Module $m -Action { param($m) Show-GridDialog -Title 'Bieżące uprawnienia' -Subtitle $m.Path.Text.Trim() -Rows $m.Data.Popup -PillColumns @('Typ') }
         }
     } | Out-Null
@@ -15415,6 +17687,7 @@ Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsReport
     $m.Depth = Add-Numeric -Parent $row -Value 2 -Minimum 0 -Maximum 100 -Width 60
     $m.Unlimited = Add-CheckBox -Parent $row -Text 'Bez limitu'
     $m.Files = Add-CheckBox -Parent $row -Text 'Także pliki'
+    $m.SkipDenied = Add-CheckBox -Parent $row -Text 'Pomiń miejsca bez dostępu (zapisz w dzienniku)' -Checked $true -ToolTip 'Np. System Volume Information, $RECYCLE.BIN, profile innych użytkowników – nawet administrator często nie ma tam uprawnień. Pominięte ścieżki z przyczyną trafiają do dziennika, na kafelek i do raportu HTML zamiast do tabeli.'
     $row2 = Add-ToolbarRow -Module $m -Title 'Filtry'
     $m.Explicit = Add-CheckBox -Parent $row2 -Text 'Tylko jawne wpisy (bez dziedziczonych)' -Checked $true
     $m.HideSystem = Add-CheckBox -Parent $row2 -Text 'Ukryj konta systemowe' -Checked $true
@@ -15433,15 +17706,47 @@ Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsReport
         $path = $m.Path.Text.Trim()
         if (-not $path) { Show-Warning 'Podaj folder.'; return }
         $depth = if (Test-Checked $m.Unlimited) { -1 } else { Get-Num $m.Depth }
-        $base = @{ Depth = $depth; Files = (Test-Checked $m.Files); ExplicitOnly = (Test-Checked $m.Explicit); HideSystem = (Test-Checked $m.HideSystem); HideSids = (Test-Checked $m.HideSids); Hidden = @($script:Settings.NtfsHiddenIdentities); Core = (Get-NtfsCore $script:NtfsScanCore) }
+        $base = @{ Depth = $depth; Files = (Test-Checked $m.Files); ExplicitOnly = (Test-Checked $m.Explicit); HideSystem = (Test-Checked $m.HideSystem); HideSids = (Test-Checked $m.HideSids); SkipDenied = (Test-Checked $m.SkipDenied); Hidden = @($script:Settings.NtfsHiddenIdentities); Core = (Get-NtfsCore $script:NtfsScanCore) }
         $computer = $m.Computer.Text.Trim()
         Reset-StatTiles $m
+        Reset-ResultTable -Module $m
+        $m.Data.Scan = @{ Root = $path; Computer = $computer; Items = New-Object System.Collections.ArrayList; Skipped = New-Object System.Collections.ArrayList; Started = Get-Date
+            Filters = (@($(if ($base.ExplicitOnly) { 'tylko jawne wpisy' }), $(if ($base.HideSystem) { 'bez kont systemowych' }), $(if ($base.HideSids) { 'bez nierozwiązanych SID' }), $(if ($depth -ge 0) { "głębokość $depth" } else { 'bez limitu głębokości' }), $(if ($base.Files) { 'z plikami' })) | Where-Object { $_ }) -join ', '
+        }
+        # Wynik każdego zadania: wiersze ACL do tabeli, rekordy pomocnicze (__rec) do raportu drzewa i dziennika
+        $onResult = {
+            param($m, $r)
+            if (-not $r.Ok) {
+                Add-ResultRows -Module $m -TargetColumn '' -Objects @([pscustomobject][ordered]@{ 'Ścieżka' = $r.Target; 'Uwagi' = ((@($r.Errors)) -join ' '); '__tone' = 'crit'; '__flag' = 'crit' })
+                return
+            }
+            $rows = New-Object System.Collections.ArrayList
+            foreach ($d in @($r.Data)) {
+                if ($null -eq $d) { continue }
+                $rec = [string](Get-ObjectValue $d '__rec')
+                if ($rec -eq 'item') { [void]$m.Data.Scan.Items.Add($d) }
+                elseif ($rec -eq 'skip') {
+                    [void]$m.Data.Scan.Skipped.Add($d)
+                    if ([string]$d.Kind -eq 'link') { Write-Log ("Łącze – nie skanowano zawartości: {0}" -f $d.Path) }
+                    elseif ($m.Data.Scan.SkipDenied) { Write-Log ("Pominięto (brak dostępu): {0} – {1}" -f $d.Path, $d.Reason) 'WARN' }
+                }
+                else { [void]$rows.Add($d) }
+            }
+            if ($rows.Count -gt 0) { Add-ResultRows -Module $m -TargetColumn '' -Objects $rows.ToArray() }
+        }
+        $m.Data.Scan.SkipDenied = $base.SkipDenied
+        $onComplete = {
+            param($m)
+            & $m.Actions.Stats $m
+            $sk = @($m.Data.Scan.Skipped | Where-Object { [string]$_.Kind -ne 'link' }).Count
+            if ($sk -gt 0 -and $m.Data.Scan.SkipDenied) { Write-Log ("Raport uprawnień: pominięto {0} miejsc bez dostępu (lista w dzienniku i w raporcie HTML)." -f $sk) 'WARN' }
+        }
         if ($computer) {
             $p = $base.Clone(); $p.Path = $path; $p.BaseLevel = 0; $p.RootOnly = $false
-            Start-HostOperation -Module $m -Name 'Raport uprawnień' -Targets @($computer) -TargetColumn '' -Parameters $p -ScriptBlock {
+            Start-HostOperation -Module $m -Name 'Raport uprawnień' -Targets @($computer) -Output None -Parameters $p -ScriptBlock {
                 param($P)
                 & ([scriptblock]::Create($P.Core)) $P
-            } -OnComplete { param($m) & $m.Actions.Stats $m }
+            } -OnResult $onResult -OnComplete $onComplete
             return
         }
         if (-not (Test-Path -LiteralPath $path)) { Show-Warning "Ścieżka nie istnieje lub jest niedostępna: $path"; return }
@@ -15454,19 +17759,31 @@ Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsReport
             try { $subs = @(Get-ChildItem -LiteralPath $path -Directory -Force -ErrorAction Stop) } catch { Write-Log "Nie można wyświetlić podfolderów: $($_.Exception.Message)" 'WARN' }
             foreach ($s in $subs) { $p = $base.Clone(); $p.Path = $s.FullName; $p.BaseLevel = 1; $p.RootOnly = $false; $per[$s.FullName] = $p }
         }
-        Start-HostOperation -Module $m -Name 'Raport uprawnień' -Targets @($per.Keys | Sort-Object) -PerTarget $per -Local -TargetColumn '' -ScriptBlock {
+        Start-HostOperation -Module $m -Name 'Raport uprawnień' -Targets @($per.Keys | Sort-Object) -PerTarget $per -Local -Output None -ScriptBlock {
             param($Target, $P, $Ctx)
             & ([scriptblock]::Create($P.Core)) $P
-        } -OnComplete { param($m) & $m.Actions.Stats $m }
+        } -OnResult $onResult -OnComplete $onComplete
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Raport HTML (drzewo)…' -Icon 'E8A5' -Module $m -ToolTip 'Drzewo folderów z uprawnieniami: miejsca z jawnymi wpisami i wyłączonym dziedziczeniem są rozwinięte, gałęzie w całości dziedziczące – zwinięte do jednego wiersza (do rozwinięcia w raporcie).' -OnClick {
+        param($m)
+        if (-not $m.Data['Scan'] -or $m.Data.Scan.Items.Count -eq 0) { Show-Warning 'Najpierw wygeneruj raport (przycisk «Generuj raport»).'; return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'Raport HTML (*.html)|*.html'
+        $dlg.FileName = 'Uprawnienia_{0}_{1:yyyyMMdd_HHmm}.html' -f (Get-SafeFileName (Split-Path -Path $m.Data.Scan.Root -Leaf)), (Get-Date)
+        $answer = if ($script:UI.Window) { $dlg.ShowDialog($script:UI.Window) } else { $dlg.ShowDialog() }
+        if ($answer -ne $true) { return }
+        Save-NtfsTreeReport -Module $m -Path $dlg.FileName
+        try { Start-Process -FilePath $dlg.FileName } catch { }
     } | Out-Null
     $m.Actions.Stats = {
         param($m)
         $rows = @(Get-ResultRowsAll -Module $m | Where-Object { $null -ne (Get-ObjectValue $_ 'Ścieżka') })
-        Set-StatTile -Module $m -Key 'items' -Value ([string]@($rows | ForEach-Object { [string]$_['Ścieżka'] } | Select-Object -Unique).Count)
+        $items = @($m.Data.Scan.Items)
+        Set-StatTile -Module $m -Key 'items' -Value ([string]$items.Count)
         Set-StatTile -Module $m -Key 'entries' -Value ([string]@($rows | Where-Object { [string]$_['Tożsamość'] }).Count)
-        Set-StatTile -Module $m -Key 'explicit' -Value ([string]@($rows | Where-Object { [string]$_['Dziedziczone'] -eq 'Nie' }).Count) -Tone 'info'
-        Set-StatTile -Module $m -Key 'broken' -Value ([string]@($rows | Where-Object { [string]$_['Dziedziczenie folderu'] -eq 'Wyłączone' } | ForEach-Object { [string]$_['Ścieżka'] } | Select-Object -Unique).Count) -Tone 'warn'
-        $denied = @($rows | Where-Object { [string]$_['Uwagi'] -like 'Brak dostępu*' }).Count
+        Set-StatTile -Module $m -Key 'explicit' -Value ([string]@($items | Where-Object { [int]$_.Explicit -gt 0 }).Count) -Tone 'info'
+        Set-StatTile -Module $m -Key 'broken' -Value ([string]@($items | Where-Object { $_.Protected }).Count) -Tone 'warn'
+        $denied = @($m.Data.Scan.Skipped | Where-Object { [string]$_.Kind -ne 'link' }).Count
         Set-StatTile -Module $m -Key 'denied' -Value ([string]$denied) -Tone $(if ($denied) { 'crit' } else { '' })
     }
     Add-RowAction -Module $m -Text 'Członkowie grupy (AD)' -Icon 'E716' -Action {
@@ -15497,11 +17814,11 @@ Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsReport
         Set-ClipboardText ($paths -join [Environment]::NewLine)
         Show-Toast "Skopiowano ścieżek: $($paths.Count)" 'ok'
     }
-    Add-StatTile -Module $m -Key 'items' -Label 'Foldery i pliki' -Icon 'E838' | Out-Null
-    Add-StatTile -Module $m -Key 'entries' -Label 'Wpisy ACL' -Icon 'E72E' | Out-Null
-    Add-StatTile -Module $m -Key 'explicit' -Label 'Wpisy jawne' -Icon 'E70F' | Out-Null
+    Add-StatTile -Module $m -Key 'items' -Label 'Sprawdzone foldery i pliki' -Icon 'E838' | Out-Null
+    Add-StatTile -Module $m -Key 'entries' -Label 'Wpisy ACL w tabeli' -Icon 'E72E' | Out-Null
+    Add-StatTile -Module $m -Key 'explicit' -Label 'Z jawnymi wpisami' -Icon 'E70F' | Out-Null
     Add-StatTile -Module $m -Key 'broken' -Label 'Wyłączone dziedziczenie' -Icon 'E7BA' | Out-Null
-    Add-StatTile -Module $m -Key 'denied' -Label 'Brak dostępu' -Icon 'E72E' | Out-Null
+    Add-StatTile -Module $m -Key 'denied' -Label 'Brak dostępu / pominięte' -Icon 'E72E' | Out-Null
     $m.EmptyHint = 'Podaj folder i kliknij «Generuj raport» (F5). Duże drzewa najszybciej sprawdzisz na serwerze plików (pole «na komputerze»).'
 }
 
