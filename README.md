@@ -74,13 +74,22 @@ Uruchomienie: `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.
 
 - **Lewy panel — obiekty docelowe.** Komputery: z AD (OU z drzewa, filtr nazwy z `*`, tylko włączone), wpisane ręcznie albo z pliku TXT/CSV. Użytkownicy: wyszukiwanie w AD (login, nazwisko, e-mail, gwiazdka), stan konta (aktywne / wyłączone / zablokowane), OU, loginy wpisane ręcznie lub z pliku. Grupy: wyszukiwanie w AD (nazwa, sAMAccountName, opis, e-mail), OU, rodzaj (zabezpieczeń, dystrybucyjne, bez członków, uprzywilejowane), nazwy wpisane ręcznie; przy grupie widać zakres i typ. Zaznaczanie polami wyboru (także kilku wierszy naraz i spacją), szybkie wyszukiwanie, kolorowa kropka stanu (np. wynik testu łączności, konto zablokowane), menu kontekstowe (pulpit zdalny, konsola zarządzania, usługi, podgląd zdarzeń, `C$`, kopiowanie nazw / adresów e-mail).
 - **Nawigacja modułów** pogrupowanych w kategorie — każda przestrzeń pamięta ostatnio otwarty moduł; kropka przy module oznacza trwającą operację.
-- **Moduł:** nagłówek z opisem, panel parametrów (zwijany), kafelki z podsumowaniem (np. kandydaci do usunięcia, średni wynik audytu), tabela wyników z sortowaniem, filtrem po wszystkich kolumnach (`Ctrl+F`, słowo z minusem wyklucza wiersze), kolorowymi „pigułkami” stanu, panelem szczegółów wiersza, menu pod prawym przyciskiem myszy (akcje modułu, kopiowanie komórki/wierszy) oraz eksportem do **CSV** lub **raportu HTML**. `F5` uruchamia główną akcję modułu.
+- **Moduł:** nagłówek z opisem, panel parametrów (zwijany), kafelki z podsumowaniem (np. kandydaci do usunięcia, średni wynik audytu), tabela wyników z sortowaniem, filtrem po wszystkich kolumnach (`Ctrl+F`, słowo z minusem wyklucza wiersze), **filtrami kolumn**, kolorowymi „pigułkami” stanu, panelem szczegółów wiersza, menu pod prawym przyciskiem myszy (akcje modułu, kopiowanie komórki/wierszy) oraz eksportem do **CSV** lub **raportu HTML**. `F5` uruchamia główną akcję modułu.
+- **Filtry kolumn** (jak autofiltr w Excelu) w każdej tabeli wyników, także w oknach z tabelą: lejek w nagłówku kolumny otwiera okienko z listą wartości (z liczbą wierszy, wyszukiwaniem i „Zaznacz wszystkie”) oraz warunkiem: *zawiera*, *nie zawiera*, *równa się*, *różne od*, *zaczyna się od*, *kończy się na*, *większe/mniejsze niż* (liczby i daty), *puste*, *niepuste*. Filtry kilku kolumn i pole „Filtruj wyniki” działają razem; lista wartości pokazuje to, co zostaje po filtrach pozostałych kolumn. Aktywny filtr wyróżnia lejek, a przycisk „Filtry kolumn: N” obok licznika wierszy czyści je jednym kliknięciem. Pod prawym przyciskiem na komórce: *Pokaż tylko «wartość»* / *Ukryj «wartość»*; na nagłówku: sortowanie, filtr, ukrycie kolumny i przywrócenie ukrytych. Eksport, kopiowanie i akcje dotyczą widocznych wierszy (raport HTML opisuje użyte filtry); nowe wyniki modułu zaczynają bez filtrów kolumn.
 - **Górny pasek:** konto używane do operacji (bieżące albo alternatywne — także dla poleceń AD) i ustawienia (kontroler domeny, liczba równoległych operacji, limit połączenia WinRM, domyślny próg nieaktywności, foldery dziennika, ustawień i modułów).
 - **Dziennik operacji** (`Ctrl+L`, z licznikiem nowych ostrzeżeń), **pasek stanu** z postępem i przyciskiem „Przerwij” oraz **powiadomienia** w rogu okna.
 
 Wszystkie operacje wykonywane są w tle (pula wątków PowerShell), równolegle dla wielu komputerów/kont — okno nie zawiesza się, a wyniki pojawiają się na bieżąco. Niedostępny komputer lub błąd pojawia się w tabeli jako wiersz „Błąd” z przyczyną. Operacje zmieniające stan wymagają potwierdzenia z listą obiektów (przy niszczących domyślnym przyciskiem jest „Anuluj”).
 
 **Zmiany hurtowe: podgląd → poprawki → wykonanie.** Moduły tworzące lub zmieniające wiele obiektów (konta, grupy, OU, członkostwa, uprawnienia NTFS, import atrybutów) najpierw budują **podgląd** sprawdzony w AD: kolumna „Stan” mówi, co zostanie utworzone, co już istnieje, gdzie jest konflikt nazwy albo błąd danych. Kolumny oznaczone ołówkiem można poprawić w tabeli (dwuklik lub `F2`), także w wielu zaznaczonych wierszach naraz; po zmianie wiersz jest sprawdzany ponownie. Dane można wkleić prosto z Excela (kolumny rozpoznawane po nagłówkach). Wykonanie raportuje wynik dla każdego wiersza — wiersze z błędem można poprawić i powtórzyć.
+
+**Raporty HTML kont, komputerów i grup.** W modułach *Szczegóły konta*, *Konto komputera* i *Szczegóły grup* wiersz „Raport” tworzy z obiektów zaznaczonych na liście po lewej jeden plik HTML — kartę każdego obiektu ze wszystkimi danymi w sekcjach, zamiast szerokiej tabeli:
+
+- **konta:** tożsamość (login, UPN, e-mail i aliasy, numer pracownika, SID), organizacja (stanowisko, dział, firma, telefony, przełożony), stan konta i blokady, hasło (ustawione, wiek, wygaśnięcie, flagi), profil i skrypt logowania, **grupy** (bezpośrednie, podstawowa i — opcjonalnie — zagnieżdżone) oraz **podwładni**; ostrzeżenia, np. „hasło nigdy nie wygasa”, konto uprzywilejowane, brak wymogu hasła;
+- **komputery:** system, konto komputera, ostatnie logowanie, LAPS i klucze BitLocker w AD (**tylko informacja o obecności i dacie — bez haseł i kluczy**), delegowanie Kerberos, liczba SPN, grupy;
+- **grupy:** właściwości, zarządca, liczniki członków, lista **członków** z typem i stanem kont (opcjonalnie także zagnieżdżonych, z oznaczeniem członkostwa) i grupy nadrzędne.
+
+Raport ma kafelki z podsumowaniem stanów, spis obiektów z odnośnikami, wyszukiwarkę (filtruje karty, także po nazwach grup i członków), zwijane listy i styl do druku (jasny, z rozwiniętymi listami); obiekty, których nie udało się odczytać, są wymienione na końcu. Plik jest samodzielny (bez skryptów i czcionek z sieci) i otwiera się w przeglądarce po zapisaniu. Listy dłuższe niż 2000 pozycji są skracane z informacją — pełną listę daje moduł i eksport CSV.
 
 **Profile użytkowników — co można usunąć.** Moduł *Profile użytkowników* zbiera profile z zaznaczonych komputerów (ostatnie użycie z `ProfileList`, opcjonalnie rozmiar) i sprawdza każde konto w AD przez ADSI (bez RSAT). Kandydaci do usunięcia: konta **usunięte z AD**, **wyłączone**, **wygasłe**, usunięte konta lokalne, profile **tymczasowe/uszkodzone** oraz — opcjonalnie — profile nieużywane dłużej niż N dni. Profile załadowane (użytkownik zalogowany) i systemowe nigdy nie są kandydatami. Przycisk *Zaznacz kandydatów* → *Usuń zaznaczone profile* usuwa profile przez `Win32_UserProfile` (folder i wpis w rejestrze), z potwierdzeniem pokazującym ścieżki, rozmiary i ostrzeżeniem, jeśli zaznaczono profil, który nie jest kandydatem.
 
@@ -121,7 +130,7 @@ Wszystkie operacje wykonywane są w tle (pula wątków PowerShell), równolegle 
 
 | Kategoria | Moduł | Możliwości |
 | --- | --- | --- |
-| Konta | Szczegóły konta | Stan, kontakt, przełożony, logowania, hasło, wygaśnięcie, profil, OU, SID. |
+| Konta | Szczegóły konta | Stan, kontakt, przełożony, logowania, hasło, wygaśnięcie, profil, OU, SID. **Raport HTML** zaznaczonych kont (opis niżej). |
 | | Hasło i blokada | Stan haseł i blokad; odblokowanie; reset hasła — **losowe, inne dla każdego konta** (widoczne jako wartości poufne, kopiowanie z czyszczeniem schowka) albo wpisane; wymuszenie zmiany przy logowaniu; „hasło nigdy nie wygasa”. |
 | | Stan konta | Włączanie i wyłączanie (z dopiskiem daty/autora/powodu w opisie i przeniesieniem do OU), data wygaśnięcia, przenoszenie do OU. |
 | | Edycja atrybutów | Odczyt i masowa zmiana atrybutów (stanowisko, dział, firma, biuro, telefony, e-mail, przełożony, extensionAttribute1–15…) z polami `{login}`, `{imie}`, `{nazwisko}`, `{nazwa}`. |
@@ -137,7 +146,7 @@ Wszystkie operacje wykonywane są w tle (pula wątków PowerShell), równolegle 
 
 | Kategoria | Moduł | Możliwości |
 | --- | --- | --- |
-| Grupy | Szczegóły grup | Zakres, typ, opis, zarządca, e-mail i liczba członków; zmiana opisu, zarządcy, adresu, zakresu i typu, zmiana nazwy, przeniesienie do OU, ochrona przed usunięciem, usuwanie. |
+| Grupy | Szczegóły grup | Zakres, typ, opis, zarządca, e-mail i liczba członków; zmiana opisu, zarządcy, adresu, zakresu i typu, zmiana nazwy, przeniesienie do OU, ochrona przed usunięciem, usuwanie. **Raport HTML** zaznaczonych grup. |
 | | Członkowie grup | Członkowie bezpośredni i zagnieżdżeni (bez limitu 5000 obiektów) z typem i stanem kont; dodawanie, kopiowanie członków z innej grupy, usuwanie, przeniesienie kont na listę użytkowników. |
 | | Członkostwo hurtowe | Dodawanie lub usuwanie wielu kont/grup/komputerów w wielu grupach: każdy do każdej albo wiersz do wiersza (np. tabela z Excela). Rozpoznaje loginy, UPN, e-mail, DN, SID i nazwy; plan pokazuje, co już jest, a co zostanie zmienione. |
 | Tworzenie | Tworzenie grup | Wiele grup z tabeli (nazwa, opis, zakres, typ, e-mail, sAMAccountName, grupy nadrzędne, zarządca, OU) — wklejanie z Excela, normalizacja sAMAccountName, podgląd z edycją i sprawdzeniem w AD. |
@@ -160,7 +169,7 @@ Wszystkie operacje wykonywane są w tle (pula wątków PowerShell), równolegle 
 
 | Kategoria | Moduł | Możliwości |
 | --- | --- | --- |
-| Konta komputerów | Konto komputera | Informacje, test i naprawa kanału zaufania, włączanie/wyłączanie, opis, przenoszenie do OU, reset, usuwanie, tworzenie nowych kont (pre-staging). |
+| Konta komputerów | Konto komputera | Informacje, test i naprawa kanału zaufania, włączanie/wyłączanie, opis, przenoszenie do OU, reset, usuwanie, tworzenie nowych kont (pre-staging). **Raport HTML** zaznaczonych komputerów. |
 | | Zmiana nazwy komputerów | Autonumeracja, mapowanie z listy (np. z Excela), edycja w tabeli, walidacja NetBIOS i duplikatów, opcjonalny restart. |
 | | Członkostwo w grupach | Jak dla użytkowników — dla kont komputerów. |
 | Hasła i klucze | LAPS | Windows LAPS (także szyfrowane) i LAPS legacy, kopiowanie hasła (dwuklik), wymuszenie zmiany z przetworzeniem zasad. |

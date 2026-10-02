@@ -21,8 +21,10 @@
                               sumy kontrolne (MD5/SHA1/SHA256/SHA384/SHA512) z porównaniem.
     Przestrzenie AD mają listę obiektów docelowych (komputery, użytkownicy albo grupy) z zaznaczaniem,
     a moduły pogrupowane są w kategorie. Wyniki trafiają do tabel z filtrem, sortowaniem, podglądem
-    wiersza, kopiowaniem i eksportem CSV/HTML; zmiany hurtowe mają podgląd z edycją komórek przed
-    wykonaniem. Operacje wykonują się w tle i równolegle - okno nie zawiesza się.
+    wiersza, filtrami kolumn (jak autofiltr w Excelu), kopiowaniem i eksportem CSV/HTML; zmiany hurtowe
+    mają podgląd z edycją komórek przed wykonaniem. Moduły szczegółów kont, komputerów i grup tworzą
+    raport HTML z kartą każdego obiektu (grupy, członkowie, podwładni). Operacje wykonują się w tle
+    i równolegle - okno nie zawiesza się.
 
     Rozbudowa: każda przestrzeń to Register-Workspace, każdy moduł to Register-Module. Własne moduły
     można dodawać bez zmiany tego pliku: pliki *.ps1 z folderu AD-ManagerDiamond.Modules (obok skryptu)
@@ -73,7 +75,7 @@ $env:ADPS_LoadDefaultDrive = '0'
 #endregion
 
 #region Konfiguracja i stan
-$script:AppVersion = '4.1'
+$script:AppVersion = '4.2'
 
 $script:App = @{
     Name       = 'Domain Ops'
@@ -257,6 +259,13 @@ function ConvertTo-CellValue {
         return (@($Value | ForEach-Object { [string]$_ }) -join ', ')
     }
     return [string]$Value
+}
+
+function ConvertTo-HtmlText {
+    # Tekst do raportu HTML: tylko znaki specjalne (polskie litery zostają czytelne w pliku UTF-8)
+    param($Text)
+    if ($null -eq $Text) { return '' }
+    return ([string]$Text).Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;')
 }
 
 function ConvertTo-LikeLiteral {
@@ -974,8 +983,11 @@ $script:ThemeXaml = @'
               <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
             <Border x:Name="box" Width="17" Height="17" CornerRadius="4" BorderThickness="1" BorderBrush="#3A4352" Background="#1B212A" VerticalAlignment="Center">
-              <Path x:Name="mark" Data="M 3.5 8 L 6.5 11 L 12.5 4.5" Stroke="White" StrokeThickness="2" Visibility="Collapsed"
-                    StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+              <Grid>
+                <Path x:Name="mark" Data="M 3.5 8 L 6.5 11 L 12.5 4.5" Stroke="White" StrokeThickness="2" Visibility="Collapsed"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+                <Rectangle x:Name="dash" Width="8" Height="2" Fill="White" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Grid>
             </Border>
             <ContentPresenter x:Name="cp" Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center"/>
           </Grid>
@@ -986,6 +998,11 @@ $script:ThemeXaml = @'
               <Setter TargetName="box" Property="Background" Value="#3E6FE0"/>
               <Setter TargetName="box" Property="BorderBrush" Value="#3E6FE0"/>
               <Setter TargetName="mark" Property="Visibility" Value="Visible"/>
+            </Trigger>
+            <Trigger Property="IsChecked" Value="{x:Null}">
+              <Setter TargetName="box" Property="Background" Value="#2C4A8F"/>
+              <Setter TargetName="box" Property="BorderBrush" Value="#3E6FE0"/>
+              <Setter TargetName="dash" Property="Visibility" Value="Visible"/>
             </Trigger>
             <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45"/></Trigger>
           </ControlTemplate.Triggers>
@@ -1187,6 +1204,31 @@ $script:ThemeXaml = @'
     <Setter Property="Padding" Value="10,8"/>
     <Setter Property="BorderBrush" Value="#252C38"/>
     <Setter Property="BorderThickness" Value="0,0,1,1"/>
+  </Style>
+  <!-- Lejek filtra w nagłówku kolumny: przygaszony, wyraźny po najechaniu na nagłówek, niebieski gdy filtr jest aktywny (Tag = on) -->
+  <Style x:Key="HeaderFilterButton" TargetType="Button">
+    <Setter Property="Foreground" Value="#7B8496"/>
+    <Setter Property="Opacity" Value="0.45"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="Focusable" Value="False"/>
+    <Setter Property="VerticalAlignment" Value="Center"/>
+    <Setter Property="ToolTip" Value="Filtruj kolumnę"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Button">
+          <Border x:Name="b" Background="Transparent" CornerRadius="4" Padding="4,3">
+            <TextBlock Text="&#xE71C;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="10.5" Foreground="{TemplateBinding Foreground}" VerticalAlignment="Center"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#2A3342"/><Setter Property="Foreground" Value="#E4E8EF"/></Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+    <Style.Triggers>
+      <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=DataGridColumnHeader}}" Value="True"><Setter Property="Opacity" Value="1"/></DataTrigger>
+      <Trigger Property="Tag" Value="on"><Setter Property="Opacity" Value="1"/><Setter Property="Foreground" Value="#8CB0FF"/></Trigger>
+    </Style.Triggers>
   </Style>
   <Style x:Key="DarkGrid" TargetType="DataGrid">
     <Style.Resources>
@@ -2885,7 +2927,8 @@ $script:ToastTimers = New-Object 'System.Collections.Generic.Dictionary[object,o
 # Kolumny tabeli tworzone są w kodzie w chwili pojawienia się nowej właściwości w wynikach
 # (bez ponownego wiązania siatki - sortowanie i przewinięcie zostają). Kolumny ukryte zaczynają się od "__":
 #   __search - tekst do filtrowania, __flag - kolor wiersza (crit/warn/muted), __tone - kolor "pigułki"
-#   w kolumnach z $m.PillColumns (ok/warn/crit/info), __secret_<kolumna> - prawdziwa wartość poufna.
+#   w kolumnach z $m.PillColumns (ok/warn/crit/info), __secret_<kolumna> - prawdziwa wartość poufna,
+#   __cf - wynik filtrów kolumn ('1' = wiersz pasuje; 31-colfilter.ps1).
 $script:ModuleViewXaml = @'
 <Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
@@ -2936,6 +2979,7 @@ $script:ModuleViewXaml = @'
     <Grid.ColumnDefinitions>
       <ColumnDefinition Width="Auto"/>
       <ColumnDefinition Width="Auto"/>
+      <ColumnDefinition Width="Auto"/>
       <ColumnDefinition Width="*"/>
       <ColumnDefinition Width="Auto"/>
       <ColumnDefinition Width="Auto"/>
@@ -2947,12 +2991,13 @@ $script:ModuleViewXaml = @'
     <Border Grid.Column="1" Style="{StaticResource Chip}" Margin="10,0,0,0">
       <TextBlock x:Name="countText" Text="0" Foreground="#AEB6C4" FontSize="11.5"/>
     </Border>
-    <TextBlock x:Name="resultHint" Grid.Column="2" Foreground="#5E6779" FontSize="12" VerticalAlignment="Center" Margin="6,0,12,0" TextTrimming="CharacterEllipsis"/>
-    <TextBox x:Name="filterBox" Grid.Column="3" Width="260" Tag="Filtruj wyniki (Ctrl+F)…" Margin="0,0,8,0"/>
-    <CheckBox x:Name="chkReveal" Grid.Column="4" Content="Pokaż poufne" Margin="4,0,12,0" Visibility="Collapsed"/>
-    <Button x:Name="btnDetail" Grid.Column="5" Style="{StaticResource GhostButton}" ToolTip="Panel szczegółów wiersza" Margin="0,0,4,0"/>
-    <Button x:Name="btnCopy" Grid.Column="6" Style="{StaticResource GhostButton}" ToolTip="Kopiuj zaznaczone wiersze lub całą tabelę (format Excel)" Margin="0,0,4,0"/>
-    <Button x:Name="btnExport" Grid.Column="7" ToolTip="Eksport widocznych wierszy do CSV lub raportu HTML"/>
+    <Button x:Name="btnFilters" Grid.Column="2" Style="{StaticResource GhostButton}" Foreground="#8CB0FF" Background="#1A2640" Padding="10,3" MinHeight="26" Margin="8,0,0,0" Visibility="Collapsed"/>
+    <TextBlock x:Name="resultHint" Grid.Column="3" Foreground="#5E6779" FontSize="12" VerticalAlignment="Center" Margin="6,0,12,0" TextTrimming="CharacterEllipsis"/>
+    <TextBox x:Name="filterBox" Grid.Column="4" Width="260" Tag="Filtruj wyniki (Ctrl+F)…" Margin="0,0,8,0"/>
+    <CheckBox x:Name="chkReveal" Grid.Column="5" Content="Pokaż poufne" Margin="4,0,12,0" Visibility="Collapsed"/>
+    <Button x:Name="btnDetail" Grid.Column="6" Style="{StaticResource GhostButton}" ToolTip="Panel szczegółów wiersza" Margin="0,0,4,0"/>
+    <Button x:Name="btnCopy" Grid.Column="7" Style="{StaticResource GhostButton}" ToolTip="Kopiuj zaznaczone wiersze lub całą tabelę (format Excel)" Margin="0,0,4,0"/>
+    <Button x:Name="btnExport" Grid.Column="8" ToolTip="Eksport widocznych wierszy do CSV lub raportu HTML"/>
   </Grid>
 
   <Border Grid.Row="4" Style="{StaticResource Card}" Padding="0">
@@ -3001,7 +3046,7 @@ function New-ModuleView {
     param([Parameter(Mandatory)][hashtable]$Module)
     $root = New-UiElement $script:ModuleViewXaml
     $Module.Root = $root
-    foreach ($n in 'paramsCard', 'paramsStack', 'statsGrid', 'busyChip', 'busyText', 'countText', 'resultHint', 'filterBox', 'chkReveal',
+    foreach ($n in 'paramsCard', 'paramsStack', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
         'btnDetail', 'btnCopy', 'btnExport', 'grid', 'emptyState', 'emptyIcon', 'emptyText', 'emptyHint', 'detailCol', 'detailSplit',
         'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse') {
         $Module.View_[$n] = $root.FindName($n)
@@ -3034,6 +3079,7 @@ function New-ModuleView {
     Register-ControlHandler -Control $v.filterBox -EventName 'TextChanged' -Module $Module -Action { param($m) Request-ResultFilter -Module $m }
     Register-ControlHandler -Control $v.btnCopy -EventName 'Click' -Module $Module -Action { param($m) Copy-ResultView -Module $m }
     Register-ControlHandler -Control $v.btnExport -EventName 'Click' -Module $Module -Action { param($m) Export-ResultView -Module $m }
+    Register-ControlHandler -Control $v.btnFilters -EventName 'Click' -Module $Module -Action { param($m) Clear-ColumnFilters -Module $m; Show-Toast 'Wyczyszczono filtry kolumn.' 'info' 2 }
     Register-ControlHandler -Control $v.btnDetail -EventName 'Click' -Module $Module -Action {
         param($m)
         $script:Settings.DetailVisible = -not $script:Settings.DetailVisible
@@ -3053,6 +3099,8 @@ function New-ModuleView {
     $grid.add_MouseDoubleClick($script:GridEvents.MouseDoubleClick)
     $grid.add_ContextMenuOpening($script:GridEvents.ContextMenuOpening)
     $grid.ContextMenu = New-Object System.Windows.Controls.ContextMenu
+    # Ctrl+C w tabeli: własne kopiowanie (nazwy kolumn w nagłówku, maskowanie wartości poufnych, kolejność widocznych kolumn)
+    [void]$grid.CommandBindings.Add((New-Object System.Windows.Input.CommandBinding([System.Windows.Input.ApplicationCommands]::Copy, [System.Windows.Input.ExecutedRoutedEventHandler]$script:GridEvents.Copy)))
     Reset-ResultTable -Module $Module
     Update-DetailPane -Module $Module
 }
@@ -3089,11 +3137,33 @@ $script:GridEvents = @{
         }
         catch { Write-Log "Nie można wyświetlić szczegółów: $($_.Exception.Message)" 'ERROR' }
     }
+    Copy               = {
+        param($s, $e)
+        try {
+            $m = $null
+            if (-not $script:GridModules.TryGetValue($s, [ref]$m)) { return }
+            $e.Handled = $true
+            Copy-ResultView -Module $m -SelectedOnly
+        }
+        catch { Write-Log "Nie można skopiować wierszy: $($_.Exception.Message)" 'ERROR' }
+    }
     ContextMenuOpening = {
         param($s, $e)
         try {
             $m = $null
-            if ($script:GridModules.TryGetValue($s, [ref]$m)) { Update-GridMenu -Module $m }
+            if (-not $script:GridModules.TryGetValue($s, [ref]$m)) { return }
+            # Nagłówek kolumny - menu kolumny; komórka - zapamiętana do szybkiego filtra po wartości
+            $m.MenuCell = $null
+            $hdr = Find-VisualParent -Element $e.OriginalSource -Type ([System.Windows.Controls.Primitives.DataGridColumnHeader])
+            if ($hdr) {
+                if (-not $hdr.Column) { $e.Handled = $true; return }
+                $m.MenuCell = @{ Column = [string]$hdr.Column.SortMemberPath; Row = $null; Header = $true }
+            }
+            else {
+                $cell = Find-VisualParent -Element $e.OriginalSource -Type ([System.Windows.Controls.DataGridCell])
+                if ($cell -and $cell.Column -and $cell.DataContext -is [System.Data.DataRowView]) { $m.MenuCell = @{ Column = [string]$cell.Column.SortMemberPath; Row = $cell.DataContext; Header = $false } }
+            }
+            Update-GridMenu -Module $m
         }
         catch { }
     }
@@ -3125,6 +3195,7 @@ function Update-GridMenu {
         [void]$script:Handlers.Remove($old)
     }
     $menu.Items.Clear()
+    if ($Module.MenuCell -and $Module.MenuCell.Header) { Update-HeaderMenu -Module $Module -Menu $menu -Column $Module.MenuCell.Column; return }
     $rows = @(Get-SelectedResultRows -Module $Module)
     $hasRows = $rows.Count -gt 0
     foreach ($a in $Module.RowActions) {
@@ -3158,6 +3229,11 @@ function Update-GridMenu {
             }))
     [void]$menu.Items.Add((New-MenuItem -Text 'Kopiuj zaznaczone wiersze' -Icon 'E8C8' -Module $Module -Enabled $hasRows -Action { param($m) Copy-ResultView -Module $m -SelectedOnly }))
     [void]$menu.Items.Add((New-MenuItem -Text 'Eksport…' -Icon 'EDE1' -Module $Module -Action { param($m) Export-ResultView -Module $m }))
+    if ($Module.MenuCell -or $Module.ColumnFilters.Count -gt 0) {
+        [void]$menu.Items.Add((New-MenuSeparator))
+        if ($Module.MenuCell) { Add-QuickFilterMenu -Module $Module -Menu $menu }
+        elseif ($Module.ColumnFilters.Count -gt 0) { [void]$menu.Items.Add((New-MenuItem -Text 'Wyczyść filtry kolumn' -Icon 'E894' -Module $Module -Action { param($m) Clear-ColumnFilters -Module $m })) }
+    }
 }
 $script:MenuActions = New-Object 'System.Collections.Generic.Dictionary[object,scriptblock]'
 
@@ -3210,7 +3286,12 @@ function Complete-ModuleView {
 function Reset-ResultTable {
     param([Parameter(Mandatory)][hashtable]$Module)
     $table = New-Object System.Data.DataTable 'Wyniki'
-    foreach ($c in '__search', '__flag', '__tone') { [void]$table.Columns.Add($c, [string]) }
+    foreach ($c in '__search', '__flag', '__tone', '__cf') { [void]$table.Columns.Add($c, [string]) }
+    # Nowe wyniki - nowe kolumny: filtry kolumn i ich lejki zaczynają od zera (pole «Filtruj wyniki» zostaje)
+    foreach ($b in @($Module.FilterButtons.Values)) { [void]$script:Handlers.Remove($b) }
+    $Module.FilterButtons = @{}
+    $Module.ColumnFilters.Clear()
+    if ($Module.View_ -and $Module.View_['btnFilters']) { $Module.View_['btnFilters'].Visibility = 'Collapsed' }
     $view = [System.Data.DataView]::new($table)
     if ($Module.Table) { [void]$script:TableModules.Remove($Module.Table) }
     if ($Module.EditableColumns.Count -gt 0) {
@@ -3269,19 +3350,8 @@ function Add-GridColumn {
         elseif ($Module.ColorBools) { $col.CellStyle = Get-ThemeResource 'BoolCell' }
     }
     $col.IsReadOnly = -not $editable
-    if ($editable) {
-        # Nagłówek kolumny edytowalnej: nazwa + ołówek
-        $hp = New-Object System.Windows.Controls.StackPanel
-        $hp.Orientation = 'Horizontal'
-        $ht = New-Object System.Windows.Controls.TextBlock
-        $ht.Text = $Name
-        [void]$hp.Children.Add($ht)
-        $hg = New-GlyphBlock -Code 'E70F' -Size 10 -Color '#6F8FD8'
-        $hg.Margin = '6,1,0,0'
-        [void]$hp.Children.Add($hg)
-        $col.Header = $hp
-    }
-    else { $col.Header = $Name }
+    # Nagłówek: nazwa (+ ołówek dla kolumn edytowalnych) i lejek filtra (bez filtra dla wartości poufnych)
+    $col.Header = New-ColumnHeader -Module $Module -Name $Name -Editable:$editable -NoFilter:($Module.SecretColumns -contains $Name)
     $col.SortMemberPath = $Name
     $col.MaxWidth = 520
     $col.MinWidth = 54
@@ -3337,6 +3407,7 @@ function Add-ResultRows {
                 if ($v -isnot [System.DBNull] -and -not $name.StartsWith('__')) { [void]$search.Append([string]$v).Append(' ') }
             }
             $row['__search'] = $search.ToString().ToLowerInvariant()
+            if ($Module.ColumnFilters.Count -gt 0) { $row['__cf'] = $(if (Test-RowColumnFilters -Module $Module -Row $row) { '1' } else { '0' }) }
             if (-not $values.Contains('__flag')) {
                 $status = [string]$values['Status']
                 if ($status.StartsWith('Błąd')) { $row['__flag'] = 'crit' }
@@ -3387,6 +3458,7 @@ function Update-RowSearch {
         if ($v -isnot [System.DBNull]) { [void]$search.Append([string]$v).Append(' ') }
     }
     $Row['__search'] = $search.ToString().ToLowerInvariant()
+    Set-RowFilterFlag -Module $Module -Row $Row
 }
 
 function Complete-GridEdit {
@@ -3509,6 +3581,7 @@ function Update-ResultFilter {
         else { "__search LIKE '*{0}*'" -f (ConvertTo-LikeLiteral $t) }
     }
     if ($Module.ExtraFilter) { $parts = @($parts) + @('(' + $Module.ExtraFilter + ')') }
+    if ($Module.ColumnFilters.Count -gt 0) { $parts = @($parts) + @("[__cf] = '1'") }
     $filter = (@($parts) -join ' AND ')
     try { $Module.View.RowFilter = $filter } catch { $Module.View.RowFilter = '' }
     Update-ResultCount -Module $Module
@@ -3534,7 +3607,7 @@ function Update-ResultCount {
             }
             elseif ($total -gt 0) {
                 $Module.View_['emptyText'].Text = 'Nic nie pasuje do filtra'
-                $Module.View_['emptyHint'].Text = 'Zmień lub wyczyść filtr. Słowo poprzedzone minusem wyklucza wiersze.'
+                $Module.View_['emptyHint'].Text = $(if ($Module.ColumnFilters.Count -gt 0) { 'Zmień lub wyczyść filtry kolumn (przycisk «Filtry kolumn» obok licznika) albo pole «Filtruj wyniki».' } else { 'Zmień lub wyczyść filtr. Słowo poprzedzone minusem wyklucza wiersze.' })
             }
             else {
                 $Module.View_['emptyText'].Text = $(if ($Module.EmptyText) { $Module.EmptyText } else { 'Brak wyników' })
@@ -3684,7 +3757,7 @@ function Export-ResultView {
 function ConvertTo-HtmlReport {
     # Samodzielny raport HTML (ciemny motyw jak w programie) z widocznych wierszy
     param([hashtable]$Module, [string[]]$Columns, [object[]]$Rows)
-    $enc = { param($t) [System.Net.WebUtility]::HtmlEncode([string]$t) }
+    $enc = { param($t) ConvertTo-HtmlText $t }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><title>').Append((& $enc $Module.Title)).Append('</title><style>')
     [void]$sb.Append(':root{--bg:#0F1318;--card:#161B22;--line:#242B36;--text:#E4E8EF;--muted:#8791A5;--ok:#5EE3AE;--warn:#FFC46B;--crit:#FF7A86}')
@@ -3698,6 +3771,7 @@ function ConvertTo-HtmlReport {
     $filter = if ($Module.FilterBox) { $Module.FilterBox.Text.Trim() } else { '' }
     $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2} • wierszy: {3}' -f $script:AppVersion, (Get-Date), $env:USERNAME, $Rows.Count
     if ($filter) { $meta += " • filtr: $filter" }
+    if ($Module.ColumnFilters.Count -gt 0) { $meta += ' • filtry kolumn: ' + (Get-ColumnFiltersText -Module $Module) }
     [void]$sb.Append((& $enc $meta)).Append('</div><div class="card"><table><thead><tr>')
     foreach ($c in $Columns) { [void]$sb.Append('<th>').Append((& $enc $c)).Append('</th>') }
     [void]$sb.Append('</tr></thead><tbody>')
@@ -3753,6 +3827,639 @@ function Show-GridDialog {
     [void]$w.FindName('dlgBody').Children.Add($m.Root)
     [void](Invoke-Dialog $w)
     [void]$script:GridModules.Remove($m.Grid)
+    foreach ($b in @($m.FilterButtons.Values)) { [void]$script:Handlers.Remove($b) }
+}
+#endregion
+
+#region Filtry kolumn tabeli wyników (jak autofiltr w Excelu)
+# $Module.ColumnFilters: kolumna -> @{ Values = HashSet[string] (wybrane wartości) albo $null; Op = warunek; Text = argument }.
+# Wynik oceny wszystkich filtrów kolumn trafia do ukrytej kolumny __cf ('1' = wiersz pasuje), a RowFilter widoku
+# dokłada warunek [__cf] = '1' - porównania liczb, pustych komórek i tekstu działają więc tak, jak widać je w siatce,
+# a filtr działa razem z polem «Filtruj wyniki». Nowe i zmienione wiersze są oceniane na bieżąco.
+$script:FilterOps = [ordered]@{
+    'zawiera'        = 'contains'
+    'nie zawiera'    = 'notcontains'
+    'równa się'      = 'eq'
+    'różne od'       = 'ne'
+    'zaczyna się od' = 'starts'
+    'kończy się na'  = 'ends'
+    'większe niż'    = 'gt'
+    'mniejsze niż'   = 'lt'
+    'puste'          = 'empty'
+    'niepuste'       = 'notempty'
+}
+$script:FilterListLimit = 500
+
+function Get-FilterText($Value) {
+    # Tekst wartości komórki do porównań (jak w siatce: liczby bez formatowania regionalnego, puste = '')
+    if ($null -eq $Value -or $Value -is [System.DBNull]) { return '' }
+    return [string]$Value
+}
+
+function Get-FilterOpLabel([string]$Op) {
+    foreach ($k in $script:FilterOps.Keys) { if ($script:FilterOps[$k] -eq $Op) { return $k } }
+    return $Op
+}
+
+function ConvertTo-FilterNumber([string]$Text, [ref]$Number) {
+    $t = $Text.Trim().Replace(' ', '').Replace(',', '.')
+    if ($t -eq '') { return $false }
+    $n = 0.0
+    if ([double]::TryParse($t, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { $Number.Value = $n; return $true }
+    return $false
+}
+
+function Test-FilterCondition {
+    # Warunek tekstowy filtra kolumny (bez rozróżniania wielkości liter; większe/mniejsze - liczbowo, gdy obie strony są liczbami)
+    param([string]$Text, [string]$Op, [string]$Arg)
+    if ($Op -eq 'empty') { return ($Text.Trim() -eq '') }
+    if ($Op -eq 'notempty') { return ($Text.Trim() -ne '') }
+    if ($Arg -eq '') { return $true }
+    $ci = [System.Globalization.CultureInfo]::CurrentCulture.CompareInfo
+    $ic = [System.Globalization.CompareOptions]::IgnoreCase
+    switch ($Op) {
+        'contains' { return ($ci.IndexOf($Text, $Arg, $ic) -ge 0) }
+        'notcontains' { return ($ci.IndexOf($Text, $Arg, $ic) -lt 0) }
+        'eq' { return ($ci.Compare($Text.Trim(), $Arg.Trim(), $ic) -eq 0) }
+        'ne' { return ($ci.Compare($Text.Trim(), $Arg.Trim(), $ic) -ne 0) }
+        'starts' { return $ci.IsPrefix($Text, $Arg, $ic) }
+        'ends' { return $ci.IsSuffix($Text.TrimEnd(), $Arg, $ic) }
+    }
+    if ($Op -eq 'gt' -or $Op -eq 'lt') {
+        if ($Text.Trim() -eq '') { return $false }
+        $a = 0.0
+        $b = 0.0
+        if ((ConvertTo-FilterNumber $Text ([ref]$a)) -and (ConvertTo-FilterNumber $Arg ([ref]$b))) { $c = $a.CompareTo($b) }
+        else { $c = [string]::Compare($Text.Trim(), $Arg.Trim(), [StringComparison]::OrdinalIgnoreCase) }
+        if ($Op -eq 'gt') { return ($c -gt 0) }
+        return ($c -lt 0)
+    }
+    return $true
+}
+
+function Get-FilterPassSet {
+    # Teksty spełniające warunek - liczone raz dla każdej różnej wartości kolumny (a nie dla każdego wiersza)
+    param($Texts, [string]$Op, [string]$Arg)
+    $pass = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $ci = [System.Globalization.CultureInfo]::CurrentCulture.CompareInfo
+    $ic = [System.Globalization.CompareOptions]::IgnoreCase
+    $a = $Arg.Trim()
+    switch ($Op) {
+        'empty' { foreach ($x in $Texts) { if ($x.Trim() -eq '') { [void]$pass.Add($x) } } }
+        'notempty' { foreach ($x in $Texts) { if ($x.Trim() -ne '') { [void]$pass.Add($x) } } }
+        'contains' { foreach ($x in $Texts) { if ($ci.IndexOf($x, $Arg, $ic) -ge 0) { [void]$pass.Add($x) } } }
+        'notcontains' { foreach ($x in $Texts) { if ($ci.IndexOf($x, $Arg, $ic) -lt 0) { [void]$pass.Add($x) } } }
+        'eq' { foreach ($x in $Texts) { if ($ci.Compare($x.Trim(), $a, $ic) -eq 0) { [void]$pass.Add($x) } } }
+        'ne' { foreach ($x in $Texts) { if ($ci.Compare($x.Trim(), $a, $ic) -ne 0) { [void]$pass.Add($x) } } }
+        'starts' { foreach ($x in $Texts) { if ($ci.IsPrefix($x, $Arg, $ic)) { [void]$pass.Add($x) } } }
+        'ends' { foreach ($x in $Texts) { if ($ci.IsSuffix($x.TrimEnd(), $Arg, $ic)) { [void]$pass.Add($x) } } }
+        { $_ -eq 'gt' -or $_ -eq 'lt' } {
+            $b = 0.0
+            $argNum = ConvertTo-FilterNumber $Arg ([ref]$b)
+            $inv = [System.Globalization.CultureInfo]::InvariantCulture
+            $sty = [System.Globalization.NumberStyles]::Float
+            $gt = ($Op -eq 'gt')
+            foreach ($x in $Texts) {
+                $xt = $x.Trim()
+                if ($xt -eq '') { continue }
+                $n = 0.0
+                if ($argNum -and [double]::TryParse($xt.Replace(' ', '').Replace(',', '.'), $sty, $inv, [ref]$n)) { $c = $n.CompareTo($b) }
+                else { $c = [string]::Compare($xt, $a, [StringComparison]::OrdinalIgnoreCase) }
+                if (($gt -and $c -gt 0) -or (-not $gt -and $c -lt 0)) { [void]$pass.Add($x) }
+            }
+        }
+        default { foreach ($x in $Texts) { [void]$pass.Add($x) } }
+    }
+    return , $pass
+}
+
+function Get-CompiledColumnFilters {
+    # Filtry kolumn do szybkiej oceny wielu wierszy: dla każdej kolumny jeden zbiór dozwolonych tekstów
+    # (wybrane wartości ∩ wartości spełniające warunek) - w pętli po wierszach zostaje tylko sprawdzenie zbioru
+    param([hashtable]$Module, $Table, [string]$Skip = '')
+    $cols = $Table.Columns
+    $deleted = [System.Data.DataRowState]::Deleted
+    return @(foreach ($col in $Module.ColumnFilters.Keys) {
+            if ($col -eq $Skip) { continue }
+            $f = $Module.ColumnFilters[$col]
+            $dc = if ($cols.Contains($col)) { $cols[$col] } else { $null }
+            $set = $f.Values
+            if ($f.Op) {
+                $texts = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+                if ($null -ne $dc) {
+                    foreach ($r in $Table.Rows) {
+                        if ($r.RowState -eq $deleted) { continue }
+                        $v = $r[$dc]
+                        [void]$texts.Add($(if ($null -eq $v -or $v -is [System.DBNull]) { '' } else { [string]$v }))
+                    }
+                }
+                else { [void]$texts.Add('') }
+                $pass = Get-FilterPassSet -Texts $texts -Op $f.Op -Arg $f.Text
+                if ($null -ne $set) { $pass.IntersectWith($set) }
+                $set = $pass
+            }
+            @{ Column = $dc; Values = $set }
+        })
+}
+
+function Test-RowColumnFilters {
+    # Czy wiersz (DataRow) spełnia filtry kolumn; -Skip pomija filtr jednej kolumny
+    param([hashtable]$Module, $Row, [string]$Skip = '')
+    if ($Row -is [System.Data.DataRowView]) { $Row = $Row.Row }
+    $cols = $Row.Table.Columns
+    foreach ($col in $Module.ColumnFilters.Keys) {
+        if ($col -eq $Skip) { continue }
+        $f = $Module.ColumnFilters[$col]
+        $text = if ($cols.Contains($col)) { Get-FilterText $Row[$col] } else { '' }
+        if ($null -ne $f.Values -and -not $f.Values.Contains($text)) { return $false }
+        if ($f.Op -and -not (Test-FilterCondition -Text $text -Op $f.Op -Arg $f.Text)) { return $false }
+    }
+    return $true
+}
+
+function Set-RowFilterFlag {
+    # Ocena filtrów kolumn dla jednego wiersza (po dodaniu albo zmianie wartości)
+    param([hashtable]$Module, $Row)
+    if ($Module.ColumnFilters.Count -eq 0) { return }
+    $v = if (Test-RowColumnFilters -Module $Module -Row $Row) { '1' } else { '0' }
+    if ([string]$Row['__cf'] -ne $v) { $Row['__cf'] = $v }
+}
+
+function Update-ColumnFilterFlags {
+    # Ponowna ocena wszystkich wierszy po zmianie filtrów (pętla bez wywołań funkcji dla filtrów wartości - szybko także przy tysiącach wierszy)
+    param([hashtable]$Module)
+    $t = $Module.Table
+    if ($null -eq $t -or $Module.ColumnFilters.Count -eq 0) { return }
+    $filters = @(Get-CompiledColumnFilters -Module $Module -Table $t)
+    $cf = $t.Columns['__cf']
+    $deleted = [System.Data.DataRowState]::Deleted
+    $wasLoading = $Module.Loading
+    $Module.Loading = $true
+    $t.BeginLoadData()
+    try {
+        foreach ($r in $t.Rows) {
+            if ($r.RowState -eq $deleted) { continue }
+            $ok = $true
+            foreach ($f in $filters) {
+                $v = if ($null -ne $f.Column) { $r[$f.Column] } else { $null }
+                if (-not $f.Values.Contains($(if ($null -eq $v -or $v -is [System.DBNull]) { '' } else { [string]$v }))) { $ok = $false; break }
+            }
+            $flag = if ($ok) { '1' } else { '0' }
+            if ([string]$r[$cf] -ne $flag) { $r[$cf] = $flag }
+        }
+    }
+    finally {
+        $t.EndLoadData()
+        $Module.Loading = $wasLoading
+    }
+}
+
+function Get-ColumnFilterText {
+    # Opis filtra kolumny do podpowiedzi, raportu HTML i dziennika
+    param([hashtable]$Module, [string]$Column)
+    $f = $Module.ColumnFilters[$Column]
+    if (-not $f) { return '' }
+    $parts = @()
+    if ($null -ne $f.Values) {
+        $vals = @($f.Values | Sort-Object | ForEach-Object { if ($_ -eq '') { '(puste)' } else { $_ } })
+        $shown = @($vals | Select-Object -First 6) -join ', '
+        if ($vals.Count -gt 6) { $shown += " … (+$($vals.Count - 6))" }
+        $parts += $(if ($vals.Count -eq 0) { 'żadna wartość' } else { $shown })
+    }
+    if ($f.Op) {
+        $label = Get-FilterOpLabel $f.Op
+        $parts += $(if ($f.Op -eq 'empty' -or $f.Op -eq 'notempty') { $label } else { "$label «$($f.Text)»" })
+    }
+    return ('{0}: {1}' -f $Column, ($parts -join '; '))
+}
+
+function Get-ColumnFiltersText {
+    param([hashtable]$Module)
+    return (@($Module.ColumnFilters.Keys | ForEach-Object { Get-ColumnFilterText -Module $Module -Column $_ }) -join ' • ')
+}
+
+function Set-ColumnFilter {
+    # Ustawia (albo usuwa, gdy brak wartości i warunku) filtr kolumny i odświeża widok
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Column, $Values = $null, [string]$Op = '', [string]$Text = '')
+    if ($Op -and $Op -ne 'empty' -and $Op -ne 'notempty' -and $Text -eq '') { $Op = '' }
+    $set = $null
+    if ($null -ne $Values) {
+        $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($v in @($Values)) { [void]$set.Add([string]$v) }
+    }
+    if ($null -eq $set -and -not $Op) { [void]$Module.ColumnFilters.Remove($Column) }
+    else { $Module.ColumnFilters[$Column] = @{ Values = $set; Op = $Op; Text = $Text } }
+    Update-ColumnFilterState -Module $Module
+    if ($Module.ColumnFilters.Contains($Column)) { Write-Log ('Filtr kolumny – ' + (Get-ColumnFilterText -Module $Module -Column $Column)) -Module $Module.Title }
+}
+
+function Clear-ColumnFilters {
+    param([Parameter(Mandatory)][hashtable]$Module, [string]$Column = '')
+    if ($Column) { [void]$Module.ColumnFilters.Remove($Column) } else { $Module.ColumnFilters.Clear() }
+    Update-ColumnFilterState -Module $Module
+}
+
+function Update-ColumnFilterState {
+    # Flagi wierszy, wyróżnienie lejków w nagłówkach, przycisk «Filtry kolumn» i filtr widoku
+    param([hashtable]$Module)
+    Update-ColumnFilterFlags -Module $Module
+    foreach ($col in @($Module.FilterButtons.Keys)) {
+        $Module.FilterButtons[$col].Tag = $(if ($Module.ColumnFilters.Contains($col)) { 'on' } else { $null })
+    }
+    $chip = $Module.View_['btnFilters']
+    if ($chip) {
+        $n = $Module.ColumnFilters.Count
+        if ($n -gt 0) {
+            $chip.Content = New-IconContent -Text ("Filtry kolumn: {0}" -f $n) -Icon 'E71C' -IconSize 11
+            $chip.ToolTip = (Get-ColumnFiltersText -Module $Module).Replace(' • ', [Environment]::NewLine) + [Environment]::NewLine + '(kliknij, aby wyczyścić filtry kolumn)'
+            $chip.Visibility = 'Visible'
+        }
+        else { $chip.Visibility = 'Collapsed' }
+    }
+    Update-ResultFilter -Module $Module
+}
+
+function New-ColumnHeader {
+    # Nagłówek kolumny: nazwa (+ ołówek dla kolumn edytowalnych) i lejek filtra
+    param([hashtable]$Module, [string]$Name, [switch]$Editable, [switch]$NoFilter)
+    $g = New-Object System.Windows.Controls.Grid
+    [void]$g.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = [System.Windows.GridLength]::new(1, 'Star') }))
+    [void]$g.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = [System.Windows.GridLength]::Auto }))
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Orientation = 'Horizontal'
+    $sp.VerticalAlignment = 'Center'
+    $t = New-Object System.Windows.Controls.TextBlock
+    $t.Text = $Name
+    [void]$sp.Children.Add($t)
+    if ($Editable) {
+        $pen = New-GlyphBlock -Code 'E70F' -Size 10 -Color '#6F8FD8'
+        $pen.Margin = '6,1,0,0'
+        [void]$sp.Children.Add($pen)
+    }
+    [void]$g.Children.Add($sp)
+    if (-not $NoFilter) {
+        $b = New-Object System.Windows.Controls.Button
+        $b.Style = Get-ThemeResource 'HeaderFilterButton'
+        $b.Margin = '8,0,-6,0'
+        $b.CommandParameter = $Name
+        [System.Windows.Controls.Grid]::SetColumn($b, 1)
+        Register-ControlHandler -Control $b -EventName 'Click' -Module $Module -Action { param($m, $s) Show-ColumnFilter -Module $m -Column ([string]$s.CommandParameter) -Anchor $s }
+        [void]$g.Children.Add($b)
+        $Module.FilterButtons[$Name] = $b
+        if ($Module.ColumnFilters.Contains($Name)) { $b.Tag = 'on' }
+    }
+    return $g
+}
+
+function Get-ColumnValueCounts {
+    # Wartości kolumny z liczbą wierszy - z wierszy spełniających filtry pozostałych kolumn
+    param([hashtable]$Module, [string]$Column)
+    $counts = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([StringComparer]::Ordinal)
+    $t = $Module.Table
+    if ($null -eq $t -or -not $t.Columns.Contains($Column)) { return @() }
+    $numeric = $true
+    $filters = @(Get-CompiledColumnFilters -Module $Module -Table $t -Skip $Column)
+    $dc = $t.Columns[$Column]
+    $deleted = [System.Data.DataRowState]::Deleted
+    foreach ($r in $t.Rows) {
+        if ($r.RowState -eq $deleted) { continue }
+        if ($filters.Count -gt 0) {
+            $ok = $true
+            foreach ($f in $filters) {
+                $fv = if ($null -ne $f.Column) { $r[$f.Column] } else { $null }
+                if (-not $f.Values.Contains($(if ($null -eq $fv -or $fv -is [System.DBNull]) { '' } else { [string]$fv }))) { $ok = $false; break }
+            }
+            if (-not $ok) { continue }
+        }
+        $v = $r[$dc]
+        if ($null -eq $v -or $v -is [System.DBNull]) { $text = '' }
+        else {
+            $text = [string]$v
+            if ($numeric -and -not ($v -is [System.ValueType])) { $numeric = $false }
+        }
+        $n = 0
+        [void]$counts.TryGetValue($text, [ref]$n)
+        $counts[$text] = $n + 1
+    }
+    # Puste na końcu; liczby rosnąco liczbowo, tekst alfabetycznie (polska kolejność)
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($k in $counts.Keys) { if ($k -ne '') { $keys.Add($k) } }
+    if ($numeric) {
+        $nums = New-Object 'double[]' $keys.Count
+        for ($i = 0; $i -lt $keys.Count; $i++) { $x = 0.0; [void](ConvertTo-FilterNumber $keys[$i] ([ref]$x)); $nums[$i] = $x }
+        $arr = $keys.ToArray()
+        [Array]::Sort($nums, $arr)
+    }
+    else {
+        $arr = $keys.ToArray()
+        [Array]::Sort($arr, [StringComparer]::Create([System.Globalization.CultureInfo]::GetCultureInfo('pl-PL'), $true))
+    }
+    $result = New-Object System.Collections.ArrayList
+    foreach ($k in $arr) { [void]$result.Add([pscustomobject]@{ Text = $k; Count = $counts[$k] }) }
+    if ($counts.ContainsKey('')) { [void]$result.Add([pscustomobject]@{ Text = ''; Count = $counts[''] }) }
+    return $result.ToArray()
+}
+
+function Set-ResultSort {
+    # Sortowanie siatki po kolumnie (jak kliknięcie nagłówka)
+    param([hashtable]$Module, [string]$Column, [switch]$Descending)
+    $g = $Module.Grid
+    $dir = if ($Descending) { [System.ComponentModel.ListSortDirection]::Descending } else { [System.ComponentModel.ListSortDirection]::Ascending }
+    foreach ($c in $g.Columns) { $c.SortDirection = $(if ([string]$c.SortMemberPath -eq $Column) { $dir } else { $null }) }
+    $g.Items.SortDescriptions.Clear()
+    $g.Items.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription($Column, $dir)))
+}
+
+$script:ColumnFilterXaml = @'
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Background="#1B212A" BorderBrush="#2F3846" BorderThickness="1" CornerRadius="10" Padding="14,12,14,12" Width="330" Margin="0,4,14,14">
+  <Border.Effect>
+    <DropShadowEffect BlurRadius="18" ShadowDepth="4" Opacity="0.5" Color="#000000"/>
+  </Border.Effect>
+  <StackPanel>
+    <Grid Margin="0,0,0,8">
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,76,0">
+        <TextBlock Style="{StaticResource Glyph}" Text="&#xE71C;" FontSize="12" Foreground="#8CB0FF" Margin="0,0,8,0"/>
+        <TextBlock x:Name="fTitle" FontWeight="SemiBold" Foreground="#E4E8EF" TextTrimming="CharacterEllipsis"/>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="fSortAsc" Style="{StaticResource GhostButton}" Padding="7,3" MinHeight="26" ToolTip="Sortuj rosnąco (A → Z, 0 → 9)"/>
+        <Button x:Name="fSortDesc" Style="{StaticResource GhostButton}" Padding="7,3" MinHeight="26" ToolTip="Sortuj malejąco (Z → A, 9 → 0)"/>
+      </StackPanel>
+    </Grid>
+    <TextBlock Text="WARUNEK" Foreground="#5E6779" FontSize="10.5" FontWeight="SemiBold" Margin="1,2,0,5"/>
+    <Grid Margin="0,0,0,12">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="138"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+      <ComboBox x:Name="fOp" Margin="0,0,6,0"/>
+      <TextBox x:Name="fText" Grid.Column="1" Tag="tekst lub liczba…"/>
+    </Grid>
+    <Grid Margin="1,0,0,5">
+      <TextBlock Text="WARTOŚCI" Foreground="#5E6779" FontSize="10.5" FontWeight="SemiBold"/>
+      <TextBlock x:Name="fCount" Foreground="#5E6779" FontSize="10.5" HorizontalAlignment="Right"/>
+    </Grid>
+    <TextBox x:Name="fSearch" Tag="Szukaj wartości…" Margin="0,0,0,6"/>
+    <Border BorderBrush="#2A323F" BorderThickness="1" CornerRadius="6" Background="#161B22">
+      <StackPanel>
+        <CheckBox x:Name="fAll" Content="(Zaznacz wszystkie)" Margin="10,7,8,5" FontWeight="SemiBold"/>
+        <Border Height="1" Background="#242B36" Margin="8,0"/>
+        <ScrollViewer x:Name="fScroll" Height="200" VerticalScrollBarVisibility="Auto" Padding="10,4,6,6">
+          <StackPanel x:Name="fList"/>
+        </ScrollViewer>
+      </StackPanel>
+    </Border>
+    <TextBlock x:Name="fNote" Foreground="#7B8496" FontSize="11.5" TextWrapping="Wrap" Margin="1,6,0,0" Visibility="Collapsed"/>
+    <Grid Margin="0,12,0,0">
+      <Button x:Name="fClear" Style="{StaticResource GhostButton}" HorizontalAlignment="Left" ToolTip="Usuń filtr tej kolumny"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="fCancel" Style="{StaticResource GhostButton}" Content="Anuluj" Margin="0,0,6,0"/>
+        <Button x:Name="fApply" Style="{StaticResource PrimaryButton}" Content="Filtruj"/>
+      </StackPanel>
+    </Grid>
+  </StackPanel>
+</Border>
+'@
+
+$script:ColumnFilterUi = $null
+$script:ColumnFilterEvents = @{
+    ItemToggled = {
+        param($s, $e)
+        try {
+            $ui = $script:ColumnFilterUi
+            if ($ui.Rendering) { return }
+            $cb = $e.OriginalSource
+            if (-not ($cb -is [System.Windows.Controls.CheckBox]) -or $null -eq $cb.Tag) { return }
+            if ($cb.IsChecked -eq $true) { [void]$ui.Checked.Add([string]$cb.Tag) } else { [void]$ui.Checked.Remove([string]$cb.Tag) }
+            Update-ColumnFilterAllBox
+        }
+        catch { }
+    }
+    KeyDown     = {
+        param($s, $e)
+        try {
+            if ($e.Key -eq [System.Windows.Input.Key]::Escape) { $script:ColumnFilterUi.Popup.IsOpen = $false; $e.Handled = $true }
+            elseif ($e.Key -eq [System.Windows.Input.Key]::Enter -and -not ($e.OriginalSource -is [System.Windows.Controls.ComboBox] -or $e.OriginalSource -is [System.Windows.Controls.ComboBoxItem])) {
+                $e.Handled = $true
+                Invoke-UiAction -Module $script:ColumnFilterUi.Module -Action { param($m) Complete-ColumnFilterUi }
+            }
+        }
+        catch { }
+    }
+}
+
+function Initialize-ColumnFilterUi {
+    # Jedno okienko filtra (Popup) używane przez wszystkie tabele
+    if ($script:ColumnFilterUi) { return $script:ColumnFilterUi }
+    $root = New-UiElement $script:ColumnFilterXaml
+    $ui = @{ Root = $root; Module = $null; Column = ''; Values = @(); Matches = @(); Rendering = $false; Checked = $null; AllState = $true }
+    foreach ($n in 'fTitle', 'fSortAsc', 'fSortDesc', 'fOp', 'fText', 'fCount', 'fSearch', 'fAll', 'fScroll', 'fList', 'fNote', 'fClear', 'fCancel', 'fApply') { $ui[$n] = $root.FindName($n) }
+    foreach ($k in $script:FilterOps.Keys) { [void]$ui.fOp.Items.Add($k) }
+    $ui.fSortAsc.Content = New-IconContent -Text '' -Icon 'E74A' -IconSize 12
+    $ui.fSortDesc.Content = New-IconContent -Text '' -Icon 'E74B' -IconSize 12
+    $ui.fClear.Content = New-IconContent -Text 'Wyczyść' -Icon 'E894' -IconSize 11
+    $popup = New-Object System.Windows.Controls.Primitives.Popup
+    $popup.Child = $root
+    $popup.StaysOpen = $false
+    $popup.AllowsTransparency = $true
+    $popup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $popup.PopupAnimation = [System.Windows.Controls.Primitives.PopupAnimation]::Fade
+    $ui.Popup = $popup
+    $script:ColumnFilterUi = $ui
+    $ui.fList.AddHandler([System.Windows.Controls.Primitives.ToggleButton]::CheckedEvent, [System.Windows.RoutedEventHandler]$script:ColumnFilterEvents.ItemToggled)
+    $ui.fList.AddHandler([System.Windows.Controls.Primitives.ToggleButton]::UncheckedEvent, [System.Windows.RoutedEventHandler]$script:ColumnFilterEvents.ItemToggled)
+    $root.add_PreviewKeyDown($script:ColumnFilterEvents.KeyDown)
+    Register-ControlHandler -Control $ui.fSearch -EventName 'TextChanged' -Module $null -Action { param($m) Update-ColumnFilterList }
+    Register-ControlHandler -Control $ui.fAll -EventName 'Click' -Module $null -Action {
+        param($m)
+        $ui = $script:ColumnFilterUi
+        # Stan sprzed kliknięcia: częściowy albo pusty -> zaznacz wszystkie (jak w Excelu), pełny -> odznacz
+        $on = ($ui.AllState -ne $true)
+        foreach ($v in $ui.Matches) { if ($on) { [void]$ui.Checked.Add($v) } else { [void]$ui.Checked.Remove($v) } }
+        $ui.Rendering = $true
+        try { foreach ($cb in $ui.fList.Children) { if ($cb -is [System.Windows.Controls.CheckBox]) { $cb.IsChecked = $on } } }
+        finally { $ui.Rendering = $false }
+        Update-ColumnFilterAllBox
+    }
+    Register-ControlHandler -Control $ui.fApply -EventName 'Click' -Module $null -Action { param($m) Complete-ColumnFilterUi }
+    Register-ControlHandler -Control $ui.fCancel -EventName 'Click' -Module $null -Action { param($m) $script:ColumnFilterUi.Popup.IsOpen = $false }
+    Register-ControlHandler -Control $ui.fClear -EventName 'Click' -Module $null -Action {
+        param($m)
+        $ui = $script:ColumnFilterUi
+        $ui.Popup.IsOpen = $false
+        Clear-ColumnFilters -Module $ui.Module -Column $ui.Column
+    }
+    Register-ControlHandler -Control $ui.fSortAsc -EventName 'Click' -Module $null -Action { param($m) $ui = $script:ColumnFilterUi; $ui.Popup.IsOpen = $false; Set-ResultSort -Module $ui.Module -Column $ui.Column }
+    Register-ControlHandler -Control $ui.fSortDesc -EventName 'Click' -Module $null -Action { param($m) $ui = $script:ColumnFilterUi; $ui.Popup.IsOpen = $false; Set-ResultSort -Module $ui.Module -Column $ui.Column -Descending }
+    return $ui
+}
+
+function Show-ColumnFilter {
+    # Okienko filtra kolumny pod lejkiem w nagłówku (albo pod nagłówkiem siatki, gdy wywołane z menu)
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Column, $Anchor = $null)
+    Complete-GridEdit -Module $Module
+    $ui = Initialize-ColumnFilterUi
+    $ui.Module = $Module
+    $ui.Column = $Column
+    $ui.Values = @(Get-ColumnValueCounts -Module $Module -Column $Column)
+    $f = $Module.ColumnFilters[$Column]
+    $ui.Checked = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($v in $ui.Values) { if ($null -eq $f -or $null -eq $f.Values -or $f.Values.Contains($v.Text)) { [void]$ui.Checked.Add($v.Text) } }
+    $ui.fTitle.Text = $Column
+    $ui.fOp.SelectedItem = $(if ($f -and $f.Op) { Get-FilterOpLabel $f.Op } else { 'zawiera' })
+    $ui.fText.Text = $(if ($f -and $f.Op) { [string]$f.Text } else { '' })
+    $ui.fClear.IsEnabled = ($null -ne $f)
+    $ui.Rendering = $true
+    try { $ui.fSearch.Text = '' } finally { $ui.Rendering = $false }
+    Update-ColumnFilterList
+    if (-not $Anchor) { $Anchor = $(if ($Module.FilterButtons.ContainsKey($Column)) { $Module.FilterButtons[$Column] } else { $Module.Grid }) }
+    if (-not $Anchor.IsVisible) { $Anchor = $Module.Grid }
+    $ui.Popup.PlacementTarget = $Anchor
+    $ui.Popup.IsOpen = $true
+    [void]$ui.fSearch.Focus()
+}
+
+function Update-ColumnFilterList {
+    # Lista pól wyboru wartości (z wyszukiwaniem; najwyżej $script:FilterListLimit pozycji naraz)
+    $ui = $script:ColumnFilterUi
+    if (-not $ui -or $ui.Rendering) { return }
+    $q = $ui.fSearch.Text.Trim()
+    $hits = @(if ($q) { $ui.Values | Where-Object { $_.Text.IndexOf($q, [StringComparison]::CurrentCultureIgnoreCase) -ge 0 -or ($_.Text -eq '' -and '(puste)'.Contains($q.ToLowerInvariant())) } } else { $ui.Values })
+    $ui.Matches = @($hits | ForEach-Object { $_.Text })
+    $ui.Rendering = $true
+    try {
+        $ui.fList.Children.Clear()
+        foreach ($v in @($hits | Select-Object -First $script:FilterListLimit)) {
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Tag = $v.Text
+            $cb.Margin = '0,3,0,3'
+            $cb.IsChecked = $ui.Checked.Contains($v.Text)
+            $sp = New-Object System.Windows.Controls.StackPanel
+            $sp.Orientation = 'Horizontal'
+            $label = New-Object System.Windows.Controls.TextBlock
+            if ($v.Text -eq '') { $label.Text = '(puste)'; $label.FontStyle = 'Italic'; $label.Foreground = Get-Brush '#8791A5' }
+            else { $label.Text = $(if ($v.Text.Length -gt 80) { $v.Text.Substring(0, 80) + '…' } else { $v.Text }) -replace '[\r\n]+', ' ' }
+            $label.MaxWidth = 230
+            $label.TextTrimming = 'CharacterEllipsis'
+            [void]$sp.Children.Add($label)
+            $count = New-Object System.Windows.Controls.TextBlock
+            $count.Text = '  ' + $v.Count
+            $count.Foreground = Get-Brush '#5E6779'
+            $count.FontSize = 11
+            $count.VerticalAlignment = 'Center'
+            [void]$sp.Children.Add($count)
+            $cb.Content = $sp
+            if ($v.Text.Length -gt 30) { $cb.ToolTip = $v.Text }
+            [void]$ui.fList.Children.Add($cb)
+        }
+    }
+    finally { $ui.Rendering = $false }
+    $ui.fScroll.ScrollToTop()
+    $ui.fCount.Text = $(if ($q) { "{0} z {1}" -f $hits.Count, $ui.Values.Count } else { [string]$ui.Values.Count })
+    if ($hits.Count -gt $script:FilterListLimit) {
+        $ui.fNote.Text = "Pokazano $script:FilterListLimit z $($hits.Count) wartości – zawęź listę wyszukiwaniem albo użyj warunku. «Zaznacz wszystkie» obejmuje także niewidoczne."
+        $ui.fNote.Visibility = 'Visible'
+    }
+    elseif ($q) {
+        $ui.fNote.Text = 'Filtr obejmie tylko zaznaczone wartości spośród wyszukanych.'
+        $ui.fNote.Visibility = 'Visible'
+    }
+    else { $ui.fNote.Visibility = 'Collapsed' }
+    Update-ColumnFilterAllBox
+}
+
+function Update-ColumnFilterAllBox {
+    $ui = $script:ColumnFilterUi
+    $on = 0
+    foreach ($v in $ui.Matches) { if ($ui.Checked.Contains($v)) { $on++ } }
+    $ui.AllState = $(if ($ui.Matches.Count -gt 0 -and $on -eq $ui.Matches.Count) { $true } elseif ($on -eq 0) { $false } else { $null })
+    $ui.Rendering = $true
+    try {
+        $ui.fAll.IsChecked = $ui.AllState
+        $ui.fAll.Content = $(if ($ui.fSearch.Text.Trim()) { '(Zaznacz wszystkie wyszukane)' } else { '(Zaznacz wszystkie)' })
+    }
+    finally { $ui.Rendering = $false }
+}
+
+function Complete-ColumnFilterUi {
+    # «Filtruj»: wybrane wartości + warunek -> filtr kolumny
+    $ui = $script:ColumnFilterUi
+    $all = @($ui.Values | ForEach-Object { $_.Text })
+    $source = if ($ui.fSearch.Text.Trim()) { $ui.Matches } else { $all }
+    $selected = @($source | Where-Object { $ui.Checked.Contains($_) })
+    # Bezpośrednie przypisanie: pusta tablica (nic nie zaznaczono) nie może zamienić się w $null (= brak filtra)
+    $values = $null
+    if ($selected.Count -ne $all.Count) { $values = $selected }
+    $op = if ($ui.fOp.SelectedItem) { $script:FilterOps[[string]$ui.fOp.SelectedItem] } else { '' }
+    $text = $ui.fText.Text
+    if ($op -ne 'empty' -and $op -ne 'notempty' -and $text.Trim() -eq '') { $op = '' }
+    $ui.Popup.IsOpen = $false
+    Set-ColumnFilter -Module $ui.Module -Column $ui.Column -Values $values -Op $op -Text $text.Trim()
+}
+
+function Add-QuickFilterMenu {
+    # Pozycje menu kontekstowego: filtr po wartości klikniętej komórki
+    param([hashtable]$Module, $Menu)
+    $cell = $Module.MenuCell
+    if (-not $cell -or -not $cell.Column -or $Module.SecretColumns -contains $cell.Column -or -not $Module.Table.Columns.Contains($cell.Column)) { return }
+    $text = Get-FilterText (Get-ObjectValue $cell.Row $cell.Column)
+    $shown = if ($text -eq '') { '(puste)' } elseif ($text.Length -gt 40) { $text.Substring(0, 40) + '…' } else { $text }
+    $shown = $shown -replace '[\r\n]+', ' '
+    [void]$Menu.Items.Add((New-MenuItem -Text ("Pokaż tylko «{0}»" -f $shown) -Icon 'E71C' -Module $Module -Action {
+                param($m)
+                $c = $m.MenuCell
+                Set-ColumnFilter -Module $m -Column $c.Column -Values @(Get-FilterText (Get-ObjectValue $c.Row $c.Column))
+            }))
+    [void]$Menu.Items.Add((New-MenuItem -Text ("Ukryj «{0}»" -f $shown) -Icon 'E8F6' -Module $Module -Action {
+                param($m)
+                $c = $m.MenuCell
+                $hide = Get-FilterText (Get-ObjectValue $c.Row $c.Column)
+                $current = $m.ColumnFilters[$c.Column]
+                $keep = @(Get-ColumnValueCounts -Module $m -Column $c.Column | ForEach-Object { $_.Text } | Where-Object { $_ -ne $hide -and ($null -eq $current -or $null -eq $current.Values -or $current.Values.Contains($_)) })
+                Set-ColumnFilter -Module $m -Column $c.Column -Values $keep -Op $(if ($current) { $current.Op } else { '' }) -Text $(if ($current) { $current.Text } else { '' })
+            }))
+    [void]$Menu.Items.Add((New-MenuItem -Text ("Filtruj kolumnę «{0}»…" -f $cell.Column) -Icon 'E71C' -Module $Module -Action { param($m) Show-ColumnFilter -Module $m -Column $m.MenuCell.Column }))
+    if ($Module.ColumnFilters.Count -gt 0) {
+        [void]$Menu.Items.Add((New-MenuItem -Text 'Wyczyść filtry kolumn' -Icon 'E894' -Module $Module -Action { param($m) Clear-ColumnFilters -Module $m }))
+    }
+}
+
+function Update-HeaderMenu {
+    # Menu pod prawym przyciskiem na nagłówku kolumny
+    param([hashtable]$Module, $Menu, [string]$Column)
+    $name = $Column
+    $canFilter = $Module.SecretColumns -notcontains $name
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Sortuj rosnąco' -Icon 'E74A' -Module $Module -Action { param($m) Set-ResultSort -Module $m -Column $m.MenuCell.Column }))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Sortuj malejąco' -Icon 'E74B' -Module $Module -Action { param($m) Set-ResultSort -Module $m -Column $m.MenuCell.Column -Descending }))
+    [void]$Menu.Items.Add((New-MenuSeparator))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Filtruj…' -Icon 'E71C' -Module $Module -Enabled $canFilter -Action { param($m) Show-ColumnFilter -Module $m -Column $m.MenuCell.Column }))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Wyczyść filtr kolumny' -Icon 'E894' -Module $Module -Enabled ($Module.ColumnFilters.Contains($name)) -Action { param($m) Clear-ColumnFilters -Module $m -Column $m.MenuCell.Column }))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Wyczyść wszystkie filtry kolumn' -Icon 'E894' -Module $Module -Enabled ($Module.ColumnFilters.Count -gt 0) -Action { param($m) Clear-ColumnFilters -Module $m }))
+    [void]$Menu.Items.Add((New-MenuSeparator))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Ukryj kolumnę' -Icon 'ED1A' -Module $Module -Action {
+                param($m)
+                foreach ($c in $m.Grid.Columns) { if ([string]$c.SortMemberPath -eq $m.MenuCell.Column) { $c.Visibility = 'Collapsed' } }
+                Show-Toast "Ukryto kolumnę «$($m.MenuCell.Column)» – nie trafi do eksportu. «Pokaż wszystkie kolumny» w menu nagłówka ją przywróci." 'info'
+            }))
+    $hidden = @($Module.Grid.Columns | Where-Object { $_.Visibility -ne 'Visible' }).Count
+    [void]$Menu.Items.Add((New-MenuItem -Text $(if ($hidden) { "Pokaż wszystkie kolumny (ukryte: $hidden)" } else { 'Pokaż wszystkie kolumny' }) -Icon 'E7B3' -Module $Module -Enabled ($hidden -gt 0) -Action {
+                param($m)
+                foreach ($c in $m.Grid.Columns) { $c.Visibility = 'Visible' }
+            }))
+}
+
+function Find-VisualParent {
+    param($Element, [type]$Type)
+    $e = $Element
+    while ($e) {
+        if ($e -is $Type) { return $e }
+        if ($e -is [System.Windows.Media.Visual] -or $e -is [System.Windows.Media.Media3D.Visual3D]) { $e = [System.Windows.Media.VisualTreeHelper]::GetParent($e) }
+        elseif ($e -is [System.Windows.FrameworkContentElement]) { $e = $e.Parent }
+        else { $e = $null }
+    }
+    return $null
 }
 #endregion
 
@@ -4202,6 +4909,9 @@ function New-ModuleContext {
         EmptyIcon      = ''
         ResultHint     = ''
         ExtraFilter    = ''
+        ColumnFilters  = [ordered]@{}
+        FilterButtons  = @{}
+        MenuCell       = $null
         ParamsCollapsed = $false
         Data           = @{}
         View_          = @{}
@@ -9204,6 +9914,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserDetails' -Title
             }
         }
     } | Out-Null
+    Add-ObjectReportRow -Module $m -Kind 'User'
     Add-RowAction -Module $m -Text 'Kopiuj DN' -Icon 'E8C8' -Action {
         param($m, $rows)
         $dns = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'DN') } | Where-Object { $_ })
@@ -9872,6 +10583,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
             if (Test-ComputerSecureChannel @tp) { 'Kanał zaufania naprawiony.' } else { 'Błąd – naprawa nie powiodła się.' }
         }
     } | Out-Null
+    Add-ObjectReportRow -Module $m -Kind 'Computer'
     $row2 = Add-ToolbarRow -Module $m -Title 'Konto w AD'
     Add-Button -Parent $row2 -Text 'Włącz' -Icon 'E73E' -Module $m -OnClick { param($m) & $m.Actions.Change $m 'Enable' } | Out-Null
     Add-Button -Parent $row2 -Text 'Wyłącz' -Icon 'E8D8' -Module $m -Danger -OnClick { param($m) & $m.Actions.Change $m 'Disable' } | Out-Null
@@ -10618,6 +11330,7 @@ Register-Module -Workspace 'AdGroups' -Category 'Grupy' -Key 'GroupDetails' -Tit
         $gm = $script:UI.Modules['GroupMembers']
         if ($gm) { Invoke-UiAction -Module $gm -Action $gm.Actions.List }
     } | Out-Null
+    Add-ObjectReportRow -Module $m -Kind 'Group'
     $row2 = Add-ToolbarRow -Module $m -Title 'Zmiany'
     Add-Button -Parent $row2 -Text 'Opis…' -Icon 'E70F' -Module $m -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'Description' } | Out-Null
     Add-Button -Parent $row2 -Text 'Zarządca…' -Icon 'E77B' -Module $m -OnClick { param($m) Invoke-GroupChange -Module $m -Op 'ManagedBy' } | Out-Null
@@ -12289,7 +13002,7 @@ function ConvertTo-GroupTreeHtml {
     # Raport HTML drzewa (rozwijane gałęzie, wyszukiwanie, rozwiń/zwiń wszystko) z wierszy tabeli w kolejności drzewa
     param([object[]]$Rows)
     $rows = @($Rows)
-    $enc = { param($t) [System.Net.WebUtility]::HtmlEncode([string]$t) }
+    $enc = { param($t) ConvertTo-HtmlText $t }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><title>Drzewo grup</title><style>')
     [void]$sb.Append('body{margin:0;padding:28px;background:#0F1318;color:#E4E8EF;font:14px/1.5 "Segoe UI",system-ui,sans-serif}h1{font-size:22px;margin:0 0 4px}.meta{color:#8791A5;margin-bottom:18px}')
@@ -13839,6 +14552,432 @@ Register-Module -Workspace 'AdUsers' -Category 'Porządki' -Key 'DisabledCleanup
     Add-StatTile -Module $m -Key 'exceptions' -Label 'Wyjątki' -Icon 'E7BA' | Out-Null
     Add-StatTile -Module $m -Key 'done' -Label 'Przetworzone' -Icon 'E73E' | Out-Null
     $m.EmptyHint = 'Ustaw jednostkę dla wyłączonych kont i kliknij «Szukaj» (F5). Akcje dotyczą zaznaczonych wierszy (albo wszystkich widocznych).'
+}
+#endregion
+
+#region Raporty HTML obiektów AD (karta konta, komputera, grupy)
+# Dla każdego zaznaczonego obiektu operacja w tle zbiera dane w postaci kart: sekcje (etykieta -> wartość)
+# i listy (grupy, członkowie, podwładni). Z kart powstaje samodzielny plik HTML (bez zasobów z sieci):
+# kafelki z podsumowaniem, spis obiektów, wyszukiwarka, zwijane listy i styl do wydruku.
+# Raport nie zawiera haseł LAPS ani kluczy odzyskiwania BitLocker - tylko informację, czy są w AD.
+$script:ReportListLimit = 2000
+
+$script:ObjectReportHelpers = @'
+function V($v) {
+    # Wartość do raportu: daty bez sekund, Tak/Nie, kolekcje po przecinku
+    if ($null -eq $v) { return '' }
+    if ($v -is [bool]) { if ($v) { return 'Tak' } else { return 'Nie' } }
+    if ($v -is [datetime]) { if ($v.Year -lt 1700) { return '' } else { return $v.ToString('yyyy-MM-dd HH:mm') } }
+    if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) { return (@($v | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) -join ', ') }
+    return [string]$v
+}
+function Get-FileTimeText($v) {
+    # FILETIME (np. lockoutTime, ms-Mcs-AdmPwdExpirationTime) -> data
+    try { $n = [int64][string]$v; if ($n -le 0 -or $n -eq [int64]::MaxValue) { return '' }; return [datetime]::FromFileTime($n).ToString('yyyy-MM-dd HH:mm') } catch { return '' }
+}
+function Get-MemberOfRows($Obj, [bool]$Nested, [bool]$WithPrimary) {
+    # Grupy obiektu: bezpośrednie (memberOf), opcjonalnie zagnieżdżone (reguła łańcuchowa) i grupa podstawowa
+    $direct = @{}
+    foreach ($dn in @($Obj.memberOf)) { if ($dn) { $direct[[string]$dn] = $true } }
+    $groups = @()
+    if ($Nested) { $groups = @(Get-ADGroup -LDAPFilter ('(member:1.2.840.113556.1.4.1941:={0})' -f (ConvertTo-LdapValue ([string]$Obj.DistinguishedName))) -Properties Description @ad) }
+    else { $groups = @($Obj.memberOf | Where-Object { $_ } | ForEach-Object { Get-ADGroup -Identity $_ -Properties Description @ad }) }
+    if ($WithPrimary -and $Obj.PrimaryGroupID) {
+        try {
+            $primary = Get-ADGroup -Identity ('{0}-{1}' -f $Obj.SID.AccountDomainSid.Value, $Obj.PrimaryGroupID) -Properties Description @ad
+            if ($primary) { $groups += $primary; $direct[[string]$primary.DistinguishedName] = $true }
+        }
+        catch { }
+    }
+    foreach ($g in ($groups | Sort-Object Name -Unique)) {
+        $isDirect = $direct.ContainsKey([string]$g.DistinguishedName)
+        [pscustomobject][ordered]@{
+            'Grupa'       = $g.Name
+            'Członkostwo' = $(if ($g.SID.Value -match '-(513|515)$' -and $isDirect) { 'Podstawowa' } elseif ($isDirect) { 'Bezpośrednie' } else { 'Zagnieżdżone' })
+            'Zakres'      = Get-ScopeLabel $g.GroupScope
+            'Typ'         = Get-CategoryLabel $g.GroupCategory
+            'Opis'        = $g.Description
+        }
+    }
+}
+function Get-OuPath([string]$Dn) {
+    # DN jednostki -> ścieżka jak w konsoli ADUC: contoso.local/Firma/Warszawa/Użytkownicy
+    $parts = @([regex]::Split($Dn, '(?<!\\),') | Where-Object { $_ })
+    $dc = @($parts | Where-Object { $_ -match '^DC=' } | ForEach-Object { $_.Substring(3) }) -join '.'
+    $rest = @($parts | Where-Object { $_ -notmatch '^DC=' } | ForEach-Object { ($_ -replace '^[^=]+=', '') -replace '\\(.)', '$1' })
+    [array]::Reverse($rest)
+    return ((@($dc) + $rest) | Where-Object { $_ }) -join '/'
+}
+function New-ReportList([string]$Title, [object[]]$Rows, [string]$Empty, [int]$Limit) {
+    $all = @($Rows | Where-Object { $null -ne $_ })
+    return @{ Title = $Title; Total = $all.Count; Rows = @($all | Select-Object -First $Limit); Empty = $Empty }
+}
+'@
+
+$script:ObjectReportScripts = @{
+    User     = {
+        . ([scriptblock]::Create($P.Helpers))
+        $u = Get-ADUser -Identity $Target -Properties * @ad
+        $st = & ([scriptblock]::Create($P.StateScript)) $u
+        $login = [string]$u.SamAccountName
+        $dn = [string]$u.DistinguishedName
+        $reports = @(Get-ADUser -LDAPFilter ('(manager={0})' -f (ConvertTo-LdapValue $dn)) -Properties displayName, title, department @ad)
+        $aliases = @($u.proxyAddresses | Where-Object { [string]$_ -clike 'smtp:*' } | ForEach-Object { ([string]$_).Substring(5) })
+        $uac = [int64]$u.userAccountControl
+        $pwdAge = if ($u.PasswordLastSet) { [int]((Get-Date) - $u.PasswordLastSet).TotalDays } else { $null }
+        $mustChange = ($null -ne $u.pwdLastSet -and [int64]$u.pwdLastSet -eq 0)
+        $chips = New-Object System.Collections.ArrayList
+        if ($u.PasswordNeverExpires) { [void]$chips.Add(@{ Text = 'Hasło nigdy nie wygasa'; Tone = 'warn' }) }
+        if ($mustChange) { [void]$chips.Add(@{ Text = 'Zmiana hasła przy logowaniu'; Tone = 'info' }) }
+        if ([int]$u.adminCount -eq 1) { [void]$chips.Add(@{ Text = 'Konto uprzywilejowane (adminCount)'; Tone = 'warn' }) }
+        if ($uac -band 0x40000) { [void]$chips.Add(@{ Text = 'Logowanie kartą inteligentną'; Tone = 'info' }) }
+        if ($uac -band 0x400000) { [void]$chips.Add(@{ Text = 'Bez wstępnego uwierzytelnienia Kerberos'; Tone = 'crit' }) }
+        if ($uac -band 0x20) { [void]$chips.Add(@{ Text = 'Hasło nie jest wymagane'; Tone = 'crit' }) }
+        $lists = New-Object System.Collections.ArrayList
+        [void]$lists.Add((New-ReportList -Title 'Grupy' -Rows @(Get-MemberOfRows $u ([bool]$P.Nested) $true) -Empty 'Konto nie należy do żadnej grupy.' -Limit $P.Limit))
+        if ($reports.Count -gt 0) {
+            $rows = foreach ($r in ($reports | Sort-Object Name)) { [pscustomobject][ordered]@{ 'Nazwa' = $(if ($r.displayName) { $r.displayName } else { $r.Name }); 'Login' = $r.SamAccountName; 'Stanowisko' = $r.title; 'Dział' = $r.department } }
+            [void]$lists.Add((New-ReportList -Title 'Podwładni' -Rows @($rows) -Empty '' -Limit $P.Limit))
+        }
+        $name = if ($u.DisplayName) { [string]$u.DisplayName } else { [string]$u.Name }
+        [pscustomobject]@{
+            Name     = $name
+            Sub      = (@($login, [string]$u.UserPrincipalName) | Where-Object { $_ }) -join ' • '
+            State    = $st.State
+            Tone     = $st.Tone
+            Toc      = [ordered]@{ 'Nazwa' = $name; 'Login' = $login; 'Stan' = $st.State; 'Dział' = [string]$u.Department; 'Ostatnie logowanie' = (V $u.LastLogonDate); 'Jednostka OU' = (Get-OuPath (Get-DnParent $dn)) }
+            Chips    = @($chips)
+            Sections = @(
+                @{ Title = 'Tożsamość'; Items = [ordered]@{
+                        'Login' = $login; 'UPN' = V $u.UserPrincipalName; 'Imię' = V $u.GivenName; 'Nazwisko' = V $u.Surname; 'Nazwa wyświetlana' = V $u.DisplayName
+                        'E-mail' = V $u.mail; 'Inne adresy e-mail' = ($aliases -join ', '); 'Numer pracownika' = V $(if ($u.employeeID) { $u.employeeID } else { $u.employeeNumber }); 'SID' = V $u.SID; 'GUID' = V $u.ObjectGUID
+                    }
+                }
+                @{ Title = 'Organizacja'; Items = [ordered]@{
+                        'Stanowisko' = V $u.Title; 'Dział' = V $u.Department; 'Firma' = V $u.Company; 'Biuro' = V $u.physicalDeliveryOfficeName; 'Miasto' = V $u.l
+                        'Telefon' = V $u.telephoneNumber; 'Komórka' = V $u.mobile; 'Przełożony' = $(if ($u.Manager) { Get-DnName ([string]$u.Manager) } else { '' }); 'Podwładni' = $(if ($reports.Count) { [string]$reports.Count } else { '' }); 'Opis' = V $u.Description
+                    }
+                }
+                @{ Title = 'Konto'; Items = [ordered]@{
+                        'Stan' = $st.State; 'Włączone' = V ([bool]$u.Enabled); 'Zablokowane' = $(if ($u.LockedOut) { 'Tak – od ' + (Get-FileTimeText $u.lockoutTime) } else { 'Nie' }); 'Konto wygasa' = $(if ($u.AccountExpirationDate) { V $u.AccountExpirationDate } else { 'Nigdy' })
+                        'Ostatnie logowanie' = V $u.LastLogonDate; 'Liczba logowań' = V $u.logonCount; 'Błędne hasła' = V $u.badPwdCount; 'Ostatnie błędne hasło' = Get-FileTimeText $u.badPasswordTime
+                        'Utworzono' = V $u.whenCreated; 'Zmieniono' = V $u.whenChanged; 'Jednostka OU' = Get-OuPath (Get-DnParent $dn); 'DN' = $dn
+                    }
+                }
+                @{ Title = 'Hasło'; Items = [ordered]@{
+                        'Ustawione' = V $u.PasswordLastSet; 'Wiek hasła (dni)' = V $pwdAge; 'Wygasa' = $(if ($u.PasswordNeverExpires) { 'Nigdy' } else { V $st.Expiry }); 'Nigdy nie wygasa' = V ([bool]$u.PasswordNeverExpires)
+                        'Zmiana przy logowaniu' = V $mustChange; 'Nie można zmienić hasła' = V ([bool]$u.CannotChangePassword); 'Hasło wygasło' = V ([bool]$u.PasswordExpired)
+                    }
+                }
+                @{ Title = 'Profil i logowanie'; Items = [ordered]@{
+                        'Skrypt logowania' = V $u.ScriptPath; 'Folder domowy' = V $u.HomeDirectory; 'Dysk domowy' = V $u.HomeDrive; 'Profil mobilny' = V $u.ProfilePath; 'Stacje logowania' = V $u.userWorkstations
+                    }
+                }
+            )
+            Lists    = @($lists)
+        }
+    }
+    Computer = {
+        . ([scriptblock]::Create($P.Helpers))
+        $c = Get-ADComputer -Identity $Target -Properties * @ad
+        $dn = [string]$c.DistinguishedName
+        $days = if ($c.LastLogonDate) { [int]((Get-Date) - $c.LastLogonDate).TotalDays } else { $null }
+        $state = if (-not $c.Enabled) { 'Wyłączone' } elseif ($null -eq $days) { 'Nigdy nie logowane' } elseif ($days -gt 90) { "Nieaktywne ($days dni)" } else { 'Aktywne' }
+        $tone = if (-not $c.Enabled) { '' } elseif ($state -eq 'Aktywne') { 'ok' } else { 'warn' }
+        $uac = [int64]$c.userAccountControl
+        $lapsNew = $c.'msLAPS-PasswordExpirationTime'
+        $lapsOld = $c.'ms-Mcs-AdmPwdExpirationTime'
+        $laps = if ($lapsNew) { 'Windows LAPS – hasło wygasa ' + (Get-FileTimeText $lapsNew) } elseif ($lapsOld) { 'LAPS (legacy) – hasło wygasa ' + (Get-FileTimeText $lapsOld) } else { 'Brak hasła LAPS w AD' }
+        $bl = @()
+        try { $bl = @(Get-ADObject -SearchBase $dn -SearchScope OneLevel -LDAPFilter '(objectClass=msFVE-RecoveryInformation)' -Properties whenCreated @ad) } catch { }
+        $blText = if ($bl.Count) { '{0} (ostatni: {1})' -f $bl.Count, (V (@($bl | Sort-Object whenCreated -Descending)[0].whenCreated)) } else { 'Brak kluczy w AD' }
+        $deleg = if ($uac -band 0x80000) { 'Nieograniczone' } elseif ($uac -band 0x1000000) { 'Ograniczone (z przejściem protokołu)' } elseif ($c.'msDS-AllowedToDelegateTo') { 'Ograniczone' } else { 'Brak' }
+        $chips = New-Object System.Collections.ArrayList
+        if ($c.OperatingSystem) { [void]$chips.Add(@{ Text = [string]$c.OperatingSystem; Tone = 'info' }) }
+        if (-not $lapsNew -and -not $lapsOld) { [void]$chips.Add(@{ Text = 'Bez LAPS'; Tone = 'warn' }) }
+        if ($bl.Count -eq 0) { [void]$chips.Add(@{ Text = 'Bez klucza BitLocker w AD'; Tone = 'warn' }) }
+        if ($uac -band 0x80000) { [void]$chips.Add(@{ Text = 'Delegowanie nieograniczone'; Tone = 'crit' }) }
+        if ($uac -band 0x2000) { [void]$chips.Add(@{ Text = 'Kontroler domeny'; Tone = 'info' }) }
+        $lists = @((New-ReportList -Title 'Grupy' -Rows @(Get-MemberOfRows $c ([bool]$P.Nested) $true) -Empty 'Komputer nie należy do żadnej grupy.' -Limit $P.Limit))
+        [pscustomobject]@{
+            Name     = [string]$c.Name
+            Sub      = (@([string]$c.DNSHostName, [string]$c.OperatingSystem) | Where-Object { $_ }) -join ' • '
+            State    = $state
+            Tone     = $tone
+            Toc      = [ordered]@{ 'Nazwa' = [string]$c.Name; 'System' = (V $c.OperatingSystem); 'Stan' = $state; 'Ostatnie logowanie' = (V $c.LastLogonDate); 'Jednostka OU' = (Get-OuPath (Get-DnParent $dn)) }
+            Chips    = @($chips)
+            Sections = @(
+                @{ Title = 'System'; Items = [ordered]@{
+                        'System' = V $c.OperatingSystem; 'Wersja' = V $c.OperatingSystemVersion; 'Dodatek' = V $c.OperatingSystemServicePack; 'Nazwa DNS' = V $c.DNSHostName; 'IPv4' = V $c.IPv4Address
+                    }
+                }
+                @{ Title = 'Konto komputera'; Items = [ordered]@{
+                        'Stan' = $state; 'Włączone' = V ([bool]$c.Enabled); 'Ostatnie logowanie' = V $c.LastLogonDate; 'Dni bez logowania' = V $days; 'Hasło konta zmienione' = V $c.PasswordLastSet
+                        'Utworzono' = V $c.whenCreated; 'Zmieniono' = V $c.whenChanged; 'Opis' = V $c.Description; 'Lokalizacja' = V $c.Location
+                        'Zarządzany przez' = $(if ($c.ManagedBy) { Get-DnName ([string]$c.ManagedBy) } else { '' }); 'Jednostka OU' = Get-OuPath (Get-DnParent $dn); 'DN' = $dn; 'SID' = V $c.SID
+                    }
+                }
+                @{ Title = 'Zabezpieczenia'; Items = [ordered]@{
+                        'LAPS' = $laps; 'Klucze BitLocker w AD' = $blText; 'Delegowanie Kerberos' = $deleg; 'Nazwy SPN' = [string]@($c.servicePrincipalName | Where-Object { $_ }).Count
+                    }
+                }
+            )
+            Lists    = $lists
+        }
+    }
+    Group    = {
+        . ([scriptblock]::Create($P.Helpers))
+        $g = Get-ADGroup -Identity $Target -Properties * @ad
+        $dn = [string]$g.DistinguishedName
+        $rid = [int](([string]$g.SID.Value) -split '-')[-1]
+        $primary = if (@(513, 515, 516, 521) -contains $rid) { $rid } else { 0 }
+        $props = @('title', 'department', 'description')
+        $direct = @(Get-GroupMemberObjects -GroupDn $dn -PrimaryRid $primary -Properties $props)
+        $directDn = @{}
+        foreach ($o in $direct) { $directDn[[string]$o.DistinguishedName] = $true }
+        $members = if ($P.Nested) { @(Get-GroupMemberObjects -GroupDn $dn -Recursive -PrimaryRid $primary -Properties $props) } else { $direct }
+        # Liczniki rodzajów - z członków bezpośrednich; wyłączone konta - z całej listy (także zagnieżdżonych)
+        $kinds = @{}
+        foreach ($o in $direct) { $cls = [string]$o.ObjectClass; $kinds[$cls] = 1 + [int]$kinds[$cls] }
+        $disabled = 0
+        $rows = foreach ($o in ($members | Sort-Object @{ Expression = { switch ([string]$_.ObjectClass) { 'group' { 0 } 'user' { 1 } 'inetOrgPerson' { 1 } 'computer' { 2 } default { 3 } } } }, Name)) {
+            $cls = [string]$o.ObjectClass
+            $off = (($cls -eq 'user' -or $cls -eq 'computer' -or $cls -eq 'inetOrgPerson') -and ([int64]$o.userAccountControl -band 2))
+            if ($off) { $disabled++ }
+            $row = [ordered]@{
+                'Nazwa' = $(if ($o.displayName) { [string]$o.displayName } else { [string]$o.Name })
+                'Login' = ([string]$o.sAMAccountName) -replace '\$$', ''
+                'Typ'   = Get-ObjectKind $cls
+                'Stan'  = $(if ($cls -eq 'group' -or $cls -eq 'contact') { '' } elseif ($off) { 'Wyłączone' } else { 'Włączone' })
+            }
+            if ($P.Nested) { $row['Członkostwo'] = $(if ($directDn.ContainsKey([string]$o.DistinguishedName)) { 'Bezpośrednie' } else { 'Zagnieżdżone' }) }
+            $row['Stanowisko / opis'] = $(if ($o.title) { [string]$o.title } else { [string]$o.description })
+            [pscustomobject]$row
+        }
+        $parents = foreach ($p in ($g.memberOf | Where-Object { $_ })) {
+            try {
+                $pg = Get-ADGroup -Identity $p -Properties Description @ad
+                [pscustomobject][ordered]@{ 'Grupa' = $pg.Name; 'Zakres' = Get-ScopeLabel $pg.GroupScope; 'Typ' = Get-CategoryLabel $pg.GroupCategory; 'Opis' = $pg.Description }
+            }
+            catch { }
+        }
+        $users = [int]$kinds['user'] + [int]$kinds['inetOrgPerson']
+        $category = Get-CategoryLabel $g.GroupCategory
+        $chips = New-Object System.Collections.ArrayList
+        [void]$chips.Add(@{ Text = (Get-ScopeLabel $g.GroupScope); Tone = 'info' })
+        if ($direct.Count -eq 0) { [void]$chips.Add(@{ Text = 'Pusta'; Tone = 'warn' }) }
+        if ([int]$g.adminCount -eq 1) { [void]$chips.Add(@{ Text = 'Uprzywilejowana (adminCount)'; Tone = 'warn' }) }
+        if ($disabled -gt 0) { [void]$chips.Add(@{ Text = "Wyłączone konta: $disabled"; Tone = 'warn' }) }
+        if ($g.ProtectedFromAccidentalDeletion) { [void]$chips.Add(@{ Text = 'Chroniona przed usunięciem'; Tone = '' }) }
+        $memberTitle = if ($P.Nested) { 'Członkowie (także zagnieżdżeni)' } else { 'Członkowie' }
+        [pscustomobject]@{
+            Name     = [string]$g.Name
+            Sub      = (@($(if ([string]$g.SamAccountName -ne [string]$g.Name) { [string]$g.SamAccountName }), [string]$g.Description) | Where-Object { $_ }) -join ' • '
+            State    = $category
+            Tone     = $(if ([string]$g.GroupCategory -eq 'Security') { 'info' } else { '' })
+            Toc      = [ordered]@{ 'Nazwa' = [string]$g.Name; 'Typ' = $category; 'Zakres' = (Get-ScopeLabel $g.GroupScope); 'Członkowie' = [string]$direct.Count; 'Jednostka OU' = (Get-OuPath (Get-DnParent $dn)) }
+            Chips    = @($chips)
+            Sections = @(
+                @{ Title = 'Grupa'; Items = [ordered]@{
+                        'Nazwa' = [string]$g.Name; 'sAMAccountName' = V $g.SamAccountName; 'Nazwa wyświetlana' = V $g.displayName; 'Zakres' = Get-ScopeLabel $g.GroupScope; 'Typ' = $category
+                        'E-mail' = V $g.mail; 'Opis' = V $g.Description; 'Uwagi' = V $g.info; 'Zarządca' = $(if ($g.managedBy) { Get-DnName ([string]$g.managedBy) } else { '' })
+                    }
+                }
+                @{ Title = 'Członkowie'; Items = [ordered]@{
+                        'Bezpośredni' = [string]$direct.Count; 'w tym użytkownicy' = [string]$users; 'w tym komputery' = [string][int]$kinds['computer']; 'w tym grupy' = [string][int]$kinds['group']
+                        'Łącznie z zagnieżdżonymi' = $(if ($P.Nested) { [string]@($members).Count } else { '' }); $(if ($P.Nested) { 'Wyłączone konta (łącznie)' } else { 'Wyłączone konta' }) = [string]$disabled; 'Należy do grup' = [string]@($parents).Count
+                    }
+                }
+                @{ Title = 'Obiekt'; Items = [ordered]@{
+                        'Utworzono' = V $g.whenCreated; 'Zmieniono' = V $g.whenChanged; 'Chroniona przed usunięciem' = V ([bool]$g.ProtectedFromAccidentalDeletion); 'Uprzywilejowana' = V ([int]$g.adminCount -eq 1)
+                        'Jednostka OU' = Get-OuPath (Get-DnParent $dn); 'DN' = $dn; 'SID' = V $g.SID
+                    }
+                }
+            )
+            Lists    = @(
+                (New-ReportList -Title $memberTitle -Rows @($rows) -Empty 'Grupa nie ma członków.' -Limit $P.Limit)
+                (New-ReportList -Title 'Należy do grup' -Rows @($parents) -Empty 'Grupa nie należy do innych grup.' -Limit $P.Limit)
+            )
+        }
+    }
+}
+
+$script:ObjectReportKinds = @{
+    User     = @{ Title = 'Konta użytkowników'; File = 'Konta'; Noun = 'kont'; Nested = 'Także grupy zagnieżdżone'; Hint = 'Karta każdego zaznaczonego konta: dane osobowe i organizacyjne, stan konta i hasła, profil, grupy i podwładni.' }
+    Computer = @{ Title = 'Komputery'; File = 'Komputery'; Noun = 'komputerów'; Nested = 'Także grupy zagnieżdżone'; Hint = 'Karta każdego zaznaczonego komputera: system, konto, LAPS i BitLocker (bez haseł i kluczy), delegowanie, grupy.' }
+    Group    = @{ Title = 'Grupy'; File = 'Grupy'; Noun = 'grup'; Nested = 'Także członkowie zagnieżdżeni'; Hint = 'Karta każdej zaznaczonej grupy: właściwości, zarządca, członkowie z typem i stanem kont, grupy nadrzędne.' }
+}
+
+function Add-ObjectReportRow {
+    # Wiersz «Raport» w module szczegółów: opcja zagnieżdżeń + przycisk raportu HTML
+    param([hashtable]$Module, [ValidateSet('User', 'Computer', 'Group')][string]$Kind)
+    $k = $script:ObjectReportKinds[$Kind]
+    $row = Add-ToolbarRow -Module $Module -Title 'Raport'
+    $Module.ReportNested = Add-CheckBox -Parent $row -Text $k.Nested -ToolTip 'Wolniejsze przy dużych grupach i głębokich zagnieżdżeniach'
+    $Module.Data.ReportKind = $Kind
+    Add-Button -Parent $row -Text 'Raport HTML…' -Icon 'E8A5' -Module $Module -ToolTip $k.Hint -OnClick { param($m) Start-ObjectReport -Module $m -Kind $m.Data.ReportKind } | Out-Null
+    Add-Label -Parent $row -Text $k.Hint -Hint -MaxWidth 560 | Out-Null
+}
+
+function Start-ObjectReport {
+    # Zbiera dane zaznaczonych obiektów w tle i zapisuje raport HTML (-Path pomija okno zapisu, -NoOpen nie otwiera przeglądarki)
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][ValidateSet('User', 'Computer', 'Group')][string]$Kind, [string]$Path = '', [switch]$NoOpen)
+    $targets = @(switch ($Kind) { 'User' { Get-TargetUsers } 'Computer' { Get-AdComputerTargets } 'Group' { Get-TargetGroups } })
+    if ($targets.Count -eq 0) { return }
+    $k = $script:ObjectReportKinds[$Kind]
+    if (-not $Path) {
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'Raport HTML (*.html)|*.html'
+        $dlg.FileName = '{0}_raport_{1:yyyyMMdd_HHmm}.html' -f $k.File, (Get-Date)
+        $answer = if ($script:UI.Window) { $dlg.ShowDialog($script:UI.Window) } else { $dlg.ShowDialog() }
+        if ($answer -ne $true) { return }
+        $Path = $dlg.FileName
+    }
+    $nested = $false
+    if ($Module['ReportNested']) { $nested = Test-Checked $Module.ReportNested }
+    $Module.Data.Report = @{ Kind = $Kind; Path = $Path; NoOpen = [bool]$NoOpen; Nested = $nested; Items = New-Object System.Collections.ArrayList; Errors = New-Object System.Collections.ArrayList }
+    $params = @{ Helpers = $script:ObjectReportHelpers; StateScript = $script:UserStateScript.ToString(); Nested = $nested; Limit = $script:ReportListLimit }
+    Start-AdOperation -Module $Module -Name "Raport HTML – $($k.Title.ToLowerInvariant())" -Targets $targets -Output None -Parameters $params -ScriptBlock $script:ObjectReportScripts[$Kind] -OnResult {
+        param($m, $r)
+        $rep = $m.Data.Report
+        $card = @($r.Data | Where-Object { $_ -and $_.PSObject.Properties['Sections'] })
+        if ($r.Ok -and $card.Count -gt 0) { [void]$rep.Items.Add($card[0]) }
+        else { [void]$rep.Errors.Add([pscustomobject]@{ Obiekt = $r.Target; Błąd = (@($r.Errors | Where-Object { $_ }) -join ' ') }) }
+    } -OnComplete {
+        param($m)
+        $rep = $m.Data.Report
+        $items = @($rep.Items | Sort-Object Name)
+        $html = ConvertTo-ObjectReportHtml -Kind $rep.Kind -Items $items -Errors @($rep.Errors) -Nested:$rep.Nested
+        [System.IO.File]::WriteAllText($rep.Path, $html, (New-Object System.Text.UTF8Encoding($true)))
+        Write-Log ("Zapisano raport HTML ({0} obiektów{1}): {2}" -f $items.Count, $(if ($rep.Errors.Count) { ", błędy: $($rep.Errors.Count)" } else { '' }), $rep.Path) 'OK'
+        Show-Toast ("Zapisano raport: {0}" -f [System.IO.Path]::GetFileName($rep.Path)) $(if ($rep.Errors.Count) { 'warn' } else { 'ok' })
+        if (-not $rep.NoOpen) { try { Start-Process -FilePath $rep.Path } catch { } }
+    }
+}
+
+function ConvertTo-ObjectReportHtml {
+    # Samodzielny raport HTML z kart obiektów (ciemny motyw programu, jasny przy wydruku)
+    param([ValidateSet('User', 'Computer', 'Group')][string]$Kind, [object[]]$Items, [object[]]$Errors = @(), [switch]$Nested)
+    $k = $script:ObjectReportKinds[$Kind]
+    $enc = { param($t) ConvertTo-HtmlText $t }
+    $toneClass = { param($t) switch ([string]$t) { 'ok' { 'ok' } 'warn' { 'warn' } 'crit' { 'crit' } 'info' { 'info' } default { 'mute' } } }
+    $sb = New-Object System.Text.StringBuilder
+    $title = "$($k.Title) – raport szczegółowy"
+    [void]$sb.Append('<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>').Append((& $enc $title)).Append('</title><style>')
+    [void]$sb.Append(':root{--bg:#0F1318;--card:#161B22;--card2:#1B212A;--line:#242B36;--line2:#222935;--text:#E4E8EF;--muted:#8791A5;--faint:#5E6779;--ok:#5EE3AE;--warn:#FFC46B;--crit:#FF7A86;--info:#8CC0FF;--accent:#3E6FE0}')
+    [void]$sb.Append('*{box-sizing:border-box}body{margin:0;padding:28px 32px;background:var(--bg);color:var(--text);font:13.5px/1.5 "Segoe UI",system-ui,sans-serif}a{color:var(--info);text-decoration:none}a:hover{text-decoration:underline}')
+    [void]$sb.Append('h1{font-size:24px;margin:0 0 4px}.meta{color:var(--muted);margin-bottom:18px}')
+    [void]$sb.Append('.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 18px;min-width:140px}.tile b{display:block;font-size:22px;font-weight:600}.tile span{color:var(--muted);font-size:12px}')
+    [void]$sb.Append('.tile.ok b{color:var(--ok)}.tile.warn b{color:var(--warn)}.tile.crit b{color:var(--crit)}.tile.info b{color:var(--info)}')
+    [void]$sb.Append('.bar{position:sticky;top:0;z-index:5;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}')
+    [void]$sb.Append('input{flex:0 1 380px;background:var(--card2);color:var(--text);border:1px solid #2A323F;border-radius:7px;padding:8px 10px;font:inherit}button{background:var(--accent);color:#fff;border:0;border-radius:7px;padding:8px 14px;font:inherit;cursor:pointer}button.g{background:#1E252F;color:#C9D0DC}.cnt{color:var(--muted);margin-left:auto}')
+    [void]$sb.Append('.box{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:auto}')
+    [void]$sb.Append('table{border-collapse:collapse;width:100%}th{background:#1B212A;color:var(--muted);text-align:left;font-weight:600;padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap;font-size:12.5px}td{padding:6px 12px;border-bottom:1px solid #1F2530;vertical-align:top}tr:nth-child(even) td{background:#181E26}')
+    [void]$sb.Append('.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:0 0 16px;scroll-margin-top:80px}')
+    [void]$sb.Append('.head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.head h2{margin:0;font-size:18px}.sub{color:var(--muted);margin-top:2px}.top{font-size:12px;color:var(--faint)}')
+    [void]$sb.Append('.pill{display:inline-block;padding:2px 11px;border-radius:10px;font-weight:600;font-size:12.5px;white-space:nowrap;background:#1E252F;color:#AEB6C4}.pill.ok{color:var(--ok);background:#15291F}.pill.warn{color:var(--warn);background:#2E2616}.pill.crit{color:var(--crit);background:#2E1A1E}.pill.info{color:var(--info);background:#1A2640}')
+    [void]$sb.Append('.chips{margin:10px 0 0}.chip{display:inline-block;font-size:11.5px;padding:1px 9px;border-radius:9px;margin:0 6px 4px 0;background:#1E252F;color:#C9D0DC}.chip.warn{background:#2E2616;color:var(--warn)}.chip.crit{background:#2E1A1E;color:var(--crit)}.chip.info{background:#1A2640;color:var(--info)}')
+    [void]$sb.Append('.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-top:14px}.sec{background:var(--card2);border:1px solid var(--line2);border-radius:10px;padding:10px 14px}')
+    [void]$sb.Append('.sec h3{margin:0 0 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}dl{display:grid;grid-template-columns:minmax(130px,42%) 1fr;gap:3px 12px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-word}dd.e{color:#3F4757}')
+    [void]$sb.Append('details{margin-top:12px;border:1px solid var(--line2);border-radius:10px;background:var(--card2);overflow:auto}summary{cursor:pointer;padding:9px 14px;font-weight:600;list-style:none}summary::-webkit-details-marker{display:none}summary::before{content:"▸";display:inline-block;width:16px;color:var(--muted)}details[open]>summary::before{content:"▾";color:var(--info)}')
+    [void]$sb.Append('.n{display:inline-block;margin-left:6px;padding:0 8px;border-radius:8px;background:#1A2640;color:var(--info);font-size:11.5px}.empty{padding:2px 14px 12px;color:var(--faint)}.note{padding:6px 14px 10px;color:var(--warn);font-size:12px}')
+    [void]$sb.Append('.errs{border-color:#4A2A32}.errs h2{color:var(--crit);font-size:15px;margin:0;padding:12px 14px}')
+    [void]$sb.Append('@media print{body{background:#fff;color:#111;padding:0;font-size:11.5px}.bar,.top{display:none}.tile,.card,.sec,details,.box{background:#fff !important;border-color:#bbb}.card{break-inside:avoid-page}th{background:#eee;color:#333}td{border-color:#ddd}tr:nth-child(even) td{background:#fff}')
+    [void]$sb.Append('dt,.sub,.meta,.tile span,.sec h3{color:#555}.pill,.chip,.n{border:1px solid #999;background:#fff !important;color:#111 !important}a{color:#111}.tile b{color:#111 !important}}')
+    [void]$sb.Append('</style><script>function all(s){document.querySelectorAll("details").forEach(function(d){d.open=s})}')
+    [void]$sb.Append('function find(){var q=document.getElementById("q").value.toLowerCase(),n=0;document.querySelectorAll(".card").forEach(function(c){var h=!q||c.textContent.toLowerCase().indexOf(q)>=0;c.style.display=h?"":"none";if(h)n++;var t=document.getElementById("t-"+c.id);if(t)t.style.display=h?"":"none"});document.getElementById("cnt").textContent=n}')
+    [void]$sb.Append('window.addEventListener("beforeprint",function(){all(true)})</script></head><body>')
+
+    # Nagłówek, kafelki ze stanami
+    $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2}\{3} • {4}: {5}' -f $script:AppVersion, (Get-Date), $env:USERDOMAIN, $env:USERNAME, $k.Noun, $Items.Count
+    if ($Nested) { $meta += ' • z zagnieżdżeniami' }
+    if ($Errors.Count) { $meta += " • nie odczytano: $($Errors.Count)" }
+    [void]$sb.Append('<h1>').Append((& $enc $title)).Append('</h1><div class="meta">').Append((& $enc $meta)).Append('</div><div class="tiles">')
+    [void]$sb.Append('<div class="tile info"><b>').Append($Items.Count).Append('</b><span>').Append((& $enc $k.Title)).Append('</span></div>')
+    foreach ($grp in ($Items | Group-Object State | Sort-Object Count -Descending)) {
+        $tone = & $toneClass ($grp.Group[0].Tone)
+        [void]$sb.Append('<div class="tile ').Append($tone).Append('"><b>').Append($grp.Count).Append('</b><span>').Append((& $enc $grp.Name)).Append('</span></div>')
+    }
+    if ($Errors.Count) { [void]$sb.Append('<div class="tile crit"><b>').Append($Errors.Count).Append('</b><span>Nie odczytano</span></div>') }
+    [void]$sb.Append('</div>')
+    [void]$sb.Append('<div class="bar"><input id="q" placeholder="Szukaj (nazwa, login, dział, grupa…)" oninput="find()"><button onclick="all(true)">Rozwiń listy</button><button class="g" onclick="all(false)">Zwiń listy</button><button class="g" onclick="window.print()">Drukuj</button><span class="cnt">widoczne: <b id="cnt">').Append($Items.Count).Append('</b></span></div>')
+
+    # Spis obiektów
+    if ($Items.Count -gt 0) {
+        $cols = @($Items[0].Toc.Keys)
+        [void]$sb.Append('<div class="box toc"><table><thead><tr><th>Lp</th>')
+        foreach ($c in $cols) { [void]$sb.Append('<th>').Append((& $enc $c)).Append('</th>') }
+        [void]$sb.Append('</tr></thead><tbody>')
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $it = $Items[$i]
+            [void]$sb.Append('<tr id="t-o').Append($i + 1).Append('"><td>').Append($i + 1).Append('</td>')
+            $first = $true
+            foreach ($c in $cols) {
+                $v = & $enc $it.Toc[$c]
+                if ($first) { $v = '<a href="#o' + ($i + 1) + '">' + $v + '</a>'; $first = $false }
+                elseif ($c -eq 'Stan' -or ($Kind -eq 'Group' -and $c -eq 'Typ')) { $v = '<span class="pill ' + (& $toneClass $it.Tone) + '">' + $v + '</span>' }
+                [void]$sb.Append('<td>').Append($v).Append('</td>')
+            }
+            [void]$sb.Append('</tr>')
+        }
+        [void]$sb.Append('</tbody></table></div>')
+    }
+
+    # Karty
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $it = $Items[$i]
+        [void]$sb.Append('<section class="card" id="o').Append($i + 1).Append('"><div class="head"><div><h2>').Append((& $enc $it.Name)).Append('</h2>')
+        if ($it.Sub) { [void]$sb.Append('<div class="sub">').Append((& $enc $it.Sub)).Append('</div>') }
+        [void]$sb.Append('</div><div style="text-align:right"><span class="pill ').Append((& $toneClass $it.Tone)).Append('">').Append((& $enc $it.State)).Append('</span><div class="top"><a href="#">↑ do góry</a></div></div></div>')
+        if (@($it.Chips).Count -gt 0) {
+            [void]$sb.Append('<div class="chips">')
+            foreach ($ch in $it.Chips) { [void]$sb.Append('<span class="chip ').Append((& $toneClass $ch.Tone)).Append('">').Append((& $enc $ch.Text)).Append('</span>') }
+            [void]$sb.Append('</div>')
+        }
+        [void]$sb.Append('<div class="grid">')
+        foreach ($sec in $it.Sections) {
+            [void]$sb.Append('<div class="sec"><h3>').Append((& $enc $sec.Title)).Append('</h3><dl>')
+            foreach ($key in $sec.Items.Keys) {
+                $val = [string]$sec.Items[$key]
+                if ($null -eq $val) { $val = '' }
+                [void]$sb.Append('<dt>').Append((& $enc $key)).Append('</dt>')
+                if ($val.Trim() -eq '') { [void]$sb.Append('<dd class="e">—</dd>') } else { [void]$sb.Append('<dd>').Append((& $enc $val)).Append('</dd>') }
+            }
+            [void]$sb.Append('</dl></div>')
+        }
+        [void]$sb.Append('</div>')
+        foreach ($list in $it.Lists) {
+            $rows = @($list.Rows)
+            [void]$sb.Append($(if ($rows.Count -le 50) { '<details open>' } else { '<details>' })).Append('<summary>').Append((& $enc $list.Title)).Append('<span class="n">').Append($list.Total).Append('</span></summary>')
+            if ($rows.Count -eq 0) { [void]$sb.Append('<div class="empty">').Append((& $enc $list.Empty)).Append('</div></details>'); continue }
+            $cols = @($rows[0].PSObject.Properties | ForEach-Object { $_.Name })
+            [void]$sb.Append('<table><thead><tr>')
+            foreach ($c in $cols) { [void]$sb.Append('<th>').Append((& $enc $c)).Append('</th>') }
+            [void]$sb.Append('</tr></thead><tbody>')
+            foreach ($r in $rows) {
+                [void]$sb.Append('<tr>')
+                foreach ($c in $cols) {
+                    $v = & $enc $r.$c
+                    if ($c -eq 'Stan' -and $v -eq 'Wyłączone') { $v = '<span class="pill warn">' + $v + '</span>' }
+                    elseif ($c -eq 'Członkostwo' -and $v -ne 'Zagnieżdżone' -and $v) { $v = '<span class="pill info">' + $v + '</span>' }
+                    [void]$sb.Append('<td>').Append($v).Append('</td>')
+                }
+                [void]$sb.Append('</tr>')
+            }
+            [void]$sb.Append('</tbody></table>')
+            if ($list.Total -gt $rows.Count) { [void]$sb.Append('<div class="note">Pokazano ').Append($rows.Count).Append(' z ').Append($list.Total).Append(' pozycji – pełną listę daje moduł w programie (eksport CSV).</div>') }
+            [void]$sb.Append('</details>')
+        }
+        [void]$sb.Append('</section>')
+    }
+
+    if ($Errors.Count) {
+        [void]$sb.Append('<div class="box errs"><h2>Nie udało się odczytać</h2><table><thead><tr><th>Obiekt</th><th>Błąd</th></tr></thead><tbody>')
+        foreach ($e in $Errors) { [void]$sb.Append('<tr><td>').Append((& $enc $e.Obiekt)).Append('</td><td>').Append((& $enc $e.Błąd)).Append('</td></tr>') }
+        [void]$sb.Append('</tbody></table></div>')
+    }
+    [void]$sb.Append('</body></html>')
+    return $sb.ToString()
 }
 #endregion
 
