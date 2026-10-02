@@ -75,7 +75,7 @@ $env:ADPS_LoadDefaultDrive = '0'
 #endregion
 
 #region Konfiguracja i stan
-$script:AppVersion = '4.3'
+$script:AppVersion = '4.4'
 
 $script:App = @{
     Name       = 'Domain Ops'
@@ -6849,7 +6849,8 @@ Register-Workspace -Key 'AdGroups' -Title 'Grupy i OU' -Icon 'E902' -Target Grou
 Register-Workspace -Key 'AdComputers' -Title 'Komputery AD' -Icon 'E977' -Target Computer `
     -Description 'Konta komputerów w Active Directory: LAPS, BitLocker, nazwy, grupy i raporty'
 Register-Workspace -Key 'Files' -Title 'Pliki i uprawnienia' -Icon 'E8B7' -Target None `
-    -Description 'Uprawnienia NTFS do folderów (nadawanie i raporty) oraz sumy kontrolne plików'
+    -Description 'Uprawnienia NTFS: nadawanie, odbieranie, uprawnienia efektywne, raporty, ryzyka, naprawa i kopie uprawnień; udziały oraz sumy kontrolne plików' `
+    -Categories @('Uprawnienia NTFS', 'Kontrola i naprawa', 'Pliki')
 #endregion
 
 #region Zarządzanie zdalne: Diagnostyka
@@ -17928,6 +17929,1853 @@ Register-Module -Workspace 'Files' -Category 'Pliki' -Key 'FileHash' -Title 'Sum
     Add-StatTile -Module $m -Key 'match' -Label 'Zgodne z oczekiwanym' -Icon 'E73E' | Out-Null
     Add-StatTile -Module $m -Key 'diff' -Label 'Niezgodne' -Icon 'E7BA' | Out-Null
     $m.EmptyHint = 'Wybierz pliki lub folder (albo przeciągnij je tutaj). Skróty liczą się w tle – można w tym czasie korzystać z innych modułów.'
+}
+#endregion
+
+#region Uprawnienia NTFS: wspólne narzędzia (przeszukiwanie drzewa, uprawnienia efektywne, zmiany z kopią zapasową)
+# Skanowanie odbywa się tam, gdzie leżą pliki (lokalnie, przez UNC albo na serwerze przez PowerShell Remoting).
+# Zwracane są płaskie rekordy (__rec): acl - deskryptor elementu jako SDDL (właściciel + uprawnienia),
+# sid - nazwa konta przetłumaczona na tamtym komputerze (konta lokalne serwera da się przetłumaczyć tylko tam),
+# skip - element pominięty (brak dostępu, łącze), stat - liczba sprawdzonych elementów.
+# Analiza (uprawnienia efektywne, ryzyka, porównania) odbywa się w programie na podstawie SDDL.
+
+# Bity praw NTFS w kolejności okna «Zaawansowane ustawienia zabezpieczeń» Windows
+$script:NtfsRightBits = @(
+    @(0x20, 'Przechodzenie przez folder / wykonywanie pliku'),
+    @(0x1, 'Wyświetlanie zawartości folderu / odczyt danych'),
+    @(0x80, 'Odczyt atrybutów'),
+    @(0x8, 'Odczyt atrybutów rozszerzonych'),
+    @(0x2, 'Tworzenie plików / zapis danych'),
+    @(0x4, 'Tworzenie folderów / dołączanie danych'),
+    @(0x100, 'Zapis atrybutów'),
+    @(0x10, 'Zapis atrybutów rozszerzonych'),
+    @(0x40, 'Usuwanie podfolderów i plików'),
+    @(0x10000, 'Usuwanie'),
+    @(0x20000, 'Odczyt uprawnień'),
+    @(0x40000, 'Zmiana uprawnień'),
+    @(0x80000, 'Przejęcie na własność')
+)
+
+# Konta o szerokim zasięgu (dotyczą prawie wszystkich użytkowników)
+$script:NtfsBroadSids = [ordered]@{
+    'S-1-1-0'      = 'Wszyscy (Everyone)'
+    'S-1-5-7'      = 'Logowanie anonimowe'
+    'S-1-5-11'     = 'Użytkownicy uwierzytelnieni'
+    'S-1-5-32-545' = 'BUILTIN\Użytkownicy'
+    'S-1-5-32-546' = 'BUILTIN\Goście'
+    'S-1-5-2'      = 'SIEĆ (NETWORK)'
+    'S-1-5-4'      = 'INTERAKTYWNY'
+}
+# Konta administracyjne i systemowe - pełna kontrola dla nich jest normalna
+$script:NtfsTrustedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-3-0', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464', 'S-1-5-32-549', 'S-1-5-32-551')
+$script:NtfsTrustedRids = @('512', '519', '518')
+
+$script:NtfsSdHelpers = @'
+$__sidNames = @{}
+function Get-SidName([string]$Sid) {
+    if ($__sidNames.ContainsKey($Sid)) { return $__sidNames[$Sid] }
+    $n = $Sid
+    try { $n = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value } catch { }
+    $__sidNames[$Sid] = $n
+    return $n
+}
+function Get-AclSddl($Acl) {
+    try { return $Acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]'Access, Owner') }
+    catch { return $Acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access) }
+}
+function Invoke-NtfsWalk([scriptblock]$Visit) {
+    # Przejście drzewa wszerz (do $P.Depth; < 0 = bez limitu); łączy (junction/symlink) nie przechodzimy
+    $reparse = [System.IO.FileAttributes]::ReparsePoint
+    $root = Get-Item -LiteralPath $P.Path -Force -ErrorAction Stop
+    & $Visit $root ([int]$P.BaseLevel)
+    if ($P.RootOnly) {
+        if ($P.Files) { foreach ($f in @(Get-ChildItem -LiteralPath $root.FullName -File -Force -ErrorAction SilentlyContinue)) { & $Visit $f ([int]$P.BaseLevel + 1) } }
+        return
+    }
+    if ($root.Attributes -band $reparse) { [pscustomobject]@{ '__rec' = 'skip'; Path = $root.FullName; Level = [int]$P.BaseLevel; Kind = 'link'; Reason = 'Łącze (junction / symlink) – zawartość nie była sprawdzana' }; return }
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue(@($root, [int]$P.BaseLevel))
+    while ($queue.Count -gt 0) {
+        $cur = $queue.Dequeue()
+        $dir = $cur[0]
+        $level = [int]$cur[1]
+        if ($P.Depth -ge 0 -and $level -ge $P.Depth) { continue }
+        $children = @()
+        try { $children = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction Stop) }
+        catch {
+            [pscustomobject]@{ '__rec' = 'skip'; Path = $dir.FullName; Level = $level; Kind = 'content'; Reason = "Brak dostępu do zawartości: $($_.Exception.Message)" }
+            continue
+        }
+        foreach ($c in $children) {
+            if ($c.PSIsContainer) {
+                & $Visit $c ($level + 1)
+                if ($c.Attributes -band $reparse) { [pscustomobject]@{ '__rec' = 'skip'; Path = $c.FullName; Level = $level + 1; Kind = 'link'; Reason = 'Łącze (junction / symlink) – zawartość nie była sprawdzana' } }
+                else { $queue.Enqueue(@($c, ($level + 1))) }
+            }
+            elseif ($P.Files) { & $Visit $c ($level + 1) }
+        }
+    }
+}
+'@
+
+$script:NtfsAclScanBody = @'
+# Tryby ($P.Mode): All - każdy element; Explicit - elementy z jawnymi wpisami, wyłączonym dziedziczeniem i folder główny;
+# Sids - elementy z wpisami dla SID z $P.Sids (jawnymi; dziedziczonymi tylko w folderze głównym albo gdy $P.Inherited);
+# Owner - elementy, których właścicielem nie jest żaden SID z $P.Sids
+$sidSet = @{}
+foreach ($s in @($P.Sids)) { if ($s) { $sidSet[[string]$s] = $true } }
+$state = @{ N = 0; Seen = @{} }
+$visit = {
+    param($Item, [int]$Level)
+    $state.N++
+    $element = if ($Item.PSIsContainer) { 'Folder' } else { 'Plik' }
+    $acl = $null
+    $err = ''
+    try { $acl = Get-ItemAcl $Item -WithOwner } catch { $err = $_.Exception.Message }
+    if (-not $acl) { try { $acl = Get-ItemAcl $Item } catch { $err = $_.Exception.Message } }
+    if (-not $acl) { [pscustomobject]@{ '__rec' = 'skip'; Path = $Item.FullName; Level = $Level; Kind = 'acl'; Reason = "Brak dostępu do uprawnień: $err" }; return }
+    $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    $explicit = @($rules | Where-Object { -not $_.IsInherited }).Count
+    $owner = ''
+    try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+    $isRoot = ($Level -eq 0)
+    $take = switch ([string]$P.Mode) {
+        'All' { $true }
+        'Explicit' { $isRoot -or $explicit -gt 0 -or $acl.AreAccessRulesProtected }
+        'Sids' { @($rules | Where-Object { $sidSet.ContainsKey($_.IdentityReference.Value) -and (-not $_.IsInherited -or $isRoot -or $P.Inherited) }).Count -gt 0 }
+        'Owner' { -not $owner -or -not $sidSet.ContainsKey($owner) }
+        default { $false }
+    }
+    if (-not $take) { return }
+    foreach ($r in $rules) { $state.Seen[$r.IdentityReference.Value] = $true }
+    if ($owner) { $state.Seen[$owner] = $true }
+    [pscustomobject]@{ '__rec' = 'acl'; Path = $Item.FullName; Element = $element; Level = $Level; Sddl = (Get-AclSddl $acl); Protected = [bool]$acl.AreAccessRulesProtected; Explicit = $explicit }
+}
+# $P.Paths: lista pojedynczych elementów (bez przechodzenia w głąb); inaczej drzewo od $P.Path
+$targets = if ($P.Paths) { @($P.Paths) } else { @($P.Path) }
+foreach ($tp in $targets) {
+    $P.Path = [string]$tp
+    if ($P.Paths) { $P.RootOnly = $true; $P.Depth = 0 }
+    try { Invoke-NtfsWalk -Visit $visit }
+    catch { [pscustomobject]@{ '__rec' = 'skip'; Path = [string]$tp; Level = 0; Kind = 'acl'; Reason = $_.Exception.Message } }
+}
+foreach ($k in @($state.Seen.Keys)) { $n = Get-SidName $k; [pscustomobject]@{ '__rec' = 'sid'; Sid = $k; Name = $n; Resolved = ($n -ne $k) } }
+[pscustomobject]@{ '__rec' = 'stat'; Items = $state.N }
+'@
+
+$script:NtfsChangeBody = @'
+# Zmiany uprawnień listy elementów ($P.Items: Path, Expected = SDDL z podglądu albo puste, Rules / Sids / Sddl) - operacja $P.Op:
+# RemoveRules - usuwa wskazane jawne wpisy; RemoveSids - wszystkie jawne wpisy podanych SID; Inherit - włącza dziedziczenie;
+# Reset - włącza dziedziczenie i usuwa jawne wpisy; Restore - przywraca DACL (i właściciela) z SDDL kopii;
+# Template - wpisy wzorca ($P.Rules, $P.Protect, $P.Replace).
+# Element, którego uprawnienia zmieniły się od podglądu, jest pomijany.
+function New-Rule($r) {
+    New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier([string]$r.Sid)),
+        [System.Security.AccessControl.FileSystemRights][int]$r.Rights, [System.Security.AccessControl.InheritanceFlags][int]$r.Inherit,
+        [System.Security.AccessControl.PropagationFlags][int]$r.Propagate, $(if ($r.Deny) { [System.Security.AccessControl.AccessControlType]::Deny } else { [System.Security.AccessControl.AccessControlType]::Allow }))
+}
+$accessOnly = [System.Security.AccessControl.AccessControlSections]::Access
+function Edit-RawDacl($Acl, [scriptblock]$ShouldRemove) {
+    # Usuwa jawne wpisy DACL spełniające warunek (na surowej liście - dokładnie te maski i flagi, które są zapisane)
+    $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor($Acl.GetSecurityDescriptorSddlForm($accessOnly))
+    $removed = 0
+    if ($raw.DiscretionaryAcl) {
+        for ($i = $raw.DiscretionaryAcl.Count - 1; $i -ge 0; $i--) {
+            $ace = $raw.DiscretionaryAcl[$i]
+            if ($ace -isnot [System.Security.AccessControl.CommonAce] -or $ace.IsInherited) { continue }
+            $f = [int]$ace.AceFlags
+            $info = @{ Sid = $ace.SecurityIdentifier.Value; Rights = [int]$ace.AccessMask; Deny = ([string]$ace.AceQualifier -eq 'AccessDenied')
+                Inherit = $(if ($f -band 2) { 1 } else { 0 }) + $(if ($f -band 1) { 2 } else { 0 }); Propagate = $(if ($f -band 4) { 1 } else { 0 }) + $(if ($f -band 8) { 2 } else { 0 }) }
+            if (& $ShouldRemove $info) { $raw.DiscretionaryAcl.RemoveAce($i); $removed++ }
+        }
+    }
+    $Acl.SetSecurityDescriptorSddlForm($raw.GetSddlForm($accessOnly), $accessOnly)
+    return $removed
+}
+foreach ($it in @($P.Items)) {
+    $res = [ordered]@{ Path = [string]$it.Path; Status = ''; Tone = 'ok'; Detail = ''; Before = '' }
+    try {
+        $item = Get-Item -LiteralPath $it.Path -Force -ErrorAction Stop
+        try { $res.Before = Get-AclSddl (Get-ItemAcl $item -WithOwner) } catch { }
+        $acl = Get-ItemAcl $item
+        if ($it.Expected) {
+            $exp = New-Object System.Security.AccessControl.DirectorySecurity
+            $exp.SetSecurityDescriptorSddlForm([string]$it.Expected, $accessOnly)
+            if ($exp.GetSecurityDescriptorSddlForm($accessOnly) -ne $acl.GetSecurityDescriptorSddlForm($accessOnly)) {
+                $res.Status = 'Pominięto – uprawnienia zmieniły się od podglądu (uruchom podgląd ponownie)'
+                $res.Tone = 'warn'
+                [pscustomobject]$res
+                continue
+            }
+        }
+        switch ([string]$P.Op) {
+            'RemoveRules' {
+                $wanted = @($it.Rules)
+                $n = Edit-RawDacl $acl {
+                    param($a)
+                    foreach ($r in $wanted) { if ($a.Sid -eq [string]$r.Sid -and $a.Rights -eq [int]$r.Rights -and $a.Deny -eq [bool]$r.Deny -and $a.Inherit -eq [int]$r.Inherit -and $a.Propagate -eq [int]$r.Propagate) { return $true } }
+                    return $false
+                }
+                $res.Detail = "usunięte wpisy: $n"
+                if ($n -lt $wanted.Count) { $res.Tone = 'warn'; $res.Detail += " z $($wanted.Count) – części wpisów już nie było" }
+            }
+            'RemoveSids' { foreach ($s in @($it.Sids)) { $acl.PurgeAccessRules((New-Object System.Security.Principal.SecurityIdentifier([string]$s))) }; $res.Detail = 'usunięte wpisy: ' + (@($it.Sids) -join ', ') }
+            'Inherit' { $acl.SetAccessRuleProtection($false, $false); $res.Detail = 'dziedziczenie włączone' }
+            'AddRules' { foreach ($r in @($it.Rules)) { $acl.AddAccessRule((New-Rule $r)) }; $res.Detail = 'dodane wpisy: ' + @($it.Rules).Count }
+            'Reset' {
+                $n = Edit-RawDacl $acl { param($a) $true }
+                $acl.SetAccessRuleProtection($false, $false)
+                $res.Detail = "dziedziczenie włączone, usunięte jawne wpisy: $n"
+            }
+            'Restore' { $acl.SetSecurityDescriptorSddlForm([string]$it.Sddl, $accessOnly); $res.Detail = 'przywrócono uprawnienia z kopii' }
+            'Template' {
+                if ($P.Replace) { [void](Edit-RawDacl $acl { param($a) $true }) }
+                foreach ($r in @($P.Rules)) { $acl.AddAccessRule((New-Rule $r)) }
+                if ($null -ne $P.Protect) { $acl.SetAccessRuleProtection([bool]$P.Protect, $false) }
+                $res.Detail = $(if ($P.Replace) { 'jawne wpisy zastąpione wpisami wzorca' } else { 'dodane brakujące wpisy wzorca' })
+            }
+            default { throw "Nieznana operacja $($P.Op)" }
+        }
+        Set-ItemAcl $item $acl
+        $res.Status = 'Zmieniono'
+        if ([string]$P.Op -eq 'Restore' -and [string]$it.Sddl -match '^O:([^:]+?)(G:|D:|S:|$)') {
+            # Właściciel z kopii - wymaga uprawnień administratora (przywileju przywracania); brak zmiany nie jest błędem
+            try {
+                $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor([string]$it.Sddl)
+                $cur = Get-ItemAcl $item -WithOwner
+                if ($raw.Owner -and $cur.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $raw.Owner.Value) {
+                    $cur.SetOwner($raw.Owner)
+                    Set-ItemAcl $item $cur
+                    $res.Detail += '; przywrócono właściciela'
+                }
+            }
+            catch { $res.Detail += '; właściciela nie przywrócono: ' + $_.Exception.Message; $res.Tone = 'warn' }
+        }
+    }
+    catch { $res.Status = 'Błąd – ' + $_.Exception.Message; $res.Tone = 'crit' }
+    [pscustomobject]$res
+}
+'@
+
+function Get-NtfsToolCore([string]$Body) {
+    return (Get-NtfsCore ($script:NtfsSdHelpers + "`n" + $Body))
+}
+
+# --- Analiza w programie (na podstawie SDDL) ---
+function New-NtfsAclFromSddl([string]$Sddl) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetSecurityDescriptorSddlForm($Sddl)
+    return $acl
+}
+
+function ConvertTo-NtfsSpecificMask([int64]$Mask) {
+    # Prawa ogólne (GENERIC_*) zamienione na prawa plików; bez bitu synchronizacji
+    $m = $Mask
+    if ($m -lt 0) { $m += 4294967296 }
+    $r = $m -band 0x0FFFFFFF
+    if ($m -band 0x10000000) { $r = $r -bor 0x1F01FF }
+    if ($m -band 2147483648) { $r = $r -bor 0x120089 }
+    if ($m -band 0x40000000) { $r = $r -bor 0x120116 }
+    if ($m -band 0x20000000) { $r = $r -bor 0x1200A0 }
+    return [int64]($r -band (-bnot 0x100000))
+}
+
+function Get-NtfsAccessLevel([int64]$Mask) {
+    $m = ConvertTo-NtfsSpecificMask $Mask
+    if (($m -band 0xF01FF) -eq 0xF01FF) { return 'Pełna kontrola' }
+    if (($m -band 0x301BF) -eq 0x301BF) { return 'Modyfikacja' }
+    if (($m -band 0x201BF) -eq 0x201BF) { return 'Odczyt i zapis' }
+    if (($m -band 0x200A9) -eq 0x200A9) { return 'Odczyt i wykonywanie' }
+    if (($m -band 0x20089) -eq 0x20089) { return 'Odczyt' }
+    if (($m -band 0x116) -eq 0x116) { return 'Zapis' }
+    if ($m -eq 0) { return 'Brak dostępu' }
+    if (($m -band 0x20) -and -not ($m -band 0x1)) { return 'Tylko przechodzenie' }
+    return 'Częściowy'
+}
+
+function Get-NtfsLevelRank([string]$Level) {
+    switch ($Level) { 'Pełna kontrola' { 7 } 'Modyfikacja' { 6 } 'Odczyt i zapis' { 5 } 'Zapis' { 4 } 'Odczyt i wykonywanie' { 3 } 'Odczyt' { 2 } 'Częściowy' { 1 } 'Tylko przechodzenie' { 1 } default { 0 } }
+}
+
+function Test-NtfsWriteMask([int64]$Mask) {
+    # Prawa pozwalające zmieniać dane lub uprawnienia
+    $m = ConvertTo-NtfsSpecificMask $Mask
+    return (($m -band (0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000)) -ne 0)
+}
+
+function Get-NtfsScopeText([int]$Inherit, [int]$Propagate) {
+    $only = ($Propagate -band 2) -ne 0
+    switch ($Inherit) {
+        0 { 'Ten folder' } 1 { if ($only) { 'Tylko podfoldery' } else { 'Ten folder i podfoldery' } } 2 { if ($only) { 'Tylko pliki' } else { 'Ten folder i pliki' } }
+        3 { if ($only) { 'Tylko podfoldery i pliki' } else { 'Ten folder, podfoldery i pliki' } } default { "flagi $Inherit/$Propagate" }
+    }
+}
+
+function Get-NtfsRules($Acl) {
+    # Wpisy DACL jako hashtable: Sid, Mask, Deny, Inherited, Inherit, Propagate (w kolejności z deskryptora)
+    return @(foreach ($r in $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            @{ Sid = $r.IdentityReference.Value; Mask = [int64][int]$r.FileSystemRights; Deny = ([string]$r.AccessControlType -eq 'Deny'); Inherited = [bool]$r.IsInherited
+                Inherit = [int]$r.InheritanceFlags; Propagate = [int]$r.PropagationFlags }
+        })
+}
+
+function Get-NtfsEffectiveAccess {
+    <#
+        Uprawnienia efektywne dla zbioru SID (-Sids: SID -> opis, np. «przez grupę GG_Finanse») według reguł Windows:
+        wpisy w kolejności deskryptora, bit raz odmówiony nie może zostać przyznany i odwrotnie; wpisy «tylko dla podrzędnych»
+        nie dotyczą samego elementu; właściciel ma zawsze odczyt i zmianę uprawnień (chyba że jest wpis PRAWA WŁAŚCICIELA).
+        Zwraca @{ Granted; Denied; Level; Sources = @(@{ Sid; Label; Mask; Deny; Inherited; Added }); OwnerApplied }
+    #>
+    param([Parameter(Mandatory)]$Acl, [Parameter(Mandatory)][hashtable]$Sids)
+    $granted = [int64]0
+    $denied = [int64]0
+    $sources = New-Object System.Collections.ArrayList
+    $ownerRights = $false
+    foreach ($r in (Get-NtfsRules $Acl)) {
+        if ($r.Sid -eq 'S-1-3-4') { $ownerRights = $true }
+        if (-not $Sids.ContainsKey($r.Sid)) { continue }
+        if (($r.Propagate -band 2) -ne 0) { continue }
+        $mask = ConvertTo-NtfsSpecificMask $r.Mask
+        if ($r.Deny) { $new = $mask -band (-bnot $granted); $denied = $denied -bor $new }
+        else { $new = $mask -band (-bnot $denied); $granted = $granted -bor $new }
+        [void]$sources.Add(@{ Sid = $r.Sid; Label = [string]$Sids[$r.Sid]; Mask = $mask; Deny = $r.Deny; Inherited = $r.Inherited; Added = $new; Scope = (Get-NtfsScopeText $r.Inherit $r.Propagate) })
+    }
+    $ownerApplied = $false
+    $owner = ''
+    try { $owner = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+    if ($owner -and $Sids.ContainsKey($owner) -and -not $ownerRights) {
+        $granted = $granted -bor 0x60000
+        $ownerApplied = $true
+    }
+    return @{ Granted = $granted; Denied = $denied; Level = (Get-NtfsAccessLevel $granted); Sources = $sources.ToArray(); OwnerApplied = $ownerApplied; Owner = $owner }
+}
+
+function Get-NtfsSidLabel([hashtable]$Names, [string]$Sid) {
+    if ($Names -and $Names.ContainsKey($Sid) -and [string]$Names[$Sid]) { return [string]$Names[$Sid] }
+    if ($script:NtfsBroadSids.Contains($Sid)) { return $script:NtfsBroadSids[$Sid] }
+    return $Sid
+}
+
+function Get-NtfsIdentitySidSet {
+    <#
+        Zbiór SID, przez które tożsamość ma dostęp: ona sama, jej grupy (tokenGroups z AD - także zagnieżdżone i podstawowa)
+        i - opcjonalnie - konta o szerokim zasięgu oraz typowe członkostwa w grupach lokalnych serwera
+        (Użytkownicy domeny w BUILTIN\Użytkownicy, Administratorzy domeny w BUILTIN\Administratorzy).
+    #>
+    param([Parameter(Mandatory)]$Identity, [switch]$Broad, [switch]$LocalGroups, [switch]$Network)
+    $set = [ordered]@{}
+    $set[[string]$Identity.Sid] = 'bezpośrednio (' + [string]$Identity.Name + ')'
+    foreach ($g in @($Identity.Groups)) {
+        $parts = ([string]$g) -split '\|', 2
+        if ($parts[0] -and -not $set.Contains($parts[0])) { $set[$parts[0]] = 'przez grupę ' + $(if ($parts.Count -gt 1 -and $parts[1]) { $parts[1] } else { $parts[0] }) }
+    }
+    $isPerson = @('Użytkownik', 'Komputer') -contains [string]$Identity.Kind
+    if ($Broad -and $isPerson) {
+        $set['S-1-1-0'] = 'przez Wszyscy (Everyone)'
+        $set['S-1-5-11'] = 'przez Użytkownicy uwierzytelnieni'
+    }
+    if ($Network -and $isPerson) { $set['S-1-5-2'] = 'przez SIEĆ (dostęp przez udział)' }
+    if ($LocalGroups) {
+        $keys = @($set.Keys)
+        if (@($keys | Where-Object { $_ -match '-513$' }).Count -or ($isPerson -and $Broad)) { if (-not $set.Contains('S-1-5-32-545')) { $set['S-1-5-32-545'] = 'przez BUILTIN\Użytkownicy (zawiera Użytkowników domeny)' } }
+        if (@($keys | Where-Object { $_ -match '-512$' }).Count) { if (-not $set.Contains('S-1-5-32-544')) { $set['S-1-5-32-544'] = 'przez BUILTIN\Administratorzy (zawiera Administratorów domeny)' } }
+    }
+    $h = @{}
+    foreach ($k in $set.Keys) { $h[$k] = $set[$k] }
+    return $h
+}
+
+# Tożsamość z AD razem z grupami (tokenGroups); konta lokalne i wbudowane - tylko SID
+$script:NtfsExpandScript = {
+    $netbios = ''
+    try { $netbios = [string](Get-ADDomain @ad).NetBIOSName } catch { }
+    foreach ($id in @($P.Identities)) {
+        $res = [ordered]@{ Id = [string]$id; Name = ''; Sid = ''; Kind = ''; Error = ''; Groups = @() }
+        $text = ([string]$id).Trim()
+        $found = $null
+        if ($text -notmatch '^(BUILTIN|NT AUTHORITY|NT SERVICE)\\' -and $text -notmatch '^(Everyone|Wszyscy|CREATOR OWNER)$' -and $text -notmatch '^S-1-5-32-') {
+            try { $found = Resolve-AdPrincipal -Id $text -Classes @('user', 'group', 'computer') } catch { $res.Error = $_.Exception.Message }
+        }
+        if ($found) {
+            $res.Error = ''
+            $res.Name = $(if ($netbios) { "$netbios\" } else { '' }) + (([string]$found.sAMAccountName) -replace '\$$', '')
+            $res.Sid = [string]$found.objectSid
+            $res.Kind = Get-ObjectKind ([string]$found.ObjectClass)
+            if ($P.Expand) {
+                $full = Get-ADObject -Identity $found.DistinguishedName -Properties tokenGroups @ad
+                $sids = @($full.tokenGroups | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_ -ne $res.Sid } | Select-Object -Unique)
+                $names = @{}
+                for ($i = 0; $i -lt $sids.Count; $i += 40) {
+                    $chunk = @($sids[$i..([Math]::Min($i + 39, $sids.Count - 1))])
+                    $filter = '(|' + ((@($chunk | ForEach-Object { "(objectSid=$_)" })) -join '') + ')'
+                    foreach ($g in @(Get-ADObject -LDAPFilter $filter -Properties sAMAccountName, objectSid @ad)) { $names[[string]$g.objectSid] = [string]$g.sAMAccountName }
+                }
+                $res.Groups = @($sids | ForEach-Object { '{0}|{1}' -f $_, $(if ($names.ContainsKey($_)) { $names[$_] } else { $_ }) })
+            }
+        }
+        if (-not $res.Sid) {
+            try {
+                $sidObj = if ($text -match '^S-1-') { New-Object System.Security.Principal.SecurityIdentifier($text) } else { (New-Object System.Security.Principal.NTAccount($text)).Translate([System.Security.Principal.SecurityIdentifier]) }
+                $res.Sid = $sidObj.Value
+                $res.Name = $text
+                try { $res.Name = $sidObj.Translate([System.Security.Principal.NTAccount]).Value } catch { }
+                $res.Kind = 'Konto lokalne / wbudowane'
+                $res.Error = ''
+            }
+            catch { if (-not $res.Error) { $res.Error = "Nie rozpoznano «$text»." } }
+        }
+        [pscustomobject]$res
+    }
+}
+
+function Start-NtfsScan {
+    <#
+        Skan drzewa w trybie $Params.Mode. Na serwerze (-Computer) jedno zadanie; lokalnie/UNC folder główny i każdy
+        podfolder pierwszego poziomu jako osobne zadania (równolegle). Wyniki zbiera $Module.Data.NtfsScan
+        (Acl: lista rekordów acl, Names: SID -> nazwa, Skipped, Items) i na końcu wywołuje -OnDone.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Path, [string]$Computer = '',
+        [Parameter(Mandatory)][hashtable]$Params, [scriptblock]$OnDone)
+    $m = $Module
+    $base = $Params.Clone()
+    if (-not $base.ContainsKey('Depth')) { $base.Depth = -1 }
+    if (-not $base.ContainsKey('Files')) { $base.Files = $false }
+    if (-not $base.ContainsKey('Sids')) { $base.Sids = @() }
+    if (-not $base.ContainsKey('Inherited')) { $base.Inherited = $false }
+    $base.Core = Get-NtfsToolCore $script:NtfsAclScanBody
+    $m.Data.NtfsScan = @{ Root = $Path; Computer = $Computer; Acl = New-Object System.Collections.ArrayList; Names = @{}; Skipped = New-Object System.Collections.ArrayList; Items = 0; Errors = New-Object System.Collections.ArrayList; OnDone = $OnDone }
+    $onResult = {
+        param($m, $r)
+        $scan = $m.Data.NtfsScan
+        if (-not $r.Ok) { [void]$scan.Errors.Add(('{0}: {1}' -f $r.Target, ((@($r.Errors)) -join ' '))); return }
+        foreach ($d in @($r.Data)) {
+            if ($null -eq $d) { continue }
+            switch ([string](Get-ObjectValue $d '__rec')) {
+                'acl' { [void]$scan.Acl.Add($d) }
+                'sid' { if ($d.Resolved -or -not $scan.Names.ContainsKey([string]$d.Sid)) { $scan.Names[[string]$d.Sid] = [string]$d.Name } }
+                'skip' {
+                    [void]$scan.Skipped.Add($d)
+                    if ([string]$d.Kind -ne 'link') { Write-Log ('Pominięto (brak dostępu): {0} – {1}' -f $d.Path, $d.Reason) 'WARN' }
+                }
+                'stat' { $scan.Items += [int]$d.Items }
+            }
+        }
+    }
+    $onComplete = {
+        param($m)
+        $scan = $m.Data.NtfsScan
+        foreach ($e in $scan.Errors) { Write-Log $e 'ERROR' }
+        if ($scan.OnDone) { & $scan.OnDone $m }
+    }
+    if ($Computer) {
+        $p = $base.Clone(); $p.Path = $Path; $p.BaseLevel = 0; $p.RootOnly = $false
+        Start-HostOperation -Module $m -Name $Name -Targets @($Computer) -Output None -Parameters $p -ScriptBlock {
+            param($P)
+            & ([scriptblock]::Create($P.Core)) $P
+        } -OnResult $onResult -OnComplete $onComplete
+        return
+    }
+    if ($base.ContainsKey('Paths')) {
+        # Lista pojedynczych folderów - jedno zadanie lokalne
+        $p = $base.Clone(); $p.Path = $Path; $p.BaseLevel = 0; $p.RootOnly = $true; $p.Depth = 0
+        Start-HostOperation -Module $m -Name $Name -Targets @($Path) -Local -Output None -Parameters $p -ScriptBlock {
+            param($Target, $P, $Ctx)
+            & ([scriptblock]::Create($P.Core)) $P
+        } -OnResult $onResult -OnComplete $onComplete
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { Show-Warning "Ścieżka nie istnieje lub jest niedostępna: $Path"; return }
+    $per = @{}
+    $root = $base.Clone(); $root.Path = $Path; $root.BaseLevel = 0; $root.RootOnly = $true
+    $per[$Path] = $root
+    if ([int]$base.Depth -ne 0 -and (Test-Path -LiteralPath $Path -PathType Container)) {
+        $subs = @()
+        try { $subs = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction Stop) } catch { Write-Log "Nie można wyświetlić podfolderów: $($_.Exception.Message)" 'WARN' }
+        foreach ($s in $subs) {
+            if ($s.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            $p = $base.Clone(); $p.Path = $s.FullName; $p.BaseLevel = 1; $p.RootOnly = $false; $per[$s.FullName] = $p
+        }
+    }
+    Start-HostOperation -Module $m -Name $Name -Targets @($per.Keys | Sort-Object) -PerTarget $per -Local -Output None -ScriptBlock {
+        param($Target, $P, $Ctx)
+        & ([scriptblock]::Create($P.Core)) $P
+    } -OnResult $onResult -OnComplete $onComplete
+}
+
+function Start-NtfsChange {
+    <#
+        Zmiana uprawnień listy elementów (Get-NtfsToolCore + $script:NtfsChangeBody) lokalnie albo na serwerze.
+        -OnDone { param($m, $results) } dostaje rekordy: Path, Status, Tone, Detail.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Name, [string]$Computer = '', [Parameter(Mandatory)][hashtable]$Params, [scriptblock]$OnDone)
+    $m = $Module
+    $p = $Params.Clone()
+    $p.Core = Get-NtfsToolCore $script:NtfsChangeBody
+    $m.Data.NtfsChange = @{ Results = New-Object System.Collections.ArrayList; OnDone = $OnDone }
+    $onResult = {
+        param($m, $r)
+        if (-not $r.Ok) { [void]$m.Data.NtfsChange.Results.Add([pscustomobject]@{ Path = $r.Target; Status = 'Błąd – ' + ((@($r.Errors)) -join ' '); Tone = 'crit'; Detail = '' }); return }
+        foreach ($d in @($r.Data)) { if ($d) { [void]$m.Data.NtfsChange.Results.Add($d) } }
+    }
+    $onComplete = {
+        param($m)
+        $res = @($m.Data.NtfsChange.Results)
+        foreach ($x in $res) { Write-Log ('{0}: {1}{2}' -f $x.Path, $x.Status, $(if ($x.Detail) { " ($($x.Detail))" } else { '' })) $(@{ ok = 'OK'; warn = 'WARN'; crit = 'ERROR' }[[string]$x.Tone]) }
+        if ($m.Data.NtfsChange.OnDone) { & $m.Data.NtfsChange.OnDone $m $res }
+    }
+    if ($Computer) {
+        Start-HostOperation -Module $m -Name $Name -Targets @($Computer) -Output None -Parameters $p -ScriptBlock { param($P) & ([scriptblock]::Create($P.Core)) $P } -OnResult $onResult -OnComplete $onComplete
+    }
+    else {
+        Start-HostOperation -Module $m -Name $Name -Targets @('lokalnie') -Local -Output None -Parameters $p -ScriptBlock { param($Target, $P, $Ctx) & ([scriptblock]::Create($P.Core)) $P } -OnResult $onResult -OnComplete $onComplete
+    }
+}
+
+# --- Kopie zapasowe uprawnień (plik JSON z SDDL każdego elementu) ---
+function Save-NtfsBackup {
+    # Zapisuje kopię przed zmianą; zwraca ścieżkę pliku albo $null (wtedy zmiana nie powinna być wykonana)
+    param([Parameter(Mandatory)][string]$Operation, [string]$Computer = '', [string]$Root = '', [Parameter(Mandatory)][object[]]$Items)
+    # Nazwa z milisekundami i licznikiem - dwie kopie tej samej operacji w jednej sekundzie nie mogą się nadpisać
+    $folder = Get-DataFolder 'AclBackup'
+    $stem = 'Uprawnienia_{0:yyyyMMdd_HHmmss_fff}_{1}' -f (Get-Date), (Get-SafeFileName $Operation)
+    $file = Join-Path $folder "$stem.json"
+    for ($i = 2; Test-Path -LiteralPath $file; $i++) { $file = Join-Path $folder "${stem}_$i.json" }
+    $doc = [ordered]@{
+        Version = 1; CreatedAt = (Get-Date).ToString('s'); CreatedBy = "$env:USERDOMAIN\$env:USERNAME"; Operation = $Operation; Computer = $Computer; Root = $Root
+        Items = @($Items | ForEach-Object { [ordered]@{ Path = [string]$_.Path; Sddl = [string]$_.Sddl } })
+    }
+    try {
+        $doc | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $file -Encoding UTF8
+        Write-Log ("Kopia uprawnień ({0} elementów): {1}" -f @($Items).Count, $file) 'OK'
+        return $file
+    }
+    catch {
+        Show-Error 'Nie udało się zapisać kopii uprawnień – zmiana nie zostanie wykonana.' $_
+        return $null
+    }
+}
+
+function Read-NtfsBackup([string]$Path) {
+    $doc = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    return @{ CreatedAt = [string]$doc.CreatedAt; CreatedBy = [string]$doc.CreatedBy; Operation = [string]$doc.Operation; Computer = [string]$doc.Computer; Root = [string]$doc.Root
+        Items = @($doc.Items | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Sddl } }); File = $Path }
+}
+
+function Get-NtfsPathField {
+    # Ścieżka i komputer z pól modułu; $null, gdy nie podano ścieżki
+    param([hashtable]$Module)
+    $path = $Module.Path.Text.Trim().Trim('"')
+    if (-not $path) { Show-Warning 'Podaj folder.'; return $null }
+    return @{ Path = $path; Computer = $Module.Computer.Text.Trim() }
+}
+
+function Add-NtfsDepthRow {
+    # Wiersz «Zakres»: głębokość, bez limitu, także pliki
+    param([hashtable]$Module, [int]$Depth = 3, [bool]$Unlimited = $true, [string]$Title = 'Zakres')
+    $row = Add-ToolbarRow -Module $Module -Title $Title
+    Add-Label -Parent $row -Text 'Głębokość' | Out-Null
+    $Module.Depth = Add-Numeric -Parent $row -Value $Depth -Minimum 0 -Maximum 100 -Width 60
+    $Module.Unlimited = Add-CheckBox -Parent $row -Text 'Bez limitu' -Checked $Unlimited
+    $Module.Files = Add-CheckBox -Parent $row -Text 'Także pliki'
+    return $row
+}
+
+function Get-NtfsDepth([hashtable]$Module) {
+    if (Test-Checked $Module.Unlimited) { return -1 }
+    return [int](Get-Num $Module.Depth)
+}
+#endregion
+
+#region Uprawnienia NTFS: dostęp tożsamości (uprawnienia efektywne, gdzie ma dostęp, odbieranie uprawnień)
+
+# Uprawnienia udziału (\\serwer\udział) przez CIM - najpierw WinRM, potem DCOM
+$script:NtfsShareAclScript = {
+    param($Target, $P, $Ctx)
+    $ErrorActionPreference = 'Stop'
+    $session = $null
+    $errors = @()
+    foreach ($proto in 'Wsman', 'Dcom') {
+        try {
+            $so = New-CimSessionOption -Protocol $proto
+            $cs = @{ ComputerName = $Target; SessionOption = $so; ErrorAction = 'Stop' }
+            if ($Ctx.Credential) { $cs.Credential = $Ctx.Credential }
+            $session = New-CimSession @cs
+            break
+        }
+        catch { $errors += "$proto`: $($_.Exception.Message)" }
+    }
+    if (-not $session) { throw ('Nie można połączyć się z serwerem udziału: ' + ($errors -join ' | ')) }
+    try {
+        $name = ([string]$P.Share).Replace("'", "''")
+        $share = Get-CimInstance -CimSession $session -ClassName Win32_Share -Filter "Name='$name'"
+        if (-not $share) { throw "Na serwerze $Target nie ma udziału «$($P.Share)»." }
+        [pscustomobject]@{ '__rec' = 'share'; Name = [string]$share.Name; Path = [string]$share.Path; Type = [int64]$share.Type; Description = [string]$share.Description }
+        $setting = Get-CimInstance -CimSession $session -ClassName Win32_LogicalShareSecuritySetting -Filter "Name='$name'"
+        if (-not $setting) {
+            # Udziały administracyjne (C$, ADMIN$) nie mają zapisanych uprawnień - dostęp tylko dla administratorów
+            [pscustomobject]@{ '__rec' = 'ace'; Sid = 'S-1-5-32-544'; Mask = 0x1F01FF; Deny = $false; Name = 'BUILTIN\Administrators'; Note = 'udział administracyjny' }
+            return
+        }
+        $sd = (Invoke-CimMethod -InputObject $setting -MethodName GetSecurityDescriptor).Descriptor
+        if (-not $sd -or $null -eq $sd.DACL) { [pscustomobject]@{ '__rec' = 'ace'; Sid = 'S-1-1-0'; Mask = 0x1F01FF; Deny = $false; Name = 'Everyone'; Note = 'brak listy uprawnień – pełny dostęp dla wszystkich' }; return }
+        foreach ($ace in @($sd.DACL)) {
+            $mask = [int64]$ace.AccessMask
+            if ($mask -lt 0) { $mask += 4294967296 }
+            [pscustomobject]@{ '__rec' = 'ace'; Sid = [string]$ace.Trustee.SIDString; Mask = $mask; Deny = ([int]$ace.AceType -eq 1); Name = ('{0}\{1}' -f $ace.Trustee.Domain, $ace.Trustee.Name).TrimStart('\'); Note = '' }
+        }
+    }
+    finally { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
+}
+
+function Get-NtfsUncParts([string]$Path) {
+    $mt = [regex]::Match($Path, '^\\\\([^\\]+)\\([^\\]+)')
+    if (-not $mt.Success) { return $null }
+    return @{ Server = $mt.Groups[1].Value; Share = $mt.Groups[2].Value }
+}
+
+function Get-NtfsAceMask {
+    # Maska przyznana przez listę wpisów (bez dziedziczenia, np. uprawnienia udziału) dla zbioru SID
+    param([object[]]$Aces, [hashtable]$Sids)
+    $granted = [int64]0
+    $denied = [int64]0
+    foreach ($a in @($Aces | Sort-Object { if ($_.Deny) { 0 } else { 1 } })) {
+        if (-not $Sids.ContainsKey([string]$a.Sid)) { continue }
+        $mask = ConvertTo-NtfsSpecificMask ([int64]$a.Mask)
+        if ($a.Deny) { $denied = $denied -bor ($mask -band (-bnot $granted)) } else { $granted = $granted -bor ($mask -band (-bnot $denied)) }
+    }
+    return $granted
+}
+
+function Start-NtfsIdentityResolve {
+    # Rozpoznanie tożsamości w AD (z grupami, gdy -Expand); wynik w $Module.Data.Identities i wywołanie -OnDone
+    param([hashtable]$Module, [string[]]$Identities, [switch]$Expand, [scriptblock]$OnDone)
+    $m = $Module
+    $m.Data.Identities = New-Object System.Collections.ArrayList
+    $m.Data.IdentityOnDone = $OnDone
+    Start-AdOperation -Module $m -Name 'Rozpoznawanie tożsamości' -Targets @('AD') -Output None -Parameters @{ Identities = @($Identities); Expand = [bool]$Expand } -ScriptBlock $script:NtfsExpandScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { $m.Data.IdentityError = (@($r.Errors)) -join ' '; return }
+        foreach ($d in @($r.Data)) { if ($d) { [void]$m.Data.Identities.Add($d) } }
+    } -OnComplete {
+        param($m)
+        if ($m.Data['IdentityError']) { $e = $m.Data.IdentityError; $m.Data.IdentityError = ''; Show-Warning "Nie udało się sprawdzić tożsamości w AD: $e"; return }
+        foreach ($i in @($m.Data.Identities | Where-Object { $_.Error })) { Write-Log ("{0}: {1}" -f $i.Id, $i.Error) 'WARN' }
+        if ($m.Data.IdentityOnDone) { & $m.Data.IdentityOnDone $m }
+    }
+}
+
+function Add-NtfsIdentityOptions {
+    param([hashtable]$Module, [string]$Title = 'Liczenie dostępu')
+    $row = Add-ToolbarRow -Module $Module -Title $Title
+    $Module.ViaGroups = Add-CheckBox -Parent $row -Text 'Przez grupy z AD (także zagnieżdżone)' -Checked $true
+    $Module.Broad = Add-CheckBox -Parent $row -Text 'Wszyscy / Użytkownicy uwierzytelnieni' -Checked $true -ToolTip 'Wpisy dla Everyone i Authenticated Users dotyczą każdego zalogowanego użytkownika'
+    $Module.LocalGroups = Add-CheckBox -Parent $row -Text 'Typowe grupy lokalne serwera' -Checked $true -ToolTip 'Użytkownicy domeny należą zwykle do BUILTIN\Użytkownicy, a Administratorzy domeny do BUILTIN\Administratorzy serwera'
+    return $row
+}
+
+function Get-NtfsModuleSidSet {
+    param([hashtable]$Module, $Identity, [string]$Path)
+    $unc = [bool](Get-NtfsUncParts $Path)
+    return (Get-NtfsIdentitySidSet -Identity $Identity -Broad:(Test-Checked $Module.Broad) -LocalGroups:(Test-Checked $Module.LocalGroups) -Network:($unc -or [bool]$Module.Computer.Text.Trim()))
+}
+
+function Show-NtfsSidSet {
+    param([hashtable]$Sids, [hashtable]$Names, [string]$Title)
+    $rows = @($Sids.Keys | Sort-Object { $Sids[$_] } | ForEach-Object { [pscustomobject][ordered]@{ 'Jak' = $Sids[$_]; 'Konto' = (Get-NtfsSidLabel $Names $_); 'SID' = $_ } })
+    Show-GridDialog -Title $Title -Subtitle 'Wpisy uprawnień dla tych kont i grup dotyczą wybranej tożsamości.' -Rows $rows
+}
+
+# --- Uprawnienia efektywne ---
+function Show-NtfsEffective {
+    param([hashtable]$Module)
+    $m = $Module
+    $d = $m.Data.Eff
+    Reset-ResultTable -Module $m
+    $acl = New-NtfsAclFromSddl $d.Sddl
+    $eff = Get-NtfsEffectiveAccess -Acl $acl -Sids $d.Sids
+    $shareGranted = $null
+    if ($d.Share) { $shareGranted = Get-NtfsAceMask -Aces $d.Share.Aces -Sids $d.Sids }
+    $final = if ($null -ne $shareGranted) { $eff.Granted -band $shareGranted } else { $eff.Granted }
+    $rows = foreach ($bit in $script:NtfsRightBits) {
+        $b = [int64]$bit[0]
+        $ntfs = if ($eff.Granted -band $b) { 'Tak' } elseif ($eff.Denied -band $b) { 'Odmowa' } else { 'Nie' }
+        $src = ''
+        if ($eff.Granted -band $b) {
+            $s = @($eff.Sources | Where-Object { -not $_.Deny -and ($_.Added -band $b) } | Select-Object -First 1)
+            $src = if ($s.Count) { '{0}: {1}{2}' -f (Get-NtfsSidLabel $d.Names $s[0].Sid), (Get-NtfsAccessLevel $s[0].Mask), $(if ($s[0].Inherited) { ' (dziedziczone)' } else { '' }) } elseif ($eff.OwnerApplied) { 'właściciel elementu (prawo domyślne)' } else { '' }
+        }
+        elseif ($eff.Denied -band $b) {
+            $s = @($eff.Sources | Where-Object { $_.Deny -and ($_.Added -band $b) } | Select-Object -First 1)
+            if ($s.Count) { $src = 'odmowa: {0}' -f (Get-NtfsSidLabel $d.Names $s[0].Sid) }
+        }
+        $share = if ($null -eq $shareGranted) { '—' } elseif ($shareGranted -band $b) { 'Tak' } else { 'Nie' }
+        [pscustomobject][ordered]@{
+            'Prawo'      = $bit[1]
+            'Efektywnie' = $(if ($final -band $b) { 'Tak' } else { 'Nie' })
+            'NTFS'       = $ntfs
+            'Udział'     = $share
+            'Skąd'       = $src
+            '__tone'     = $(if ($final -band $b) { 'ok' } elseif ($ntfs -eq 'Odmowa') { 'crit' } else { '' })
+        }
+    }
+    Add-ResultRows -Module $m -Objects @($rows) -TargetColumn ''
+    $lvlNtfs = Get-NtfsAccessLevel $eff.Granted
+    $lvlShare = if ($null -ne $shareGranted) { Get-NtfsAccessLevel $shareGranted } else { '' }
+    $lvlFinal = Get-NtfsAccessLevel $final
+    Set-StatTile -Module $m -Key 'final' -Value $lvlFinal -Tone $(if ((Get-NtfsLevelRank $lvlFinal) -ge 4) { 'warn' } elseif ((Get-NtfsLevelRank $lvlFinal) -gt 0) { 'ok' } else { 'crit' })
+    Set-StatTile -Module $m -Key 'ntfs' -Value $lvlNtfs
+    Set-StatTile -Module $m -Key 'share' -Value $(if ($d.Share) { $lvlShare } elseif ($d.ShareError) { 'nie odczytano' } else { 'nie dotyczy' }) -Tone $(if ($d.ShareError) { 'warn' } else { '' })
+    Set-StatTile -Module $m -Key 'sids' -Value ([string]$d.Sids.Count)
+    $hint = '{0}: efektywnie «{1}»' -f $d.Identity.Name, $lvlFinal
+    if ($d.Share) { $hint += ' (NTFS: {0}; udział {1}: {2})' -f $lvlNtfs, $d.Share.Name, $lvlShare } elseif ($d.ShareError) { $hint += ' – uprawnień udziału nie odczytano: ' + $d.ShareError }
+    if ($eff.OwnerApplied) { $hint += ' • jest właścicielem' }
+    $m.ResultHint = $hint
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $hint }
+    $m.Data.EffResult = $eff
+    Write-Log $hint 'OK'
+}
+
+Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsEffective' -Title 'Uprawnienia efektywne' -Icon 'E8D7' -Badge 'nowe' `
+    -Description 'Jakie prawa faktycznie ma użytkownik lub grupa do folderu albo pliku: wpisy NTFS dla niej samej, jej grup z AD (także zagnieżdżonych) i kont ogólnych, z regułami odmowy i dziedziczenia; dla ścieżki \\serwer\udział także uprawnienia udziału i dostęp wynikowy. Przy każdym prawie – skąd się wzięło.' -Build {
+    param($m)
+    $m.PillColumns = @('Efektywnie')
+    $m.Data.Eff = $null
+    $row = Add-ToolbarRow -Module $m -Title 'Tożsamość'
+    $m.Identity = Add-TextBox -Parent $row -Width 300 -Placeholder 'login, grupa, UPN, DOMENA\nazwa albo SID' -Text ([string](Get-ModuleSetting -Module $m -Name 'Identity' -Default ''))
+    $f = Add-FolderField -Module $m -Title 'Folder lub plik'
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    Add-NtfsIdentityOptions -Module $m | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title ' '
+    $m.UseShare = Add-CheckBox -Parent $row2 -Text 'Uwzględnij uprawnienia udziału (ścieżka \\serwer\udział)' -Checked $true
+    Add-Button -Parent $row2 -Text 'Sprawdź dostęp' -Icon 'E8D7' -Module $m -Primary -OnClick {
+        param($m)
+        $id = $m.Identity.Text.Trim()
+        if (-not $id) { Show-Warning 'Podaj użytkownika albo grupę.'; return }
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        Set-ModuleSetting -Module $m -Name 'Identity' -Value $id
+        $m.Data.Eff = @{ Path = $pf.Path; Computer = $pf.Computer }
+        Start-NtfsIdentityResolve -Module $m -Identities @($id) -Expand:(Test-Checked $m.ViaGroups) -OnDone {
+            param($m)
+            $ident = @($m.Data.Identities)[0]
+            if (-not $ident -or $ident.Error) { Show-Warning ("Nie rozpoznano tożsamości: {0}" -f $(if ($ident) { $ident.Error } else { '' })); return }
+            $e = $m.Data.Eff
+            $e.Identity = $ident
+            $e.Sids = Get-NtfsModuleSidSet -Module $m -Identity $ident -Path $e.Path
+            Start-NtfsScan -Module $m -Name 'Odczyt uprawnień' -Path $e.Path -Computer $e.Computer -Params @{ Mode = 'All'; Depth = 0; Files = $false } -OnDone {
+                param($m)
+                $scan = $m.Data.NtfsScan
+                $e = $m.Data.Eff
+                $rec = @($scan.Acl | Select-Object -First 1)
+                if ($rec.Count -eq 0) { Show-Warning ("Nie można odczytać uprawnień: {0}" -f ((@($scan.Skipped | ForEach-Object { $_.Reason }) + @($scan.Errors)) -join ' ')); return }
+                $e.Sddl = [string]$rec[0].Sddl
+                $e.Names = $scan.Names
+                foreach ($g in @($e.Identity.Groups)) { $parts = ([string]$g) -split '\|', 2; if ($parts.Count -gt 1 -and -not $e.Names.ContainsKey($parts[0])) { $e.Names[$parts[0]] = $parts[1] } }
+                $e.Share = $null
+                $e.ShareError = ''
+                $unc = Get-NtfsUncParts $e.Path
+                if ($unc -and (Test-Checked $m.UseShare) -and -not $e.Computer) {
+                    $m.Data.ShareAces = New-Object System.Collections.ArrayList
+                    Start-HostOperation -Module $m -Name 'Uprawnienia udziału' -Targets @($unc.Server) -Local -Output None -Parameters @{ Share = $unc.Share } -ScriptBlock $script:NtfsShareAclScript -OnResult {
+                        param($m, $r)
+                        if (-not $r.Ok) { $m.Data.Eff.ShareError = (@($r.Errors)) -join ' '; return }
+                        $info = @($r.Data | Where-Object { $_.__rec -eq 'share' }) | Select-Object -First 1
+                        $m.Data.Eff.Share = @{ Name = $(if ($info) { [string]$info.Name } else { '' }); Path = $(if ($info) { [string]$info.Path } else { '' }); Aces = @($r.Data | Where-Object { $_.__rec -eq 'ace' }) }
+                        foreach ($a in $m.Data.Eff.Share.Aces) { if (-not $m.Data.Eff.Names.ContainsKey([string]$a.Sid)) { $m.Data.Eff.Names[[string]$a.Sid] = [string]$a.Name } }
+                    } -OnComplete { param($m) Show-NtfsEffective -Module $m }
+                }
+                else { Show-NtfsEffective -Module $m }
+            }
+        }
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Grupy i konta…' -Icon 'E716' -Module $m -AlwaysEnabled -ToolTip 'Konta i grupy, przez które liczony jest dostęp' -OnClick {
+        param($m)
+        if (-not $m.Data['Eff'] -or -not $m.Data.Eff['Sids']) { Show-Warning 'Najpierw sprawdź dostęp.'; return }
+        Show-NtfsSidSet -Sids $m.Data.Eff.Sids -Names $m.Data.Eff.Names -Title ('Przez kogo liczony jest dostęp: ' + $m.Data.Eff.Identity.Name)
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Wpisy dotyczące tożsamości…' -Icon 'E8A1' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        if (-not $m.Data['EffResult']) { Show-Warning 'Najpierw sprawdź dostęp.'; return }
+        $e = $m.Data.Eff
+        $rows = @($m.Data.EffResult.Sources | ForEach-Object {
+                [pscustomobject][ordered]@{ 'Konto we wpisie' = (Get-NtfsSidLabel $e.Names $_.Sid); 'Jak' = $e.Sids[$_.Sid]; 'Typ' = $(if ($_.Deny) { 'Odmawiaj' } else { 'Zezwalaj' }); 'Uprawnienia' = (Get-NtfsAccessLevel $_.Mask); 'Dziedziczone' = $_.Inherited; 'Dotyczy' = $_.Scope; 'Wniósł nowe prawa' = ([int64]$_.Added -ne 0); '__tone' = $(if ($_.Deny) { 'crit' } else { '' }) }
+            })
+        if ($e.Share) { foreach ($a in $e.Share.Aces) { if ($e.Sids.ContainsKey([string]$a.Sid)) { $rows += [pscustomobject][ordered]@{ 'Konto we wpisie' = ('udział: ' + (Get-NtfsSidLabel $e.Names ([string]$a.Sid))); 'Jak' = $e.Sids[[string]$a.Sid]; 'Typ' = $(if ($a.Deny) { 'Odmawiaj' } else { 'Zezwalaj' }); 'Uprawnienia' = (Get-NtfsAccessLevel ([int64]$a.Mask)); 'Dziedziczone' = $false; 'Dotyczy' = 'udział'; 'Wniósł nowe prawa' = $null; '__tone' = '' } } } }
+        Show-GridDialog -Title 'Wpisy dotyczące tożsamości' -Subtitle $e.Path -Rows $rows -PillColumns @('Typ')
+    } | Out-Null
+    Add-StatTile -Module $m -Key 'final' -Label 'Efektywnie' -Icon 'E8D7' | Out-Null
+    Add-StatTile -Module $m -Key 'ntfs' -Label 'Uprawnienia NTFS' -Icon 'E72E' | Out-Null
+    Add-StatTile -Module $m -Key 'share' -Label 'Uprawnienia udziału' -Icon 'E8CE' | Out-Null
+    Add-StatTile -Module $m -Key 'sids' -Label 'Kont i grup w obliczeniu' -Icon 'E716' | Out-Null
+    $m.EmptyHint = 'Podaj użytkownika lub grupę oraz folder (najlepiej \\serwer\udział\folder – wtedy liczony jest też udział) i kliknij «Sprawdź dostęp» (F5).'
+}
+
+# --- Gdzie ma dostęp ---
+function Show-NtfsFindResults {
+    param([hashtable]$Module)
+    $m = $Module
+    $scan = $m.Data.NtfsScan
+    $f = $m.Data.Find
+    Reset-ResultTable -Module $m
+    $rows = New-Object System.Collections.ArrayList
+    $paths = @{}
+    $write = @{}
+    foreach ($rec in @($scan.Acl | Sort-Object Path)) {
+        $acl = New-NtfsAclFromSddl ([string]$rec.Sddl)
+        $eff = Get-NtfsEffectiveAccess -Acl $acl -Sids $f.Sids
+        foreach ($r in (Get-NtfsRules $acl)) {
+            if (-not $f.Sids.ContainsKey($r.Sid)) { continue }
+            if ($r.Inherited -and [int]$rec.Level -ne 0 -and -not (Test-Checked $m.ShowInherited)) { continue }
+            $paths[[string]$rec.Path] = $true
+            if (Test-NtfsWriteMask $eff.Granted) { $write[[string]$rec.Path] = $true }
+            [void]$rows.Add([pscustomobject][ordered]@{
+                    'Ścieżka'      = $rec.Path
+                    'Element'      = $rec.Element
+                    'Poziom'       = $rec.Level
+                    'Efektywnie'   = $eff.Level
+                    'Przez'        = $f.Sids[$r.Sid]
+                    'Konto we wpisie' = (Get-NtfsSidLabel $scan.Names $r.Sid)
+                    'Typ'          = $(if ($r.Deny) { 'Odmawiaj' } else { 'Zezwalaj' })
+                    'Uprawnienia'  = (Get-NtfsAccessLevel $r.Mask)
+                    'Dziedziczone' = $r.Inherited
+                    'Dotyczy'      = (Get-NtfsScopeText $r.Inherit $r.Propagate)
+                    '__tone'       = $(if ($r.Deny) { 'crit' } elseif (Test-NtfsWriteMask $eff.Granted) { 'warn' } else { 'info' })
+                })
+        }
+    }
+    if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows.ToArray() -TargetColumn '' }
+    Set-StatTile -Module $m -Key 'folders' -Value ([string]$paths.Count) -Tone 'info'
+    Set-StatTile -Module $m -Key 'write' -Value ([string]$write.Count) -Tone $(if ($write.Count) { 'warn' } else { '' })
+    $deny = @($rows | Where-Object { $_.'Typ' -eq 'Odmawiaj' }).Count
+    Set-StatTile -Module $m -Key 'deny' -Value ([string]$deny) -Tone $(if ($deny) { 'crit' } else { '' })
+    Set-StatTile -Module $m -Key 'checked' -Value ([string]$scan.Items)
+    $skipped = @($scan.Skipped | Where-Object { [string]$_.Kind -ne 'link' }).Count
+    $m.ResultHint = '{0}: miejsca z wpisami dla niej lub jej grup ({1} kont i grup){2}' -f $f.Identity.Name, $f.Sids.Count, $(if ($skipped) { " • pominięto bez dostępu: $skipped (dziennik)" } else { '' })
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+    if ($rows.Count -eq 0) { Show-Toast 'Nie znaleziono jawnych wpisów dla tej tożsamości ani jej grup.' 'info' }
+}
+
+Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsFindAccess' -Title 'Gdzie ma dostęp' -Icon 'E721' -Badge 'nowe' `
+    -Description 'Miejsca w drzewie folderów, w których użytkownik lub grupa ma wpisy uprawnień – bezpośrednio albo przez grupy z AD (także zagnieżdżone) i konta ogólne – z uprawnieniami efektywnymi w każdym z nich. Dobre przy odejściu pracownika, audycie i zmianie stanowiska.' -Build {
+    param($m)
+    $m.PillColumns = @('Typ', 'Efektywnie')
+    $m.ColorBools = $true
+    $m.Data.Find = $null
+    $row = Add-ToolbarRow -Module $m -Title 'Tożsamość'
+    $m.Identity = Add-TextBox -Parent $row -Width 300 -Placeholder 'login, grupa, UPN, DOMENA\nazwa albo SID' -Text ([string](Get-ModuleSetting -Module $m -Name 'Identity' -Default ''))
+    $f = Add-FolderField -Module $m
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    Add-NtfsDepthRow -Module $m | Out-Null
+    $opt = Add-NtfsIdentityOptions -Module $m
+    $m.ShowInherited = Add-CheckBox -Parent $opt -Text 'Pokaż też wpisy dziedziczone' -ToolTip 'Domyślnie: wpisy jawne w każdym folderze oraz dziedziczone tylko w folderze głównym'
+    $row3 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row3 -Text 'Szukaj' -Icon 'E721' -Module $m -Primary -OnClick {
+        param($m)
+        $id = $m.Identity.Text.Trim()
+        if (-not $id) { Show-Warning 'Podaj użytkownika albo grupę.'; return }
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        Set-ModuleSetting -Module $m -Name 'Identity' -Value $id
+        Reset-ResultTable -Module $m
+        $m.Data.Find = @{ Path = $pf.Path; Computer = $pf.Computer }
+        Start-NtfsIdentityResolve -Module $m -Identities @($id) -Expand:(Test-Checked $m.ViaGroups) -OnDone {
+            param($m)
+            $ident = @($m.Data.Identities)[0]
+            if (-not $ident -or $ident.Error) { Show-Warning ("Nie rozpoznano tożsamości: {0}" -f $(if ($ident) { $ident.Error } else { '' })); return }
+            $fd = $m.Data.Find
+            $fd.Identity = $ident
+            $fd.Sids = Get-NtfsModuleSidSet -Module $m -Identity $ident -Path $fd.Path
+            Write-Log ("Szukanie dostępu {0} przez {1} kont i grup w {2}" -f $ident.Name, $fd.Sids.Count, $fd.Path)
+            Start-NtfsScan -Module $m -Name 'Gdzie ma dostęp' -Path $fd.Path -Computer $fd.Computer -Params @{ Mode = 'Sids'; Sids = @($fd.Sids.Keys); Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files); Inherited = (Test-Checked $m.ShowInherited) } -OnDone { param($m) Show-NtfsFindResults -Module $m }
+        }
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Grupy i konta…' -Icon 'E716' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        if (-not $m.Data['Find'] -or -not $m.Data.Find['Sids']) { Show-Warning 'Najpierw wyszukaj.'; return }
+        Show-NtfsSidSet -Sids $m.Data.Find.Sids -Names $m.Data.NtfsScan.Names -Title ('Przez kogo liczony jest dostęp: ' + $m.Data.Find.Identity.Name)
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Uprawnienia efektywne tutaj' -Icon 'E8D7' -Action {
+        param($m, $rows)
+        $path = [string](Get-ObjectValue $rows[0] 'Ścieżka')
+        $id = $m.Identity.Text.Trim()
+        $comp = $m.Computer.Text.Trim()
+        Show-Module -Key 'NtfsEffective'
+        $em = $script:UI.Modules['NtfsEffective']
+        $em.Identity.Text = $id
+        $em.Path.Text = $path
+        $em.Computer.Text = $comp
+    }
+    Add-RowAction -Module $m -Text 'Odbierz te uprawnienia…' -Icon 'E74D' -Danger -Action {
+        param($m, $rows)
+        $paths = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Ścieżka') } | Select-Object -Unique)
+        $ids = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Konto we wpisie') } | Select-Object -Unique)
+        Show-Module -Key 'NtfsRevoke'
+        $rm = $script:UI.Modules['NtfsRevoke']
+        $rm.Path.Text = $(if ($paths.Count -eq 1) { $paths[0] } else { $m.Path.Text.Trim() })
+        $rm.Computer.Text = $m.Computer.Text.Trim()
+        $rm.Input.Text = ($ids -join "`r`n")
+        Show-Toast 'Sprawdź tożsamości i kliknij «Podgląd».' 'info'
+    }
+    Add-RowAction -Module $m -Text 'Otwórz w Eksploratorze' -Icon 'E838' -Separator -Action { param($m, $rows) Open-Folder ([string](Get-ObjectValue $rows[0] 'Ścieżka')) }
+    Add-StatTile -Module $m -Key 'folders' -Label 'Miejsca z dostępem' -Icon 'E838' | Out-Null
+    Add-StatTile -Module $m -Key 'write' -Label 'Z prawem zapisu' -Icon 'E70F' | Out-Null
+    Add-StatTile -Module $m -Key 'deny' -Label 'Wpisy odmowy' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'checked' -Label 'Sprawdzone elementy' -Icon 'E9D5' | Out-Null
+    $m.EmptyHint = 'Podaj użytkownika lub grupę i folder (np. udział działu) i kliknij «Szukaj» (F5). Duże drzewa najszybciej sprawdzisz na serwerze plików (pole «na komputerze»).'
+}
+
+# --- Odbieranie uprawnień ---
+function ConvertTo-NtfsRuleKey($r) { return ('{0}|{1}|{2}|{3}|{4}' -f $r.Sid, $r.Mask, [int][bool]$r.Deny, $r.Inherit, $r.Propagate) }
+function ConvertFrom-NtfsRuleKey([string]$Key) {
+    $p = $Key -split '\|'
+    return @{ Sid = $p[0]; Rights = [int][int64]$p[1]; Deny = ($p[2] -eq '1'); Inherit = [int]$p[3]; Propagate = [int]$p[4] }
+}
+
+Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsRevoke' -Title 'Odbieranie uprawnień' -Icon 'E8F8' -Badge 'nowe' `
+    -Description 'Usuwa jawne wpisy wskazanych kont lub grup w całym drzewie folderów: podgląd wszystkich miejsc, wybór, co usunąć, kopia uprawnień przed zmianą (do przywrócenia w module «Kopie uprawnień»). Wpisy dziedziczone z wyższych folderów są wskazane – trzeba je usunąć tam.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.ColorBools = $true
+    $f = Add-FolderField -Module $m
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Tożsamości' -Multiline -Height 70 -Placeholder 'Konta lub grupy – po jednej w wierszu (login, grupa, DOMENA\nazwa, SID – także nierozwiązany SID usuniętego konta)'
+    $row = Add-NtfsDepthRow -Module $m
+    $m.WithDeny = Add-CheckBox -Parent $row -Text 'Usuń też wpisy «Odmawiaj»' -Checked $true
+    $row2 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row2 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick {
+        param($m)
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        $ids = @(Get-TextLines $m.Input)
+        if ($ids.Count -eq 0) { Show-Warning 'Wpisz konta lub grupy, którym trzeba odebrać uprawnienia.'; return }
+        Reset-ResultTable -Module $m
+        $m.Data.Revoke = @{ Path = $pf.Path; Computer = $pf.Computer }
+        Start-NtfsIdentityResolve -Module $m -Identities $ids -OnDone {
+            param($m)
+            $ok = @($m.Data.Identities | Where-Object { $_.Sid })
+            if ($ok.Count -eq 0) { Show-Warning 'Nie rozpoznano żadnej tożsamości (szczegóły w dzienniku).'; return }
+            $rv = $m.Data.Revoke
+            $rv.Sids = @{}
+            foreach ($i in $ok) { $rv.Sids[[string]$i.Sid] = [string]$i.Name }
+            Start-NtfsScan -Module $m -Name 'Podgląd odbierania' -Path $rv.Path -Computer $rv.Computer -Params @{ Mode = 'Sids'; Sids = @($rv.Sids.Keys); Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files) } -OnDone {
+                param($m)
+                $scan = $m.Data.NtfsScan
+                $rv = $m.Data.Revoke
+                $rows = New-Object System.Collections.ArrayList
+                foreach ($rec in @($scan.Acl | Sort-Object Path)) {
+                    $acl = New-NtfsAclFromSddl ([string]$rec.Sddl)
+                    foreach ($r in (Get-NtfsRules $acl)) {
+                        if (-not $rv.Sids.ContainsKey($r.Sid)) { continue }
+                        if ($r.Inherited -and [int]$rec.Level -ne 0) { continue }
+                        $state = if ($r.Inherited) { 'Dziedziczony z folderu wyżej' } elseif ($r.Deny -and -not (Test-Checked $m.WithDeny)) { 'Zostaje (odmowa)' } else { 'Do usunięcia' }
+                        [void]$rows.Add([pscustomobject][ordered]@{
+                                'Stan' = $state; 'Ścieżka' = $rec.Path; 'Element' = $rec.Element; 'Tożsamość' = (Get-NtfsSidLabel $scan.Names $r.Sid); 'Typ' = $(if ($r.Deny) { 'Odmawiaj' } else { 'Zezwalaj' })
+                                'Uprawnienia' = (Get-NtfsAccessLevel $r.Mask); 'Dotyczy' = (Get-NtfsScopeText $r.Inherit $r.Propagate)
+                                'Uwagi' = $(if ($r.Inherited) { 'usuń wpis w folderze nadrzędnym (poza sprawdzanym drzewem) albo wyłącz tu dziedziczenie' } else { '' })
+                                '__tone' = $(if ($state -eq 'Do usunięcia') { 'warn' } elseif ($r.Inherited) { 'crit' } else { 'info' }); '__sddl' = [string]$rec.Sddl; '__rule' = (ConvertTo-NtfsRuleKey $r)
+                            })
+                    }
+                }
+                if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows.ToArray() -TargetColumn '' }
+                $todo = @($rows | Where-Object { $_.'Stan' -eq 'Do usunięcia' }).Count
+                Set-StatTile -Module $m -Key 'todo' -Value ([string]$todo) -Tone $(if ($todo) { 'warn' } else { '' })
+                Set-StatTile -Module $m -Key 'inherited' -Value ([string]@($rows | Where-Object { $_.'Stan' -like 'Dziedziczony*' }).Count) -Tone 'info'
+                Set-StatTile -Module $m -Key 'checked' -Value ([string]$scan.Items)
+                if ($rows.Count -eq 0) { Show-Toast 'W drzewie nie ma wpisów tych tożsamości.' 'ok' }
+                else { Write-Log ("Podgląd odbierania: {0} wpisów do usunięcia w {1}" -f $todo, $rv.Path) }
+            }
+        }
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Odbierz uprawnienia' -Icon 'E8F8' -Module $m -Danger -OnClick {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string]$_['Stan'] -eq 'Do usunięcia' })
+        if ($rows.Count -eq 0) { Show-Warning 'Brak wpisów do usunięcia – najpierw «Podgląd».'; return }
+        $items = @($rows | ForEach-Object { '{0}: {1} – {2} ({3})' -f $_['Ścieżka'], $_['Tożsamość'], $_['Uprawnienia'], $_['Typ'] })
+        $chosen = @(Confirm-Action -Text 'Usunąć wybrane wpisy uprawnień? Przed zmianą zostanie zapisana kopia uprawnień tych folderów (przywracanie: «Kopie uprawnień»).' -Items $items -ConfirmText 'Odbierz uprawnienia' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $byPath = [ordered]@{}
+        foreach ($i in $chosen) {
+            $r = $rows[$i]
+            $path = [string]$r['Ścieżka']
+            if (-not $byPath.Contains($path)) { $byPath[$path] = @{ Path = $path; Expected = [string]$r['__sddl']; Rules = @(); Rows = @() } }
+            $byPath[$path].Rules += (ConvertFrom-NtfsRuleKey ([string]$r['__rule']))
+            $byPath[$path].Rows += $r
+        }
+        $backup = Save-NtfsBackup -Operation 'Odbieranie uprawnień' -Computer $m.Data.Revoke.Computer -Root $m.Data.Revoke.Path -Items @($byPath.Values | ForEach-Object { @{ Path = $_.Path; Sddl = $_.Expected } })
+        if (-not $backup) { return }
+        $m.Data.RevokeRows = $byPath
+        foreach ($v in $byPath.Values) { foreach ($r in $v.Rows) { Set-RowState -Module $m -Row $r -State 'Usuwanie…' -Tone '' } }
+        Start-NtfsChange -Module $m -Name 'Odbieranie uprawnień' -Computer $m.Data.Revoke.Computer -Params @{ Op = 'RemoveRules'; Items = @($byPath.Values | ForEach-Object { @{ Path = $_.Path; Expected = $_.Expected; Rules = $_.Rules } }) } -OnDone {
+            param($m, $results)
+            foreach ($x in $results) {
+                $entry = $m.Data.RevokeRows[[string]$x.Path]
+                if (-not $entry) { continue }
+                $state = if ($x.Status -eq 'Zmieniono') { 'Usunięto' } else { [string]$x.Status }
+                foreach ($r in $entry.Rows) { Set-RowState -Module $m -Row $r -State $state -Tone ([string]$x.Tone) }
+            }
+            $ok = @($results | Where-Object { $_.Status -eq 'Zmieniono' }).Count
+            Show-Toast ("Odebrano uprawnienia w {0} z {1} miejsc." -f $ok, @($results).Count) $(if ($ok -eq @($results).Count) { 'ok' } else { 'warn' })
+        }
+    } | Out-Null
+    Add-StatTile -Module $m -Key 'todo' -Label 'Wpisy do usunięcia' -Icon 'E74D' | Out-Null
+    Add-StatTile -Module $m -Key 'inherited' -Label 'Dziedziczone z wyższego folderu' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'checked' -Label 'Sprawdzone elementy' -Icon 'E9D5' | Out-Null
+    $m.EmptyHint = 'Podaj folder i konta lub grupy, kliknij «Podgląd» (F5), a potem «Odbierz uprawnienia» – w oknie potwierdzenia można odznaczyć miejsca, których nie zmieniać.'
+}
+#endregion
+
+#region Uprawnienia NTFS: kontrola i naprawa (naprawa, kopie, ryzyka, wzorzec, grupy dostępu, udziały)
+
+function Get-NtfsSubfolders {
+    # Podfoldery pierwszego poziomu - lokalnie/UNC albo na serwerze (WinRM)
+    param([string]$Path, [string]$Computer = '')
+    if (-not $Computer) { return @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction Stop | Where-Object { -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) } | ForEach-Object { $_.FullName }) }
+    $session = Invoke-WithWaitCursor { Open-RemoteBrowseSession -Computer $Computer }
+    try {
+        $kids = @(Get-RemoteFolderChildren $session $Path)
+        $bad = @($kids | Where-Object { $_.PSObject.Properties['Error'] -and $_.Error })
+        if ($bad.Count) { throw [string]$bad[0].Error }
+        return @($kids | Where-Object { -not $_.Link } | ForEach-Object { [string]$_.Path })
+    }
+    finally { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+}
+
+function Get-NtfsRuleText([hashtable]$Names, $Rule) {
+    return ('{0}: {1}{2}' -f (Get-NtfsSidLabel $Names $Rule.Sid), (Get-NtfsAccessLevel $Rule.Mask), $(if ($Rule.Deny) { ' (odmowa)' } else { '' }))
+}
+
+# --- Naprawa uprawnień ---
+$script:NtfsRepairOps = @(
+    'Włącz dziedziczenie w podfolderach (zachowaj jawne wpisy)',
+    'Przywróć dziedziczenie w podfolderach (usuń jawne wpisy)',
+    'Usuń wpisy usuniętych kont (nierozwiązane SID)',
+    'Przejmij własność (Administratorzy) i nadaj Administratorom pełną kontrolę'
+)
+
+$script:NtfsOwnershipScript = @'
+# icacls: właściciel - grupa Administratorzy (SID, niezależnie od języka), potem pełna kontrola dla niej; /C - dalej mimo błędów
+$results = @()
+$steps = @(@{ Name = 'Właściciel: Administratorzy'; Args = ('"{0}" /setowner *S-1-5-32-544 /T /C /Q' -f $P.Path) })
+if ($P.Grant) { $steps += @{ Name = 'Pełna kontrola dla Administratorów'; Args = ('"{0}" /grant *S-1-5-32-544:(OI)(CI)F /T /C /Q' -f $P.Path) } }
+foreach ($s in $steps) {
+    $r = & $__exec @{ Mode = 'EXE'; FilePath = (Join-Path $env:SystemRoot 'System32\icacls.exe'); Arguments = $s.Args; TimeoutSec = [int]$P.TimeoutSec }
+    [pscustomobject]@{ 'Krok' = $s.Name; 'Stan' = $r.'Stan'; 'Kod wyjścia' = $r.'Kod wyjścia'; 'Czas (s)' = $r.'Czas (s)'; 'Wynik' = $r.'Wynik'; '__tone' = $r.__tone }
+}
+'@
+
+function Start-NtfsOwnershipFix {
+    param([hashtable]$Module, [string]$Path, [string]$Computer, [bool]$Grant)
+    $text = "param(`$P)`n`$__exec = {`n" + $script:RemoteExecScript.ToString() + "`n}`n" + $script:NtfsOwnershipScript
+    $params = @{ Path = $Path; Grant = $Grant; TimeoutSec = 0; Core = $text }
+    $Module.Data.OwnerResults = New-Object System.Collections.ArrayList
+    $onResult = { param($m, $r) if ($r.Ok) { foreach ($d in @($r.Data)) { [void]$m.Data.OwnerResults.Add($d) } } else { [void]$m.Data.OwnerResults.Add([pscustomobject]@{ 'Krok' = 'Połączenie'; 'Stan' = 'Błąd'; 'Wynik' = ((@($r.Errors)) -join ' '); '__tone' = 'crit' }) } }
+    $onComplete = { param($m) Show-GridDialog -Title 'Przejęcie własności' -Subtitle 'Wynik icacls (pełny tekst w panelu szczegółów)' -Rows @($m.Data.OwnerResults) -PillColumns @('Stan'); & $m.Actions.Preview $m }
+    if ($Computer) { Start-HostOperation -Module $Module -Name 'Przejęcie własności' -Targets @($Computer) -Output None -Parameters $params -ScriptBlock { param($P) & ([scriptblock]::Create($P.Core)) $P } -OnResult $onResult -OnComplete $onComplete }
+    else { Start-HostOperation -Module $Module -Name 'Przejęcie własności' -Targets @($Path) -Local -Output None -Parameters $params -ScriptBlock { param($Target, $P, $Ctx) & ([scriptblock]::Create($P.Core)) $P } -OnResult $onResult -OnComplete $onComplete }
+}
+
+Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsRepair' -Title 'Naprawa uprawnień' -Icon 'E90F' -Badge 'nowe' `
+    -Description 'Porządki w drzewie folderów: włączenie lub przywrócenie dziedziczenia w podfolderach, usunięcie wpisów kont usuniętych z AD (nierozwiązane SID) oraz przejęcie własności miejsc bez dostępu. Zawsze podgląd, wybór miejsc i kopia uprawnień przed zmianą.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $f = Add-FolderField -Module $m
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $row = Add-ToolbarRow -Module $m -Title 'Naprawa'
+    $m.Op = Add-ComboBox -Parent $row -Items $script:NtfsRepairOps -Width 520
+    $m.IncludeRoot = Add-CheckBox -Parent $row -Text 'Także folder główny' -ToolTip 'Dla dziedziczenia: domyślnie zmieniane są tylko podfoldery i pliki – folder główny zachowuje swoje uprawnienia'
+    $m.Grant = Add-CheckBox -Parent $row -Text 'Pełna kontrola dla Administratorów' -Checked $true -ToolTip 'Przy przejęciu własności: dodaje wpis Administratorzy – pełna kontrola w całym drzewie'
+    $m.Grant.Visibility = 'Collapsed'
+    # Opcje dotyczą tylko części operacji: folder główny - dziedziczenia, pełna kontrola - przejęcia własności
+    Register-ControlHandler -Control $m.Op -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        $op = $m.Op.SelectedIndex
+        $m.IncludeRoot.Visibility = $(if ($op -le 1) { 'Visible' } else { 'Collapsed' })
+        $m.Grant.Visibility = $(if ($op -eq 3) { 'Visible' } else { 'Collapsed' })
+    }
+    Add-NtfsDepthRow -Module $m | Out-Null
+    $m.Actions.Preview = {
+        param($m)
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        Reset-ResultTable -Module $m
+        $op = $m.Op.SelectedIndex
+        $m.Data.Repair = @{ Path = $pf.Path; Computer = $pf.Computer; Op = $op }
+        $params = if ($op -eq 3) { @{ Mode = 'Owner'; Sids = @('S-1-5-32-544'); Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files) } } else { @{ Mode = 'Explicit'; Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files) } }
+        Start-NtfsScan -Module $m -Name 'Podgląd naprawy' -Path $pf.Path -Computer $pf.Computer -Params $params -OnDone {
+            param($m)
+            $scan = $m.Data.NtfsScan
+            $rp = $m.Data.Repair
+            $rows = New-Object System.Collections.ArrayList
+            $orphans = @{}
+            foreach ($rec in @($scan.Acl | Sort-Object Path)) {
+                $acl = New-NtfsAclFromSddl ([string]$rec.Sddl)
+                $rules = Get-NtfsRules $acl
+                $explicit = @($rules | Where-Object { -not $_.Inherited })
+                $isRoot = ([int]$rec.Level -eq 0)
+                if ($rp.Op -le 1) {
+                    if ($isRoot -and -not (Test-Checked $m.IncludeRoot)) { continue }
+                    $needs = if ($rp.Op -eq 0) { [bool]$rec.Protected } else { [bool]$rec.Protected -or $explicit.Count -gt 0 }
+                    if (-not $needs) { continue }
+                    [void]$rows.Add([pscustomobject][ordered]@{ 'Stan' = 'Do zmiany'; 'Ścieżka' = $rec.Path; 'Element' = $rec.Element; 'Dziedziczenie' = $(if ($rec.Protected) { 'wyłączone' } else { 'włączone' }); 'Jawne wpisy' = $explicit.Count
+                            'Opis' = ((@($explicit | ForEach-Object { Get-NtfsRuleText $scan.Names $_ })) -join '; '); '__tone' = 'warn'; '__sddl' = [string]$rec.Sddl; '__sids' = '' })
+                }
+                elseif ($rp.Op -eq 2) {
+                    foreach ($r in $explicit) {
+                        if ($r.Sid -notmatch '^S-1-5-21-' -or ($scan.Names.ContainsKey($r.Sid) -and [string]$scan.Names[$r.Sid] -ne $r.Sid)) { continue }
+                        $orphans[$r.Sid] = $true
+                        [void]$rows.Add([pscustomobject][ordered]@{ 'Stan' = 'Do usunięcia'; 'Ścieżka' = $rec.Path; 'Element' = $rec.Element; 'Tożsamość' = $r.Sid; 'Uprawnienia' = (Get-NtfsAccessLevel $r.Mask); 'Typ' = $(if ($r.Deny) { 'Odmawiaj' } else { 'Zezwalaj' })
+                                'Opis' = 'nierozwiązany SID – konto usunięte albo z niedostępnej domeny'; '__tone' = 'warn'; '__sddl' = [string]$rec.Sddl; '__sids' = $r.Sid })
+                    }
+                }
+                else {
+                    $owner = ''
+                    try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+                    [void]$rows.Add([pscustomobject][ordered]@{ 'Stan' = 'Do zmiany'; 'Ścieżka' = $rec.Path; 'Element' = $rec.Element; 'Właściciel' = (Get-NtfsSidLabel $scan.Names $owner); 'Opis' = 'właścicielem nie są Administratorzy'; '__tone' = 'info'; '__sddl' = [string]$rec.Sddl; '__sids' = '' })
+                }
+            }
+            if ($rp.Op -eq 3) {
+                foreach ($sk in @($scan.Skipped | Where-Object { [string]$_.Kind -ne 'link' })) {
+                    [void]$rows.Add([pscustomobject][ordered]@{ 'Stan' = 'Brak dostępu'; 'Ścieżka' = $sk.Path; 'Element' = ''; 'Właściciel' = '?'; 'Opis' = [string]$sk.Reason; '__tone' = 'crit'; '__sddl' = ''; '__sids' = '' })
+                }
+            }
+            if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows.ToArray() -TargetColumn '' }
+            Set-StatTile -Module $m -Key 'todo' -Value ([string]$rows.Count) -Tone $(if ($rows.Count) { 'warn' } else { 'ok' })
+            Set-StatTile -Module $m -Key 'checked' -Value ([string]$scan.Items)
+            Set-StatTile -Module $m -Key 'denied' -Value ([string]@($scan.Skipped | Where-Object { [string]$_.Kind -ne 'link' }).Count)
+            if ($rp.Op -eq 2 -and $orphans.Count) {
+                # Nierozwiązany SID może być kontem z domeny zaufanej lub chwilowo niedostępnej - sprawdzamy w AD
+                Start-AdOperation -Module $m -Name 'Sprawdzenie SID w AD' -Targets @('AD') -Output None -Parameters @{ Sids = @($orphans.Keys) } -ScriptBlock {
+                    foreach ($s in @($P.Sids)) { $o = @(Get-ADObject -LDAPFilter "(objectSid=$s)" -Properties sAMAccountName @ad); [pscustomobject]@{ Sid = $s; Found = ($o.Count -gt 0); Name = $(if ($o.Count) { [string]$o[0].sAMAccountName } else { '' }) } }
+                } -OnResult {
+                    param($m, $r)
+                    if (-not $r.Ok) { Write-Log ('Nie sprawdzono SID w AD: ' + ((@($r.Errors)) -join ' ')) 'WARN'; return }
+                    foreach ($d in @($r.Data | Where-Object { $_.Found })) {
+                        foreach ($row in @(Find-ResultRow -Module $m -Column '__sids' -Value ([string]$d.Sid))) { Set-RowState -Module $m -Row $row -State 'Konto istnieje w AD' -Tone 'info' -Note $null; Set-ResultValue -Module $m -Row $row -Column 'Opis' -Value ("istnieje w AD jako $($d.Name) – nazwy nie przetłumaczono na serwerze; pomijane") }
+                    }
+                }
+            }
+        }
+    }
+    $row2 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row2 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row2 -Text 'Napraw' -Icon 'E90F' -Module $m -Danger -OnClick {
+        param($m)
+        if (-not $m.Data['Repair']) { Show-Warning 'Najpierw «Podgląd».'; return }
+        $rp = $m.Data.Repair
+        if ($m.Op.SelectedIndex -ne $rp.Op) { Show-Warning 'Zmieniono rodzaj naprawy – uruchom podgląd ponownie.'; return }
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Do zmiany', 'Do usunięcia', 'Brak dostępu') -contains [string]$_['Stan'] })
+        if ($rows.Count -eq 0) { Show-Message -Text 'Podgląd nie wskazał miejsc do naprawy.' -Title 'Brak zmian'; return }
+        if ($rp.Op -eq 3) {
+            $text = "Przejąć własność całego drzewa:`r`n$($rp.Path)`r`n(na komputerze: $(if ($rp.Computer) { $rp.Computer } else { 'ten' }))?`r`nWłaścicielem zostanie grupa Administratorzy$(if (Test-Checked $m.Grant) { ', która dostanie też pełną kontrolę' }). Do odczytu, a potem zmiany uprawnień potrzebne są prawa administratora."
+            if (-not (Confirm-Action -Text $text -Items @("$($rows.Count) elementów do zmiany (z podglądu)") -ConfirmText 'Przejmij własność' -Danger)) { return }
+            $readable = @($rows | Where-Object { [string]$_['__sddl'] })
+            if ($readable.Count) { if (-not (Save-NtfsBackup -Operation 'Przejęcie własności' -Computer $rp.Computer -Root $rp.Path -Items @($readable | ForEach-Object { @{ Path = [string]$_['Ścieżka']; Sddl = [string]$_['__sddl'] } }))) { return } }
+            Start-NtfsOwnershipFix -Module $m -Path $rp.Path -Computer $rp.Computer -Grant (Test-Checked $m.Grant)
+            return
+        }
+        $rows = @($rows | Where-Object { [string]$_['__sddl'] })
+        $items = @($rows | ForEach-Object { if ($rp.Op -eq 2) { '{0}: {1} ({2})' -f $_['Ścieżka'], $_['Tożsamość'], $_['Uprawnienia'] } else { '{0} ({1})' -f $_['Ścieżka'], $_['Opis'] } })
+        $what = @('Włączyć dziedziczenie uprawnień (jawne wpisy zostają)', 'Przywrócić dziedziczenie i usunąć jawne wpisy', 'Usunąć wpisy nierozwiązanych SID')[$rp.Op]
+        $chosen = @(Confirm-Action -Text "$what w wybranych miejscach? Przed zmianą zostanie zapisana kopia uprawnień (przywracanie: «Kopie uprawnień»)." -Items $items -ConfirmText 'Napraw' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $byPath = [ordered]@{}
+        foreach ($i in $chosen) {
+            $r = $rows[$i]
+            $p = [string]$r['Ścieżka']
+            if (-not $byPath.Contains($p)) { $byPath[$p] = @{ Path = $p; Expected = [string]$r['__sddl']; Sids = @(); Rows = @() } }
+            if ([string]$r['__sids']) { $byPath[$p].Sids += [string]$r['__sids'] }
+            $byPath[$p].Rows += $r
+        }
+        if (-not (Save-NtfsBackup -Operation @('Włączenie dziedziczenia', 'Przywrócenie dziedziczenia', 'Usunięcie nierozwiązanych SID')[$rp.Op] -Computer $rp.Computer -Root $rp.Path -Items @($byPath.Values | ForEach-Object { @{ Path = $_.Path; Sddl = $_.Expected } }))) { return }
+        $m.Data.RepairRows = $byPath
+        foreach ($v in $byPath.Values) { foreach ($r in $v.Rows) { Set-RowState -Module $m -Row $r -State 'Zmiana…' -Tone '' } }
+        $opName = @('Inherit', 'Reset', 'RemoveSids')[$rp.Op]
+        Start-NtfsChange -Module $m -Name 'Naprawa uprawnień' -Computer $rp.Computer -Params @{ Op = $opName; Items = @($byPath.Values | ForEach-Object { @{ Path = $_.Path; Expected = $_.Expected; Sids = $_.Sids } }) } -OnDone {
+            param($m, $results)
+            foreach ($x in $results) {
+                $entry = $m.Data.RepairRows[[string]$x.Path]
+                if (-not $entry) { continue }
+                foreach ($r in $entry.Rows) { Set-RowState -Module $m -Row $r -State $(if ($x.Status -eq 'Zmieniono') { 'Naprawiono' } else { [string]$x.Status }) -Tone ([string]$x.Tone) }
+            }
+            $ok = @($results | Where-Object { $_.Status -eq 'Zmieniono' }).Count
+            $left = @(Get-ResultRowsAll -Module $m | Where-Object { [string]$_['Stan'] -ne 'Naprawiono' -and [string]$_['Stan'] -ne 'Konto istnieje w AD' }).Count
+            Set-StatTile -Module $m -Key 'todo' -Value ([string]$left) -Tone $(if ($left) { 'warn' } else { 'ok' })
+            Show-Toast ("Naprawiono {0} z {1} miejsc." -f $ok, @($results).Count) $(if ($ok -eq @($results).Count) { 'ok' } else { 'warn' })
+        }
+    } | Out-Null
+    Add-StatTile -Module $m -Key 'todo' -Label 'Do naprawy' -Icon 'E90F' | Out-Null
+    Add-StatTile -Module $m -Key 'checked' -Label 'Sprawdzone elementy' -Icon 'E9D5' | Out-Null
+    Add-StatTile -Module $m -Key 'denied' -Label 'Bez dostępu' -Icon 'E72E' | Out-Null
+    Add-RowAction -Module $m -Text 'Otwórz w Eksploratorze' -Icon 'E838' -Action { param($m, $rows) Open-Folder ([string](Get-ObjectValue $rows[0] 'Ścieżka')) }
+    $m.EmptyHint = 'Wybierz folder i rodzaj naprawy, kliknij «Podgląd» (F5), a potem «Napraw». Miejsca bez dostępu (np. po zmianie domeny) napraw opcją przejęcia własności.'
+}
+
+# --- Kopie uprawnień ---
+function Update-NtfsBackupList {
+    param([hashtable]$Module)
+    $m = $Module
+    Reset-ResultTable -Module $m
+    $files = @(Get-ChildItem -LiteralPath (Get-DataFolder 'AclBackup') -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    $rows = foreach ($f in $files) {
+        try {
+            $b = Read-NtfsBackup $f.FullName
+            [pscustomobject][ordered]@{ 'Utworzono' = ($b.CreatedAt -replace 'T', ' '); 'Operacja' = $b.Operation; 'Folder' = $b.Root; 'Komputer' = $b.Computer; 'Elementów' = $b.Items.Count; 'Autor' = $b.CreatedBy; 'Plik' = $f.Name; '__file' = $f.FullName }
+        }
+        catch { [pscustomobject][ordered]@{ 'Utworzono' = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'); 'Operacja' = 'Nie można odczytać pliku'; 'Plik' = $f.Name; '__file' = $f.FullName; '__flag' = 'crit' } }
+    }
+    $rows = @($rows)
+    if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+    Set-StatTile -Module $m -Key 'count' -Value ([string]$rows.Count)
+}
+
+Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsBackups' -Title 'Kopie uprawnień' -Icon 'E81C' -Badge 'nowe' `
+    -Description 'Kopie uprawnień (właściciel, wpisy i dziedziczenie każdego folderu) zapisywane automatycznie przed zmianami narzędzi NTFS albo ręcznie dla całego drzewa – i przywracanie ich w całości lub dla wybranych folderów.' -Build {
+    param($m)
+    $f = Add-FolderField -Module $m -Title 'Nowa kopia'
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $row = Add-NtfsDepthRow -Module $m
+    Add-Button -Parent $row -Text 'Zrób kopię uprawnień' -Icon 'E74E' -Module $m -Primary -OnClick {
+        param($m)
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        $m.Data.BackupJob = $pf
+        Start-NtfsScan -Module $m -Name 'Kopia uprawnień' -Path $pf.Path -Computer $pf.Computer -Params @{ Mode = 'All'; Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files) } -OnDone {
+            param($m)
+            $scan = $m.Data.NtfsScan
+            if ($scan.Acl.Count -eq 0) { Show-Warning 'Nie odczytano uprawnień żadnego elementu.'; return }
+            $file = Save-NtfsBackup -Operation 'Kopia ręczna' -Computer $m.Data.BackupJob.Computer -Root $m.Data.BackupJob.Path -Items @($scan.Acl | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Sddl } })
+            if ($file) { Show-Toast ("Zapisano kopię uprawnień: {0} elementów{1}" -f $scan.Acl.Count, $(if ($scan.Skipped.Count) { ", pominięto bez dostępu: $(@($scan.Skipped | Where-Object { [string]$_.Kind -ne 'link' }).Count)" } else { '' })) 'ok' 6 }
+            Update-NtfsBackupList -Module $m
+        }
+    } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Kopie'
+    Add-Button -Parent $row2 -Text 'Odśwież listę' -Icon 'E72C' -Module $m -AlwaysEnabled -OnClick { param($m) Update-NtfsBackupList -Module $m } | Out-Null
+    Add-Button -Parent $row2 -Text 'Folder kopii' -Icon 'E838' -Module $m -AlwaysEnabled -OnClick { param($m) Open-Folder (Get-DataFolder 'AclBackup') } | Out-Null
+    $m.Actions.Restore = {
+        param($m, $rows)
+        $file = [string](Get-ObjectValue $rows[0] '__file')
+        if (-not $file) { return }
+        $b = Read-NtfsBackup $file
+        if ($b.Items.Count -eq 0) { Show-Warning 'Kopia nie zawiera elementów.'; return }
+        $items = @($b.Items | ForEach-Object { $_.Path })
+        $chosen = @(Confirm-Action -Text ("Przywrócić uprawnienia z kopii «{0}» ({1}, {2}){3}? Obecne uprawnienia wybranych elementów zostaną zastąpione; ich stan sprzed przywrócenia trafi do nowej kopii." -f $b.Operation, ($b.CreatedAt -replace 'T', ' '), $b.CreatedBy, $(if ($b.Computer) { " na komputerze $($b.Computer)" } else { '' })) -Items $items -ConfirmText 'Przywróć' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $m.Data.RestoreFrom = $b
+        Start-NtfsChange -Module $m -Name 'Przywracanie uprawnień' -Computer $b.Computer -Params @{ Op = 'Restore'; Items = @($chosen | ForEach-Object { @{ Path = $b.Items[$_].Path; Sddl = $b.Items[$_].Sddl; Expected = '' } }) } -OnDone {
+            param($m, $results)
+            $before = @($results | Where-Object { $_.Before })
+            if ($before.Count) { [void](Save-NtfsBackup -Operation 'Stan przed przywróceniem' -Computer $m.Data.RestoreFrom.Computer -Root $m.Data.RestoreFrom.Root -Items @($before | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Before } })) }
+            $rows = @($results | ForEach-Object { [pscustomobject][ordered]@{ 'Ścieżka' = $_.Path; 'Wynik' = $(if ($_.Status -eq 'Zmieniono') { 'Przywrócono' } else { $_.Status }); 'Szczegóły' = $_.Detail; '__tone' = $_.Tone } })
+            Update-NtfsBackupList -Module $m
+            Show-GridDialog -Title 'Przywracanie uprawnień' -Subtitle ('Kopia: ' + [System.IO.Path]::GetFileName($m.Data.RestoreFrom.File)) -Rows $rows -PillColumns @('Wynik')
+        }
+    }
+    Add-RowAction -Module $m -Text 'Przywróć uprawnienia…' -Icon 'E7A7' -Danger -Action { param($m, $rows) & $m.Actions.Restore $m $rows }
+    Add-RowAction -Module $m -Text 'Pokaż zawartość' -Icon 'E8A1' -Action {
+        param($m, $rows)
+        $b = Read-NtfsBackup ([string](Get-ObjectValue $rows[0] '__file'))
+        $list = @($b.Items | ForEach-Object {
+                $o = [ordered]@{ 'Ścieżka' = $_.Path }
+                try {
+                    $acl = New-NtfsAclFromSddl $_.Sddl
+                    $rules = Get-NtfsRules $acl
+                    $o['Dziedziczenie'] = $(if ($acl.AreAccessRulesProtected) { 'wyłączone' } else { 'włączone' })
+                    $o['Jawne wpisy'] = ((@($rules | Where-Object { -not $_.Inherited } | ForEach-Object { Get-NtfsRuleText @{} $_ })) -join '; ')
+                    $o['Właściciel'] = $(try { $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { '' })
+                }
+                catch { $o['Dziedziczenie'] = 'niepoprawny zapis' }
+                $o['SDDL'] = $_.Sddl
+                [pscustomobject]$o
+            })
+        Show-GridDialog -Title ('Kopia uprawnień: ' + $b.Operation) -Subtitle ('{0} • {1} • {2}' -f ($b.CreatedAt -replace 'T', ' '), $b.Root, $b.CreatedBy) -Rows $list
+    }
+    Add-RowAction -Module $m -Text 'Usuń plik kopii' -Icon 'E74D' -Danger -Separator -Action {
+        param($m, $rows)
+        $files = @($rows | ForEach-Object { [string](Get-ObjectValue $_ '__file') } | Where-Object { $_ })
+        if (-not (Confirm-Action -Text 'Usunąć wybrane pliki kopii uprawnień? Nie będzie można z nich przywrócić uprawnień.' -Items @($files | ForEach-Object { [System.IO.Path]::GetFileName($_) }) -ConfirmText 'Usuń' -Danger)) { return }
+        foreach ($f in $files) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        Update-NtfsBackupList -Module $m
+    }
+    Add-StatTile -Module $m -Key 'count' -Label 'Zapisane kopie' -Icon 'E81C' | Out-Null
+    $m.ResultHint = 'Prawy przycisk na kopii: przywróć (całość lub wybrane foldery), pokaż zawartość, usuń'
+    $m.EmptyHint = 'Kopie powstają automatycznie przed zmianami w modułach NTFS. Własną kopię drzewa zrobisz przyciskiem «Zrób kopię uprawnień».'
+    Update-NtfsBackupList -Module $m
+}
+
+# --- Raport ryzyk ---
+function Get-NtfsRiskFindings {
+    # Ryzykowne wpisy (jawne w całym drzewie, dziedziczone - tylko w folderze głównym); $Classes: SID -> objectClass z AD
+    param([object[]]$Acl, [hashtable]$Names, [hashtable]$Classes, [int]$FullLimit = 3)
+    $out = New-Object System.Collections.ArrayList
+    $add = { param($sev, $title, $rec, $sid, $rights, $text) [void]$out.Add([pscustomobject][ordered]@{ 'Ryzyko' = $sev; 'Problem' = $title; 'Tożsamość' = $(if ($sid) { Get-NtfsSidLabel $Names $sid } else { '' }); 'Uprawnienia' = $rights; 'Ścieżka' = $rec.Path; 'Opis' = $text
+                '__tone' = @{ 'Wysokie' = 'crit'; 'Średnie' = 'warn'; 'Niskie' = 'info' }[$sev]; '__sid' = $sid }) }
+    $isTrusted = { param($s) ($script:NtfsTrustedSids -contains $s) -or ($s -match '^S-1-5-21-' -and $script:NtfsTrustedRids -contains ($s -replace '^.*-', '')) }
+    foreach ($rec in @($Acl | Sort-Object Path)) {
+        $sd = New-NtfsAclFromSddl ([string]$rec.Sddl)
+        $isRoot = ([int]$rec.Level -eq 0)
+        $rules = @(Get-NtfsRules $sd | Where-Object { -not $_.Inherited -or $isRoot })
+        $fullCount = 0
+        foreach ($r in $rules) {
+            $lvl = Get-NtfsAccessLevel $r.Mask
+            $rid = $r.Sid -replace '^.*-', ''
+            $broad = $script:NtfsBroadSids.Contains($r.Sid) -or ($r.Sid -match '^S-1-5-21-' -and @('513', '514') -contains $rid)
+            $where = $(if ($r.Inherited) { ' (dziedziczone z wyższego folderu)' } else { '' })
+            if ($r.Deny) { & $add 'Niskie' 'Wpis odmowy' $rec $r.Sid $lvl ('Odmowy utrudniają diagnozę dostępu – lepiej nie nadawać uprawnień niż odmawiać' + $where); continue }
+            $write = Test-NtfsWriteMask $r.Mask
+            $mask = ConvertTo-NtfsSpecificMask $r.Mask
+            if ($broad -and $write) { & $add 'Wysokie' 'Szeroka grupa może zmieniać dane' $rec $r.Sid $lvl ('Prawie każdy użytkownik może tworzyć, zmieniać lub usuwać pliki; nadaj zapis właściwej grupie' + $where) }
+            elseif ($broad -and @('S-1-1-0', 'S-1-5-7', 'S-1-5-32-546') -contains $r.Sid) { & $add 'Średnie' 'Odczyt dla wszystkich (także gości)' $rec $r.Sid $lvl ('Wszyscy / anonimowi / goście mogą czytać dane' + $where) }
+            elseif ($broad) { & $add 'Niskie' 'Odczyt dla wszystkich użytkowników' $rec $r.Sid $lvl ('Każdy uwierzytelniony użytkownik może czytać – sprawdź, czy to zamierzone' + $where) }
+            $trusted = & $isTrusted $r.Sid
+            if (-not $trusted -and -not $broad -and ($mask -band 0xC0000)) {
+                $fullCount++
+                & $add 'Średnie' 'Pełna kontrola / zmiana uprawnień' $rec $r.Sid $lvl ('Może zmieniać uprawnienia i przejmować pliki – zwykle wystarcza Modyfikacja' + $where)
+            }
+            if ($r.Sid -match '^S-1-5-21-' -and [string]$Classes[$r.Sid] -eq 'user') { & $add $(if ($write) { 'Średnie' } else { 'Niskie' }) 'Wpis dla konta zamiast grupy' $rec $r.Sid $lvl ('Uprawnienia nadane bezpośrednio użytkownikowi trudno utrzymać – nadaj je grupie' + $where) }
+            if ($r.Sid -match '^S-1-5-21-' -and (-not $Names.ContainsKey($r.Sid) -or [string]$Names[$r.Sid] -eq $r.Sid) -and -not $Classes.ContainsKey($r.Sid)) { & $add 'Średnie' 'Wpis usuniętego konta' $rec $r.Sid $lvl 'Nierozwiązany SID – usuń w module «Naprawa uprawnień»' }
+        }
+        if ($fullCount -gt $FullLimit) { & $add 'Średnie' "Zbyt wiele kont z pełną kontrolą ($fullCount)" $rec '' '' "Więcej niż $FullLimit kont/grup (poza administratorami) może zmieniać uprawnienia" }
+        $owner = ''
+        try { $owner = $sd.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($owner -and [string]$Classes[$owner] -eq 'user') { & $add 'Niskie' 'Właścicielem jest użytkownik' $rec $owner '' 'Właściciel zawsze może zmienić uprawnienia – przy porządkach ustaw grupę Administratorzy' }
+    }
+    return $out.ToArray()
+}
+
+Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsRisks' -Title 'Raport ryzyk' -Icon 'E7BA' -Badge 'nowe' `
+    -Description 'Ryzykowne uprawnienia w drzewie folderów: zapis dla Wszystkich / Użytkowników domeny, pełna kontrola dla zwykłych kont, zbyt wiele kont z pełną kontrolą, wpisy dla użytkowników zamiast grup, usunięte konta, odmowy i użytkownicy jako właściciele – z oceną i zaleceniem.' -Build {
+    param($m)
+    $m.PillColumns = @('Ryzyko')
+    $f = Add-FolderField -Module $m
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $row = Add-NtfsDepthRow -Module $m
+    Add-Label -Parent $row -Text '   Pełna kontrola – ostrzegaj powyżej' | Out-Null
+    $m.FullLimit = Add-Numeric -Parent $row -Value 3 -Minimum 1 -Maximum 50 -Width 50
+    Add-Button -Parent $row -Text 'Analizuj' -Icon 'E7BA' -Module $m -Primary -OnClick {
+        param($m)
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        Reset-ResultTable -Module $m
+        Start-NtfsScan -Module $m -Name 'Raport ryzyk' -Path $pf.Path -Computer $pf.Computer -Params @{ Mode = 'Explicit'; Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files) } -OnDone {
+            param($m)
+            $scan = $m.Data.NtfsScan
+            $sids = @{}
+            foreach ($rec in $scan.Acl) {
+                $acl = New-NtfsAclFromSddl ([string]$rec.Sddl)
+                foreach ($r in (Get-NtfsRules $acl)) { if ($r.Sid -match '^S-1-5-21-') { $sids[$r.Sid] = $true } }
+                try { $o = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if ($o -match '^S-1-5-21-') { $sids[$o] = $true } } catch { }
+            }
+            $m.Data.RiskClasses = @{}
+            $finish = {
+                param($m)
+                $scan = $m.Data.NtfsScan
+                Reset-ResultTable -Module $m
+                $rows = @(Get-NtfsRiskFindings -Acl @($scan.Acl) -Names $scan.Names -Classes $m.Data.RiskClasses -FullLimit (Get-Num $m.FullLimit))
+                $order = @{ 'Wysokie' = 0; 'Średnie' = 1; 'Niskie' = 2 }
+                $rows = @($rows | Sort-Object @{ Expression = { $order[$_.'Ryzyko'] } }, 'Ścieżka')
+                if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+                foreach ($k in 'Wysokie', 'Średnie', 'Niskie') { Set-StatTile -Module $m -Key $k -Value ([string]@($rows | Where-Object { $_.'Ryzyko' -eq $k }).Count) -Tone $(if (@($rows | Where-Object { $_.'Ryzyko' -eq $k }).Count) { @{ 'Wysokie' = 'crit'; 'Średnie' = 'warn'; 'Niskie' = 'info' }[$k] } else { '' }) }
+                Set-StatTile -Module $m -Key 'checked' -Value ([string]$scan.Items)
+                Set-StatTile -Module $m -Key 'protected' -Value ([string]@($scan.Acl | Where-Object { $_.Protected }).Count)
+                if ($rows.Count -eq 0) { Show-Toast 'Nie znaleziono ryzykownych uprawnień.' 'ok' }
+            }
+            $m.Data.RiskFinish = $finish
+            if ($sids.Count -and (Get-Module -ListAvailable -Name ActiveDirectory)) {
+                Start-AdOperation -Module $m -Name 'Rodzaje kont (AD)' -Targets @('AD') -Output None -Parameters @{ Sids = @($sids.Keys) } -ScriptBlock {
+                    $list = @($P.Sids)
+                    for ($i = 0; $i -lt $list.Count; $i += 40) {
+                        $chunk = @($list[$i..([Math]::Min($i + 39, $list.Count - 1))])
+                        $filter = '(|' + ((@($chunk | ForEach-Object { "(objectSid=$_)" })) -join '') + ')'
+                        foreach ($o in @(Get-ADObject -LDAPFilter $filter -Properties objectSid, sAMAccountName @ad)) { [pscustomobject]@{ Sid = [string]$o.objectSid; Class = [string]$o.ObjectClass; Name = [string]$o.sAMAccountName } }
+                    }
+                } -OnResult {
+                    param($m, $r)
+                    if (-not $r.Ok) { Write-Log ('Rodzajów kont nie sprawdzono w AD: ' + ((@($r.Errors)) -join ' ')) 'WARN'; return }
+                    foreach ($d in @($r.Data)) { $m.Data.RiskClasses[[string]$d.Sid] = [string]$d.Class; if (-not $m.Data.NtfsScan.Names.ContainsKey([string]$d.Sid) -or [string]$m.Data.NtfsScan.Names[[string]$d.Sid] -eq [string]$d.Sid) { $m.Data.NtfsScan.Names[[string]$d.Sid] = [string]$d.Name } }
+                } -OnComplete { param($m) & $m.Data.RiskFinish $m }
+            }
+            else { & $finish $m }
+        }
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Gdzie jeszcze ma dostęp ta tożsamość' -Icon 'E721' -Action {
+        param($m, $rows)
+        $id = [string](Get-ObjectValue $rows[0] 'Tożsamość')
+        if (-not $id) { return }
+        Show-Module -Key 'NtfsFindAccess'
+        $fm = $script:UI.Modules['NtfsFindAccess']
+        $fm.Identity.Text = $id
+        $fm.Path.Text = $m.Path.Text.Trim()
+        $fm.Computer.Text = $m.Computer.Text.Trim()
+    }
+    Add-RowAction -Module $m -Text 'Odbierz uprawnienia tej tożsamości…' -Icon 'E8F8' -Danger -Action {
+        param($m, $rows)
+        $ids = @($rows | ForEach-Object { [string](Get-ObjectValue $_ '__sid') } | Where-Object { $_ } | Select-Object -Unique)
+        if (-not $ids.Count) { return }
+        Show-Module -Key 'NtfsRevoke'
+        $rm = $script:UI.Modules['NtfsRevoke']
+        $rm.Path.Text = $m.Path.Text.Trim()
+        $rm.Computer.Text = $m.Computer.Text.Trim()
+        $rm.Input.Text = ($ids -join "`r`n")
+        Show-Toast 'Kliknij «Podgląd», aby zobaczyć wszystkie wpisy tych tożsamości.' 'info'
+    }
+    Add-RowAction -Module $m -Text 'Otwórz w Eksploratorze' -Icon 'E838' -Separator -Action { param($m, $rows) Open-Folder ([string](Get-ObjectValue $rows[0] 'Ścieżka')) }
+    Add-StatTile -Module $m -Key 'Wysokie' -Label 'Ryzyko wysokie' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'Średnie' -Label 'Ryzyko średnie' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'Niskie' -Label 'Ryzyko niskie' -Icon 'E946' | Out-Null
+    Add-StatTile -Module $m -Key 'protected' -Label 'Wyłączone dziedziczenie' -Icon 'E72E' | Out-Null
+    Add-StatTile -Module $m -Key 'checked' -Label 'Sprawdzone elementy' -Icon 'E9D5' | Out-Null
+    $m.EmptyHint = 'Podaj folder (np. udział z danymi działów) i kliknij «Analizuj» (F5). Wpisy dziedziczone są oceniane raz – w folderze głównym.'
+}
+
+# --- Porównanie ze wzorcem ---
+function Compare-NtfsAcl {
+    # Różnice wpisów folderu względem wzorca; -All: wszystkie wpisy (jawne i dziedziczone) bez rozróżnienia
+    param($Template, $Target, [switch]$All, [hashtable]$Names, [switch]$Protection, [switch]$Owner)
+    $key = { param($r) '{0}|{1}|{2}|{3}' -f $r.Sid, [int][bool]$r.Deny, $r.Inherit, $r.Propagate }
+    $collect = {
+        param($acl)
+        $h = [ordered]@{}
+        foreach ($r in (Get-NtfsRules $acl)) {
+            if (-not $All -and $r.Inherited) { continue }
+            $k = & $key $r
+            $mask = ConvertTo-NtfsSpecificMask $r.Mask
+            if ($h.Contains($k)) { $h[$k].Mask = $h[$k].Mask -bor $mask } else { $h[$k] = @{ Sid = $r.Sid; Deny = $r.Deny; Inherit = $r.Inherit; Propagate = $r.Propagate; Mask = $mask } }
+        }
+        return $h
+    }
+    $t = & $collect $Template
+    $g = & $collect $Target
+    $diffs = New-Object System.Collections.ArrayList
+    $fmt = { param($r) '{0}{1}, {2}' -f (Get-NtfsAccessLevel $r.Mask), $(if ($r.Deny) { ' (odmowa)' } else { '' }), (Get-NtfsScopeText $r.Inherit $r.Propagate) }
+    foreach ($k in $t.Keys) {
+        if (-not $g.Contains($k)) { [void]$diffs.Add(@{ Kind = 'Brak wpisu'; Sid = $t[$k].Sid; T = (& $fmt $t[$k]); G = '—'; Tone = 'crit' }) }
+        elseif ($g[$k].Mask -ne $t[$k].Mask) { [void]$diffs.Add(@{ Kind = 'Inne uprawnienia'; Sid = $t[$k].Sid; T = (& $fmt $t[$k]); G = (& $fmt $g[$k]); Tone = 'warn' }) }
+    }
+    foreach ($k in $g.Keys) { if (-not $t.Contains($k)) { [void]$diffs.Add(@{ Kind = 'Nadmiarowy wpis'; Sid = $g[$k].Sid; T = '—'; G = (& $fmt $g[$k]); Tone = 'warn' }) } }
+    if ($Protection -and $Template.AreAccessRulesProtected -ne $Target.AreAccessRulesProtected) {
+        [void]$diffs.Add(@{ Kind = 'Dziedziczenie'; Sid = ''; T = $(if ($Template.AreAccessRulesProtected) { 'wyłączone' } else { 'włączone' }); G = $(if ($Target.AreAccessRulesProtected) { 'wyłączone' } else { 'włączone' }); Tone = 'warn' })
+    }
+    if ($Owner) {
+        $to = ''; $go = ''
+        try { $to = $Template.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        try { $go = $Target.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($to -ne $go) { [void]$diffs.Add(@{ Kind = 'Właściciel'; Sid = ''; T = (Get-NtfsSidLabel $Names $to); G = (Get-NtfsSidLabel $Names $go); Tone = 'info' }) }
+    }
+    return $diffs.ToArray()
+}
+
+function Show-NtfsTemplateCompare {
+    param([hashtable]$Module)
+    $m = $Module
+    $scan = $m.Data.NtfsScan
+    $tp = $m.Data.Template
+    Reset-ResultTable -Module $m
+    $byPath = @{}
+    foreach ($rec in $scan.Acl) { $byPath[[string]$rec.Path] = $rec }
+    $tRec = $byPath[$tp.Path]
+    if (-not $tRec) { Show-Warning ("Nie można odczytać uprawnień wzorca: {0}" -f ((@($scan.Skipped | Where-Object { $_.Path -eq $tp.Path } | ForEach-Object { $_.Reason }) + @($scan.Errors)) -join ' ')); return }
+    $tAcl = New-NtfsAclFromSddl ([string]$tRec.Sddl)
+    $tp.Sddl = [string]$tRec.Sddl
+    $rows = New-Object System.Collections.ArrayList
+    $okCount = 0
+    foreach ($path in $tp.Targets) {
+        $rec = $byPath[$path]
+        if (-not $rec) {
+            $why = @($scan.Skipped | Where-Object { $_.Path -eq $path } | ForEach-Object { $_.Reason }) -join ' '
+            [void]$rows.Add([pscustomobject][ordered]@{ 'Stan' = 'Brak dostępu'; 'Folder' = $path; 'Tożsamość' = ''; 'Wzorzec' = ''; 'Folder docelowy' = $why; '__tone' = 'crit'; '__sddl' = '' })
+            continue
+        }
+        $diffs = @(Compare-NtfsAcl -Template $tAcl -Target (New-NtfsAclFromSddl ([string]$rec.Sddl)) -All:($m.Mode.SelectedIndex -eq 1) -Names $scan.Names -Protection:(Test-Checked $m.CmpProtect) -Owner:(Test-Checked $m.CmpOwner))
+        if ($diffs.Count -eq 0) { $okCount++; [void]$rows.Add([pscustomobject][ordered]@{ 'Stan' = 'Zgodny z wzorcem'; 'Folder' = $path; 'Tożsamość' = ''; 'Wzorzec' = ''; 'Folder docelowy' = ''; '__tone' = 'ok'; '__sddl' = [string]$rec.Sddl }); continue }
+        foreach ($d in $diffs) { [void]$rows.Add([pscustomobject][ordered]@{ 'Stan' = $d.Kind; 'Folder' = $path; 'Tożsamość' = $(if ($d.Sid) { Get-NtfsSidLabel $scan.Names $d.Sid } else { '' }); 'Wzorzec' = $d.T; 'Folder docelowy' = $d.G; '__tone' = $d.Tone; '__sddl' = [string]$rec.Sddl }) }
+    }
+    if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows.ToArray() -TargetColumn '' }
+    Set-StatTile -Module $m -Key 'ok' -Value ([string]$okCount) -Tone $(if ($okCount) { 'ok' } else { '' })
+    $diff = @($rows | Where-Object { @('Zgodny z wzorcem', 'Brak dostępu') -notcontains $_.'Stan' } | ForEach-Object { $_.'Folder' } | Select-Object -Unique).Count
+    Set-StatTile -Module $m -Key 'diff' -Value ([string]$diff) -Tone $(if ($diff) { 'warn' } else { '' })
+    $tRules = @(Get-NtfsRules $tAcl | Where-Object { -not $_.Inherited })
+    $m.ResultHint = 'Wzorzec: {0} – dziedziczenie {1}, jawne wpisy: {2}' -f $tp.Path, $(if ($tAcl.AreAccessRulesProtected) { 'wyłączone' } else { 'włączone' }), ((@($tRules | ForEach-Object { Get-NtfsRuleText $scan.Names $_ })) -join '; ')
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+}
+
+Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsTemplate' -Title 'Porównanie ze wzorcem' -Icon 'E8F1' -Badge 'nowe' `
+    -Description 'Porównuje uprawnienia folderów z folderem wzorcowym (brakujące, nadmiarowe i inne wpisy, dziedziczenie, właściciel) i kopiuje uprawnienia wzorca na wybrane foldery – w całości albo tylko brakujące wpisy, z kopią zapasową.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $f = Add-FolderField -Module $m -Title 'Wzorzec'
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $m.Targets = Add-StretchTextBox -Module $m -Title 'Foldery' -Multiline -Height 90 -Placeholder 'Foldery do porównania – po jednym w wierszu (na tym samym komputerze co wzorzec)'
+    $row = Add-ToolbarRow -Module $m -Title 'Porównuj'
+    $m.Mode = Add-ComboBox -Parent $row -Items @('jawne wpisy', 'wszystkie wpisy (z dziedziczonymi)') -Width 260
+    $m.CmpProtect = Add-CheckBox -Parent $row -Text 'Dziedziczenie' -Checked $true
+    $m.CmpOwner = Add-CheckBox -Parent $row -Text 'Właściciel'
+    Add-Button -Parent $row -Text 'Wstaw podfoldery…' -Icon 'E8F4' -Module $m -AlwaysEnabled -ToolTip 'Dopisuje do listy podfoldery wskazanego folderu (np. wszystkie foldery działów)' -OnClick {
+        param($m)
+        $comp = $m.Computer.Text.Trim()
+        $parent = Show-InputDialog -Title 'Podfoldery' -Prompt ('Folder, którego podfoldery dopisać do listy{0}.' -f $(if ($comp) { " (na komputerze $comp)" } else { '' })) -Default (Split-Path -Path $m.Path.Text.Trim() -Parent) -Icon 'E8F4'
+        if (-not $parent) { return }
+        try { $subs = @(Get-NtfsSubfolders -Path $parent.Trim() -Computer $comp) } catch { Show-Error 'Nie można wyświetlić podfolderów.' $_; return }
+        $tpl = $m.Path.Text.Trim()
+        $current = @(Get-TextLines $m.Targets)
+        $m.Targets.Text = ((@($current) + @($subs | Where-Object { $_ -ne $tpl -and $current -notcontains $_ })) -join "`r`n")
+    } | Out-Null
+    $m.Actions.Compare = {
+        param($m)
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        $targets = @(Get-TextLines $m.Targets | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ -and $_ -ne $pf.Path } | Select-Object -Unique)
+        if ($targets.Count -eq 0) { Show-Warning 'Wpisz foldery do porównania (albo «Wstaw podfoldery…»).'; return }
+        $m.Data.Template = @{ Path = $pf.Path; Computer = $pf.Computer; Targets = $targets }
+        Start-NtfsScan -Module $m -Name 'Porównanie ze wzorcem' -Path $pf.Path -Computer $pf.Computer -Params @{ Mode = 'All'; Paths = @(@($pf.Path) + $targets) } -OnDone { param($m) Show-NtfsTemplateCompare -Module $m }
+    }
+    $row2 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row2 -Text 'Porównaj' -Icon 'E8F1' -Module $m -Primary -OnClick $m.Actions.Compare | Out-Null
+    Add-Button -Parent $row2 -Text 'Zastosuj wzorzec…' -Icon 'E8C8' -Module $m -Danger -OnClick {
+        param($m)
+        $tp = $m.Data['Template']
+        if (-not $tp -or -not $tp['Sddl']) { Show-Warning 'Najpierw «Porównaj».'; return }
+        $diffRows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Zgodny z wzorcem', 'Brak dostępu') -notcontains [string]$_['Stan'] })
+        $folders = @($diffRows | ForEach-Object { [string]$_['Folder'] } | Select-Object -Unique)
+        if ($folders.Count -eq 0) { Show-Message -Text 'Wszystkie foldery są zgodne z wzorcem.' -Title 'Brak zmian'; return }
+        $how = Show-FormDialog -Title 'Zastosuj wzorzec' -Icon 'E8C8' -Fields @(@{ Key = 'Mode'; Label = 'Sposób'; Type = 'Combo'; Items = @('Zastąp jawne wpisy wpisami wzorca (dokładna kopia, z ustawieniem dziedziczenia)', 'Dodaj tylko brakujące wpisy i prawa (bez usuwania)') })
+        if (-not $how) { return }
+        $replace = $how.Mode -like 'Zastąp*'
+        $chosen = @(Confirm-Action -Text ("{0} w wybranych folderach? Przed zmianą zostanie zapisana kopia uprawnień." -f $(if ($replace) { 'Zastąpić uprawnienia uprawnieniami wzorca' } else { 'Dodać brakujące wpisy wzorca' })) -Items $folders -ConfirmText 'Zastosuj' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $sddlOf = @{}
+        foreach ($r in $diffRows) { $sddlOf[[string]$r['Folder']] = [string]$r['__sddl'] }
+        $items = @($chosen | ForEach-Object { @{ Path = $folders[$_]; Expected = $sddlOf[$folders[$_]] } })
+        if (-not (Save-NtfsBackup -Operation 'Zastosowanie wzorca' -Computer $tp.Computer -Root $tp.Path -Items @($items | ForEach-Object { @{ Path = $_.Path; Sddl = $_.Expected } }))) { return }
+        $tAcl = New-NtfsAclFromSddl $tp.Sddl
+        $rules = @(Get-NtfsRules $tAcl | Where-Object { -not $_.Inherited } | ForEach-Object { @{ Sid = $_.Sid; Rights = [int]$_.Mask; Deny = $_.Deny; Inherit = $_.Inherit; Propagate = $_.Propagate } })
+        $protect = if ($replace) { [bool]$tAcl.AreAccessRulesProtected } else { $null }
+        Start-NtfsChange -Module $m -Name 'Zastosowanie wzorca' -Computer $tp.Computer -Params @{ Op = 'Template'; Items = $items; Rules = $rules; Protect = $protect; Replace = $replace } -OnDone {
+            param($m, $results)
+            $bad = @($results | Where-Object { $_.Status -ne 'Zmieniono' })
+            Show-Toast ("Zastosowano wzorzec w {0} z {1} folderów." -f (@($results).Count - $bad.Count), @($results).Count) $(if ($bad.Count) { 'warn' } else { 'ok' })
+            if ($bad.Count) { Show-GridDialog -Title 'Zastosowanie wzorca – problemy' -Rows @($bad | ForEach-Object { [pscustomobject][ordered]@{ 'Folder' = $_.Path; 'Wynik' = $_.Status; '__tone' = $_.Tone } }) -PillColumns @('Wynik') }
+            & $m.Actions.Compare $m
+        }
+    } | Out-Null
+    Add-StatTile -Module $m -Key 'ok' -Label 'Zgodne z wzorcem' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'diff' -Label 'Z różnicami' -Icon 'E7BA' | Out-Null
+    $m.EmptyHint = 'Wskaż folder wzorcowy i foldery do porównania (np. «Wstaw podfoldery…»), kliknij «Porównaj» (F5). «Zastosuj wzorzec…» kopiuje jawne wpisy wzorca na wybrane foldery.'
+}
+
+# --- Grupy dostępu do folderu ---
+$script:NtfsAccessLevels = [ordered]@{
+    'RO' = @{ Label = 'Odczyt'; Right = 'Odczyt i wykonywanie' }
+    'RW' = @{ Label = 'Modyfikacja'; Right = 'Modyfikacja' }
+    'FC' = @{ Label = 'Pełna kontrola'; Right = 'Pełna kontrola' }
+}
+
+Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsAccessGroups' -Title 'Grupy dostępu do folderu' -Icon 'E902' -Badge 'nowe' `
+    -Description 'Dla folderu (albo każdego jego podfolderu) tworzy w AD grupy dostępu – odczyt, modyfikacja, opcjonalnie pełna kontrola – według szablonu nazwy, dodaje do nich członków i od razu nadaje im uprawnienia NTFS. Uporządkowany model «grupa na folder» zamiast wpisów dla pojedynczych osób.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.EditableColumns = @('Grupa', 'Opis')
+    $m.OnCellEdit = { param($m, $row, $column) if (@('Utworzono i nadano', 'Nadano (grupa istniała)') -notcontains [string]$row['Stan']) { Set-RowState -Module $m -Row $row -State 'Zmieniono – sprawdź' -Tone 'warn' } }
+    $f = Add-FolderField -Module $m
+    $m.Path = $f[0]
+    $m.Computer = $f[1]
+    $row = Add-ToolbarRow -Module $m -Title 'Dla'
+    $m.Scope = Add-ComboBox -Parent $row -Items @('tego folderu', 'każdego podfolderu (pierwszy poziom)') -Width 260
+    Add-Label -Parent $row -Text '   Poziomy' | Out-Null
+    $m.LvlRO = Add-CheckBox -Parent $row -Text 'Odczyt (RO)' -Checked $true
+    $m.LvlRW = Add-CheckBox -Parent $row -Text 'Modyfikacja (RW)' -Checked $true
+    $m.LvlFC = Add-CheckBox -Parent $row -Text 'Pełna kontrola (FC)'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Grupy'
+    Add-Label -Parent $row2 -Text 'Nazwa' | Out-Null
+    $m.NameTpl = Add-TextBox -Parent $row2 -Width 220 -Text ([string](Get-ModuleSetting -Module $m -Name 'NameTpl' -Default 'DL_{Folder}_{Poziom}'))
+    $m.NameTpl.ToolTip = 'Pola: {Folder}, {Nadrzędny}, {Udział}, {Serwer}, {Poziom} (RO/RW/FC)'
+    Add-Label -Parent $row2 -Text 'Opis' | Out-Null
+    $m.DescTpl = Add-TextBox -Parent $row2 -Width 260 -Text ([string](Get-ModuleSetting -Module $m -Name 'DescTpl' -Default 'Dostęp ({Uprawnienie}) do {Ścieżka}'))
+    Add-Label -Parent $row2 -Text 'Zakres' | Out-Null
+    $m.GroupScope = Add-ComboBox -Parent $row2 -Items @('Lokalna domeny', 'Globalna', 'Uniwersalna') -Width 150
+    $m.Ou = Add-OuField -Parent (Add-ToolbarRow -Module $m -Title 'OU dla grup') -Module $m -Width 420 -Placeholder 'jednostka organizacyjna nowych grup' -DialogTitle 'Jednostka dla grup dostępu' -Remember 'Ou'
+    $m.Members = Add-StretchTextBox -Module $m -Title 'Członkowie' -Multiline -Height 60 -Placeholder "Opcjonalnie – poziom i konto lub grupa w wierszu, np.`r`nRO: GG_Finanse_Wszyscy`r`nRW: GG_Finanse_Księgowi"
+    $m.Actions.Preview = {
+        param($m)
+        $pf = Get-NtfsPathField -Module $m
+        if (-not $pf) { return }
+        $ou = $m.Ou.Text.Trim()
+        if (-not $ou) { Show-Warning 'Wybierz OU dla nowych grup.'; return }
+        $levels = @(@('RO', 'RW', 'FC') | Where-Object { Test-Checked $m["Lvl$_"] })
+        if ($levels.Count -eq 0) { Show-Warning 'Zaznacz co najmniej jeden poziom dostępu.'; return }
+        Set-ModuleSetting -Module $m -Name 'NameTpl' -Value $m.NameTpl.Text.Trim()
+        Set-ModuleSetting -Module $m -Name 'DescTpl' -Value $m.DescTpl.Text.Trim()
+        $folders = @($pf.Path)
+        if ($m.Scope.SelectedIndex -eq 1) {
+            try { $folders = @(Get-NtfsSubfolders -Path $pf.Path -Computer $pf.Computer) } catch { Show-Error 'Nie można wyświetlić podfolderów.' $_; return }
+            if ($folders.Count -eq 0) { Show-Warning 'Folder nie ma podfolderów.'; return }
+        }
+        $members = @{}
+        foreach ($line in (Get-TextLines $m.Members)) {
+            $mt = [regex]::Match($line, '^\s*(RO|RW|FC)\s*:\s*(.+)$', 'IgnoreCase')
+            if (-not $mt.Success) { Show-Warning "Wiersz członków «$line» – użyj formatu RO: grupa"; return }
+            $lv = $mt.Groups[1].Value.ToUpperInvariant()
+            if (-not $members.ContainsKey($lv)) { $members[$lv] = @() }
+            $members[$lv] += $mt.Groups[2].Value.Trim()
+        }
+        $unc = Get-NtfsUncParts $pf.Path
+        Reset-ResultTable -Module $m
+        $rows = foreach ($folder in $folders) {
+            $leaf = Split-Path -Path $folder -Leaf
+            $parent = Split-Path -Path (Split-Path -Path $folder -Parent) -Leaf
+            foreach ($lv in $levels) {
+                $def = $script:NtfsAccessLevels[$lv]
+                $tokens = @{ Folder = (ConvertTo-SamName $leaf); 'Nadrzędny' = (ConvertTo-SamName $parent); Nadrzedny = (ConvertTo-SamName $parent); 'Udział' = $(if ($unc) { ConvertTo-SamName $unc.Share } else { '' }); Udzial = $(if ($unc) { ConvertTo-SamName $unc.Share } else { '' })
+                    Serwer = $(if ($unc) { ConvertTo-SamName $unc.Server } elseif ($pf.Computer) { ConvertTo-SamName $pf.Computer } else { '' }); Poziom = $lv; Uprawnienie = $def.Label.ToLowerInvariant(); 'Ścieżka' = $folder; Sciezka = $folder }
+                $name = ConvertTo-SamName (Expand-Template $m.NameTpl.Text.Trim() $tokens)
+                [pscustomobject][ordered]@{
+                    'Stan' = 'Sprawdzanie…'; 'Folder' = $folder; 'Poziom' = $lv; 'Grupa' = $name; 'Uprawnienie' = $def.Right; 'Opis' = (Expand-Template $m.DescTpl.Text.Trim() $tokens)
+                    'Członkowie' = $(if ($members.ContainsKey($lv)) { (@($members[$lv]) -join ', ') } else { '' }); 'Uwagi' = ''; '__tone' = ''; '__id' = [guid]::NewGuid().ToString('N'); '__sid' = ''
+                }
+            }
+        }
+        Add-ResultRows -Module $m -Objects @($rows) -TargetColumn ''
+        $m.Data.AG = @{ Path = $pf.Path; Computer = $pf.Computer; Ou = $ou; Scope = @('DomainLocal', 'Global', 'Universal')[$m.GroupScope.SelectedIndex] }
+        & $m.Actions.Check $m
+    }
+    $m.Actions.Check = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Utworzono i nadano', 'Nadano (grupa istniała)') -notcontains [string]$_['Stan'] })
+        $per = @{}
+        foreach ($r in $rows) { $per[[string]$r['__id']] = @{ Name = [string]$r['Grupa']; Members = @(([string]$r['Członkowie']) -split ',' | Where-Object { $_.Trim() }) } }
+        if ($per.Count -eq 0) { return }
+        Start-AdOperation -Module $m -Name 'Sprawdzenie grup' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock {
+            $n = [string]$P.Name
+            if (-not $n) { return [pscustomobject]@{ State = 'Błąd danych'; Note = 'pusta nazwa grupy'; Sid = '' } }
+            if ($n.Length -gt 64) { return [pscustomobject]@{ State = 'Błąd danych'; Note = 'nazwa dłuższa niż 64 znaki'; Sid = '' } }
+            $g = @(Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapValue $n))" @ad)
+            if ($g.Count) { return [pscustomobject]@{ State = 'Grupa istnieje'; Note = $(if (@($P.Members).Count) { 'zostanie użyta (bez tworzenia); członkowie z listy zostaną do niej dodani' } else { 'zostanie użyta (bez tworzenia)' }); Sid = [string]$g[0].SID } }
+            [pscustomobject]@{ State = 'Do utworzenia'; Note = ''; Sid = '' }
+        } -OnResult {
+            param($m, $r)
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value $r.Target)) {
+                if (-not $r.Ok) { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note ((@($r.Errors)) -join ' '); continue }
+                $d = @($r.Data)[0]
+                Set-RowState -Module $m -Row $row -State $d.State -Tone $(if ($d.State -eq 'Do utworzenia') { 'info' } elseif ($d.State -eq 'Grupa istnieje') { 'warn' } else { 'crit' }) -Note $d.Note
+                Set-ResultValue -Module $m -Row $row -Column '__sid' -Value $d.Sid
+            }
+        }
+    }
+    $row4 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row4 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick $m.Actions.Preview | Out-Null
+    Add-Button -Parent $row4 -Text 'Sprawdź ponownie' -Icon 'E72C' -Module $m -OnClick $m.Actions.Check | Out-Null
+    Add-Button -Parent $row4 -Text 'Utwórz grupy i nadaj uprawnienia' -Icon 'E902' -Module $m -OnClick {
+        param($m)
+        if (-not $m.Data['AG']) { Show-Warning 'Najpierw «Podgląd».'; return }
+        Complete-GridEdit -Module $m
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Do utworzenia', 'Grupa istnieje') -contains [string]$_['Stan'] })
+        if (@(Get-ResultRowsAll -Module $m | Where-Object { [string]$_['Stan'] -eq 'Zmieniono – sprawdź' }).Count) { Show-Warning 'Po zmianach w tabeli kliknij «Sprawdź ponownie».'; return }
+        if ($rows.Count -eq 0) { Show-Warning 'Brak wierszy gotowych do wykonania.'; return }
+        $items = @($rows | ForEach-Object { '{0} → {1} ({2}){3}' -f $_['Grupa'], $_['Folder'], $_['Uprawnienie'], $(if ([string]$_['Stan'] -eq 'Grupa istnieje') { ' – grupa istnieje' } else { '' }) })
+        $chosen = @(Confirm-Action -Text ("Utworzyć brakujące grupy w`r`n{0}`r`ni nadać im uprawnienia do folderów (ten folder, podfoldery i pliki)? Przed zmianą zostanie zapisana kopia uprawnień folderów." -f $m.Data.AG.Ou) -Items $items -ConfirmText 'Wykonaj' -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $sel = @($chosen | ForEach-Object { $rows[$_] })
+        $per = @{}
+        foreach ($r in $sel) {
+            $per[[string]$r['__id']] = @{ Name = [string]$r['Grupa']; Description = [string]$r['Opis']; Ou = $m.Data.AG.Ou; Scope = $m.Data.AG.Scope; Members = @(([string]$r['Członkowie']) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+            Set-RowState -Module $m -Row $r -State 'Tworzenie…' -Tone ''
+        }
+        $m.Data.AGSelected = @($sel | ForEach-Object { [string]$_['__id'] })
+        Start-AdOperation -Module $m -Name 'Grupy dostępu' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock {
+            $created = $false
+            $g = @(Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapValue $P.Name))" @ad)
+            if ($g.Count -eq 0) {
+                $np = @{ Name = $P.Name; SamAccountName = $P.Name; GroupScope = $P.Scope; GroupCategory = 'Security'; Path = $P.Ou }
+                if ($P.Description) { $np.Description = $P.Description }
+                New-ADGroup @np @ad
+                $created = $true
+                $g = @(Get-ADGroup -Identity ('CN={0},{1}' -f (ConvertTo-RdnValue $P.Name), $P.Ou) @ad)
+            }
+            $notes = @()
+            foreach ($mem in @($P.Members)) {
+                try { $o = Resolve-AdPrincipal -Id $mem; Add-ADGroupMember -Identity $g[0].DistinguishedName -Members $o.DistinguishedName @ad; $notes += "dodano $mem" }
+                catch { $notes += "nie dodano $mem`: $($_.Exception.Message)" }
+            }
+            [pscustomobject]@{ Sid = [string]$g[0].SID; Created = $created; Notes = ($notes -join '; ') }
+        } -OnResult {
+            param($m, $r)
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value $r.Target)) {
+                if (-not $r.Ok) { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')); continue }
+                $d = @($r.Data)[0]
+                Set-ResultValue -Module $m -Row $row -Column '__sid' -Value $d.Sid
+                Set-RowState -Module $m -Row $row -State $(if ($d.Created) { 'Grupa utworzona' } else { 'Grupa istniała' }) -Tone 'info' -Note $d.Notes
+            }
+        } -OnComplete {
+            param($m)
+            $ready = @(Get-ResultRowsAll -Module $m | Where-Object { $m.Data.AGSelected -contains [string]$_['__id'] -and [string]$_['__sid'] -and @('Grupa utworzona', 'Grupa istniała') -contains [string]$_['Stan'] })
+            if ($ready.Count -eq 0) { return }
+            $byFolder = [ordered]@{}
+            foreach ($r in $ready) {
+                $folder = [string]$r['Folder']
+                if (-not $byFolder.Contains($folder)) { $byFolder[$folder] = @{ Path = $folder; Rules = @(); Rows = @() } }
+                $byFolder[$folder].Rules += @{ Sid = [string]$r['__sid']; Rights = [int]$script:NtfsRights[[string]$r['Uprawnienie']]; Deny = $false; Inherit = 3; Propagate = 0 }
+                $byFolder[$folder].Rows += $r
+            }
+            $m.Data.AGFolders = $byFolder
+            # Kopia uprawnień folderów zapisywana z odczytu tuż przed zmianą (pole Before wyniku)
+            Start-NtfsChange -Module $m -Name 'Nadawanie uprawnień grupom' -Computer $m.Data.AG.Computer -Params @{ Op = 'AddRules'; Items = @($byFolder.Values | ForEach-Object { @{ Path = $_.Path; Expected = ''; Rules = $_.Rules } }) } -OnDone {
+                param($m, $results)
+                $before = @($results | Where-Object { $_.Before })
+                if ($before.Count) { [void](Save-NtfsBackup -Operation 'Grupy dostępu – stan przed nadaniem' -Computer $m.Data.AG.Computer -Root $m.Data.AG.Path -Items @($before | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Before } })) }
+                foreach ($x in $results) {
+                    $entry = $m.Data.AGFolders[[string]$x.Path]
+                    if (-not $entry) { continue }
+                    foreach ($r in $entry.Rows) {
+                        if ($x.Status -eq 'Zmieniono') { Set-RowState -Module $m -Row $r -State $(if ([string]$r['Stan'] -eq 'Grupa utworzona') { 'Utworzono i nadano' } else { 'Nadano (grupa istniała)' }) -Tone 'ok' }
+                        else { Set-RowState -Module $m -Row $r -State 'Grupa jest, uprawnień nie nadano' -Tone 'crit' -Note ([string]$x.Status) }
+                    }
+                }
+                Show-Toast 'Gotowe. Członkowie nowych grup zobaczą dostęp po ponownym zalogowaniu.' 'ok' 6
+            }
+        }
+    } | Out-Null
+    Add-Label -Parent $row4 -Text 'Uprawnienia: ten folder, podfoldery i pliki. Nowe członkostwo działa po ponownym zalogowaniu użytkownika.' -Hint -MaxWidth 520 | Out-Null
+    $m.EmptyHint = 'Podaj folder (albo folder z podfolderami działów), OU i szablon nazwy, kliknij «Podgląd» (F5). Nazwy i opisy grup można poprawić w tabeli.'
+}
+
+# --- Udziały i NTFS ---
+$script:NtfsSharesBody = @'
+# Udziały serwera: uprawnienia udziału (CIM, lokalnie na serwerze) i NTFS folderu udziału; nazwy kont tłumaczone tutaj
+$seen = @{}
+$shares = @(Get-CimInstance -ClassName Win32_Share)
+foreach ($s in $shares) {
+    $admin = ([int64]$s.Type -band 0x80000000) -ne 0
+    if ([int64]$s.Type -band 0xFFFF) { continue }
+    if ($admin -and -not $P.Admin) { continue }
+    $rec = [ordered]@{ '__rec' = 'share'; Name = [string]$s.Name; Path = [string]$s.Path; Description = [string]$s.Description; Admin = $admin; Sddl = ''; Error = '' }
+    try {
+        $acl = Get-ItemAcl (Get-Item -LiteralPath $s.Path -Force -ErrorAction Stop) -WithOwner
+        $rec.Sddl = Get-AclSddl $acl
+        foreach ($r in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) { $seen[$r.IdentityReference.Value] = $true }
+    }
+    catch { $rec.Error = $_.Exception.Message }
+    [pscustomobject]$rec
+    try {
+        $set = Get-CimInstance -ClassName Win32_LogicalShareSecuritySetting -Filter ("Name='{0}'" -f ([string]$s.Name).Replace("'", "''"))
+        if (-not $set) { [pscustomobject]@{ '__rec' = 'sace'; Share = [string]$s.Name; Sid = 'S-1-5-32-544'; Mask = 0x1F01FF; Deny = $false; Name = '' }; $seen['S-1-5-32-544'] = $true; continue }
+        $sd = (Invoke-CimMethod -InputObject $set -MethodName GetSecurityDescriptor).Descriptor
+        if (-not $sd -or $null -eq $sd.DACL) { [pscustomobject]@{ '__rec' = 'sace'; Share = [string]$s.Name; Sid = 'S-1-1-0'; Mask = 0x1F01FF; Deny = $false; Name = '' }; $seen['S-1-1-0'] = $true; continue }
+        foreach ($ace in @($sd.DACL)) {
+            $mask = [int64]$ace.AccessMask
+            if ($mask -lt 0) { $mask += 4294967296 }
+            $sid = [string]$ace.Trustee.SIDString
+            $seen[$sid] = $true
+            [pscustomobject]@{ '__rec' = 'sace'; Share = [string]$s.Name; Sid = $sid; Mask = $mask; Deny = ([int]$ace.AceType -eq 1); Name = ('{0}\{1}' -f $ace.Trustee.Domain, $ace.Trustee.Name).Trim('\') }
+        }
+    }
+    catch { [pscustomobject]@{ '__rec' = 'serr'; Share = [string]$s.Name; Error = $_.Exception.Message } }
+}
+foreach ($k in @($seen.Keys)) { $n = Get-SidName $k; [pscustomobject]@{ '__rec' = 'sid'; Sid = $k; Name = $n; Resolved = ($n -ne $k) } }
+'@
+
+function Get-NtfsShareRows {
+    # Wiersze «udział × tożsamość»: poziom z udziału, z NTFS folderu udziału i wynikowy (mniejszy z nich)
+    param([object[]]$Shares, [object[]]$ShareAces, [hashtable]$Names, [hashtable]$ShareErrors = @{})
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($s in @($Shares | Sort-Object Name)) {
+        $aces = @($ShareAces | Where-Object { $_.Share -eq $s.Name })
+        $acl = $null
+        if ($s.Sddl) { $acl = New-NtfsAclFromSddl ([string]$s.Sddl) }
+        $sids = [ordered]@{}
+        foreach ($a in $aces) { $sids[[string]$a.Sid] = $true }
+        if ($acl) { foreach ($r in (Get-NtfsRules $acl)) { if (@('S-1-3-0', 'S-1-5-18') -notcontains $r.Sid) { $sids[$r.Sid] = $true } } }
+        $problem = { param($text) [pscustomobject][ordered]@{ 'Udział' = $s.Name; 'Tożsamość' = ''; 'Efektywnie przez udział' = ''; 'Udział – uprawnienia' = ''; 'NTFS – folder udziału' = ''; 'Uwagi' = $text; 'Ścieżka' = $s.Path; '__tone' = 'crit' } }
+        if (-not $acl) { [void]$rows.Add((& $problem ('NTFS nieodczytane: ' + $s.Error))) }
+        if ($ShareErrors.ContainsKey([string]$s.Name)) { [void]$rows.Add((& $problem ('uprawnień udziału nie odczytano: ' + $ShareErrors[[string]$s.Name]))) }
+        foreach ($sid in $sids.Keys) {
+            $set = @{ $sid = 1 }
+            if (@('S-1-1-0', 'S-1-5-7') -notcontains $sid) { $set['S-1-1-0'] = 1; $set['S-1-5-11'] = 1 }
+            $sm = Get-NtfsAceMask -Aces $aces -Sids $set
+            $nm = if ($acl) { (Get-NtfsEffectiveAccess -Acl $acl -Sids $set).Granted } else { [int64]0 }
+            $em = $sm -band $nm
+            $broad = $script:NtfsBroadSids.Contains($sid) -or ($sid -match '^S-1-5-21-' -and ($sid -replace '^.*-', '') -eq '513')
+            $note = @()
+            if ((Get-NtfsLevelRank (Get-NtfsAccessLevel $sm)) -gt (Get-NtfsLevelRank (Get-NtfsAccessLevel $nm)) -and $nm -ne 0) { $note += 'NTFS ogranicza dostęp z udziału' }
+            if ((Get-NtfsLevelRank (Get-NtfsAccessLevel $nm)) -gt (Get-NtfsLevelRank (Get-NtfsAccessLevel $sm)) -and $sm -ne 0) { $note += 'udział ogranicza dostęp z NTFS' }
+            if ($sm -eq 0 -and $nm -ne 0) { $note += 'brak dostępu przez udział' }
+            if ($broad -and (Test-NtfsWriteMask $em)) { $note += 'szeroka grupa może zmieniać dane przez sieć' }
+            [void]$rows.Add([pscustomobject][ordered]@{
+                    'Udział' = $s.Name; 'Tożsamość' = (Get-NtfsSidLabel $Names $sid); 'Efektywnie przez udział' = (Get-NtfsAccessLevel $em); 'Udział – uprawnienia' = (Get-NtfsAccessLevel $sm)
+                    'NTFS – folder udziału' = (Get-NtfsAccessLevel $nm); 'Uwagi' = ($note -join '; '); 'Ścieżka' = $s.Path
+                    '__tone' = $(if ($broad -and (Test-NtfsWriteMask $em)) { 'crit' } elseif ($em -eq 0) { '' } elseif (Test-NtfsWriteMask $em) { 'warn' } else { 'info' })
+                })
+        }
+    }
+    return $rows.ToArray()
+}
+
+Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsShares' -Title 'Udziały i NTFS' -Icon 'E8CE' -Badge 'nowe' `
+    -Description 'Udziały serwera plików z uprawnieniami udziału i NTFS folderu udziału obok siebie: dla każdego konta poziom z udziału, z NTFS i wynikowy dostęp przez sieć (mniejszy z dwóch), z oznaczeniem, które uprawnienia ograniczają dostęp, i ostrzeżeniem o zapisie dla szerokich grup.' -Build {
+    param($m)
+    $m.PillColumns = @('Efektywnie przez udział')
+    $row = Add-ToolbarRow -Module $m -Title 'Serwer'
+    $m.Server = Add-TextBox -Parent $row -Width 220 -Placeholder 'np. SRV-FS01' -Text ([string](Get-ModuleSetting -Module $m -Name 'Server' -Default ''))
+    $m.Admin = Add-CheckBox -Parent $row -Text 'Także udziały administracyjne (C$, ADMIN$)'
+    Add-Button -Parent $row -Text 'Pokaż udziały' -Icon 'E8CE' -Module $m -Primary -OnClick {
+        param($m)
+        $srv = $m.Server.Text.Trim()
+        if (-not $srv) { Show-Warning 'Podaj serwer plików.'; return }
+        Set-ModuleSetting -Module $m -Name 'Server' -Value $srv
+        $m.Data.Shares = @{ Server = $srv; Shares = New-Object System.Collections.ArrayList; Aces = New-Object System.Collections.ArrayList; Errors = @{}; Names = @{} }
+        Reset-ResultTable -Module $m
+        $params = @{ Admin = (Test-Checked $m.Admin); Core = (Get-NtfsToolCore $script:NtfsSharesBody) }
+        Start-HostOperation -Module $m -Name 'Udziały i NTFS' -Targets @($srv) -Output None -Parameters $params -ScriptBlock {
+            param($P)
+            & ([scriptblock]::Create($P.Core)) $P
+        } -OnResult {
+            param($m, $r)
+            $d = $m.Data.Shares
+            if (-not $r.Ok) { $d.Error = (@($r.Errors)) -join ' '; return }
+            foreach ($o in @($r.Data)) {
+                switch ([string]$o.__rec) {
+                    'share' { [void]$d.Shares.Add($o) }
+                    'sace' { [void]$d.Aces.Add($o); if ($o.Name -and -not $d.Names.ContainsKey([string]$o.Sid)) { $d.Names[[string]$o.Sid] = [string]$o.Name } }
+                    'serr' { $d.Errors[[string]$o.Share] = [string]$o.Error }
+                    'sid' { if ($o.Resolved -or -not $d.Names.ContainsKey([string]$o.Sid)) { $d.Names[[string]$o.Sid] = [string]$o.Name } }
+                }
+            }
+        } -OnComplete {
+            param($m)
+            $d = $m.Data.Shares
+            if ($d['Error']) { Show-Error ("Nie udało się odczytać udziałów serwera {0}." -f $d.Server) $d.Error; return }
+            $rows = @(Get-NtfsShareRows -Shares @($d.Shares) -ShareAces @($d.Aces) -Names $d.Names -ShareErrors $d.Errors)
+            if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+            Set-StatTile -Module $m -Key 'shares' -Value ([string]$d.Shares.Count)
+            $risk = @($rows | Where-Object { $_.__tone -eq 'crit' -and $_.'Tożsamość' }).Count
+            Set-StatTile -Module $m -Key 'risk' -Value ([string]$risk) -Tone $(if ($risk) { 'crit' } else { '' })
+        }
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Uprawnienia efektywne użytkownika…' -Icon 'E8D7' -Action {
+        param($m, $rows)
+        $share = [string](Get-ObjectValue $rows[0] 'Udział')
+        Show-Module -Key 'NtfsEffective'
+        $em = $script:UI.Modules['NtfsEffective']
+        $em.Path.Text = '\\{0}\{1}' -f $m.Server.Text.Trim(), $share
+        $em.Computer.Text = ''
+        Show-Toast 'Podaj użytkownika i kliknij «Sprawdź dostęp».' 'info'
+    }
+    Add-RowAction -Module $m -Text 'Raport ryzyk dla udziału' -Icon 'E7BA' -Action {
+        param($m, $rows)
+        $path = [string](Get-ObjectValue $rows[0] 'Ścieżka')
+        Show-Module -Key 'NtfsRisks'
+        $rk = $script:UI.Modules['NtfsRisks']
+        $rk.Path.Text = $path
+        $rk.Computer.Text = $m.Server.Text.Trim()
+    }
+    Add-StatTile -Module $m -Key 'shares' -Label 'Udziały' -Icon 'E8CE' | Out-Null
+    Add-StatTile -Module $m -Key 'risk' -Label 'Zapis dla szerokich grup' -Icon 'EA39' | Out-Null
+    $m.EmptyHint = 'Podaj serwer plików i kliknij «Pokaż udziały» (F5). Dostęp przez sieć to mniejsze z uprawnień udziału i NTFS – dla konkretnej osoby z jej grupami użyj «Uprawnienia efektywne».'
 }
 #endregion
 
