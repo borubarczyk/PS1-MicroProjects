@@ -248,11 +248,14 @@ function Get-AdSplat {
 }
 
 function Import-AdModule {
-    if (Get-Module -Name ActiveDirectory) { return }
-    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-        throw 'Brak modułu ActiveDirectory (RSAT). Zainstaluj «RSAT: Active Directory Domain Services» i spróbuj ponownie.'
+    # Moduł w wątku okna; polecenia AD idą potem przez wspólną blokadę procesu z wątkami operacji (Install-AdCallProxy)
+    if (-not (Get-Module -Name ActiveDirectory)) {
+        if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+            throw 'Brak modułu ActiveDirectory (RSAT). Zainstaluj «RSAT: Active Directory Domain Services» i spróbuj ponownie.'
+        }
+        Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false | Out-Null
     }
-    Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false | Out-Null
+    Install-AdCallProxy
 }
 
 function Get-ObjectValue {
@@ -5157,7 +5160,8 @@ function Update-Operations {
                     $output = $item.PS.EndInvoke($item.Handle)
                     if ($output -and $output.Count -gt 0) { $r = $output[0] }
                     if (-not $r) {
-                        $msg = 'Zadanie nie zwróciło wyniku.'
+                        # Zadanie zatrzymane, zanim ruszyło (czekało w kolejce puli), nie zwraca nic
+                        $msg = if ($op.Cancelled) { 'Anulowano.' } else { 'Zadanie nie zwróciło wyniku.' }
                         if ($item.PS.Streams.Error.Count -gt 0) { $msg = $item.PS.Streams.Error[0].Exception.Message }
                         $r = [pscustomobject]@{ Target = $item.Target; Ok = $false; Data = @(); Errors = @($msg) }
                     }
@@ -6008,7 +6012,6 @@ function Start-AdComputerLoad {
     }
     Start-AdOperation -Module $Module -Name 'Wczytywanie komputerów z AD' -Targets @('Active Directory') -Output None -Parameters $params -ScriptBlock {
         param($Target, $P, $Ctx)
-        Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
         $q = @{
             LDAPFilter  = $P.LdapFilter
             Properties  = @('OperatingSystem', 'LastLogonDate', 'Enabled', 'DNSHostName')
@@ -6205,7 +6208,6 @@ function Initialize-UserPanel {
 $script:UserLoadScript = {
     # Wspólny blok: wyszukiwanie (LdapFilter) albo uzupełnianie danych podanych loginów (Logins)
     param($Target, $P, $Ctx)
-    Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
     $ad = @{ ErrorAction = 'Stop' }
     if ($Ctx.Server) { $ad.Server = $Ctx.Server }
     if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
@@ -6429,7 +6431,6 @@ function Initialize-GroupPanel {
 $script:GroupLoadScript = {
     # Wyszukiwanie grup (LdapFilter) albo pobranie podanych nazw (Names: sAMAccountName, nazwa, DN)
     param($Target, $P, $Ctx)
-    Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
     $ad = @{ ErrorAction = 'Stop' }
     if ($Ctx.Server) { $ad.Server = $Ctx.Server }
     if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
@@ -12421,38 +12422,115 @@ foreach ($fn in 'ConvertTo-AsciiText', 'ConvertTo-SamName', 'Expand-Template', '
     $script:AdHelpers += "`nfunction $fn {`n" + (Get-Item "function:$fn").ScriptBlock.ToString() + "`n}"
 }
 
+# Wywołania modułu ActiveDirectory przez jedną blokadę na cały proces. Moduł trzyma połączenia z usługą ADWS we wspólnej
+# pamięci podręcznej procesu, a operacje biegną w kilku wątkach naraz: równoległe polecenia potrafią zamknąć sobie nawzajem
+# kanał («Cannot access a disposed object… ServiceChannel», zwykle po zawieszeniu do limitu 2 min) albo zgłosić
+# «connection … unavailable». Polecenia z list niżej są zastępowane funkcjami o tej samej nazwie (Invoke-AdCall):
+# każde wywołanie czeka na blokadę, odczyty są dodatkowo ponawiane przy przejściowych błędach ADWS, zmian się nie ponawia.
+# Obiekt blokady leży w danych AppDomain - wspólnych dla wszystkich wątków i runspace'ów procesu.
+if ($null -eq [System.AppDomain]::CurrentDomain.GetData('DomainOps.AdLock')) { [System.AppDomain]::CurrentDomain.SetData('DomainOps.AdLock', (New-Object System.Object)) }
+$script:AdReadCommands = @('Get-ADUser', 'Get-ADComputer', 'Get-ADGroup', 'Get-ADObject', 'Get-ADOrganizationalUnit', 'Get-ADGroupMember', 'Get-ADPrincipalGroupMembership',
+    'Get-ADDomain', 'Get-ADForest', 'Get-ADRootDSE', 'Get-ADDomainController', 'Search-ADAccount', 'Get-ADDefaultDomainPasswordPolicy', 'Get-ADFineGrainedPasswordPolicy',
+    'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata', 'Get-ADOptionalFeature', 'Get-ADReplicationPartnerMetadata',
+    'Get-ADReplicationFailure', 'Get-ADServiceAccount', 'Get-ADTrust')
+$script:AdWriteCommands = @('Set-ADUser', 'Set-ADComputer', 'Set-ADGroup', 'Set-ADObject', 'Set-ADOrganizationalUnit', 'Set-ADAccountPassword', 'Set-ADAccountExpiration',
+    'Set-ADAccountControl', 'Clear-ADAccountExpiration', 'New-ADUser', 'New-ADComputer', 'New-ADGroup', 'New-ADOrganizationalUnit', 'Add-ADGroupMember', 'Remove-ADGroupMember',
+    'Add-ADPrincipalGroupMembership', 'Remove-ADPrincipalGroupMembership', 'Move-ADObject', 'Rename-ADObject', 'Remove-ADObject', 'Remove-ADUser', 'Remove-ADComputer',
+    'Remove-ADGroup', 'Remove-ADOrganizationalUnit', 'Restore-ADObject', 'Enable-ADAccount', 'Disable-ADAccount', 'Unlock-ADAccount', 'Enable-ADOptionalFeature',
+    'Move-ADDirectoryServerOperationMasterRole', 'Install-ADServiceAccount')
+
+function Invoke-AdCall {
+    # Polecenie modułu ActiveDirectory pod blokadą procesu. -WaitMs: jak długo czekać na blokadę (-1 bez limitu; wątek okna
+    # czeka krótko, potem wywołuje bez blokady, żeby okno nie wisiało). -Retry: ponawianie przy przejściowych błędach ADWS.
+    param([string]$Command, [object[]]$Arguments, [object[]]$Pipe, [bool]$HasPipe, [bool]$Retry, [int]$WaitMs = -1)
+    # Pary «-Nazwa:» + wartość z $args idą do hashtabli: rozwinięte z tablicy gubią wiązanie (-Confirm:$false stałoby się
+    # przełącznikiem -Confirm i osobnym argumentem $false). Reszta zostaje w kolejności - przypisanie do elementu tablicy
+    # zachowuje znacznik nazwy parametru (ArrayList.Add by go zdjął) i tablice jako wartości.
+    $named = @{}
+    $tmp = New-Object object[] $Arguments.Count
+    $n = 0
+    for ($i = 0; $i -lt $Arguments.Count; $i++) {
+        $a = $Arguments[$i]
+        if ($a -is [string] -and $a.EndsWith(':') -and $i + 1 -lt $Arguments.Count) {
+            $pn = $a.PSObject.Properties['<CommandParameterName>']
+            if ($pn) { $named[[string]$pn.Value] = $Arguments[$i + 1]; $i++; continue }
+        }
+        $tmp[$n] = $a
+        $n++
+    }
+    $pos = New-Object object[] $n
+    for ($i = 0; $i -lt $n; $i++) { $pos[$i] = $tmp[$i] }
+    $lock = [System.AppDomain]::CurrentDomain.GetData('DomainOps.AdLock')
+    $transient = 'connection to the directory on which to process the request was unavailable|invalid enumeration context|enumeration context is (not valid|invalid)|Unable to contact the server|server is busy|disposed object|ServiceChannel|Faulted state'
+    $delays = @(500, 1500, 3000, 6000)
+    for ($attempt = 0; ; $attempt++) {
+        $locked = $false
+        try {
+            if ($null -ne $lock) {
+                # Krótkie odcinki czekania: przerwanie operacji (Stop) działa także w trakcie czekania na blokadę
+                $waited = 0
+                while (-not $locked) {
+                    [System.Threading.Monitor]::TryEnter($lock, 250, [ref]$locked)
+                    if (-not $locked) { $waited += 250; if ($WaitMs -ge 0 -and $waited -ge $WaitMs) { break } }
+                }
+            }
+            if ($HasPipe) { return @($Pipe | & $Command @pos @named) }
+            return @(& $Command @pos @named)
+        }
+        catch {
+            $msg = $_.Exception.Message
+            # Przekroczony limit czasu ADWS (2 min) tylko jedna powtórka - kolejne trzymałyby blokadę minutami
+            $again = $Retry -and $attempt -lt $delays.Count -and ($msg -match $transient -or ($attempt -eq 0 -and $msg -match 'timeout limit was exceeded'))
+            if (-not $again) { throw }
+        }
+        finally { if ($locked) { [System.Threading.Monitor]::Exit($lock) } }
+        Start-Sleep -Milliseconds ($delays[$attempt] + (Get-Random -Maximum 500))
+    }
+}
+
+function Get-AdCallProxyText([string]$Command, [bool]$Retry, [int]$WaitMs) {
+    # Treść funkcji zastępującej polecenie modułu (z potokiem albo bez)
+    $r = if ($Retry) { '$true' } else { '$false' }
+    return "if (`$MyInvocation.ExpectingInput) { Invoke-AdCall 'ActiveDirectory\$Command' `$args @(`$input) `$true $r $WaitMs } else { Invoke-AdCall 'ActiveDirectory\$Command' `$args `$null `$false $r $WaitMs }"
+}
+
+$script:AdCallProxyReady = $false
+function Install-AdCallProxy {
+    # Funkcje zastępujące polecenia modułu w wątku okna (wywoływane po imporcie modułu; czekanie na blokadę do 15 s)
+    if ($script:AdCallProxyReady) { return }
+    $mod = @(Get-Module -Name ActiveDirectory)
+    if ($mod.Count -eq 0) { return }
+    $exported = $mod[0].ExportedCommands
+    foreach ($c in @($script:AdReadCommands) + @($script:AdWriteCommands)) {
+        if (-not $exported.ContainsKey($c)) { continue }
+        Set-Item -Path "function:script:$c" -Value ([scriptblock]::Create((Get-AdCallProxyText -Command $c -Retry ($script:AdReadCommands -contains $c) -WaitMs 15000)))
+    }
+    $script:AdCallProxyReady = $true
+}
+
 # Początek każdego bloku operacji AD (funkcje pomocnicze z $script:AdHelpers dołączane w chwili uruchomienia,
-# więc kolejne regiony mogą je rozszerzać)
+# więc kolejne regiony mogą je rozszerzać). Funkcje zastępujące polecenia modułu powstają w zakresie globalnym
+# runspace'u, raz na wątek puli (kilkadziesiąt funkcji w każdym zadaniu kosztowałoby kilkanaście ms). Polecenia
+# prawdziwego modułu to cmdlety, więc funkcje mają pierwszeństwo; moduł z funkcjami (np. atrapa w testach) ponowny
+# import nadpisuje - wtedy funkcje powstają od nowa.
 $script:AdPrelude = @'
 Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
 $ad = @{ ErrorAction = 'Stop' }
 if ($Ctx.Server) { $ad.Server = $Ctx.Server }
 if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
-# Odczyty z AD ponawiane przy przejściowych błędach usługi ADWS (przeciążony kontroler, wygasły kontekst wyliczania).
-# Polecenia Get-AD* są tu zastępowane funkcjami o tej samej nazwie; zmiany (Set/New/Add/Remove) nie są ponawiane.
-$__adTransient = 'connection to the directory on which to process the request was unavailable|invalid enumeration context|enumeration context is (not valid|invalid)|Unable to contact the server|server is busy|timeout limit was exceeded'
-function Invoke-AdRead {
-    param([string]$Command, [object[]]$Arguments, [object[]]$Pipe, [bool]$HasPipe)
-    $delays = @(500, 1500, 3000, 6000)
-    for ($i = 0; ; $i++) {
-        try {
-            if ($HasPipe) { return @($Pipe | & $Command @Arguments) }
-            return @(& $Command @Arguments)
-        }
-        catch {
-            if ($i -ge $delays.Count -or $_.Exception.Message -notmatch $__adTransient) { throw }
-            Start-Sleep -Milliseconds ($delays[$i] + (Get-Random -Maximum 500))
-        }
-    }
-}
-$__exported = (Get-Module -Name ActiveDirectory).ExportedCommands
-foreach ($__c in 'Get-ADUser', 'Get-ADComputer', 'Get-ADGroup', 'Get-ADObject', 'Get-ADOrganizationalUnit', 'Get-ADGroupMember', 'Get-ADPrincipalGroupMembership',
-    'Get-ADDomain', 'Get-ADForest', 'Get-ADRootDSE', 'Get-ADDomainController', 'Search-ADAccount', 'Get-ADDefaultDomainPasswordPolicy', 'Get-ADFineGrainedPasswordPolicy',
-    'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata', 'Get-ADOptionalFeature', 'Get-ADReplicationPartnerMetadata', 'Get-ADReplicationFailure') {
-    if (-not $__exported.ContainsKey($__c)) { continue }
-    Set-Item -Path "function:$__c" -Value ([scriptblock]::Create("if (`$MyInvocation.ExpectingInput) { Invoke-AdRead 'ActiveDirectory\$__c' `$args @(`$input) `$true } else { Invoke-AdRead 'ActiveDirectory\$__c' `$args `$null `$false }"))
+$__probe = Get-Item -Path 'function:Get-ADObject' -ErrorAction SilentlyContinue
+if (-not $__probe -or $__probe.ScriptBlock.ToString() -notmatch 'Invoke-AdCall') {
+%PROXIES%
 }
 '@
+$script:AdPrelude = $script:AdPrelude.Replace('%PROXIES%', (& {
+            "function global:Invoke-AdCall {`n" + (Get-Item 'function:Invoke-AdCall').ScriptBlock.ToString() + "`n}"
+            '$__exported = @(Get-Module -Name ActiveDirectory)[0].ExportedCommands'
+            foreach ($c in @($script:AdReadCommands) + @($script:AdWriteCommands)) {
+                $text = Get-AdCallProxyText -Command $c -Retry ($script:AdReadCommands -contains $c) -WaitMs -1
+                "if (`$__exported.ContainsKey('$c')) { function global:$c { $text } }"
+            }
+        }) -join "`n")
 
 # Systemy bez wsparcia producenta (stan na 2026 r.): Windows 10 poza LTSC, Windows 7/8.x, Server 2003-2012 R2
 $script:UnsupportedOsPattern = 'Windows (XP|Vista|7|8|8\.1)( |$)|Windows 10 (?!.*LTSC)|Windows Server (2003|2008|2012)'
@@ -12469,6 +12547,7 @@ function Get-FriendlyAdError {
     if ($m -match 'naming violation|invalid dn syntax|bad name') { return "Niedozwolona nazwa (CN) – usuń znaki specjalne. ($Message)" }
     if ($m -match 'group type cannot be changed|cannot be converted|group scope') { return "Nie można zmienić zakresu grupy – koliduje z jej członkami lub przynależnością. ($Message)" }
     if ($m -match 'unable to contact|server is not operational|cannot contact') { return "Brak połączenia z kontrolerem domeny. ($Message)" }
+    if ($m -match 'disposed object|servicechannel|faulted state|timeout limit was exceeded') { return "Przerwane połączenie z usługą sieci Web AD (ADWS) na kontrolerze domeny – spróbuj ponownie. ($Message)" }
     return $Message
 }
 
@@ -21465,13 +21544,22 @@ $script:AdAuditScript = {
 }
 
 function Get-AdAuditScore([object[]]$Rows) {
-    # 100 minus wagi niespełnionych kontroli (wysokie 10, średnie 5, niskie 2)
+    # 100 minus wagi niespełnionych kontroli (wysokie 10, średnie 5, niskie 2). Kontrole i grupy z błędem nie mają wagi,
+    # więc ocena jest wtedy niepełna (zawyżona) - Text to mówi
     $sum = 0
-    foreach ($r in $Rows) { $s = $script:AdAuditSeverity[[string](Get-ObjectValue $r 'Ocena')]; if ($s) { $sum += $s.Weight } }
+    $unchecked = 0
+    foreach ($r in $Rows) {
+        $sev = [string](Get-ObjectValue $r 'Ocena')
+        if ($sev -eq 'Błąd') { $unchecked++ }
+        $s = $script:AdAuditSeverity[$sev]
+        if ($s) { $sum += $s.Weight }
+    }
     $score = [Math]::Max(0, 100 - $sum)
     $grade = if ($score -ge 90) { 'dobry' } elseif ($score -ge 70) { 'do poprawy' } elseif ($score -ge 50) { 'słaby' } else { 'krytyczny' }
     $tone = if ($score -ge 90) { 'ok' } elseif ($score -ge 70) { 'warn' } else { 'crit' }
-    return @{ Score = $score; Grade = $grade; Tone = $tone }
+    $text = '{0}/100 ({1})' -f $score, $grade
+    if ($unchecked) { $text += ' – ocena niepełna, nie sprawdzono: {0}' -f $unchecked }
+    return @{ Score = $score; Grade = $grade; Tone = $tone; Unchecked = $unchecked; Text = $text }
 }
 
 function New-AdAuditData([hashtable]$Params) {
@@ -21576,7 +21664,7 @@ function Get-AdAuditReportHtml {
     $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2}\{3} • domena {4} • progi: nieaktywność {5} dni, hasło administratora {6} dni, krbtgt {7} dni, konta uprzywilejowane {8}' -f $script:AppVersion, $a.At, $env:USERDOMAIN, $env:USERNAME, $a.Domain, $a.Params.InactiveDays, $a.Params.AdminPwdDays, $a.Params.KrbtgtDays, $a.Params.AdminLimit
     if (-not $ReportTitle) { $ReportTitle = 'Audyt bezpieczeństwa Active Directory – ' + $a.Domain }
     [void]$sb.Append((Get-ReportHead -Title $ReportTitle -Meta $meta))
-    [void]$sb.Append('<div class="tiles"><div class="tile ').Append($sc.Tone).Append('"><b>').Append($sc.Score).Append('/100</b><span>Ocena: ').Append((& $enc $sc.Grade)).Append('</span></div>')
+    [void]$sb.Append('<div class="tiles"><div class="tile ').Append($sc.Tone).Append('"><b>').Append($sc.Score).Append('/100</b><span>Ocena: ').Append((& $enc $sc.Grade)).Append($(if ($sc.Unchecked) { ' (niepełna)' } else { '' })).Append('</span></div>')
     foreach ($k in 'Wysokie', 'Średnie', 'Niskie', 'OK') {
         $n = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Ocena') -eq $k }).Count
         [void]$sb.Append('<div class="tile ').Append($(if ($k -eq 'OK') { 'ok' } else { $script:AdAuditSeverity[$k].Tone })).Append('"><b>').Append($n).Append('</b><span>').Append($(if ($k -eq 'OK') { 'Kontrole bez uwag' } else { "Ryzyko $($k.ToLowerInvariant())" })).Append('</span></div>')
@@ -21661,7 +21749,7 @@ Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdAudit' -
             if (-not $m.Data.Audit.Domain) { $m.Data.Audit.Domain = [string]$env:USERDNSDOMAIN }
             Show-AdAuditResults -Module $m
             $sc = $m.Data.Audit.Score
-            Write-Log ("Audyt bezpieczeństwa AD: ocena {0}/100 ({1})" -f $sc.Score, $sc.Grade) $(if ($sc.Tone -eq 'ok') { 'OK' } else { 'WARN' }) -Module $m.Title
+            Write-Log ('Audyt bezpieczeństwa AD: ocena ' + $sc.Text) $(if ($sc.Tone -eq 'ok' -and -not $sc.Unchecked) { 'OK' } else { 'WARN' }) -Module $m.Title
         }
     }
     $row2 = Add-ToolbarRow -Module $m -Title ' '
@@ -22616,7 +22704,7 @@ Register-ReportType -Key 'AdAudit' -Title 'Audyt bezpieczeństwa AD' -Icon 'EA18
     $sc = $a.Score
     $tiles = @(@{ Label = 'Ocena: ' + $sc.Grade; Value = ('{0}/100' -f $sc.Score); Tone = $sc.Tone }) + @(New-ReportSeverityTiles -Rows $rows -Column 'Ocena')
     return @{
-        Title = 'Audyt bezpieczeństwa Active Directory – ' + $a.Domain; Subtitle = ('domena {0}' -f $a.Domain); Summary = ('ocena {0}/100 ({1})' -f $sc.Score, $sc.Grade)
+        Title = 'Audyt bezpieczeństwa Active Directory – ' + $a.Domain; Subtitle = ('domena {0}' -f $a.Domain); Summary = ('ocena ' + $sc.Text)
         Rows = $findings.ToArray(); Tiles = $tiles; PillColumns = @('Ocena')
         Errors = @($a.Errors | ForEach-Object { 'Nie sprawdzono grupy «{0}»: {1}' -f $_.Category, $_.Message })
         Data = @{ Audit = $a; AuditRows = $rows }
