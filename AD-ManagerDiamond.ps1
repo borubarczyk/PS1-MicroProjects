@@ -11344,6 +11344,348 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'AppLogs' -Titl
 }
 #endregion
 
+#region Zarządzanie zdalne: gdzie używane jest konto (usługi, zadania, IIS, automatyczne logowanie) i zmiana zapisanych haseł
+
+# Blok na komputerze docelowym. $P: Accounts (lista nazw; pusta = wszystkie konta poza wbudowanymi), Services, Tasks, Iis,
+# Autologon (przełączniki), IncludeBuiltin, IisConfig i WinlogonKey (opcjonalnie inne położenie - testy).
+# Rodzaj konta (wbudowane / lokalne / domenowe) ustalany po SID, więc niezależnie od języka systemu.
+$script:AccountUsageScript = {
+    param($P)
+    $cache = @{}
+    function Get-AccountKey([string]$Name) {
+        $n = ([string]$Name).Trim()
+        if ($n -match '^[^\\]+\\(.+)$') { $n = $Matches[1] }
+        if ($n -match '^([^@]+)@') { $n = $Matches[1] }
+        return $n.ToLowerInvariant()
+    }
+    function Get-AccountInfo([string]$Name) {
+        if ($cache.ContainsKey($Name)) { return $cache[$Name] }
+        $n = ([string]$Name).Trim()
+        $sid = ''
+        $full = $n
+        if ($n -match '^S-1-[\d-]+$') { $sid = $n }
+        elseif ($n -and $n -notmatch '^(LocalSystem)$') { try { $sid = (New-Object System.Security.Principal.NTAccount($n)).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { } }
+        if ($sid) { try { $full = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value } catch { } }
+        $builtinSid = $sid -match '^S-1-5-(18|19|20|4|6|7|9|11|13|14|15|17|2|3)$' -or $sid -match '^S-1-5-(32|80|82|83|90|96)-' -or $sid -match '^S-1-[0-3]-'
+        $builtinName = $n -eq '' -or $n -match '^(LocalSystem|NT AUTHORITY\\|NT SERVICE\\|IIS APPPOOL\\|NT VIRTUAL MACHINE\\|Window Manager\\|Font Driver Host\\)' -or @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'INTERACTIVE', 'Users', 'Everyone') -contains $n
+        $kind = if ($builtinSid -or (-not $sid -and $builtinName)) { 'wbudowane' }
+        elseif ($full -match '^([^\\]+)\\' -and ($Matches[1] -ieq $env:COMPUTERNAME -or $Matches[1] -eq '.')) { 'lokalne' }
+        elseif ($sid -or $n -match '\\|@') { 'domenowe' }
+        else { 'nieznane' }
+        $info = @{ Sid = $sid; Full = $full; Kind = $kind; Key = (Get-AccountKey $full) }
+        $cache[$Name] = $info
+        return $info
+    }
+    $wanted = @{}
+    foreach ($a in @($P.Accounts)) { if ([string]$a) { $wanted[(Get-AccountKey $a)] = $true; if ([string]$a -match '^S-1-') { $wanted[[string]$a] = $true } } }
+    function Test-Wanted($Info, [string]$Raw) {
+        if ($wanted.Count -gt 0) { return ($wanted.ContainsKey($Info.Key) -or $wanted.ContainsKey((Get-AccountKey $Raw)) -or ($Info.Sid -and $wanted.ContainsKey($Info.Sid))) }
+        return ($P.IncludeBuiltin -or $Info.Kind -ne 'wbudowane')
+    }
+    function Out-Entry([string]$Type, [string]$Kind, [string]$Id, [string]$Name, [string]$Account, [string]$State, [string]$Start, [string]$Stored, [string]$Details, [string]$Tone = '') {
+        $info = Get-AccountInfo $Account
+        if (-not (Test-Wanted $info $Account)) { return }
+        [pscustomobject][ordered]@{
+            'Typ' = $Type; 'Nazwa' = $Name; 'Konto' = $Account; 'Rodzaj konta' = $info.Kind; 'Stan' = $State; 'Uruchamianie' = $Start
+            'Hasło zapisane' = $Stored; 'Szczegóły' = $Details; 'Konto w AD' = ''; 'Zmiana hasła' = ''
+            '__kind' = $Kind; '__id' = $Id; '__acc' = $info.Key; '__tone' = $Tone
+        }
+    }
+    $warnings = New-Object System.Collections.ArrayList
+    if ($P.Services) {
+        try {
+            foreach ($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)) {
+                $acc = [string]$s.StartName
+                $info = Get-AccountInfo $acc
+                $stored = if ($info.Kind -eq 'wbudowane' -or $acc -match '\$$') { 'Nie' } else { 'Tak' }
+                $tone = if ([string]$s.StartMode -eq 'Auto' -and [string]$s.State -ne 'Running' -and $info.Kind -ne 'wbudowane') { 'warn' } else { '' }
+                Out-Entry 'Usługa' 'svc' ([string]$s.Name) ('{0} ({1})' -f $s.DisplayName, $s.Name) $acc ([string]$s.State) ([string]$s.StartMode) $stored ([string]$s.PathName) $tone
+            }
+        }
+        catch { [void]$warnings.Add("Usługi: $($_.Exception.Message)") }
+    }
+    if ($P.Tasks) {
+        try {
+            foreach ($t in @(Get-ScheduledTask -ErrorAction Stop)) {
+                $pr = $t.Principal
+                $acc = [string]$pr.UserId
+                if (-not $acc) { $acc = [string]$pr.GroupId }
+                $logon = [string]$pr.LogonType
+                $stored = if ($logon -eq 'Password') { 'Tak' } else { 'Nie' }
+                $actions = (@($t.Actions | ForEach-Object { if ($_.PSObject.Properties['Execute'] -and $_.Execute) { ('{0} {1}' -f $_.Execute, $_.Arguments).Trim() } })) -join ' ; '
+                $logonText = switch ($logon) { 'Password' { 'z zapisanym hasłem' } 'S4U' { 'bez zapisanego hasła (S4U)' } 'InteractiveToken' { 'tylko gdy użytkownik jest zalogowany' } 'ServiceAccount' { 'konto usługi' } 'Group' { 'grupa' } default { $logon } }
+                Out-Entry 'Zadanie' 'task' ([string]$t.TaskPath + [string]$t.TaskName) ([string]$t.TaskPath + [string]$t.TaskName) $acc ([string]$t.State) $logonText $stored $actions
+            }
+        }
+        catch { [void]$warnings.Add("Zadania: $($_.Exception.Message)") }
+    }
+    if ($P.Iis) {
+        $cfg = if ($P.IisConfig) { [string]$P.IisConfig } else { Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config' }
+        if (Test-Path -LiteralPath $cfg) {
+            try {
+                [xml]$x = [System.IO.File]::ReadAllText($cfg)
+                $ah = $x.configuration.'system.applicationHost'
+                foreach ($ap in @($ah.applicationPools.add)) {
+                    if (-not $ap) { continue }
+                    $pm = $ap.processModel
+                    if (-not $pm -or [string]$pm.identityType -ne 'SpecificUser') { continue }
+                    Out-Entry 'Pula aplikacji IIS' 'pool' ([string]$ap.name) ([string]$ap.name) ([string]$pm.userName) $(if ([string]$ap.autoStart -eq 'false') { 'bez autostartu' } else { 'autostart' }) ([string]$ap.managedRuntimeVersion) 'Tak' 'tożsamość: konto określone (SpecificUser)'
+                }
+                foreach ($site in @($ah.sites.site)) {
+                    if (-not $site) { continue }
+                    foreach ($app in @($site.application)) {
+                        foreach ($vd in @($app.virtualDirectory)) {
+                            if (-not $vd -or -not [string]$vd.userName) { continue }
+                            $id = '{0}|{1}|{2}' -f $site.name, $app.path, $vd.path
+                            Out-Entry 'Katalog wirtualny IIS' 'vdir' $id ('{0}{1}' -f $site.name, ('/' + (([string]$app.path).Trim('/') + '/' + ([string]$vd.path).Trim('/')).Trim('/'))) ([string]$vd.userName) '' '' 'Tak' ('ścieżka fizyczna: ' + [string]$vd.physicalPath)
+                        }
+                    }
+                }
+            }
+            catch { [void]$warnings.Add("IIS: $($_.Exception.Message)") }
+        }
+    }
+    if ($P.Autologon) {
+        $key = if ($P.WinlogonKey) { [string]$P.WinlogonKey } else { 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' }
+        $wl = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        if ($wl -and $wl.PSObject.Properties['AutoAdminLogon'] -and [string]$wl.AutoAdminLogon -eq '1' -and $wl.PSObject.Properties['DefaultUserName'] -and [string]$wl.DefaultUserName) {
+            $acc = if ($wl.PSObject.Properties['DefaultDomainName'] -and [string]$wl.DefaultDomainName) { '{0}\{1}' -f $wl.DefaultDomainName, $wl.DefaultUserName } else { [string]$wl.DefaultUserName }
+            $plain = $wl.PSObject.Properties['DefaultPassword'] -and [string]$wl.DefaultPassword
+            Out-Entry 'Automatyczne logowanie' 'autologon' 'Winlogon' 'Logowanie przy starcie systemu' $acc '' 'przy starcie' $(if ($plain) { 'Tak' } else { 'Nie' }) $(if ($plain) { 'hasło w rejestrze jawnym tekstem (DefaultPassword) – zalecane narzędzie Autologon, które zapisuje je w LSA' } else { 'hasło w LSA (zmiana narzędziem Autologon) albo brak' }) $(if ($plain) { 'crit' } else { '' })
+        }
+    }
+    foreach ($w in $warnings) { Write-Error $w }
+}
+
+# Zmiana zapisanego hasła konta. $P: Items (Kind, Id), Password, Restart
+$script:AccountPasswordScript = {
+    param($P)
+    foreach ($it in @($P.Items)) {
+        $res = [ordered]@{ Kind = [string]$it.Kind; Id = [string]$it.Id; Result = 'Zmieniono'; Detail = ''; Tone = 'ok' }
+        try {
+            switch ([string]$it.Kind) {
+                'svc' {
+                    $name = ([string]$it.Id).Replace('\', '\\').Replace("'", "\'")
+                    $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+                    if (-not $svc) { throw 'Nie znaleziono usługi.' }
+                    $r = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ StartName = [string]$svc.StartName; StartPassword = [string]$P.Password } -ErrorAction Stop
+                    if ([int]$r.ReturnValue -ne 0) { throw ('Win32_Service.Change zwróciło kod {0}' -f $r.ReturnValue) }
+                    if ($P.Restart -and [string]$svc.State -eq 'Running') { Restart-Service -Name ([string]$it.Id) -Force -ErrorAction Stop; $res.Detail = 'usługa uruchomiona ponownie' }
+                    elseif ([string]$svc.State -eq 'Running') { $res.Detail = 'nowe hasło zadziała po ponownym uruchomieniu usługi' }
+                }
+                'task' {
+                    $full = [string]$it.Id
+                    $i = $full.LastIndexOf('\')
+                    $path = $full.Substring(0, $i + 1)
+                    $name = $full.Substring($i + 1)
+                    $t = Get-ScheduledTask -TaskPath $path -TaskName $name -ErrorAction Stop
+                    Set-ScheduledTask -TaskPath $path -TaskName $name -User ([string]$t.Principal.UserId) -Password ([string]$P.Password) -ErrorAction Stop | Out-Null
+                }
+                { $_ -in 'pool', 'vdir' } {
+                    $dll = Join-Path $env:windir 'System32\inetsrv\Microsoft.Web.Administration.dll'
+                    if (-not (Test-Path -LiteralPath $dll)) { throw 'Brak IIS (Microsoft.Web.Administration) na tym komputerze.' }
+                    [void][System.Reflection.Assembly]::LoadFrom($dll)
+                    $sm = New-Object Microsoft.Web.Administration.ServerManager
+                    try {
+                        if ($it.Kind -eq 'pool') {
+                            $pool = $sm.ApplicationPools[[string]$it.Id]
+                            if (-not $pool) { throw 'Nie znaleziono puli aplikacji.' }
+                            $pool.ProcessModel.Password = [string]$P.Password
+                            $sm.CommitChanges()
+                            if ($P.Restart) { [void]$pool.Recycle(); $res.Detail = 'pula odświeżona (recycle)' }
+                        }
+                        else {
+                            $parts = ([string]$it.Id).Split('|')
+                            $vd = $sm.Sites[$parts[0]].Applications[$parts[1]].VirtualDirectories[$parts[2]]
+                            if (-not $vd) { throw 'Nie znaleziono katalogu wirtualnego.' }
+                            $vd.Password = [string]$P.Password
+                            $sm.CommitChanges()
+                        }
+                    }
+                    finally { $sm.Dispose() }
+                }
+                'autologon' {
+                    $key = if ($P.WinlogonKey) { [string]$P.WinlogonKey } else { 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' }
+                    $wl = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+                    if (-not $wl.PSObject.Properties['DefaultPassword']) { throw 'Hasło automatycznego logowania jest w LSA – zmień je narzędziem Autologon (Sysinternals).' }
+                    Set-ItemProperty -LiteralPath $key -Name DefaultPassword -Value ([string]$P.Password) -ErrorAction Stop
+                    $res.Detail = 'zapisane w rejestrze jawnym tekstem – rozważ narzędzie Autologon'
+                    $res.Tone = 'warn'
+                }
+                default { throw "Nieobsługiwany rodzaj: $($it.Kind)" }
+            }
+        }
+        catch { $res.Result = 'Błąd'; $res.Detail = $_.Exception.Message; $res.Tone = 'crit' }
+        [pscustomobject]$res
+    }
+}
+
+function Test-AdAccountPassword {
+    # Sprawdza hasło konta domenowego w AD: $true / $false, $null - nie da się sprawdzić (brak domeny, błąd połączenia)
+    param([string]$Account, [string]$Password)
+    $sam = [string]$Account
+    if ($sam -match '^[^\\]+\\(.+)$') { $sam = $Matches[1] }
+    try {
+        Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
+        $type = [System.DirectoryServices.AccountManagement.ContextType]::Domain
+        $ctx = if ($script:Settings.DomainController) { New-Object System.DirectoryServices.AccountManagement.PrincipalContext($type, [string]$script:Settings.DomainController) } else { New-Object System.DirectoryServices.AccountManagement.PrincipalContext($type) }
+        try { return [bool]$ctx.ValidateCredentials($sam, $Password, [System.DirectoryServices.AccountManagement.ContextOptions]::Negotiate) }
+        finally { $ctx.Dispose() }
+    }
+    catch { return $null }
+}
+
+function Show-AccountPasswordDialog {
+    # Nowe hasło konta i opcje zmiany; zwraca hashtablę albo $null
+    param([string]$Account, [int]$Count, [bool]$CanValidate)
+    $body = @'
+<StackPanel>
+  <TextBlock Text="Hasło" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+  <PasswordBox x:Name="np1"/>
+  <TextBlock Text="Powtórz hasło" Foreground="#8791A5" FontSize="12" Margin="0,10,0,5"/>
+  <PasswordBox x:Name="np2"/>
+  <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
+  <CheckBox x:Name="npValidate" Content="Najpierw sprawdź hasło w Active Directory (zalecane – złe hasło zablokuje konto przy starcie usług)" IsChecked="True" Margin="0,0,0,8"/>
+  <CheckBox x:Name="npRestart" Content="Uruchom ponownie działające usługi i odśwież pule aplikacji IIS" IsChecked="False"/>
+  <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,10,0,0"
+             Text="Program nie zmienia hasła konta w AD – zrób to wcześniej (Użytkownicy AD → Hasło i blokada). Tu zapisuje nowe hasło tam, gdzie konto je przechowuje."/>
+</StackPanel>
+'@
+    $w = New-Dialog -Title 'Nowe hasło konta' -Subtitle ('{0} – miejsc: {1}' -f $Account, $Count) -Body $body -Icon 'E8D7' -OkText 'Zapisz hasło' -Width 540 -Validate {
+        param($w)
+        $p1 = $w.FindName('np1').Password
+        if (-not $p1) { Show-Warning 'Hasło nie może być puste.'; return $false }
+        if ($p1 -cne $w.FindName('np2').Password) { Show-Warning 'Hasła nie są identyczne.'; return $false }
+        return $true
+    }
+    if (-not $CanValidate) { $cb = $w.FindName('npValidate'); $cb.IsChecked = $false; $cb.IsEnabled = $false; $cb.Content = 'Sprawdzenie w AD niedostępne – konto lokalne' }
+    if (-not (Invoke-Dialog $w)) { return $null }
+    return @{ Password = $w.FindName('np1').Password; Validate = ($w.FindName('npValidate').IsChecked -eq $true); Restart = ($w.FindName('npRestart').IsChecked -eq $true) }
+}
+
+Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'AccountUsage' -Title 'Gdzie używane jest konto' -Icon 'E77B' -Badge 'nowe' `
+    -Description 'Usługi, zadania Harmonogramu, pule aplikacji i katalogi wirtualne IIS oraz automatyczne logowanie działające na wskazanych kontach (albo na wszystkich kontach innych niż wbudowane) na zaznaczonych komputerach – ze stanem konta w AD. Przed zmianą hasła konta usługi: widać, gdzie je zapisano, i można je tam zaktualizować.' -Build {
+    param($m)
+    $m.PillColumns = @('Rodzaj konta', 'Zmiana hasła')
+    $m.Accounts = Add-StretchTextBox -Module $m -Title 'Konta' -Placeholder 'np. svc.sql, CONTOSO\svc.backup, gmsa-web$ – puste: wszystkie konta poza wbudowanymi (SYSTEM, usługi sieciowe…)' -Text ([string](Get-ModuleSetting -Module $m -Name 'Accounts' -Default ''))
+    $row = Add-ToolbarRow -Module $m -Title 'Szukaj w'
+    $m.Services = Add-CheckBox -Parent $row -Text 'Usługi' -Checked $true
+    $m.Tasks = Add-CheckBox -Parent $row -Text 'Zadania Harmonogramu' -Checked $true
+    $m.Iis = Add-CheckBox -Parent $row -Text 'IIS (pule i katalogi wirtualne)' -Checked $true
+    $m.Autologon = Add-CheckBox -Parent $row -Text 'Automatyczne logowanie' -Checked $true
+    $m.Builtin = Add-CheckBox -Parent $row -Text 'Także konta wbudowane' -ToolTip 'SYSTEM, LocalService, NetworkService, NT SERVICE\…, IIS APPPOOL\… – tylko gdy pole «Konta» jest puste'
+    $m.Actions.Scan = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $accounts = @(([string]$m.Accounts.Text) -split '[,;\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        Set-ModuleSetting -Module $m -Name 'Accounts' -Value ($accounts -join ', ')
+        $params = @{ Accounts = $accounts; Services = (Test-Checked $m.Services); Tasks = (Test-Checked $m.Tasks); Iis = (Test-Checked $m.Iis); Autologon = (Test-Checked $m.Autologon); IncludeBuiltin = (Test-Checked $m.Builtin) }
+        Start-HostOperation -Module $m -Name 'Gdzie używane jest konto' -Targets $targets -Parameters $params -ScriptBlock $script:AccountUsageScript -OnComplete { param($m) & $m.Actions.Summary $m; & $m.Actions.CheckAd $m }
+    }
+    $m.Actions.Summary = {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { $m.Table.Columns.Contains('__acc') -and [string]$_['__acc'] })
+        Set-StatTile -Module $m -Key 'places' -Value ([string]$rows.Count)
+        Set-StatTile -Module $m -Key 'computers' -Value ([string]@($rows | ForEach-Object { [string]$_['Komputer'] } | Select-Object -Unique).Count)
+        Set-StatTile -Module $m -Key 'accounts' -Value ([string]@($rows | ForEach-Object { [string]$_['__acc'] } | Select-Object -Unique).Count)
+        $stored = @($rows | Where-Object { [string]$_['Hasło zapisane'] -eq 'Tak' }).Count
+        Set-StatTile -Module $m -Key 'stored' -Value ([string]$stored) -Tone $(if ($stored) { 'info' } else { '' })
+    }
+    $m.Actions.CheckAd = {
+        # Stan kont domenowych w AD (wyłączone, zablokowane, wygasłe hasło - usługa nie wystartuje)
+        param($m)
+        if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { return }
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { $m.Table.Columns.Contains('Rodzaj konta') -and [string]$_['Rodzaj konta'] -eq 'domenowe' })
+        $names = @($rows | ForEach-Object { [string]$_['__acc'] } | Where-Object { $_ } | Select-Object -Unique)
+        if ($names.Count -eq 0) { return }
+        Start-AdOperation -Module $m -Name 'Stan kont w AD' -Targets $names -Output None -ScriptBlock {
+            # Brak konta w AD to wynik (konto z innej domeny lub usunięte), nie błąd operacji
+            try { $o = Resolve-AdPrincipal -Id $Target -Classes @('user', 'msDS-GroupManagedServiceAccount', 'msDS-ManagedServiceAccount', 'computer') -Properties @('pwdLastSet', 'lockoutTime', 'msDS-UserPasswordExpiryTimeComputed') }
+            catch { if ($_.Exception.Message -like 'Nie znaleziono*') { return [pscustomobject]@{ Text = 'nie znaleziono w AD (inna domena albo konto usunięte)'; Tone = 'crit' } }; throw }
+            $uac = [int64]$o.userAccountControl
+            $cls = [string]$o.ObjectClass
+            $pwdAge = if ($o.pwdLastSet -and [int64]$o.pwdLastSet -gt 0) { [int]((Get-Date) - [datetime]::FromFileTime([int64]$o.pwdLastSet)).TotalDays } else { $null }
+            $exp = [int64]$o.'msDS-UserPasswordExpiryTimeComputed'
+            $expired = $exp -gt 0 -and $exp -lt [int64]::MaxValue -and [datetime]::FromFileTime($exp) -lt (Get-Date)
+            if ($uac -band 2) { return [pscustomobject]@{ Text = 'konto wyłączone'; Tone = 'crit' } }
+            if ([int64]$o.lockoutTime -gt 0) { return [pscustomobject]@{ Text = 'konto zablokowane'; Tone = 'crit' } }
+            if ($cls -like 'msDS-*ManagedServiceAccount') { return [pscustomobject]@{ Text = 'konto zarządzane (gMSA) – hasło zmienia AD'; Tone = 'ok' } }
+            if ($expired) { return [pscustomobject]@{ Text = 'hasło wygasło'; Tone = 'crit' } }
+            [pscustomobject]@{ Text = $(if ($null -ne $pwdAge) { "aktywne, hasło ustawione $pwdAge dni temu" } else { 'aktywne' }); Tone = '' }
+        } -OnResult {
+            param($m, $r)
+            $text = if ($r.Ok) { [string]@($r.Data)[0].Text } else { 'nie sprawdzono: ' + ((@($r.Errors)) -join ' ') }
+            $tone = if ($r.Ok) { [string]@($r.Data)[0].Tone } else { 'crit' }
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__acc' -Value ([string]$r.Target))) {
+                Set-ResultValue -Module $m -Row $row -Column 'Konto w AD' -Value $text
+                if ($tone -eq 'crit') { Set-ResultValue -Module $m -Row $row -Column '__tone' -Value 'crit' }
+            }
+        }
+    }
+    $m.Actions.SetPassword = {
+        param($m, $Rows)
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('__kind', '__id', '__acc', 'Typ', 'Nazwa', 'Konto', 'Hasło zapisane') -Rows $Rows
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli miejsca, w których zapisać nowe hasło (albo kliknij prawym przyciskiem).'; return }
+        $all = @(foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { $i['__host'] = $h; $i } })
+        $usable = @($all | Where-Object { [string]$_['Hasło zapisane'] -eq 'Tak' })
+        if ($usable.Count -eq 0) { Show-Warning 'Wybrane miejsca nie przechowują hasła (konta wbudowane, zadania bez zapisanego hasła, konta gMSA).'; return }
+        $accs = @($usable | ForEach-Object { [string]$_['__acc'] } | Select-Object -Unique)
+        if ($accs.Count -gt 1) { Show-Warning ('Wybrano miejsca kilku kont ({0}) – hasło zmienia się dla jednego konta naraz.' -f ($accs -join ', ')); return }
+        $account = [string]$usable[0]['Konto']
+        $isDomain = @($usable | Where-Object { [string](Get-ObjectValue $_.__row 'Rodzaj konta') -eq 'domenowe' }).Count -gt 0
+        $opt = Show-AccountPasswordDialog -Account $account -Count $usable.Count -CanValidate $isDomain
+        if (-not $opt) { return }
+        if ($opt.Validate) {
+            $ok = Invoke-WithWaitCursor { Test-AdAccountPassword -Account $account -Password $opt.Password }
+            if ($ok -eq $false) { Show-Warning "Hasło nie pasuje do konta $account w Active Directory. Najpierw ustaw je w AD – zapisanie złego hasła zablokowałoby konto przy starcie usług."; return }
+            if ($null -eq $ok -and -not (Confirm-Action -Text 'Nie udało się sprawdzić hasła w Active Directory (brak połączenia z domeną). Zapisać je mimo to?' -ConfirmText 'Zapisz bez sprawdzenia')) { return }
+        }
+        $items = @($usable | ForEach-Object { '{0}: {1} {2}' -f $_['__host'], $_['Typ'], $_['Nazwa'] })
+        $skipped = $all.Count - $usable.Count
+        $text = "Zapisać nowe hasło konta $account w wybranych miejscach?$(if ($opt.Restart) { ' Działające usługi zostaną uruchomione ponownie, a pule IIS odświeżone.' })$(if ($skipped) { " Pominięto miejsca bez zapisanego hasła: $skipped." })"
+        $chosen = @(Confirm-Action -Text $text -Items $items -ConfirmText 'Zapisz hasło' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $per = @{}
+        foreach ($i in $chosen) {
+            $u = $usable[$i]
+            $h = [string]$u['__host']
+            if (-not $per.ContainsKey($h)) { $per[$h] = @{ Items = @(); Password = $opt.Password; Restart = $opt.Restart } }
+            $per[$h].Items += @{ Kind = [string]$u['__kind']; Id = [string]$u['__id'] }
+            Set-ResultValue -Module $m -Row $u.__row -Column 'Zmiana hasła' -Value 'Zapisywanie…'
+        }
+        Start-HostOperation -Module $m -Name "Hasło konta $account" -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:AccountPasswordScript -OnResult {
+            param($m, $r)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string]$_['Komputer'] -eq [string]$r.Target })
+            if (-not $r.Ok) {
+                foreach ($row in @($rows | Where-Object { [string]$_['Zmiana hasła'] -eq 'Zapisywanie…' })) { Set-ResultValue -Module $m -Row $row -Column 'Zmiana hasła' -Value ('Błąd: ' + ((@($r.Errors)) -join ' ')) }
+                return
+            }
+            foreach ($d in @($r.Data)) {
+                foreach ($row in @($rows | Where-Object { [string]$_['__kind'] -eq [string]$d.Kind -and [string]$_['__id'] -eq [string]$d.Id })) {
+                    Set-ResultValue -Module $m -Row $row -Column 'Zmiana hasła' -Value $(if ($d.Detail) { '{0} – {1}' -f $d.Result, $d.Detail } else { [string]$d.Result })
+                    if ($d.Tone -eq 'crit') { Set-ResultValue -Module $m -Row $row -Column '__tone' -Value 'crit' }
+                }
+            }
+        } -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { $m.Table.Columns.Contains('Zmiana hasła') -and [string]$_['Zmiana hasła'] })
+            $bad = @($rows | Where-Object { [string]$_['Zmiana hasła'] -like 'Błąd*' }).Count
+            Show-Toast $(if ($bad) { "Hasła nie zapisano w $bad miejscach – szczegóły w kolumnie «Zmiana hasła»." } else { 'Zapisano nowe hasło we wszystkich wybranych miejscach.' }) $(if ($bad) { 'warn' } else { 'ok' })
+        }
+    }
+    $row2 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row2 -Text 'Szukaj' -Icon 'E721' -Module $m -Primary -OnClick $m.Actions.Scan | Out-Null
+    Add-Button -Parent $row2 -Text 'Zapisz nowe hasło w zaznaczonych…' -Icon 'E8D7' -Module $m -Danger -OnClick { param($m) & $m.Actions.SetPassword $m $null } | Out-Null
+    Add-RowAction -Module $m -Text 'Zapisz nowe hasło konta w tych miejscach…' -Icon 'E8D7' -Danger -Action { param($m, $rows) & $m.Actions.SetPassword $m $rows }
+    Add-StatTile -Module $m -Key 'places' -Label 'Miejsca użycia' -Icon 'E77B' | Out-Null
+    Add-StatTile -Module $m -Key 'computers' -Label 'Komputery' -Icon 'E977' | Out-Null
+    Add-StatTile -Module $m -Key 'accounts' -Label 'Konta' -Icon 'E716' | Out-Null
+    Add-StatTile -Module $m -Key 'stored' -Label 'Z zapisanym hasłem' -Icon 'E8D7' | Out-Null
+    $m.EmptyHint = 'Zaznacz komputery (np. wszystkie serwery), wpisz konta usług albo zostaw pole puste i kliknij «Szukaj» (F5). Kolumna «Konto w AD» ostrzega o kontach wyłączonych, zablokowanych i z wygasłym hasłem.'
+}
+#endregion
+
 #region Active Directory: wspólne
 # Operacje AD wykonywane są lokalnie w puli wątków modułem ActiveDirectory. Blok modułu dostaje gotową
 # hashtablę $ad (Server, Credential, ErrorAction = Stop) do rozwinięcia w poleceniach: Get-ADUser ... @ad
