@@ -7,7 +7,8 @@
 .DESCRIPTION
     Program jest podzielony na przestrzenie robocze (przełącznik na górze okna, Ctrl+1..6):
       - Zarządzanie zdalne  - operacje na zaznaczonych komputerach przez PowerShell Remoting (WinRM):
-                              diagnostyka, sesje i profile użytkowników, usługi, procesy, dyski, zdarzenia,
+                              diagnostyka, sesje i profile użytkowników, grupy lokalne i ich zgodność z szablonem,
+                              usługi, procesy, dyski, zdarzenia,
                               oprogramowanie i aktualizacje, bezpieczeństwo, udziały, polecenia, instalacje,
       - Użytkownicy AD      - konta użytkowników: szczegóły, hasła i blokady, stan konta, grupy, atrybuty,
                               hurtowe tworzenie kont (profile), import atrybutów z CSV z cofaniem zmian,
@@ -129,6 +130,8 @@ $script:Settings = [ordered]@{
     DisabledBaseOU   = ''
     AadSyncServer    = ''
     ReportJobsDir    = ''
+    # Szablony zgodności grup lokalnych: @{ Name; Groups = @(@{ Sid; Name; Allowed; Required; Exclusive }) }
+    LocalGroupTemplates = @()
     UserProfiles     = @()
     ModuleValues     = @{}
     ProfilesImported = $false
@@ -473,6 +476,9 @@ function Import-Settings {
     foreach ($b in 'OnlyEnabled', 'WindowMaximized', 'LogVisible', 'DetailVisible', 'ProfilesImported') { $s[$b] = [bool]$s[$b] }
     foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace', 'GroupSearchBase', 'DisabledBaseOU', 'AadSyncServer', 'ReportJobsDir') { $s[$t] = [string]$s[$t] }
     foreach ($l in 'ExceptionUsers', 'ProtectedGroups', 'NtfsHiddenIdentities') { $s[$l] = @($s[$l] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
+    # ConvertTo-PlainData zwraca tablicę jako jeden obiekt - najpierw do zmiennej, dopiero potem wyliczanie
+    $tpl = ConvertTo-PlainData $s.LocalGroupTemplates
+    $s.LocalGroupTemplates = @(foreach ($t in @($tpl)) { if ($t -is [hashtable] -and [string]$t['Name']) { ConvertTo-LocalGroupTemplate $t } })
     $s.LastModules = ConvertTo-Hashtable $s.LastModules
     $mv = ConvertTo-Hashtable $s.ModuleValues
     foreach ($k in @($mv.Keys)) { $mv[$k] = ConvertTo-Hashtable $mv[$k] }
@@ -11889,6 +11895,456 @@ Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'Acc
 }
 #endregion
 
+#region Zgodność grup lokalnych z szablonem (Administratorzy, Pulpit zdalny, WinRM…) z naprawą hurtową
+# Szablon opisuje dla wybranych grup lokalnych (po SID - niezależnie od języka systemu, albo po nazwie dla grup własnych)
+# członków wymaganych i dozwolonych. Wzorce: DOMENA\nazwa, nazwa (dowolna domena), .\nazwa (konto lokalne), SID albo
+# wzorzec SID (np. *-512 = Administratorzy domeny, *-500 = wbudowane konto Administrator); * zastępuje dowolne znaki.
+
+$script:LocalGroupTemplateGroups = @(
+    @{ Name = 'Administratorzy'; Sid = 'S-1-5-32-544' }
+    @{ Name = 'Użytkownicy pulpitu zdalnego'; Sid = 'S-1-5-32-555' }
+    @{ Name = 'Użytkownicy zarządzania zdalnego (WinRM)'; Sid = 'S-1-5-32-580' }
+    @{ Name = 'Operatorzy kopii zapasowych'; Sid = 'S-1-5-32-551' }
+    @{ Name = 'Użytkownicy zaawansowani'; Sid = 'S-1-5-32-547' }
+    @{ Name = 'Użytkownicy DCOM'; Sid = 'S-1-5-32-562' }
+    @{ Name = 'Czytelnicy dziennika zdarzeń'; Sid = 'S-1-5-32-573' }
+    @{ Name = 'Operatorzy konfiguracji sieci'; Sid = 'S-1-5-32-556' }
+    @{ Name = 'Administratorzy funkcji Hyper-V'; Sid = 'S-1-5-32-578' }
+)
+
+function ConvertTo-LocalGroupTemplate {
+    # Szablon z ustawień (po ConvertTo-PlainData) z uzupełnionymi polami
+    param([hashtable]$Data)
+    $groups = @(foreach ($g in @($Data['Groups'])) {
+            if (-not ($g -is [hashtable])) { continue }
+            @{
+                Sid       = [string]$g['Sid']
+                Name      = [string]$g['Name']
+                Allowed   = @(@($g['Allowed']) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+                Required  = @(@($g['Required']) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+                Exclusive = $(if ($g.ContainsKey('Exclusive')) { [bool]$g['Exclusive'] } else { $true })
+            }
+        })
+    return @{ Name = [string]$Data['Name']; Groups = $groups }
+}
+
+function Get-LocalGroupTemplates {
+    # Szablony z ustawień; przy pierwszym użyciu przykład dla stacji roboczych
+    $list = @($script:Settings.LocalGroupTemplates | Where-Object { $_ -is [hashtable] })
+    if ($list.Count) { return $list }
+    return @(@{
+            Name   = 'Stacje robocze (przykład)'
+            Groups = @(
+                @{ Sid = 'S-1-5-32-544'; Name = 'Administratorzy'; Allowed = @('*-500', '*-512'); Required = @('*-512'); Exclusive = $true }
+                @{ Sid = 'S-1-5-32-555'; Name = 'Użytkownicy pulpitu zdalnego'; Allowed = @(); Required = @(); Exclusive = $true }
+                @{ Sid = 'S-1-5-32-580'; Name = 'Użytkownicy zarządzania zdalnego (WinRM)'; Allowed = @(); Required = @(); Exclusive = $true }
+            )
+        })
+}
+
+function Save-LocalGroupTemplate([hashtable]$Template, [string]$OldName = '') {
+    # Tylko szablony zapisane (przykład z Get-LocalGroupTemplates nie trafia do ustawień, chyba że zapiszesz go sam)
+    $list = New-Object System.Collections.ArrayList
+    foreach ($t in @($script:Settings.LocalGroupTemplates | Where-Object { $_ -is [hashtable] })) { if ([string]$t.Name -ne $OldName -and [string]$t.Name -ne [string]$Template.Name) { [void]$list.Add($t) } }
+    [void]$list.Add($Template)
+    $script:Settings.LocalGroupTemplates = @($list | Sort-Object { [string]$_.Name })
+    Export-Settings
+}
+
+function Get-LocalGroupTemplateText([hashtable]$Template) {
+    # Opis szablonu do podpowiedzi i raportu
+    return ((@($Template.Groups | ForEach-Object {
+                    '{0}: {1}{2}{3}' -f $_.Name, $(if (@($_.Allowed).Count) { 'dozwoleni ' + ((@($_.Allowed)) -join ', ') } else { 'bez dozwolonych' }), $(if (@($_.Required).Count) { '; wymagani ' + ((@($_.Required)) -join ', ') } else { '' }), $(if ($_.Exclusive) { '' } else { ' (pozostali dopuszczeni)' })
+                })) -join ' • ')
+}
+
+function Test-LocalMemberPattern {
+    # Czy członek (Name, Sid, Local) pasuje do wzorca: SID / wzorzec SID, DOMENA\nazwa, .\nazwa (lokalne), nazwa (dowolna domena)
+    param([string]$Pattern, $Member)
+    $p = $Pattern.Trim()
+    if (-not $p) { return $false }
+    $sid = [string]$Member.Sid
+    if ($p -match '^(S-1-|\*-|\*S-1-)' -or $p -match '^-\d+$') {
+        if ($p -match '^-\d+$') { $p = '*' + $p }
+        return ($sid -and $sid -like $p)
+    }
+    $name = [string]$Member.Name
+    $short = ($name -split '\\')[-1]
+    if ($p -match '^\.\\') { return ([bool]$Member.Local -and $short -like $p.Substring(2)) }
+    if ($p.Contains('\')) { return ($name -like $p) }
+    return ($short -like $p)
+}
+
+$script:LocalGroupMembersScript = {
+    # Członkowie grup z szablonu przez ADSI (działa także z osieroconymi SID-ami, w każdym języku systemu). $P.Groups: @(@{ Key; Sid; Name })
+    param($P)
+    foreach ($g in @($P.Groups)) {
+        $name = [string]$g.Name
+        if ($g.Sid) { try { $name = (New-Object System.Security.Principal.SecurityIdentifier([string]$g.Sid)).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1] } catch { $name = '' } }
+        $members = $null
+        if ($name) {
+            try { $members = @(([ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME, $name)).Invoke('Members')) } catch { $members = $null }
+        }
+        if ($null -eq $members) { [pscustomobject]@{ '__rec' = 'group'; Key = [string]$g.Key; Name = $(if ($name) { $name } else { [string]$g.Name }); Exists = $false }; continue }
+        [pscustomobject]@{ '__rec' = 'group'; Key = [string]$g.Key; Name = $name; Exists = $true }
+        foreach ($mbr in $members) {
+            $type = $mbr.GetType()
+            $path = [string]$type.InvokeMember('ADsPath', 'GetProperty', $null, $mbr, $null)
+            $class = [string]$type.InvokeMember('Class', 'GetProperty', $null, $mbr, $null)
+            $msid = ''
+            try { $msid = (New-Object System.Security.Principal.SecurityIdentifier($type.InvokeMember('objectSid', 'GetProperty', $null, $mbr, $null), 0)).Value } catch { }
+            $parts = @($path -replace '^WinNT://', '' -split '/')
+            $local = ($parts.Count -ge 3) -or ($parts.Count -eq 2 -and $parts[0] -ieq $env:COMPUTERNAME)
+            $mname = if ($parts.Count -ge 2) { $parts[-2] + '\' + $parts[-1] } else { $parts[-1] }
+            $source = if ($mname -match '^S-1-') { 'nierozwiązany SID (usunięte konto)' } elseif ($msid -like 'S-1-12-1-*') { 'Entra ID (Azure AD)' } elseif ($local) { 'lokalne' } elseif ($msid -like 'S-1-5-21-*') { 'domena' } else { 'wbudowane' }
+            [pscustomobject]@{ '__rec' = 'member'; Key = [string]$g.Key; Group = $name; Name = $mname; Sid = $msid; Class = $(if ($class -ieq 'Group') { 'grupa' } else { 'użytkownik' }); Local = $local; Source = $source }
+        }
+    }
+}
+
+$script:LocalGroupFixScript = {
+    # Zmiany członkostwa: $P.Remove = @(@{ GroupSid; GroupName; Sid; Name }), $P.Add = @(@{ GroupSid; GroupName; Member })
+    param($P)
+    $resolve = {
+        param($gsid, $gname)
+        if ($gsid) { return (New-Object System.Security.Principal.SecurityIdentifier($gsid)).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1] }
+        return $gname
+    }
+    foreach ($r in @($P.Remove)) {
+        $gname = ''
+        try {
+            $gname = & $resolve $r.GroupSid $r.GroupName
+            # Zabezpieczenie przed odcięciem dostępu: wbudowane konto Administrator i Domain Admins w grupie Administratorzy
+            if ($r.GroupSid -eq 'S-1-5-32-544' -and ([string]$r.Sid -match '-500$' -or [string]$r.Sid -match '^S-1-5-21-.+-512$')) { throw 'pominięto – wbudowane konto Administrator / Domain Admins usuń ręcznie, jeśli naprawdę trzeba' }
+            $identity = if ($r.Sid) { [string]$r.Sid } else { [string]$r.Name }
+            if (Get-Command Remove-LocalGroupMember -ErrorAction SilentlyContinue) {
+                if ($r.GroupSid) { Remove-LocalGroupMember -SID $r.GroupSid -Member $identity -ErrorAction Stop } else { Remove-LocalGroupMember -Group $gname -Member $identity -ErrorAction Stop }
+            }
+            else { ([ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME, $gname)).Remove($(if ($r.Sid) { 'WinNT://' + $r.Sid } else { 'WinNT://' + ([string]$r.Name -replace '\\', '/') })) }
+            [pscustomobject]@{ 'Grupa' = $gname; 'Członek' = [string]$r.Name; 'Zmiana' = 'usunięcie'; 'Wynik' = 'Usunięto'; '__tone' = 'ok' }
+        }
+        catch { [pscustomobject]@{ 'Grupa' = $(if ($gname) { $gname } else { [string]$r.GroupName }); 'Członek' = [string]$r.Name; 'Zmiana' = 'usunięcie'; 'Wynik' = 'Błąd – ' + $_.Exception.Message; '__tone' = 'crit' } }
+    }
+    foreach ($a in @($P.Add)) {
+        $gname = ''
+        try {
+            $gname = & $resolve $a.GroupSid $a.GroupName
+            if (Get-Command Add-LocalGroupMember -ErrorAction SilentlyContinue) {
+                if ($a.GroupSid) { Add-LocalGroupMember -SID $a.GroupSid -Member $a.Member -ErrorAction Stop } else { Add-LocalGroupMember -Group $gname -Member $a.Member -ErrorAction Stop }
+            }
+            else { ([ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME, $gname)).Add($(if ([string]$a.Member -match '^S-1-') { 'WinNT://' + $a.Member } else { 'WinNT://' + ([string]$a.Member -replace '\\', '/') })) }
+            [pscustomobject]@{ 'Grupa' = $gname; 'Członek' = [string]$a.Member; 'Zmiana' = 'dodanie'; 'Wynik' = 'Dodano'; '__tone' = 'ok' }
+        }
+        catch {
+            $msg = $_.Exception.Message
+            if ($_.FullyQualifiedErrorId -like 'MemberExists*') { $msg = 'już jest członkiem grupy' }
+            [pscustomobject]@{ 'Grupa' = $(if ($gname) { $gname } else { [string]$a.GroupName }); 'Członek' = [string]$a.Member; 'Zmiana' = 'dodanie'; 'Wynik' = 'Błąd – ' + $msg; '__tone' = 'crit' }
+        }
+    }
+}
+
+function Get-LocalGroupScanGroups([hashtable]$Template) {
+    return @(foreach ($g in $Template.Groups) { @{ Key = $(if ($g.Sid) { [string]$g.Sid } else { 'name:' + [string]$g.Name }); Sid = [string]$g.Sid; Name = [string]$g.Name } })
+}
+
+function Compare-LocalGroupCompliance {
+    <#
+        Wynik skanu jednego komputera (rekordy group/member) porównany z szablonem: wiersz na członka (zgodny / niedozwolony /
+        dodatkowy) i na brakującego wymaganego członka; grupy, których nie ma na komputerze, z uwagą.
+    #>
+    param([object[]]$Records, [hashtable]$Template)
+    $rows = New-Object System.Collections.ArrayList
+    $groups = @{}
+    foreach ($d in $Records) { if ([string](Get-ObjectValue $d '__rec') -eq 'group') { $groups[[string]$d.Key] = $d } }
+    foreach ($g in $Template.Groups) {
+        $key = if ($g.Sid) { [string]$g.Sid } else { 'name:' + [string]$g.Name }
+        $info = $groups[$key]
+        $gname = if ($info -and $info.Name) { [string]$info.Name } else { [string]$g.Name }
+        if (-not $info -or -not $info.Exists) {
+            if (@($g.Required).Count) { [void]$rows.Add([pscustomobject][ordered]@{ 'Grupa' = $gname; 'Członek' = ''; 'Zgodność' = 'brak grupy'; 'Typ' = ''; 'Źródło' = ''; 'SID' = ''; 'Reguła' = 'grupa z wymaganymi członkami nie istnieje na komputerze'; '__tone' = 'warn'; '__gsid' = [string]$g.Sid; '__gname' = [string]$g.Name }) }
+            continue
+        }
+        $members = @($Records | Where-Object { [string](Get-ObjectValue $_ '__rec') -eq 'member' -and [string]$_.Key -eq $key })
+        foreach ($mb in $members) {
+            $rule = @(@($g.Required) + @($g.Allowed) | Where-Object { Test-LocalMemberPattern $_ $mb } | Select-Object -First 1)
+            $protected = ([string]$g.Sid -eq 'S-1-5-32-544' -and ([string]$mb.Sid -match '-500$' -or [string]$mb.Sid -match '^S-1-5-21-.+-512$'))
+            $state = if ($rule.Count) { 'zgodny' } elseif ($g.Exclusive) { 'niedozwolony' } else { 'dodatkowy' }
+            [void]$rows.Add([pscustomobject][ordered]@{
+                    'Grupa' = $gname; 'Członek' = [string]$mb.Name; 'Zgodność' = $state; 'Typ' = [string]$mb.Class; 'Źródło' = [string]$mb.Source; 'SID' = [string]$mb.Sid
+                    'Reguła' = $(if ($rule.Count) { [string]$rule[0] } elseif ($protected) { 'brak pasującej reguły – konto chronione (usuń ręcznie)' } else { 'brak pasującej reguły' })
+                    '__tone' = $(switch ($state) { 'zgodny' { 'ok' } 'niedozwolony' { 'crit' } default { '' } }); '__gsid' = [string]$g.Sid; '__gname' = [string]$g.Name; '__protected' = $protected
+                })
+        }
+        foreach ($req in @($g.Required)) {
+            if (@($members | Where-Object { Test-LocalMemberPattern $req $_ }).Count) { continue }
+            [void]$rows.Add([pscustomobject][ordered]@{ 'Grupa' = $gname; 'Członek' = $req; 'Zgodność' = 'brakujący'; 'Typ' = ''; 'Źródło' = ''; 'SID' = ''; 'Reguła' = 'wymagany członek'; '__tone' = 'warn'; '__gsid' = [string]$g.Sid; '__gname' = [string]$g.Name; '__protected' = $false })
+        }
+    }
+    return $rows.ToArray()
+}
+
+function Show-LocalGroupTemplateEditor {
+    # Dwa kroki: nazwa i grupy, potem reguły każdej grupy. Zwraca szablon albo $null.
+    param([hashtable]$Template = $null)
+    $isNew = -not $Template
+    if ($isNew) { $Template = @{ Name = ''; Groups = @(@{ Sid = 'S-1-5-32-544'; Name = 'Administratorzy'; Allowed = @('*-500', '*-512'); Required = @(); Exclusive = $true }) } }
+    $known = @($script:LocalGroupTemplateGroups | ForEach-Object { $_.Name })
+    $selected = @($Template.Groups | Where-Object { $_.Sid } | ForEach-Object { $s = $_.Sid; @($script:LocalGroupTemplateGroups | Where-Object { $_.Sid -eq $s } | ForEach-Object { $_.Name }) })
+    $custom = @($Template.Groups | Where-Object { -not $_.Sid } | ForEach-Object { $_.Name })
+    $step1 = Show-FormDialog -Title $(if ($isNew) { 'Nowy szablon grup lokalnych' } else { 'Szablon: ' + $Template.Name }) -Subtitle 'Krok 1 z 2 – nazwa i grupy objęte kontrolą' -Icon 'E902' -OkText 'Dalej' -Width 600 -Fields @(
+        @{ Key = 'Name'; Label = 'Nazwa szablonu'; Value = [string]$Template.Name; Placeholder = 'np. Stacje robocze, Serwery plików' }
+        @{ Key = 'Groups'; Label = 'Grupy wbudowane (wyznaczane po SID – działa w każdym języku systemu)'; Type = 'Flags'; Items = $known; Value = $selected }
+        @{ Key = 'Custom'; Label = 'Inne grupy lokalne (nazwy, po przecinku)'; Value = ($custom -join ', '); Placeholder = 'np. docker-users, SQLServerMSSQLUser$…' }
+    ) -Validate {
+        param($v)
+        if (-not $v.Name) { return 'Podaj nazwę szablonu.' }
+        if (-not @($v.Groups).Count -and -not (Split-ListText $v.Custom).Count) { return 'Wybierz co najmniej jedną grupę.' }
+        return ''
+    }
+    if (-not $step1) { return $null }
+    $chosen = New-Object System.Collections.ArrayList
+    foreach ($n in @($step1.Groups)) { $def = @($script:LocalGroupTemplateGroups | Where-Object { $_.Name -eq $n })[0]; [void]$chosen.Add(@{ Sid = $def.Sid; Name = $def.Name }) }
+    foreach ($n in @(Split-ListText $step1.Custom)) { [void]$chosen.Add(@{ Sid = ''; Name = $n }) }
+    $fields = New-Object System.Collections.ArrayList
+    [void]$fields.Add(@{ Type = 'Header'; Label = 'Wzorce członków'; Hint = 'Po jednym w wierszu: DOMENA\nazwa, sama nazwa (dowolna domena), .\nazwa (konto lokalne), SID albo wzorzec SID – *-500 to wbudowane konto Administrator, *-512 Administratorzy domeny (niezależnie od nazwy i języka). Znak * zastępuje dowolny ciąg.' })
+    for ($i = 0; $i -lt $chosen.Count; $i++) {
+        $c = $chosen[$i]
+        $prev = @($Template.Groups | Where-Object { ($c.Sid -and $_.Sid -eq $c.Sid) -or (-not $c.Sid -and -not $_.Sid -and $_.Name -eq $c.Name) })
+        $p = if ($prev.Count) { $prev[0] } else { @{ Allowed = @(); Required = @(); Exclusive = $true } }
+        [void]$fields.Add(@{ Type = 'Header'; Label = $(if ($c.Sid) { '{0} ({1})' -f $c.Name, $c.Sid } else { $c.Name + ' (grupa własna)' }) })
+        [void]$fields.Add(@{ Key = "a$i"; Label = 'Dozwoleni'; Type = 'Multi'; Height = 64; Value = ((@($p.Allowed)) -join "`r`n") })
+        [void]$fields.Add(@{ Key = "r$i"; Label = 'Wymagani (brak = niezgodność; konkretne nazwy można dodać hurtowo)'; Type = 'Multi'; Height = 48; Value = ((@($p.Required)) -join "`r`n") })
+        [void]$fields.Add(@{ Key = "x$i"; Label = 'Pozostali członkowie są niedozwoleni (do usunięcia)'; Type = 'Check'; Value = [bool]$p.Exclusive })
+    }
+    $step2 = Show-FormDialog -Title ('Szablon: ' + $step1.Name) -Subtitle 'Krok 2 z 2 – reguły dla każdej grupy' -Icon 'E902' -OkText 'Zapisz szablon' -Width 640 -MaxHeight 600 -Fields $fields.ToArray()
+    if (-not $step2) { return $null }
+    $groups = for ($i = 0; $i -lt $chosen.Count; $i++) {
+        @{ Sid = $chosen[$i].Sid; Name = $chosen[$i].Name; Allowed = @(Split-ListText $step2["a$i"] | Select-Object -Unique); Required = @(Split-ListText $step2["r$i"] | Select-Object -Unique); Exclusive = [bool]$step2["x$i"] }
+    }
+    return @{ Name = [string]$step1.Name; Groups = @($groups) }
+}
+
+function Get-LocalGroupTemplateByName([string]$Name) {
+    # $null, gdy nie ma (pod StrictMode @()[0] rzuca wyjątek - np. przy czyszczeniu listy wyboru)
+    foreach ($t in @(Get-LocalGroupTemplates)) { if ([string]$t.Name -eq $Name) { return $t } }
+    return $null
+}
+
+function Update-LocalGroupTemplateList([hashtable]$Module, [string]$Select = '') {
+    $m = $Module
+    $names = @(Get-LocalGroupTemplates | ForEach-Object { [string]$_.Name })
+    $m.Template.Items.Clear()
+    foreach ($n in $names) { [void]$m.Template.Items.Add($n) }
+    $idx = if ($Select) { [Array]::IndexOf($names, $Select) } else { [Array]::IndexOf($names, [string](Get-ModuleSetting -Module $m -Name 'Template' -Default '')) }
+    $m.Template.SelectedIndex = [Math]::Max(0, $idx)
+}
+
+function Get-SelectedLocalGroupTemplate([hashtable]$Module) {
+    $name = [string]$Module.Template.SelectedItem
+    $t = Get-LocalGroupTemplateByName $name
+    if (-not $t) { Show-Warning 'Wybierz szablon.'; return $null }
+    return $t
+}
+
+function Start-LocalGroupFix {
+    # Usunięcie niedozwolonych i/lub dodanie brakujących członków (wiersze z tabeli), z kopią członkostwa przed zmianą
+    param([hashtable]$Module, [object[]]$Rows, [ValidateSet('Remove', 'Add')][string]$Mode)
+    $m = $Module
+    $per = @{}
+    $items = New-Object System.Collections.ArrayList
+    $skipped = 0
+    foreach ($r in $Rows) {
+        $c = [string](Get-ObjectValue $r 'Komputer')
+        $state = [string](Get-ObjectValue $r 'Zgodność')
+        if (-not $c) { continue }
+        if ($Mode -eq 'Remove') {
+            if ($state -ne 'niedozwolony') { continue }
+            # W tabeli wyników wartości logiczne są tekstem Tak/Nie
+            $prot = Get-ObjectValue $r '__protected'
+            if ($prot -eq $true -or [string]$prot -eq 'Tak') { $skipped++; continue }
+            if (-not $per.ContainsKey($c)) { $per[$c] = @{ Remove = New-Object System.Collections.ArrayList; Add = @() } }
+            [void]$per[$c].Remove.Add(@{ GroupSid = [string](Get-ObjectValue $r '__gsid'); GroupName = [string](Get-ObjectValue $r '__gname'); Sid = [string](Get-ObjectValue $r 'SID'); Name = [string](Get-ObjectValue $r 'Członek') })
+        }
+        else {
+            $member = [string](Get-ObjectValue $r 'Członek')
+            if ($state -ne 'brakujący' -or $member -match '[*?]' -or $member -match '^\*?-\d+$') { if ($state -eq 'brakujący') { $skipped++ }; continue }
+            if (-not $per.ContainsKey($c)) { $per[$c] = @{ Remove = @(); Add = New-Object System.Collections.ArrayList } }
+            [void]$per[$c].Add.Add(@{ GroupSid = [string](Get-ObjectValue $r '__gsid'); GroupName = [string](Get-ObjectValue $r '__gname'); Member = $member })
+        }
+        [void]$items.Add(('{0}: {1} – {2}' -f $c, (Get-ObjectValue $r 'Grupa'), (Get-ObjectValue $r 'Członek')))
+    }
+    if (-not $per.Count) {
+        $why = if ($Mode -eq 'Remove') { 'Brak niedozwolonych członków do usunięcia (konta chronione – wbudowany Administrator i Administratorzy domeny w grupie Administratorzy – usuń ręcznie).' } else { 'Brak brakujących członków o konkretnej nazwie (wzorce z * lub SID nie mogą zostać dodane).' }
+        Show-Warning $(if ($skipped) { "$why Pominięto: $skipped." } else { $why })
+        return
+    }
+    $text = if ($Mode -eq 'Remove') { 'Usunąć niedozwolonych członków z grup lokalnych? Członkostwo sprzed zmiany trafi do kopii, z której można je przywrócić.' } else { 'Dodać brakujących członków do grup lokalnych?' }
+    if ($skipped) { $text += " Pominięto: $skipped (konta chronione albo wzorce)." }
+    if (-not (Confirm-Action -Text $text -Items $items.ToArray() -ConfirmText $(if ($Mode -eq 'Remove') { 'Usuń z grup' } else { 'Dodaj do grup' }) -Danger:($Mode -eq 'Remove'))) { return }
+    if ($Mode -eq 'Remove') {
+        $backup = foreach ($c in $per.Keys) { foreach ($x in $per[$c].Remove) { [pscustomobject]@{ Computer = $c; GroupSid = $x.GroupSid; GroupName = $x.GroupName; Sid = $x.Sid; Name = $x.Name } } }
+        $file = Join-Path (Get-DataFolder 'Backup') ('GrupyLokalne_{0:yyyyMMdd_HHmmss_fff}.json' -f (Get-Date))
+        try { [System.IO.File]::WriteAllText($file, (ConvertTo-Json -InputObject @($backup) -Depth 4), (New-Object System.Text.UTF8Encoding($false))) }
+        catch { Show-Error 'Nie zapisano kopii członkostwa – zmiana nie została wykonana.' $_; return }
+        Write-Log "Kopia członkostwa grup lokalnych przed usunięciem: $file" 'OK'
+    }
+    $params = @{}
+    foreach ($c in $per.Keys) { $params[$c] = @{ Remove = @($per[$c].Remove); Add = @($per[$c].Add) } }
+    Start-HostOperation -Module $m -Name $(if ($Mode -eq 'Remove') { 'Usuwanie niedozwolonych członków' } else { 'Dodawanie brakujących członków' }) -Targets @($per.Keys) -PerTarget $params -Output Log -ScriptBlock $script:LocalGroupFixScript -OnComplete { param($m) & $m.Actions.Check $m }
+}
+
+Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'LocalGroupCompliance' -Title 'Zgodność grup lokalnych' -Icon 'E73E' -Badge 'nowe' `
+    -Description 'Członkowie grup lokalnych (Administratorzy, Pulpit zdalny, WinRM, Operatorzy kopii… i grupy własne) porównani z szablonem: kto jest niedozwolony, kogo brakuje, osierocone SID-y. Hurtowe usunięcie niedozwolonych z kopią członkostwa i przywracaniem oraz dodanie brakujących.' -Build {
+    param($m)
+    $m.PillColumns = @('Zgodność')
+    $row = Add-ToolbarRow -Module $m -Title 'Szablon'
+    $m.Template = Add-ComboBox -Parent $row -Items @() -Width 300
+    Register-ControlHandler -Control $m.Template -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        $t = Get-LocalGroupTemplateByName ([string]$m.Template.SelectedItem)
+        if ($t) { Set-ModuleSetting -Module $m -Name 'Template' -Value $t.Name; $m.TemplateHint.Text = Get-LocalGroupTemplateText $t }
+    }
+    Add-Button -Parent $row -Text 'Nowy…' -Icon 'E710' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $t = Show-LocalGroupTemplateEditor
+        if ($t) { Save-LocalGroupTemplate $t; Update-LocalGroupTemplateList -Module $m -Select $t.Name; Show-Toast "Zapisano szablon «$($t.Name)»." 'ok' }
+    } | Out-Null
+    Add-Button -Parent $row -Text 'Edytuj…' -Icon 'E70F' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $old = Get-SelectedLocalGroupTemplate $m
+        if (-not $old) { return }
+        $t = Show-LocalGroupTemplateEditor -Template $old
+        if ($t) { Save-LocalGroupTemplate $t -OldName $old.Name; Update-LocalGroupTemplateList -Module $m -Select $t.Name; Show-Toast "Zapisano szablon «$($t.Name)»." 'ok' }
+    } | Out-Null
+    Add-Button -Parent $row -Text 'Usuń' -Icon 'E74D' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $t = Get-SelectedLocalGroupTemplate $m
+        if (-not $t) { return }
+        if (-not (Confirm-Action -Text "Usunąć szablon «$($t.Name)»?" -ConfirmText 'Usuń' -Danger)) { return }
+        $script:Settings.LocalGroupTemplates = @($script:Settings.LocalGroupTemplates | Where-Object { $_ -is [hashtable] -and [string]$_.Name -ne [string]$t.Name })
+        Export-Settings
+        Update-LocalGroupTemplateList -Module $m
+    } | Out-Null
+    $row1 = Add-ToolbarRow -Module $m -Title ' '
+    $m.TemplateHint = Add-Label -Parent $row1 -Text '' -Hint -MaxWidth 900
+    $row2 = Add-ToolbarRow -Module $m -Title 'Sprawdzenie'
+    $m.OnlyIssues = Add-CheckBox -Parent $row2 -Text 'Pokaż tylko niezgodności' -Checked $true -ToolTip 'Niedozwoleni, brakujący i brak grupy – bez członków zgodnych z szablonem'
+    $m.Actions.Check = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $t = Get-SelectedLocalGroupTemplate $m
+        if (-not $t) { return }
+        $m.Data.Template = $t
+        Reset-StatTiles $m
+        Reset-ResultTable -Module $m
+        $m.Data.Compliance = @{}
+        $m.Data.Offline = New-Object System.Collections.ArrayList
+        Start-HostOperation -Module $m -Name 'Zgodność grup lokalnych' -Targets $targets -Output None -Parameters @{ Groups = @(Get-LocalGroupScanGroups $m.Data.Template) } -ScriptBlock $script:LocalGroupMembersScript -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) {
+                [void]$m.Data.Offline.Add([string]$r.Target)
+                Add-ResultRows -Module $m -Computer $r.Target -Objects @([pscustomobject]@{ 'Grupa' = ''; 'Członek' = ''; 'Zgodność' = 'brak połączenia'; 'Reguła' = ((@($r.Errors)) -join ' '); '__tone' = 'crit' })
+                return
+            }
+            $rows = @(Compare-LocalGroupCompliance -Records @($r.Data) -Template $m.Data.Template)
+            $m.Data.Compliance[[string]$r.Target] = $rows
+            $shown = @(if (Test-Checked $m.OnlyIssues) { $rows | Where-Object { @('niedozwolony', 'brakujący', 'brak grupy') -contains $_.'Zgodność' } } else { $rows })
+            if ($shown.Count) { Add-ResultRows -Module $m -Computer $r.Target -Objects $shown }
+        } -OnComplete {
+            param($m)
+            $all = @($m.Data.Compliance.Values | ForEach-Object { $_ })
+            $bad = @($m.Data.Compliance.Keys | Where-Object { @($m.Data.Compliance[$_] | Where-Object { @('niedozwolony', 'brakujący', 'brak grupy') -contains $_.'Zgodność' }).Count })
+            $okCount = $m.Data.Compliance.Count - $bad.Count
+            Set-StatTile -Module $m -Key 'computers' -Value ([string]($m.Data.Compliance.Count + $m.Data.Offline.Count))
+            Set-StatTile -Module $m -Key 'compliant' -Value ([string]$okCount) -Tone $(if ($bad.Count) { 'warn' } else { 'ok' })
+            $notAllowed = @($all | Where-Object { $_.'Zgodność' -eq 'niedozwolony' }).Count
+            Set-StatTile -Module $m -Key 'denied' -Value ([string]$notAllowed) -Tone $(if ($notAllowed) { 'crit' } else { '' })
+            $missing = @($all | Where-Object { @('brakujący', 'brak grupy') -contains $_.'Zgodność' }).Count
+            Set-StatTile -Module $m -Key 'missing' -Value ([string]$missing) -Tone $(if ($missing) { 'warn' } else { '' })
+            $orph = @($all | Where-Object { [string]$_.'Źródło' -like 'nierozwiązany*' }).Count
+            Set-StatTile -Module $m -Key 'orphans' -Value ([string]$orph) -Tone $(if ($orph) { 'warn' } else { '' })
+            if (-not $m.Table.Rows.Count -and $m.Data.Compliance.Count) { Show-Toast 'Wszystkie komputery są zgodne z szablonem.' 'ok' }
+            Write-Log ('Zgodność grup lokalnych «{0}»: zgodne {1} z {2}, niedozwoleni {3}, brakujący {4}, bez połączenia {5}' -f $m.Data.Template.Name, $okCount, $m.Data.Compliance.Count, $notAllowed, $missing, $m.Data.Offline.Count) $(if ($bad.Count) { 'WARN' } else { 'OK' })
+        }
+    }
+    Add-Button -Parent $row2 -Text 'Sprawdź zgodność' -Icon 'E73E' -Module $m -Primary -OnClick $m.Actions.Check | Out-Null
+    $row3 = Add-ToolbarRow -Module $m -Title 'Naprawa'
+    Add-Button -Parent $row3 -Text 'Usuń niedozwolonych…' -Icon 'E74D' -Module $m -Danger -ToolTip 'Zaznaczone wiersze albo wszystkie widoczne' -OnClick {
+        param($m)
+        $rows = @(Get-SelectedResultRows -Module $m)
+        if ($rows.Count -le 1) { $rows = @($m.View | ForEach-Object { $_ }) }
+        Start-LocalGroupFix -Module $m -Rows $rows -Mode Remove
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Dodaj brakujących…' -Icon 'E710' -Module $m -ToolTip 'Wymagani członkowie o konkretnej nazwie (bez * i SID) – zaznaczone wiersze albo wszystkie widoczne' -OnClick {
+        param($m)
+        $rows = @(Get-SelectedResultRows -Module $m)
+        if ($rows.Count -le 1) { $rows = @($m.View | ForEach-Object { $_ }) }
+        Start-LocalGroupFix -Module $m -Rows $rows -Mode Add
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Przywróć z kopii…' -Icon 'E777' -Module $m -OnClick {
+        param($m)
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Filter = 'Kopie członkostwa grup lokalnych (GrupyLokalne_*.json)|GrupyLokalne_*.json'
+        $dlg.InitialDirectory = Get-DataFolder 'Backup'
+        $answer = if ($script:UI.Window) { $dlg.ShowDialog($script:UI.Window) } else { $dlg.ShowDialog() }
+        if ($answer -ne $true) { return }
+        & $m.Actions.Restore $m $dlg.FileName
+    } | Out-Null
+    $m.Actions.Restore = {
+        param($m, [string]$File)
+        $entries = @()
+        try { $raw = ConvertTo-PlainData ([System.IO.File]::ReadAllText($File, [System.Text.Encoding]::UTF8) | ConvertFrom-Json); $entries = @(@($raw) | Where-Object { $_ -is [hashtable] }) }
+        catch { Show-Error 'Nie można odczytać kopii członkostwa.' $_; return }
+        if (-not $entries.Count) { Show-Warning 'Kopia jest pusta.'; return }
+        $items = @($entries | ForEach-Object { '{0}: {1} – {2}' -f $_.Computer, $_.GroupName, $_.Name })
+        if (-not (Confirm-Action -Text ('Przywrócić członkostwo z kopii {0}? Konta usunięte z AD (osierocone SID-y) nie dadzą się dodać ponownie.' -f [System.IO.Path]::GetFileName($File)) -Items $items -ConfirmText 'Przywróć')) { return }
+        $per = @{}
+        foreach ($e in $entries) {
+            $c = [string]$e.Computer
+            if (-not $per.ContainsKey($c)) { $per[$c] = @{ Remove = @(); Add = New-Object System.Collections.ArrayList } }
+            [void]$per[$c].Add.Add(@{ GroupSid = [string]$e.GroupSid; GroupName = [string]$e.GroupName; Member = $(if ([string]$e.Name -match '^S-1-' -or -not $e.Sid) { [string]$e.Name } else { [string]$e.Sid }) })
+        }
+        $params = @{}
+        foreach ($c in $per.Keys) { $params[$c] = @{ Remove = @(); Add = @($per[$c].Add) } }
+        Start-HostOperation -Module $m -Name 'Przywracanie członkostwa' -Targets @($per.Keys) -PerTarget $params -Output Log -ScriptBlock $script:LocalGroupFixScript
+    }
+    Add-RowAction -Module $m -Text 'Usuń z grupy' -Icon 'E74D' -Danger -Action { param($m, $rows) Start-LocalGroupFix -Module $m -Rows $rows -Mode Remove }
+    Add-RowAction -Module $m -Text 'Dodaj brakującego' -Icon 'E710' -Action { param($m, $rows) Start-LocalGroupFix -Module $m -Rows $rows -Mode Add }
+    Add-RowAction -Module $m -Text 'Dopisz do dozwolonych w szablonie' -Icon 'E73E' -Separator -Action {
+        param($m, $rows)
+        $t = Get-LocalGroupTemplateByName ([string]$m.Data.Template.Name)
+        if (-not $t) { return }
+        $added = New-Object System.Collections.ArrayList
+        foreach ($r in $rows) {
+            if ([string](Get-ObjectValue $r 'Zgodność') -notin @('niedozwolony', 'dodatkowy')) { continue }
+            $gsid = [string](Get-ObjectValue $r '__gsid'); $gname = [string](Get-ObjectValue $r '__gname')
+            $member = [string](Get-ObjectValue $r 'Członek')
+            $sid = [string](Get-ObjectValue $r 'SID')
+            # Konta lokalne jako .\nazwa (ta sama nazwa na każdym komputerze), osierocone - po SID
+            $pattern = if ([string](Get-ObjectValue $r 'Źródło') -eq 'lokalne') { '.\' + ($member -split '\\')[-1] } elseif ($member -match '^S-1-') { $sid } else { $member }
+            foreach ($g in $t.Groups) {
+                if (($gsid -and $g.Sid -eq $gsid) -or (-not $gsid -and $g.Name -eq $gname)) {
+                    if (@($g.Allowed) -notcontains $pattern) { $g.Allowed = @(@($g.Allowed) + $pattern); [void]$added.Add(('{0}: {1}' -f $g.Name, $pattern)) }
+                }
+            }
+        }
+        if (-not $added.Count) { Show-Warning 'Wybierz wiersze niedozwolonych albo dodatkowych członków.'; return }
+        Save-LocalGroupTemplate $t
+        Update-LocalGroupTemplateList -Module $m -Select $t.Name
+        Write-Log ('Szablon «{0}» – dopisano dozwolonych: {1}' -f $t.Name, ($added -join '; ')) 'OK'
+        & $m.Actions.Check $m
+    }
+    Add-StatTile -Module $m -Key 'computers' -Label 'Komputery' -Icon 'E977' | Out-Null
+    Add-StatTile -Module $m -Key 'compliant' -Label 'Zgodne z szablonem' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'denied' -Label 'Niedozwoleni członkowie' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'missing' -Label 'Brakujący wymagani' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'orphans' -Label 'Osierocone SID-y' -Icon 'E8C9' | Out-Null
+    $m.EmptyHint = 'Wybierz albo utwórz szablon, zaznacz komputery i kliknij «Sprawdź zgodność» (F5). Wzorce SID (*-500, *-512) działają niezależnie od nazw i języka systemu.'
+    Update-LocalGroupTemplateList -Module $m
+}
+#endregion
+
 #region Active Directory: wspólne
 # Operacje AD wykonywane są lokalnie w puli wątków modułem ActiveDirectory. Blok modułu dostaje gotową
 # hashtablę $ad (Server, Credential, ErrorAction = Stop) do rozwinięcia w poleceniach: Get-ADUser ... @ad
@@ -21872,6 +22328,8 @@ function Register-ReportType {
                    Data (dowolne dane dla -Render). Wyjątek = raport nie powstał.
         -KeyColumns / -KeyScript { param($row) } : klucz wiersza do porównania z poprzednim uruchomieniem
         -Render { param($Result, [string]$Extra, [string]$Title) } : własny dokument HTML ($Extra - zmiany i problemy)
+        -Prepare { param([hashtable]$Options) } : przy zapisie z edytora (np. dołączenie szablonu do definicji, żeby konto
+                   zadania nie zależało od ustawień administratora); opcje typu Combo mogą mieć ItemsScript zamiast Items
         -MailMode : domyślny tryb wysyłki dla nowych definicji
     #>
     param(
@@ -21884,11 +22342,12 @@ function Register-ReportType {
         [scriptblock]$KeyScript,
         [Parameter(Mandatory)][scriptblock]$Run,
         [scriptblock]$Render,
+        [scriptblock]$Prepare,
         [string]$MailMode = 'Findings',
         [string]$Requires = 'AD'
     )
     $script:ReportTypes[$Key] = @{ Key = $Key; Title = $Title; Description = $Description; Icon = $Icon; Options = @($Options); KeyColumns = @($KeyColumns)
-        KeyScript = $KeyScript; Run = $Run; Render = $Render; MailMode = $MailMode; Requires = $Requires }
+        KeyScript = $KeyScript; Run = $Run; Render = $Render; Prepare = $Prepare; MailMode = $MailMode; Requires = $Requires }
 }
 
 #region Pliki definicji i stanu
@@ -22094,18 +22553,19 @@ function Invoke-ReportAd {
 }
 
 function Get-ReportComputerTargets {
-    # Lista komputerów z opcji albo włączone serwery z AD (logowanie w ostatnich 45 dniach)
-    param([string]$Computers, [string]$SearchBase)
+    # Lista komputerów z opcji albo włączone komputery z AD (logowanie w ostatnich 45 dniach): serwery, stacje robocze albo wszystkie
+    param([string]$Computers, [string]$SearchBase, [ValidateSet('Servers', 'Workstations', 'All')][string]$Kind = 'Servers')
     $list = @(Split-ListText $Computers | Select-Object -Unique)
     if ($list.Count) { return $list }
-    $r = Invoke-ReportAd -Parameters @{ SearchBase = $SearchBase } -ScriptBlock {
+    $os = @{ Servers = '(operatingSystem=*Server*)'; Workstations = '(!(operatingSystem=*Server*))'; All = '' }[$Kind]
+    $r = Invoke-ReportAd -Parameters @{ SearchBase = $SearchBase; Os = $os } -ScriptBlock {
         $ft = (Get-Date).AddDays(-45).ToFileTimeUtc()
-        $q = @{ LDAPFilter = "(&(objectCategory=computer)(operatingSystem=*Server*)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(lastLogonTimestamp>=$ft))"; Properties = @('dNSHostName') }
+        $q = @{ LDAPFilter = "(&(objectCategory=computer)$($P.Os)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(lastLogonTimestamp>=$ft))"; Properties = @('dNSHostName') }
         if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
         foreach ($c in @(Get-ADComputer @q @ad)) { if ($c.DNSHostName) { [string]$c.DNSHostName } else { [string]$c.Name } }
     }
     $names = @($r.Data | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)
-    if (-not $names.Count) { throw 'Nie znaleziono w AD włączonych serwerów (wpisz listę komputerów w definicji raportu).' }
+    if (-not $names.Count) { throw ('Nie znaleziono w AD włączonych {0} (wpisz listę komputerów w definicji raportu).' -f @{ Servers = 'serwerów'; Workstations = 'stacji roboczych'; All = 'komputerów' }[$Kind]) }
     return $names
 }
 
@@ -23142,7 +23602,8 @@ function Get-ReportEditorFields {
     [void]$fields.Add(@{ Key = 'Name'; Label = 'Nazwa (nazwa plików raportu i zadania w Harmonogramie)'; Value = [string]$Job.Name })
     foreach ($o in $Type.Options) {
         $f = @{}
-        foreach ($k in $o.Keys) { $f[$k] = $o[$k] }
+        foreach ($k in $o.Keys) { if ($k -ne 'ItemsScript') { $f[$k] = $o[$k] } }
+        if ($o['ItemsScript']) { $f.Items = @(& $o.ItemsScript) }
         $f.Key = 'o_' + [string]$o.Key
         $v = if ($Job.Options.ContainsKey([string]$o.Key)) { $Job.Options[[string]$o.Key] } else { $o['Value'] }
         $f.Value = $(if ([string]$o['Type'] -eq 'Check') { [bool]$v } else { [string]$v })
@@ -23251,6 +23712,7 @@ function Show-ReportJobEditor {
         $raw = $v['o_' + [string]$o.Key]
         $j.Options[[string]$o.Key] = switch ([string]$o['Type']) { 'Number' { [int]$raw } 'Check' { [bool]$raw } default { [string]$raw } }
     }
+    if ($type.Prepare) { & $type.Prepare $j.Options }
     $j.Output = @{ Folder = [string]$v.OutFolder; Keep = [int]$v.Keep; Latest = [bool]$v.Latest; Csv = [bool]$v.Csv }
     $modeKey = { param($map, $text) @($map.Keys | Where-Object { $map[$_] -eq $text })[0] }
     $mail = $j.Mail
@@ -24264,6 +24726,55 @@ Register-ReportType -Key 'GpoHealth' -Title 'Problemy z zasadami grupy' -Icon 'E
         Rows = $issues; Findings = (Get-ReportSeverityRows -Rows $issues -Column 'Ocena' -Min ([string](Get-ReportOption $O 'MinSeverity' 'Niskie'))); PillColumns = @('Ocena')
         Tiles = @(@{ Label = 'Obiekty GPO'; Value = @($a.Gpos).Count; Tone = '' }) + @(New-ReportSeverityTiles -Rows $issues -Column 'Ocena')
         Errors = @($scan.Errors)
+    }
+}
+#endregion
+
+#region Raport cykliczny: zgodność grup lokalnych z szablonem (moduł w 59-remote-groupcompliance.ps1)
+# Raport cykliczny: zgodność grup lokalnych (szablon zapisywany w definicji - konto zadania nie zależy od ustawień administratora)
+Register-ReportType -Key 'LocalGroupCompliance' -Title 'Zgodność grup lokalnych' -Icon 'E73E' -MailMode 'Changes' -Requires 'Remote' `
+    -Description 'Członkowie grup lokalnych na komputerach porównani z szablonem (jak moduł «Zgodność grup lokalnych»): niedozwoleni, brakujący, osierocone SID-y; zmiany – np. nowy członek grupy Administratorzy na stacji.' `
+    -KeyColumns @('Komputer', 'Grupa', 'Członek', 'Zgodność') -Options @(
+    @{ Key = 'Template'; Label = 'Szablon (zapisywany w definicji przy zapisie)'; Type = 'Combo'; ItemsScript = { @(Get-LocalGroupTemplates | ForEach-Object { [string]$_.Name }) }; Value = '' }
+    @{ Key = 'Computers'; Label = 'Komputery (po jednym w wierszu)'; Type = 'Multi'; Value = ''; Hint = 'Puste – włączone komputery z AD (wybranego rodzaju), które logowały się w ostatnich 45 dniach.' }
+    @{ Key = 'Kind'; Label = 'Komputery z AD (gdy lista jest pusta)'; Type = 'Combo'; Items = @('Stacje robocze', 'Serwery', 'Wszystkie'); Value = 'Stacje robocze' }
+    @{ Key = 'SearchBase'; Label = 'Jednostka organizacyjna komputerów (gdy lista jest pusta)'; Type = 'Ou'; Value = ''; Placeholder = 'Cała domena' }
+) -Prepare {
+    param($O)
+    $t = Get-LocalGroupTemplateByName ([string]$O['Template'])
+    if ($t) { $O['TemplateData'] = $t }
+} -Run {
+    param($O)
+    $t = if ($O['TemplateData'] -is [hashtable]) { ConvertTo-LocalGroupTemplate $O.TemplateData } else { Get-LocalGroupTemplateByName ([string](Get-ReportOption $O 'Template' '')) }
+    if (-not $t -or -not @($t.Groups).Count) { throw ('Brak szablonu «{0}» – zapisz definicję raportu ponownie w programie.' -f (Get-ReportOption $O 'Template' '')) }
+    $kind = @{ 'Stacje robocze' = 'Workstations'; 'Serwery' = 'Servers'; 'Wszystkie' = 'All' }[[string](Get-ReportOption $O 'Kind' 'Stacje robocze')]
+    if (-not $kind) { $kind = 'Workstations' }
+    $targets = @(Get-ReportComputerTargets -Computers ([string](Get-ReportOption $O 'Computers' '')) -SearchBase ([string](Get-ReportOption $O 'SearchBase' '')) -Kind $kind)
+    $results = @(Invoke-SyncOperation -Targets $targets -ScriptBlock $script:LocalGroupMembersScript -Parameters @{ Groups = @(Get-LocalGroupScanGroups $t) })
+    $rows = New-Object System.Collections.ArrayList
+    $errs = New-Object System.Collections.ArrayList
+    $okCount = 0
+    foreach ($r in $results) {
+        if (-not $r.Ok) {
+            [void]$errs.Add(('{0}: {1}' -f $r.Target, ((@($r.Errors)) -join ' ')))
+            [void]$rows.Add([pscustomobject][ordered]@{ 'Komputer' = [string]$r.Target; 'Grupa' = ''; 'Członek' = ''; 'Zgodność' = 'brak połączenia'; 'Reguła' = ((@($r.Errors)) -join ' '); '__tone' = 'crit' })
+            continue
+        }
+        $issues = @(Compare-LocalGroupCompliance -Records @($r.Data) -Template $t | Where-Object { @('niedozwolony', 'brakujący', 'brak grupy') -contains $_.'Zgodność' })
+        if (-not $issues.Count) { $okCount++ }
+        foreach ($x in $issues) {
+            $rec = [ordered]@{ 'Komputer' = [string]$r.Target }
+            foreach ($p in $x.PSObject.Properties) { if (-not $p.Name.StartsWith('__') -or $p.Name -eq '__tone') { $rec[$p.Name] = $p.Value } }
+            [void]$rows.Add([pscustomobject]$rec)
+        }
+    }
+    $findings = @($rows | Where-Object { $_.'Zgodność' -ne 'brak połączenia' })
+    $denied = @($findings | Where-Object { $_.'Zgodność' -eq 'niedozwolony' }).Count
+    return @{
+        Title = 'Zgodność grup lokalnych – szablon «' + $t.Name + '»'; Subtitle = ('komputery: {0}; {1}' -f $targets.Count, (Get-LocalGroupTemplateText $t))
+        Summary = ('zgodne: {0} z {1}, niedozwoleni: {2}' -f $okCount, ($results.Count - $errs.Count), $denied)
+        Rows = $rows.ToArray(); Findings = $findings; PillColumns = @('Zgodność'); Errors = $errs.ToArray()
+        Tiles = @(@{ Label = 'Komputery'; Value = $targets.Count; Tone = '' }, @{ Label = 'Zgodne z szablonem'; Value = $okCount; Tone = $(if ($okCount -eq $results.Count) { 'ok' } else { 'warn' }) }, @{ Label = 'Niedozwoleni członkowie'; Value = $denied; Tone = $(if ($denied) { 'crit' } else { '' }) }, @{ Label = 'Bez połączenia'; Value = $errs.Count; Tone = $(if ($errs.Count) { 'crit' } else { '' }) })
     }
 }
 #endregion
