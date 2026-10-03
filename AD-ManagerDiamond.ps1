@@ -20979,6 +20979,245 @@ Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdAudit' -
 }
 #endregion
 
+#region Domena: delegacje uprawnień w Active Directory (ACL jednostek, katalogu głównego domeny i AdminSDHolder)
+
+# Nazwy najczęstszych klas, atrybutów, zestawów właściwości i praw rozszerzonych (gdy nie da się odczytać schematu)
+$script:AdGuidNames = @{
+    'bf967aba-0de6-11d0-a285-00aa003049e2' = 'user'; 'bf967a86-0de6-11d0-a285-00aa003049e2' = 'computer'; 'bf967a9c-0de6-11d0-a285-00aa003049e2' = 'group'
+    'bf967aa5-0de6-11d0-a285-00aa003049e2' = 'organizationalUnit'; '4828cc14-1437-45bc-9b07-ad6f015e5f28' = 'inetOrgPerson'; '5cb41ed0-0e4c-11d0-a286-00aa003049e2' = 'contact'
+    'bf9679c0-0de6-11d0-a285-00aa003049e2' = 'member'; 'bf967a68-0de6-11d0-a285-00aa003049e2' = 'userAccountControl'; 'bf967a0a-0de6-11d0-a285-00aa003049e2' = 'pwdLastSet'
+    '28630ebf-41d5-11d1-a9c1-0000f80367c1' = 'lockoutTime'; 'f30e3bbe-9ff0-11d1-b603-0000f80367c1' = 'gPLink'; 'f30e3bbf-9ff0-11d1-b603-0000f80367c1' = 'gPOptions'
+    '5b47d60f-6090-40b2-9f37-2a4de88f3063' = 'msDS-KeyCredentialLink'; '3f78c3e5-f79a-46bd-a0b8-9d18116ddc79' = 'msDS-AllowedToActOnBehalfOfOtherIdentity'
+    '00299570-246d-11d0-a768-00aa006e0529' = 'Reset hasła'; 'ab721a53-1e2f-11d0-9819-00aa0040529b' = 'Zmiana hasła'
+    '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'Replikacja zmian katalogu'; '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'Replikacja zmian katalogu – wszystkie'
+    '89e95b76-444d-4c62-991a-0facbeda640c' = 'Replikacja zmian katalogu – zestaw filtrowany'; '1131f6ab-9c07-11d1-f79f-00c04fc2dcd2' = 'Synchronizacja replikacji'
+    '1131f6ac-9c07-11d1-f79f-00c04fc2dcd2' = 'Zarządzanie topologią replikacji'; '4c164200-20c0-11d0-a768-00aa006e0529' = 'Ograniczenia konta (zestaw)'
+    '5f202010-79a5-11d0-9020-00c04fc2d4cf' = 'Logowanie (zestaw)'; 'bc0ac240-79a9-11d0-9020-00c04fc2d4cf' = 'Członkostwo (zestaw)'; 'e45795b2-9455-11d1-aebd-0000f80367c1' = 'Informacje e-mail (zestaw)'
+    '77b5b886-944a-11d1-aebd-0000f80367c1' = 'Informacje osobiste (zestaw)'; 'e48d0154-bcf8-11d1-8702-00c04fb96050' = 'Informacje publiczne (zestaw)'; '59ba2f42-79a2-11d0-9020-00c04fc2d3cf' = 'Informacje ogólne (zestaw)'
+    '72e39547-7b18-11d1-adef-00c04fd8d5cd' = 'Sprawdzany zapis nazwy DNS'; 'f3a64788-5306-11d1-a9c5-0000f80367c1' = 'Sprawdzany zapis SPN'
+}
+$script:AdReplicationGuids = @('1131f6aa-9c07-11d1-f79f-00c04fc2dcd2', '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2', '89e95b76-444d-4c62-991a-0facbeda640c')
+
+function Get-AdStandardTrustees([string]$DomainSid) {
+    # Wpisy tych kont są częścią domyślnych uprawnień AD; Read - tylko gdy dają wyłącznie odczyt
+    return @{
+        Any  = @('S-1-5-18', "$DomainSid-512", "$DomainSid-519", "$DomainSid-518", 'S-1-5-32-544', 'S-1-5-9', 'S-1-5-10', 'S-1-3-0', "$DomainSid-526", "$DomainSid-527", "$DomainSid-516", "$DomainSid-521", "$DomainSid-498",
+            'S-1-5-32-548', 'S-1-5-32-550', 'S-1-5-32-561', 'S-1-5-32-560', "$DomainSid-517", "$DomainSid-553")
+        Read = @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-554', 'S-1-5-7', 'S-1-5-32-545')
+    }
+}
+
+$script:AdDelegationScript = {
+    # Jedno zadanie: mapa GUID ze schematu i praw rozszerzonych, ACL obiektów i nazwy kont. $P: Containers, IncludeRead, HideStandard, Std (Any, Read)
+    $domain = Get-ADDomain @ad
+    $root = [string]$domain.DistinguishedName
+    $dse = Get-ADRootDSE @ad
+    $guids = @{}
+    try { foreach ($o in @(Get-ADObject -SearchBase ([string]$dse.schemaNamingContext) -LDAPFilter '(schemaIDGUID=*)' -Properties lDAPDisplayName, schemaIDGUID @ad)) { $guids[([guid]$o.schemaIDGUID).ToString()] = [string]$o.lDAPDisplayName } } catch { }
+    try { foreach ($o in @(Get-ADObject -SearchBase ('CN=Extended-Rights,' + [string]$dse.configurationNamingContext) -LDAPFilter '(objectClass=controlAccessRight)' -Properties displayName, rightsGuid @ad)) { $guids[([string]$o.rightsGuid).ToLowerInvariant()] = [string]$o.displayName } } catch { }
+    [pscustomobject]@{ '__rec' = 'guids'; Map = $guids }
+    $targets = New-Object System.Collections.ArrayList
+    [void]$targets.Add(@{ Dn = $root; Kind = 'Domena' })
+    [void]$targets.Add(@{ Dn = "CN=AdminSDHolder,CN=System,$root"; Kind = 'AdminSDHolder' })
+    foreach ($ou in @(Get-ADObject -LDAPFilter '(objectClass=organizationalUnit)' @ad | Sort-Object DistinguishedName)) { [void]$targets.Add(@{ Dn = [string]$ou.DistinguishedName; Kind = 'OU' }) }
+    if ($P.Containers) { foreach ($c in @("CN=Users,$root", "CN=Computers,$root")) { [void]$targets.Add(@{ Dn = $c; Kind = 'Kontener' }) } }
+    $any = @{}; foreach ($s in @($P.Std.Any)) { $any[$s] = $true }
+    $readStd = @{}; foreach ($s in @($P.Std.Read)) { $readStd[$s] = $true }
+    $sids = @{}
+    foreach ($t in $targets) {
+        try {
+            $o = Get-ADObject -Identity $t.Dn -Properties nTSecurityDescriptor @ad
+            $sd = $o.nTSecurityDescriptor
+            if ($sd -is [string]) { $s2 = New-Object System.DirectoryServices.ActiveDirectorySecurity; $s2.SetSecurityDescriptorSddlForm($sd); $sd = $s2 }
+            $owner = ''
+            try { $owner = $sd.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+            if ($owner) { $sids[$owner] = $true }
+            [pscustomobject]@{ '__rec' = 'obj'; Dn = $t.Dn; Kind = $t.Kind; Owner = $owner; Protected = [bool]$sd.AreAccessRulesProtected }
+            foreach ($r in $sd.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+                $sid = $r.IdentityReference.Value
+                $mask = [int64][int]$r.ActiveDirectoryRights
+                if ($mask -lt 0) { $mask += 4294967296 }
+                $readOnly = ($mask -band (-bnot [int64](0x10 -bor 0x4 -bor 0x80 -bor 0x20000 -bor 0x100000 -bor 0x80000000))) -eq 0
+                $allow = ([string]$r.AccessControlType -eq 'Allow')
+                if ($P.HideStandard) {
+                    if ($any.ContainsKey($sid)) { continue }
+                    if ($readStd.ContainsKey($sid) -and ($readOnly -or -not $allow)) { continue }
+                    # Wszyscy i SELF: zmiana własnego hasła jest domyślna
+                    if (@('S-1-1-0', 'S-1-5-10') -contains $sid -and ([string]$r.ObjectType) -eq 'ab721a53-1e2f-11d0-9819-00aa0040529b') { continue }
+                }
+                if ($readOnly -and $allow -and -not $P.IncludeRead) { continue }
+                $sids[$sid] = $true
+                [pscustomobject]@{ '__rec' = 'ace'; Dn = $t.Dn; Kind = $t.Kind; Sid = $sid; Mask = $mask; Allow = $allow; ObjectType = ([string]$r.ObjectType).ToLowerInvariant(); InheritedObjectType = ([string]$r.InheritedObjectType).ToLowerInvariant(); Inheritance = [string]$r.InheritanceType }
+            }
+        }
+        catch { [pscustomobject]@{ '__rec' = 'err'; Dn = $t.Dn; Kind = $t.Kind; Error = $_.Exception.Message } }
+    }
+    # Nazwy i rodzaje kont: domenowe z AD (porcjami), wbudowane - tłumaczenie na tym komputerze
+    $list = @($sids.Keys)
+    $found = @{}
+    for ($i = 0; $i -lt $list.Count; $i += 40) {
+        $chunk = @($list[$i..([Math]::Min($i + 39, $list.Count - 1))])
+        $filter = '(|' + ((@($chunk | ForEach-Object { "(objectSid=$_)" })) -join '') + ')'
+        try { foreach ($x in @(Get-ADObject -LDAPFilter $filter -Properties objectSid, sAMAccountName @ad)) { $found[[string]$x.objectSid] = @{ Name = [string]$x.sAMAccountName; Class = [string]$x.ObjectClass } } } catch { }
+    }
+    foreach ($s in $list) {
+        $name = $s; $class = ''
+        if ($found.ContainsKey($s)) { $name = $found[$s].Name; $class = $found[$s].Class }
+        else { try { $name = (New-Object System.Security.Principal.SecurityIdentifier($s)).Translate([System.Security.Principal.NTAccount]).Value } catch { } }
+        [pscustomobject]@{ '__rec' = 'sid'; Sid = $s; Name = $name; Class = $class; Resolved = ($name -ne $s) }
+    }
+}
+
+function Get-AdRightsText {
+    # Opis praw wpisu ACL obiektu AD; $ObjectType - GUID klasy, atrybutu, zestawu właściwości albo prawa rozszerzonego
+    param([int64]$Mask, [string]$ObjectType, [hashtable]$Guids)
+    $empty = '00000000-0000-0000-0000-000000000000'
+    $obj = if ($ObjectType -and $ObjectType -ne $empty) { $(if ($Guids.ContainsKey($ObjectType)) { $Guids[$ObjectType] } else { $ObjectType }) } else { '' }
+    if ($Mask -band 0x10000000) { $Mask = $Mask -bor 0xF01FF }
+    if ($Mask -band 0x40000000) { $Mask = $Mask -bor 0x20028 }
+    if (($Mask -band 0xF01FF) -eq 0xF01FF) { return 'Pełna kontrola' }
+    $parts = New-Object System.Collections.ArrayList
+    if ($Mask -band 0x40000) { [void]$parts.Add('Zmiana uprawnień') }
+    if ($Mask -band 0x80000) { [void]$parts.Add('Zmiana właściciela') }
+    if ($Mask -band 0x1) { [void]$parts.Add($(if ($obj) { "Tworzenie obiektów $obj" } else { 'Tworzenie wszystkich obiektów' })) }
+    if ($Mask -band 0x2) { [void]$parts.Add($(if ($obj) { "Usuwanie obiektów $obj" } else { 'Usuwanie wszystkich obiektów' })) }
+    if ($Mask -band 0x10000) { [void]$parts.Add('Usuwanie obiektu') }
+    if ($Mask -band 0x40) { [void]$parts.Add('Usuwanie drzewa') }
+    if ($Mask -band 0x20) { [void]$parts.Add($(if ($obj) { "Zapis: $obj" } else { 'Zapis wszystkich atrybutów' })) }
+    if ($Mask -band 0x8) { [void]$parts.Add($(if ($obj) { "Zapis sprawdzany: $obj" } else { 'Wszystkie zapisy sprawdzane' })) }
+    if ($Mask -band 0x100) { [void]$parts.Add($(if ($obj) { "Prawo: $obj" } else { 'Wszystkie prawa rozszerzone (m.in. reset hasła)' })) }
+    if ($Mask -band 0x10) { [void]$parts.Add($(if ($obj) { "Odczyt: $obj" } else { 'Odczyt wszystkich atrybutów' })) }
+    if ($Mask -band 0x4) { [void]$parts.Add('Wyświetlanie zawartości') }
+    if ($Mask -band 0x80) { [void]$parts.Add('Wyświetlanie obiektu') }
+    if ($Mask -band 0x20000) { [void]$parts.Add('Odczyt uprawnień') }
+    if ($parts.Count -eq 0) { return ('maska 0x{0:X}' -f $Mask) }
+    return ($parts -join ', ')
+}
+
+function Get-AdScopeText([string]$Inheritance, [string]$InheritedObjectType, [hashtable]$Guids) {
+    $empty = '00000000-0000-0000-0000-000000000000'
+    $cls = if ($InheritedObjectType -and $InheritedObjectType -ne $empty) { $(if ($Guids.ContainsKey($InheritedObjectType)) { $Guids[$InheritedObjectType] } else { $InheritedObjectType }) } else { '' }
+    $base = switch ($Inheritance) {
+        'None' { 'ten obiekt' }
+        'All' { 'ten obiekt i wszystkie podrzędne' }
+        'Descendents' { 'wszystkie obiekty podrzędne' }
+        'SelfAndChildren' { 'ten obiekt i bezpośrednio podrzędne' }
+        'Children' { 'bezpośrednio podrzędne' }
+        default { $Inheritance }
+    }
+    if ($cls) { return "$base – tylko obiekty $cls" }
+    return $base
+}
+
+function Get-AdDelegationRows {
+    # Wiersze raportu z oceną ryzyka; $Sids: SID -> @{ Name; Class; Resolved }
+    param([object[]]$Aces, [object[]]$Objects, [hashtable]$Guids, [hashtable]$Sids, [string]$DomainSid)
+    $std = Get-AdStandardTrustees $DomainSid
+    $broad = @('S-1-1-0', 'S-1-5-11', 'S-1-5-7', 'S-1-5-32-545', "$DomainSid-513", "$DomainSid-515")
+    $label = { param($s) if ($Sids.ContainsKey($s) -and $Sids[$s].Name) { [string]$Sids[$s].Name } elseif ($script:NtfsBroadSids.Contains($s)) { $script:NtfsBroadSids[$s] } else { $s } }
+    $objName = { param($dn, $kind) if ($kind -eq 'Domena') { 'Domena (katalog główny)' } elseif ($kind -eq 'AdminSDHolder') { 'AdminSDHolder' } else { (([regex]::Match($dn, '^(?:\\.|[^,])+').Value -replace '^[^=]+=', '') -replace '\\(.)', '$1') } }
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($a in $Aces) {
+        $mask = [int64]$a.Mask
+        if ($mask -band 0x10000000) { $mask = $mask -bor 0xF01FF }
+        $control = ($mask -band 0xC0000) -ne 0 -or ($mask -band 0xF01FF) -eq 0xF01FF
+        $write = $control -or ($mask -band (0x1 -bor 0x2 -bor 0x8 -bor 0x20 -bor 0x40 -bor 0x100 -bor 0x10000)) -ne 0
+        $replication = ($mask -band 0x100) -and $script:AdReplicationGuids -contains [string]$a.ObjectType
+        $allExtended = ($mask -band 0x100) -and (-not $a.ObjectType -or $a.ObjectType -eq '00000000-0000-0000-0000-000000000000')
+        $allProps = ($mask -band 0x20) -and (-not $a.ObjectType -or $a.ObjectType -eq '00000000-0000-0000-0000-000000000000')
+        $isStd = $std.Any -contains $a.Sid
+        $info = if ($Sids.ContainsKey($a.Sid)) { $Sids[$a.Sid] } else { @{ Name = ''; Class = ''; Resolved = $false } }
+        $sev = 'Info'
+        $why = New-Object System.Collections.ArrayList
+        if (-not $a.Allow) { [void]$why.Add('wpis odmowy') }
+        elseif ($broad -contains $a.Sid -and $write) { $sev = 'Wysokie'; [void]$why.Add('szeroka grupa może zmieniać obiekty') }
+        elseif ($a.Kind -eq 'AdminSDHolder' -and -not $isStd) { $sev = 'Wysokie'; [void]$why.Add('wpis AdminSDHolder trafia co godzinę na wszystkie konta chronione (administratorzy)') }
+        elseif ($a.Kind -eq 'Domena' -and $replication -and -not $isStd) { $sev = 'Wysokie'; [void]$why.Add('prawa replikacji pozwalają pobrać skróty haseł wszystkich kont (DCSync)') }
+        elseif ($a.Kind -eq 'Domena' -and $control -and -not $isStd) { $sev = 'Wysokie'; [void]$why.Add('kontrola nad katalogiem głównym domeny') }
+        elseif ($control -and -not $isStd) { $sev = 'Średnie'; [void]$why.Add('pełna kontrola lub zmiana uprawnień – także nad obiektami w jednostce') }
+        elseif (($allExtended -or $allProps) -and -not $isStd) { $sev = 'Średnie'; [void]$why.Add($(if ($allExtended) { 'wszystkie prawa rozszerzone obejmują m.in. reset hasła' } else { 'zapis wszystkich atrybutów' })) }
+        elseif ($a.Kind -eq 'Domena' -and $write -and -not $isStd) { $sev = 'Średnie'; [void]$why.Add('zapis w katalogu głównym domeny') }
+        if ($sev -eq 'Info' -and $a.Allow -and $write -and @('user', 'inetOrgPerson') -contains [string]$info.Class) { $sev = 'Niskie' }
+        if (@('user', 'inetOrgPerson') -contains [string]$info.Class) { [void]$why.Add('delegacja dla konta zamiast grupy') }
+        if ($a.Sid -match '^S-1-5-21-' -and -not $info.Resolved) { if ($sev -eq 'Info') { $sev = 'Niskie' }; [void]$why.Add('nierozwiązany SID – konto usunięte') }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                'Ocena' = $sev; 'Obiekt' = (& $objName $a.Dn $a.Kind); 'Rodzaj' = $a.Kind; 'Tożsamość' = (& $label $a.Sid); 'Uprawnienia' = (Get-AdRightsText -Mask $mask -ObjectType $a.ObjectType -Guids $Guids)
+                'Dotyczy' = (Get-AdScopeText $a.Inheritance $a.InheritedObjectType $Guids); 'Typ' = $(if ($a.Allow) { 'Zezwalaj' } else { 'Odmawiaj' }); 'Uwagi' = ($why -join '; '); 'DN' = $a.Dn
+                '__tone' = @{ 'Wysokie' = 'crit'; 'Średnie' = 'warn'; 'Niskie' = 'info'; 'Info' = '' }[$sev]; '__sid' = $a.Sid
+            })
+    }
+    $okOwners = @("$DomainSid-512", "$DomainSid-519", 'S-1-5-32-544', 'S-1-5-18')
+    foreach ($o in $Objects) {
+        if (-not $o.Owner -or $okOwners -contains $o.Owner) { continue }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                'Ocena' = 'Niskie'; 'Obiekt' = (& $objName $o.Dn $o.Kind); 'Rodzaj' = $o.Kind; 'Tożsamość' = (& $label $o.Owner); 'Uprawnienia' = 'Właściciel obiektu (zawsze może zmienić uprawnienia)'
+                'Dotyczy' = 'ten obiekt'; 'Typ' = 'Właściciel'; 'Uwagi' = 'właścicielem nie są Domain Admins ani Administratorzy'; 'DN' = $o.Dn; '__tone' = 'info'; '__sid' = $o.Owner
+            })
+    }
+    $order = @{ 'Wysokie' = 0; 'Średnie' = 1; 'Niskie' = 2; 'Info' = 3 }
+    return @($rows | Sort-Object @{ Expression = { $order[$_.'Ocena'] } }, 'DN', 'Tożsamość')
+}
+
+Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdDelegation' -Title 'Delegacje uprawnień w AD' -Icon 'E8D7' -Badge 'nowe' `
+    -Description 'Kto ma jakie uprawnienia do jednostek organizacyjnych, katalogu głównego domeny i AdminSDHolder: reset haseł, tworzenie kont, zapis członkostwa, pełna kontrola, prawa replikacji (DCSync). Wpisy opisane po polsku (nazwy klas, atrybutów i praw ze schematu) z oceną ryzyka; wpisy domyślne ukryte. Tylko odczyt.' -Build {
+    param($m)
+    $m.PillColumns = @('Ocena')
+    $row = Add-ToolbarRow -Module $m -Title 'Zakres'
+    $m.HideStandard = Add-CheckBox -Parent $row -Text 'Ukryj wpisy domyślne' -Checked $true -ToolTip 'SYSTEM, grupy administratorów i kontrolerów domeny, SELF, CREATOR OWNER, operatorzy kont i drukarek; Użytkownicy uwierzytelnieni, Wszyscy i Pre-Windows 2000 – gdy mają tylko odczyt'
+    $m.IncludeRead = Add-CheckBox -Parent $row -Text 'Także uprawnienia tylko do odczytu'
+    $m.Containers = Add-CheckBox -Parent $row -Text 'Także kontenery Users i Computers'
+    Add-Button -Parent $row -Text 'Analizuj' -Icon 'E8D7' -Module $m -Primary -OnClick {
+        param($m)
+        if (-not (Test-AdAvailable)) { return }
+        Reset-ResultTable -Module $m
+        $m.Data.Deleg = @{ Aces = New-Object System.Collections.ArrayList; Objects = New-Object System.Collections.ArrayList; Errors = New-Object System.Collections.ArrayList; Sids = @{}; Guids = @{}; DomainSid = '' }
+        $dsid = Invoke-WithWaitCursor { Import-AdModule; $ad = Get-AdSplat; [string](Get-ADDomain @ad).DomainSID.Value }
+        $m.Data.Deleg.DomainSid = $dsid
+        $params = @{ Containers = (Test-Checked $m.Containers); IncludeRead = (Test-Checked $m.IncludeRead); HideStandard = (Test-Checked $m.HideStandard); Std = (Get-AdStandardTrustees $dsid) }
+        Start-AdOperation -Module $m -Name 'Delegacje uprawnień w AD' -Targets @('AD') -Output None -Parameters $params -ScriptBlock $script:AdDelegationScript -OnResult {
+            param($m, $r)
+            $d = $m.Data.Deleg
+            if (-not $r.Ok) { [void]$d.Errors.Add((@($r.Errors)) -join ' '); return }
+            foreach ($x in @($r.Data)) {
+                switch ([string](Get-ObjectValue $x '__rec')) {
+                    'guids' { foreach ($k in $x.Map.Keys) { $d.Guids[[string]$k] = [string]$x.Map[$k] } }
+                    'ace' { [void]$d.Aces.Add($x) }
+                    'obj' { [void]$d.Objects.Add($x) }
+                    'sid' { $d.Sids[[string]$x.Sid] = @{ Name = [string]$x.Name; Class = [string]$x.Class; Resolved = [bool]$x.Resolved } }
+                    'err' { [void]$d.Errors.Add(('{0}: {1}' -f $x.Dn, $x.Error)) }
+                }
+            }
+        } -OnComplete {
+            param($m)
+            $d = $m.Data.Deleg
+            $guids = @{}
+            foreach ($k in $script:AdGuidNames.Keys) { $guids[$k] = $script:AdGuidNames[$k] }
+            foreach ($k in $d.Guids.Keys) { if (-not $script:AdGuidNames.ContainsKey($k)) { $guids[$k] = $d.Guids[$k] } }
+            $rows = @(Get-AdDelegationRows -Aces @($d.Aces) -Objects @($d.Objects) -Guids $guids -Sids $d.Sids -DomainSid $d.DomainSid)
+            if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+            foreach ($k in 'Wysokie', 'Średnie', 'Niskie') { $n = @($rows | Where-Object { $_.'Ocena' -eq $k }).Count; Set-StatTile -Module $m -Key $k -Value ([string]$n) -Tone $(if ($n) { @{ 'Wysokie' = 'crit'; 'Średnie' = 'warn'; 'Niskie' = 'info' }[$k] } else { '' }) }
+            Set-StatTile -Module $m -Key 'objects' -Value ([string]$d.Objects.Count)
+            Set-StatTile -Module $m -Key 'trustees' -Value ([string]@($rows | ForEach-Object { $_.'__sid' } | Select-Object -Unique).Count)
+            foreach ($e in $d.Errors) { Write-Log "Nie odczytano uprawnień: $e" 'WARN' -Module $m.Title }
+            if ($d.Errors.Count) { Show-Toast ("Nie odczytano uprawnień {0} obiektów – szczegóły w dzienniku." -f $d.Errors.Count) 'warn' }
+        }
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Pokaż wszystkie delegacje tej tożsamości' -Icon 'E721' -Action {
+        param($m, $rows)
+        $s = [string](Get-ObjectValue $rows[0] '__sid')
+        $list = @(Get-ResultRowsAll -Module $m | Where-Object { [string]$_['__sid'] -eq $s } | ForEach-Object { [pscustomobject][ordered]@{ 'Ocena' = $_['Ocena']; 'Obiekt' = $_['Obiekt']; 'Uprawnienia' = $_['Uprawnienia']; 'Dotyczy' = $_['Dotyczy']; 'Typ' = $_['Typ']; 'DN' = $_['DN']; '__tone' = $_['__tone'] } })
+        Show-GridDialog -Title ('Delegacje: ' + [string](Get-ObjectValue $rows[0] 'Tożsamość')) -Rows $list -PillColumns @('Ocena')
+    }
+    Add-RowAction -Module $m -Text 'Kopiuj DN obiektu' -Icon 'E8C8' -Action { param($m, $rows) Set-Clipboard -Value ([string](Get-ObjectValue $rows[0] 'DN')); Show-Toast 'Skopiowano DN.' 'ok' }
+    Add-StatTile -Module $m -Key 'Wysokie' -Label 'Ryzyko wysokie' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'Średnie' -Label 'Ryzyko średnie' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'Niskie' -Label 'Ryzyko niskie' -Icon 'E946' | Out-Null
+    Add-StatTile -Module $m -Key 'objects' -Label 'Sprawdzone obiekty' -Icon 'E8B7' | Out-Null
+    Add-StatTile -Module $m -Key 'trustees' -Label 'Konta i grupy z delegacjami' -Icon 'E902' | Out-Null
+    $m.EmptyHint = 'Kliknij «Analizuj» (F5). Wpisy «Info» to zwykłe delegacje (np. reset haseł w jednostce dla helpdesku) – warto sprawdzić, czy nadal są potrzebne.'
+}
+#endregion
+
 #region Uruchomienie
 function Initialize-MainWindow {
     # Buduje okno główne (bez wyświetlania) - wydzielone, aby dało się je testować
