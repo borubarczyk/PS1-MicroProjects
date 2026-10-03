@@ -1,11 +1,11 @@
 ﻿<#
 .SYNOPSIS
     Domain Ops (AD-ManagerDiamond) - centrum administracji domeną: zdalne zarządzanie komputerami,
-    użytkownicy, grupy, jednostki organizacyjne i komputery w Active Directory, uprawnienia NTFS
-    i sumy kontrolne plików. Interfejs WPF.
+    użytkownicy, grupy, jednostki organizacyjne i komputery w Active Directory, uprawnienia NTFS,
+    bezpieczeństwo i stan domeny oraz raporty cykliczne. Interfejs WPF.
 
 .DESCRIPTION
-    Program jest podzielony na przestrzenie robocze (przełącznik na górze okna, Ctrl+1..5):
+    Program jest podzielony na przestrzenie robocze (przełącznik na górze okna, Ctrl+1..6):
       - Zarządzanie zdalne  - operacje na zaznaczonych komputerach przez PowerShell Remoting (WinRM):
                               diagnostyka, sesje i profile użytkowników, usługi, procesy, dyski, zdarzenia,
                               oprogramowanie i aktualizacje, bezpieczeństwo, udziały, polecenia, instalacje,
@@ -17,8 +17,10 @@
                               lokalizacje i role (OU + grupy z szablonu, grupy zbiorcze ALL),
       - Komputery AD        - konta komputerów: informacje, kanał zaufania, LAPS, klucze BitLocker,
                               zmiana nazwy, grupy i raporty (nieaktywne, systemy, bez LAPS...),
-      - Pliki i uprawnienia - nadawanie uprawnień NTFS wielu grupom, raport uprawnień folderów,
-                              sumy kontrolne (MD5/SHA1/SHA256/SHA384/SHA512) z porównaniem.
+      - Pliki i uprawnienia - uprawnienia NTFS: nadawanie, raport, uprawnienia efektywne, odbieranie,
+                              naprawa, kopie i zmiany uprawnień, ryzyka, wzorce, udziały; sumy kontrolne,
+      - Domena              - audyt bezpieczeństwa AD, delegacje uprawnień, stan kontrolerów i replikacji,
+                              raporty cykliczne (Harmonogram zadań, HTML do folderu lub pocztą).
     Przestrzenie AD mają listę obiektów docelowych (komputery, użytkownicy albo grupy) z zaznaczaniem,
     a moduły pogrupowane są w kategorie. Wyniki trafiają do tabel z filtrem, sortowaniem, podglądem
     wiersza, filtrami kolumn (jak autofiltr w Excelu), kopiowaniem i eksportem CSV/HTML; zmiany hurtowe
@@ -41,12 +43,22 @@
     Pliki robocze na komputerach: %SystemRoot%\Temp\DomainOps
     Plik musi pozostać zapisany jako UTF-8 z BOM (polskie znaki w Windows PowerShell 5.1).
 
+.PARAMETER RunReport
+    Tryb bez okna (raporty cykliczne): ścieżka pliku definicji raportu (*.json z folderu zadań). Program tworzy
+    raport HTML, opcjonalnie wysyła go pocztą i kończy pracę z kodem 0 (sukces), 1 (raport z błędami lub
+    niewysłana poczta) albo 2 (raport nie powstał). Tak uruchamiają go zadania Harmonogramu zadań.
+
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1
+
+.EXAMPLE
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1 -RunReport "C:\ProgramData\AD-ManagerDiamond\Reports\audyt.json"
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
-param()
+param(
+    [string]$RunReport = ''
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -57,10 +69,11 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 }
 
 # Interfejs jest pisany pod Windows PowerShell 5.1 (WPF w trybie STA). Z PowerShell 7 przełączamy się na powershell.exe,
-# chyba że zmienna środowiskowa DOMAINOPS_ALLOW_CORE=1 pozwala zostać w PowerShell 7.
+# chyba że zmienna środowiskowa DOMAINOPS_ALLOW_CORE=1 pozwala zostać w PowerShell 7. Tryb bez okna (-RunReport)
+# nie tworzy okien, więc działa w każdym trybie i wersji.
 $isCore = ($PSVersionTable.PSEdition -eq 'Core') -and ($env:DOMAINOPS_ALLOW_CORE -ne '1')
 $isSta = [System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA
-if ($isCore -or -not $isSta) {
+if (-not $RunReport -and ($isCore -or -not $isSta)) {
     if (-not $PSCommandPath) { throw 'Uruchom skrypt jako plik: powershell.exe -STA -File .\AD-ManagerDiamond.ps1' }
     $exe = if ($isCore) { Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' } else { (Get-Process -Id $PID).Path }
     Start-Process -FilePath $exe -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath)) | Out-Null
@@ -82,6 +95,10 @@ $script:App = @{
     DataDir    = Join-Path $env:APPDATA 'AD-ManagerDiamond'
     LogDir     = Join-Path $env:LOCALAPPDATA 'AD-ManagerDiamond\Logs'
     ModulesDir = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'AD-ManagerDiamond.Modules' } else { '' }
+    ScriptPath = if ($PSCommandPath) { $PSCommandPath } else { '' }
+    # Tryb bez okna (-RunReport): dodatkowy dziennik raportu cyklicznego obok jego definicji
+    Headless   = $false
+    RunLog     = ''
 }
 $script:App.SettingsFile = Join-Path $script:App.DataDir 'settings.json'
 $script:App.LogFile = Join-Path $script:App.LogDir ('DomainOps_{0:yyyyMMdd}.log' -f (Get-Date))
@@ -110,6 +127,7 @@ $script:Settings = [ordered]@{
     GroupFilter      = 0
     DisabledBaseOU   = ''
     AadSyncServer    = ''
+    ReportJobsDir    = ''
     UserProfiles     = @()
     ModuleValues     = @{}
     ProfilesImported = $false
@@ -196,6 +214,9 @@ function Write-Log {
         [System.IO.File]::AppendAllText($script:App.LogFile, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
     }
     catch { }
+    if ($script:App.RunLog) {
+        try { [System.IO.File]::AppendAllText($script:App.RunLog, ('{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f $now, $Level, $Message) + [Environment]::NewLine, [System.Text.Encoding]::UTF8) } catch { }
+    }
 }
 
 function Update-LogBadge {
@@ -449,7 +470,7 @@ function Import-Settings {
     try { $s.LogHeight = [Math]::Min(600, [Math]::Max(90, [int]$s.LogHeight)) } catch { $s.LogHeight = 190 }
     try { $s.WindowWidth = [Math]::Max(1100, [int]$s.WindowWidth); $s.WindowHeight = [Math]::Max(680, [int]$s.WindowHeight) } catch { }
     foreach ($b in 'OnlyEnabled', 'WindowMaximized', 'LogVisible', 'DetailVisible', 'ProfilesImported') { $s[$b] = [bool]$s[$b] }
-    foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace', 'GroupSearchBase', 'DisabledBaseOU', 'AadSyncServer') { $s[$t] = [string]$s[$t] }
+    foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace', 'GroupSearchBase', 'DisabledBaseOU', 'AadSyncServer', 'ReportJobsDir') { $s[$t] = [string]$s[$t] }
     foreach ($l in 'ExceptionUsers', 'ProtectedGroups', 'NtfsHiddenIdentities') { $s[$l] = @($s[$l] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
     $s.LastModules = ConvertTo-Hashtable $s.LastModules
     $mv = ConvertTo-Hashtable $s.ModuleValues
@@ -2541,13 +2562,17 @@ function Read-NewPassword {
 
 function Show-FormDialog {
     <#
-        Formularz w oknie. -Fields: @(@{ Key; Label; Type = 'Text' | 'Multi' | 'Combo' | 'Check' | 'Ou'; Value; Items; Placeholder; Hint })
-        Zwraca hashtablę Key -> wartość (Text/Multi/Ou: tekst, Combo: wybrany tekst, Check: bool) albo $null (anulowano).
+        Formularz w oknie. -Fields: @(@{ Key; Label; Type; Value; Items; Placeholder; Hint; EnabledWhen })
+          Type: Text | Multi | Combo | Check | Ou | Number | Password | Folder | Flags | Header (nagłówek sekcji, bez wartości)
+          EnabledWhen: @{ Key = 'pole'; In = @(wartości) } albo @{ Key; NotIn = @(...) } - pole aktywne tylko przy tych
+                       wartościach innego pola (Check: 'True' / 'False'); tablica warunków - wszystkie muszą być spełnione
+        Zwraca hashtablę Key -> wartość (Text/Multi/Ou/Number/Folder: tekst, Combo: wybrany tekst, Check: bool,
+        Password: SecureString, Flags: zaznaczone pozycje) albo $null (anulowano).
         -Validate { param($values) } zwraca opis błędu albo pusty tekst.
     #>
     param([Parameter(Mandatory)][string]$Title, [string]$Subtitle = '', [Parameter(Mandatory)][object[]]$Fields, [string]$OkText = 'OK',
-        [string]$Icon = 'E70F', [scriptblock]$Validate, [double]$Width = 540, [switch]$Danger)
-    $w = New-Dialog -Title $Title -Subtitle $Subtitle -Body '<ScrollViewer MaxHeight="560" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="fmHost" Margin="0,0,6,0"/></ScrollViewer>' `
+        [string]$Icon = 'E70F', [scriptblock]$Validate, [double]$Width = 540, [switch]$Danger, [double]$MaxHeight = 560)
+    $w = New-Dialog -Title $Title -Subtitle $Subtitle -Body ('<ScrollViewer MaxHeight="{0}" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="fmHost" Margin="0,0,6,0"/></ScrollViewer>' -f [int]$MaxHeight) `
         -Icon $Icon -OkText $OkText -Width $Width -Danger:$Danger -Validate {
         param($w)
         $values = Get-FormValues -Controls $w.Tag.Controls
@@ -2560,14 +2585,36 @@ function Show-FormDialog {
     $stack = $w.FindName('fmHost')
     $controls = [ordered]@{}
     $first = $true
+    $gap = 0
     foreach ($f in $Fields) {
         $type = if ($f['Type']) { [string]$f['Type'] } else { 'Text' }
+        if ($type -eq 'Header') {
+            $hd = New-DialogText -Text ([string]$f['Label']) -Color '#8CB0FF' -Size 13.5
+            $hd.FontWeight = 'SemiBold'
+            $hd.Margin = $(if ($first -and $gap -eq 0) { '0,0,0,2' } else { '0,20,0,2' })
+            [void]$stack.Children.Add($hd)
+            $line = New-Object System.Windows.Controls.Border
+            $line.Height = 1
+            $line.Background = Get-Brush '#242B36'
+            $line.Margin = '0,4,0,4'
+            [void]$stack.Children.Add($line)
+            if ($f['Hint']) {
+                $hh = New-DialogText -Text ([string]$f['Hint']) -Color '#6B7487' -Size 11.5
+                $hh.Margin = '1,2,0,4'
+                [void]$stack.Children.Add($hh)
+            }
+            $first = $true
+            $gap = 6
+            continue
+        }
+        $lbl = $null
         if ($type -ne 'Check') {
             $lbl = New-DialogText -Text ([string]$f['Label']) -Color '#8791A5' -Size 12
-            $lbl.Margin = $(if ($first) { '0,0,0,5' } else { '0,12,0,5' })
+            $lbl.Margin = $(if ($first) { '0,{0},0,5' -f $gap } else { '0,12,0,5' })
             [void]$stack.Children.Add($lbl)
         }
         $ctl = $null
+        $holder = $null
         switch ($type) {
             'Combo' {
                 $ctl = New-Object System.Windows.Controls.ComboBox
@@ -2575,56 +2622,93 @@ function Show-FormDialog {
                 $sel = [string]$f['Value']
                 $ctl.SelectedIndex = [Math]::Max(0, $ctl.Items.IndexOf($sel))
                 [void]$stack.Children.Add($ctl)
+                $ctl.add_SelectionChanged($script:FormEvents.Changed)
             }
             'Check' {
                 $ctl = New-Object System.Windows.Controls.CheckBox
-                $ctl.Content = [string]$f['Label']
+                $cbText = New-Object System.Windows.Controls.TextBlock
+                $cbText.Text = [string]$f['Label']
+                $cbText.TextWrapping = 'Wrap'
+                $ctl.Content = $cbText
                 $ctl.IsChecked = [bool]$f['Value']
-                $ctl.Margin = $(if ($first) { '0,0,0,0' } else { '0,12,0,0' })
+                $ctl.Margin = $(if ($first) { '0,{0},0,0' -f $gap } else { '0,12,0,0' })
                 [void]$stack.Children.Add($ctl)
+                $ctl.add_Checked($script:FormEvents.Changed)
+                $ctl.add_Unchecked($script:FormEvents.Changed)
             }
             'Multi' {
                 $ctl = New-Object System.Windows.Controls.TextBox
                 $ctl.Style = Get-ThemeResource 'MultiText'
-                $ctl.Height = 130
+                $ctl.Height = $(if ($f['Height']) { [double]$f['Height'] } else { 130 })
                 $ctl.Text = [string]$f['Value']
+                [void]$stack.Children.Add($ctl)
+            }
+            'Password' {
+                $ctl = New-Object System.Windows.Controls.PasswordBox
+                [void]$stack.Children.Add($ctl)
+            }
+            'Flags' {
+                $ctl = New-Object System.Windows.Controls.WrapPanel
+                $selected = @($f['Value'] | ForEach-Object { [string]$_ })
+                foreach ($i in @($f['Items'])) {
+                    $cb = New-Object System.Windows.Controls.CheckBox
+                    $cb.Content = [string]$i
+                    $cb.IsChecked = $selected -contains [string]$i
+                    $cb.Margin = '0,2,16,2'
+                    [void]$ctl.Children.Add($cb)
+                }
                 [void]$stack.Children.Add($ctl)
             }
             default {
                 $ctl = New-Object System.Windows.Controls.TextBox
                 $ctl.Text = [string]$f['Value']
-                if ($type -eq 'Ou') {
+                if ($type -eq 'Number') {
+                    $ctl.Width = 130
+                    $ctl.HorizontalAlignment = 'Left'
+                }
+                if ($type -eq 'Ou' -or $type -eq 'Folder') {
                     $dock = New-Object System.Windows.Controls.DockPanel
-                    $btn = New-PlainButton -Icon 'E8B7' -ToolTip 'Wybierz jednostkę organizacyjną'
+                    $btn = New-PlainButton -Icon $(if ($type -eq 'Ou') { 'E8B7' } else { 'E838' }) -ToolTip $(if ($type -eq 'Ou') { 'Wybierz jednostkę organizacyjną' } else { 'Wybierz folder' })
                     $btn.Padding = '9,6'
                     $btn.Margin = '6,0,0,0'
                     [System.Windows.Controls.DockPanel]::SetDock($btn, 'Right')
                     [void]$dock.Children.Add($btn)
                     [void]$dock.Children.Add($ctl)
-                    $script:FormOuButtons[$btn] = $ctl
+                    $script:FormOuButtons[$btn] = @{ Box = $ctl; Kind = $type }
                     $btn.add_Click({
                             param($s, $e)
-                            $box = $script:FormOuButtons[$s]
+                            $entry = $script:FormOuButtons[$s]
+                            $box = $entry.Box
+                            if ($entry.Kind -eq 'Folder') {
+                                $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+                                $dlg.Description = 'Wybierz folder'
+                                if ($box.Text.Trim() -and (Test-Path -LiteralPath $box.Text.Trim())) { $dlg.SelectedPath = $box.Text.Trim() }
+                                if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $box.Text = $dlg.SelectedPath }
+                                return
+                            }
                             $dn = $null
                             try { $dn = Select-OrganizationalUnit -Selected $box.Text.Trim() -AllowDomainRoot } catch { Show-Error 'Nie można wczytać jednostek organizacyjnych.' $_ }
                             if ($null -ne $dn) { $box.Text = $dn }
                         })
                     [void]$stack.Children.Add($dock)
+                    $holder = $dock
                 }
                 else { [void]$stack.Children.Add($ctl) }
             }
         }
         if ($f['Placeholder'] -and $ctl -is [System.Windows.Controls.TextBox]) { $ctl.Tag = [string]$f['Placeholder'] }
+        $hint = $null
         if ($f['Hint']) {
-            $h = New-DialogText -Text ([string]$f['Hint']) -Color '#6B7487' -Size 11.5
-            $h.Margin = '1,5,0,0'
-            [void]$stack.Children.Add($h)
+            $hint = New-DialogText -Text ([string]$f['Hint']) -Color '#6B7487' -Size 11.5
+            $hint.Margin = '1,5,0,0'
+            [void]$stack.Children.Add($hint)
         }
-        $controls[[string]$f['Key']] = @{ Type = $type; Control = $ctl }
+        $controls[[string]$f['Key']] = @{ Type = $type; Control = $ctl; Holder = $(if ($holder) { $holder } else { $ctl }); Label = $lbl; HintText = $hint; When = $f['EnabledWhen'] }
         $first = $false
     }
     $w.Tag.Controls = $controls
     $w.Tag.Check = $Validate
+    Update-FormState -Window $w
     $w.add_ContentRendered({
             param($s, $e)
             foreach ($c in $s.Tag.Controls.Values) { if ($c.Control -is [System.Windows.Controls.TextBox]) { [void]$c.Control.Focus(); $c.Control.SelectAll(); break } }
@@ -2634,6 +2718,34 @@ function Show-FormDialog {
     return (Get-FormValues -Controls $controls)
 }
 $script:FormOuButtons = New-Object 'System.Collections.Generic.Dictionary[object,object]'
+$script:FormEvents = @{
+    Changed = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        if ($w -and $w.Tag -is [hashtable] -and $w.Tag['Controls']) { Update-FormState -Window $w }
+    }
+}
+
+function Update-FormState {
+    # Pola z EnabledWhen: aktywne tylko przy wskazanych wartościach innego pola
+    param($Window)
+    $controls = $Window.Tag['Controls']
+    if (-not $controls) { return }
+    $values = $null
+    foreach ($k in $controls.Keys) {
+        $c = $controls[$k]
+        if (-not $c['When']) { continue }
+        if ($null -eq $values) { $values = Get-FormValues -Controls $controls }
+        $on = $true
+        foreach ($cond in @($c['When'])) {
+            $v = [string]$values[[string]$cond['Key']]
+            $ok = if ($cond['In']) { @($cond['In'] | ForEach-Object { [string]$_ }) -contains $v } elseif ($cond['NotIn']) { @($cond['NotIn'] | ForEach-Object { [string]$_ }) -notcontains $v } else { $v -eq 'True' }
+            if (-not $ok) { $on = $false }
+        }
+        $c.Holder.IsEnabled = $on
+        foreach ($t in @($c.Label, $c.HintText)) { if ($t) { $t.Opacity = $(if ($on) { 1 } else { 0.45 }) } }
+    }
+}
 
 function Get-FormValues {
     param([System.Collections.IDictionary]$Controls)
@@ -2644,6 +2756,8 @@ function Get-FormValues {
             'Combo' { [string]$c.Control.SelectedItem }
             'Check' { ($c.Control.IsChecked -eq $true) }
             'Multi' { [string]$c.Control.Text }
+            'Password' { $c.Control.SecurePassword }
+            'Flags' { , @($c.Control.Children | Where-Object { $_.IsChecked -eq $true } | ForEach-Object { [string]$_.Content }) }
             default { ([string]$c.Control.Text).Trim() }
         }
     }
@@ -4935,6 +5049,79 @@ function Start-HostOperation {
     Write-Log ("{0} – start ({1}): {2}" -f $Name, $items.Count, $list) -Module $Module.Title
     $script:Engine.Timer.Start()
     Update-StatusBar
+}
+
+function Invoke-SyncOperation {
+    <#
+        Synchroniczny odpowiednik Start-HostOperation - dla raportów cyklicznych i trybu bez okna (-RunReport).
+        Ten sam WorkerScript (zdalnie przez Invoke-Command albo lokalnie z $Target, $P, $Ctx), osobna pula wątków;
+        czeka na wszystkie obiekty i zwraca wyniki (Target, Ok, Data, Errors) w kolejności -Targets.
+        -Ad: blok jak w Start-AdOperation (moduł ActiveDirectory i hashtabla $ad). Obiekty, które nie skończą się
+        w ciągu -TimeoutSec, dostają wynik z błędem (zadanie jest przerywane).
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Targets,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [switch]$Local,
+        [switch]$Ad,
+        [hashtable]$Parameters = @{},
+        [hashtable]$PerTarget = @{},
+        [int]$Throttle = 0,
+        [int]$TimeoutSec = 3600
+    )
+    $items = @($Targets | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    if ($items.Count -eq 0) { return @() }
+    $mode = if ($Local -or $Ad) { 'Local' } else { 'Remote' }
+    $scriptText = if ($Ad) { Get-AdOperationText $ScriptBlock } else { $ScriptBlock.ToString() }
+    if ($Throttle -le 0) { $Throttle = if ($Ad) { [int]$script:Settings.AdThrottleLimit } else { [int]$script:Settings.ThrottleLimit } }
+    $ctx = @{
+        Credential    = Get-EffectiveCredential
+        Server        = [string]$script:Settings.DomainController
+        SessionOption = New-SessionOption
+    }
+    $pool = New-EnginePool ([Math]::Max(1, [Math]::Min($Throttle, $items.Count)))
+    $jobs = New-Object System.Collections.ArrayList
+    try {
+        foreach ($t in $items) {
+            $p = $Parameters
+            if ($PerTarget.ContainsKey($t)) { $p = $PerTarget[$t] }
+            $ps = [System.Management.Automation.PowerShell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($script:WorkerScript)
+            [void]$ps.AddArgument($t).AddArgument($mode).AddArgument($scriptText).AddArgument($p).AddArgument($ctx)
+            [void]$jobs.Add(@{ Target = $t; PS = $ps; Handle = $ps.BeginInvoke() })
+        }
+        $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSec))
+        $results = foreach ($j in $jobs) {
+            $left = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+            if (-not $j.Handle.AsyncWaitHandle.WaitOne($left)) {
+                try { [void]$j.PS.BeginStop($null, $null) } catch { }
+                [pscustomobject]@{ Target = $j.Target; Ok = $false; Data = @(); Errors = @("Przekroczono limit czasu ($TimeoutSec s).") }
+                continue
+            }
+            $r = $null
+            try {
+                $output = $j.PS.EndInvoke($j.Handle)
+                if ($output -and $output.Count -gt 0) { $r = $output[0] }
+                if (-not $r) {
+                    $msg = 'Zadanie nie zwróciło wyniku.'
+                    if ($j.PS.Streams.Error.Count -gt 0) { $msg = $j.PS.Streams.Error[0].Exception.Message }
+                    $r = [pscustomobject]@{ Target = $j.Target; Ok = $false; Data = @(); Errors = @($msg) }
+                }
+            }
+            catch { $r = [pscustomobject]@{ Target = $j.Target; Ok = $false; Data = @(); Errors = @($_.Exception.Message) } }
+            $r
+        }
+        return @($results)
+    }
+    finally {
+        $stuck = $false
+        foreach ($j in $jobs) {
+            if ($j.Handle.IsCompleted) { try { $j.PS.Dispose() } catch { } } else { $stuck = $true }
+        }
+        # Pula z wiszącym zadaniem zostaje (Close czekałby na nie); wątki tła kończą się razem z procesem
+        if (-not $stuck) { try { $pool.Close(); $pool.Dispose() } catch { } }
+    }
 }
 
 function Update-Operations {
@@ -8396,6 +8583,29 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Processes' -Title '
     Add-RowAction -Module $m -Text 'Zakończ proces' -Icon 'E711' -Danger -Action { param($m, $rows) & $m.Actions.Kill $m $rows }
 }
 
+# Zajętość dysków lokalnych (progi $P.WarnPct / $P.CritPct, domyślnie 15 i 5% wolnego) - moduł i raporty cykliczne
+$script:DiskSpaceScript = {
+    param($P)
+    $warnPct = if ($P -and $P.ContainsKey('WarnPct') -and [double]$P.WarnPct -gt 0) { [double]$P.WarnPct } else { 15 }
+    $critPct = if ($P -and $P.ContainsKey('CritPct') -and [double]$P.CritPct -gt 0) { [double]$P.CritPct } else { 5 }
+    Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3' | ForEach-Object {
+        $size = [double]$_.Size
+        $free = [double]$_.FreeSpace
+        $freePct = if ($size -gt 0) { [Math]::Round($free / $size * 100, 1) } else { $null }
+        $tone = if ($null -eq $freePct) { '' } elseif ($freePct -le $critPct) { 'crit' } elseif ($freePct -le $warnPct) { 'warn' } else { 'ok' }
+        [pscustomobject]@{
+            'Dysk'          = $_.DeviceID
+            'Stan'          = $(switch ($tone) { 'crit' { 'krytycznie mało' } 'warn' { 'mało miejsca' } 'ok' { 'OK' } default { '' } })
+            'Etykieta'      = $_.VolumeName
+            'System plików' = $_.FileSystem
+            'Rozmiar (GB)'  = [Math]::Round($size / 1GB, 1)
+            'Wolne (GB)'    = [Math]::Round($free / 1GB, 1)
+            'Wolne (%)'     = $freePct
+            '__tone'        = $tone
+        }
+    }
+}
+
 Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dyski' -Icon 'EDA2' `
     -Description 'Zajętość dysków lokalnych oraz czyszczenie plików tymczasowych i Kosza (z raportem odzyskanego miejsca).' -Build {
     param($m)
@@ -8405,25 +8615,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Dyski' -Targets $targets -ScriptBlock {
-            param($P)
-            Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3' | ForEach-Object {
-                $size = [double]$_.Size
-                $free = [double]$_.FreeSpace
-                $freePct = if ($size -gt 0) { [Math]::Round($free / $size * 100, 1) } else { $null }
-                $tone = if ($null -eq $freePct) { '' } elseif ($freePct -le 5) { 'crit' } elseif ($freePct -le 15) { 'warn' } else { 'ok' }
-                [pscustomobject]@{
-                    'Dysk'          = $_.DeviceID
-                    'Stan'          = $(switch ($tone) { 'crit' { 'krytycznie mało' } 'warn' { 'mało miejsca' } 'ok' { 'OK' } default { '' } })
-                    'Etykieta'      = $_.VolumeName
-                    'System plików' = $_.FileSystem
-                    'Rozmiar (GB)'  = [Math]::Round($size / 1GB, 1)
-                    'Wolne (GB)'    = [Math]::Round($free / 1GB, 1)
-                    'Wolne (%)'     = $freePct
-                    '__tone'        = $tone
-                }
-            }
-        }
+        Start-HostOperation -Module $m -Name 'Dyski' -Targets $targets -ScriptBlock $script:DiskSpaceScript
     } | Out-Null
     $row2 = Add-ToolbarRow -Module $m -Title 'Czyszczenie'
     $m.WinTemp = Add-CheckBox -Parent $row2 -Text 'Windows\Temp' -Checked $true
@@ -9928,6 +10120,41 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Firewall' 
     } | Out-Null
 }
 
+# Certyfikaty komputera ($P.Store albo $P.Stores, Filter, ExpiringDays, WarnDays) - moduł i raporty cykliczne
+$script:CertificatesScript = {
+    param($P)
+    $now = Get-Date
+    $warnDays = if ($P.ContainsKey('WarnDays') -and [int]$P.WarnDays -gt 0) { [int]$P.WarnDays } else { 30 }
+    $stores = if ($P.ContainsKey('Stores') -and @($P.Stores).Count) { @($P.Stores) } else { @($P.Store) }
+    foreach ($store in $stores) {
+        $certs = @()
+        try { $certs = @(Get-ChildItem -Path ('Cert:\LocalMachine\' + $store) -ErrorAction Stop) }
+        catch { if ($stores.Count -gt 1 -and $_.Exception.Message -match 'cannot find|nie można znaleźć|does not exist') { continue } else { throw } }
+        foreach ($c in $certs) {
+            if ($P.Filter) {
+                $f = "*$($P.Filter)*"
+                if ($c.Subject -notlike $f -and $c.Thumbprint -notlike $f -and $c.FriendlyName -notlike $f -and $c.Issuer -notlike $f) { continue }
+            }
+            $days = [int][Math]::Floor(($c.NotAfter - $now).TotalDays)
+            if ($P.ExpiringDays -gt 0 -and $days -gt $P.ExpiringDays) { continue }
+            [pscustomobject]@{
+                'Podmiot'            = $c.Subject
+                'Ważność'            = $(if ($days -lt 0) { 'Wygasł' } elseif ($days -le $warnDays) { "Wygasa za $days dni" } else { 'Ważny' })
+                'Wystawca'           = $c.Issuer
+                'Ważny od'           = $c.NotBefore
+                'Ważny do'           = $c.NotAfter
+                'Dni do wygaśnięcia' = $days
+                'Klucz prywatny'     = $c.HasPrivateKey
+                'Przeznaczenie'      = (@($c.EnhancedKeyUsageList | ForEach-Object { $_.FriendlyName } | Where-Object { $_ }) -join ', ')
+                'Nazwa przyjazna'    = $c.FriendlyName
+                'Odcisk palca'       = $c.Thumbprint
+                'Magazyn'            = $store
+                '__tone'             = $(if ($days -lt 0) { 'crit' } elseif ($days -le $warnDays) { 'warn' } else { 'ok' })
+            }
+        }
+    }
+}
+
 Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Certificates' -Title 'Certyfikaty komputera' -Icon 'EB95' `
     -Description 'Certyfikaty z magazynów LocalMachine, wyszukiwanie wygasających oraz eksport zaznaczonych do plików .cer.' -Build {
     param($m)
@@ -9944,32 +10171,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Certificat
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
         $params = @{ Store = [string]$m.Store.SelectedItem; Filter = $m.Filter.Text.Trim(); ExpiringDays = $(if (Test-Checked $m.OnlyExpiring) { Get-Num $m.Days } else { 0 }) }
-        Start-HostOperation -Module $m -Name 'Certyfikaty' -Targets $targets -Parameters $params -ScriptBlock {
-            param($P)
-            $now = Get-Date
-            foreach ($c in @(Get-ChildItem -Path ('Cert:\LocalMachine\' + $P.Store) -ErrorAction Stop)) {
-                if ($P.Filter) {
-                    $f = "*$($P.Filter)*"
-                    if ($c.Subject -notlike $f -and $c.Thumbprint -notlike $f -and $c.FriendlyName -notlike $f -and $c.Issuer -notlike $f) { continue }
-                }
-                $days = [int][Math]::Floor(($c.NotAfter - $now).TotalDays)
-                if ($P.ExpiringDays -gt 0 -and $days -gt $P.ExpiringDays) { continue }
-                [pscustomobject]@{
-                    'Podmiot'            = $c.Subject
-                    'Ważność'            = $(if ($days -lt 0) { 'Wygasł' } elseif ($days -le 30) { "Wygasa za $days dni" } else { 'Ważny' })
-                    'Wystawca'           = $c.Issuer
-                    'Ważny od'           = $c.NotBefore
-                    'Ważny do'           = $c.NotAfter
-                    'Dni do wygaśnięcia' = $days
-                    'Klucz prywatny'     = $c.HasPrivateKey
-                    'Przeznaczenie'      = (@($c.EnhancedKeyUsageList | ForEach-Object { $_.FriendlyName } | Where-Object { $_ }) -join ', ')
-                    'Nazwa przyjazna'    = $c.FriendlyName
-                    'Odcisk palca'       = $c.Thumbprint
-                    'Magazyn'            = $P.Store
-                    '__tone'             = $(if ($days -lt 0) { 'crit' } elseif ($days -le 30) { 'warn' } else { 'ok' })
-                }
-            }
-        }
+        Start-HostOperation -Module $m -Name 'Certyfikaty' -Targets $targets -Parameters $params -ScriptBlock $script:CertificatesScript
     } | Out-Null
     Add-Button -Parent $row2 -Text 'Eksportuj zaznaczone (.cer)…' -Icon 'EDE1' -Module $m -OnClick {
         param($m)
@@ -11819,6 +12021,11 @@ function Test-AdAvailable {
     return $false
 }
 
+function Get-AdOperationText([scriptblock]$Body) {
+    # Pełny tekst bloku operacji AD: parametry ($Target, $P, $Ctx), moduł ActiveDirectory z $ad, funkcje pomocnicze i treść
+    return 'param($Target, $P, $Ctx)' + "`n" + $script:AdPrelude + "`n" + $script:AdHelpers + "`n" + '$__body = {' + $Body.ToString() + "`n}`n" + '& $__body $Target $P $Ctx'
+}
+
 function Start-AdOperation {
     # Start-HostOperation w trybie lokalnym z modułem ActiveDirectory i hashtablą $ad w bloku skryptu
     param(
@@ -11835,12 +12042,11 @@ function Start-AdOperation {
         [scriptblock]$OnComplete
     )
     if (-not (Test-AdAvailable)) { return }
-    $text = 'param($Target, $P, $Ctx)' + "`n" + $script:AdPrelude + "`n" + $script:AdHelpers + "`n" + '$__body = {' + $ScriptBlock.ToString() + "`n}`n" + '& $__body $Target $P $Ctx'
     $sp = @{
         Module       = $Module
         Name         = $Name
         Targets      = $Targets
-        ScriptBlock  = [scriptblock]::Create($text)
+        ScriptBlock  = [scriptblock]::Create((Get-AdOperationText $ScriptBlock))
         Local        = $true
         Parameters   = $Parameters
         PerTarget    = $PerTarget
@@ -12432,6 +12638,69 @@ $script:UserReports = @(
     @{ Key = 'Privileged'; Name = 'Konta uprzywilejowane (adminCount = 1)' }
 )
 
+# Raporty kont (blok operacji AD: $P.Report, Days, OnlyEnabled, SearchBase, StateScript) - moduł i raporty cykliczne
+$script:UserReportScript = {
+    $now = Get-Date
+    $days = [int]$P.Days
+    $enabledOnly = '(!(userAccountControl:1.2.840.113556.1.4.803:=2))'
+    $base = '(objectCategory=person)(objectClass=user)'
+    $cut = $now.AddDays(-$days)
+    $ft = $cut.ToFileTimeUtc()
+    $gen = $cut.ToUniversalTime().ToString('yyyyMMddHHmmss.0Z')
+    $extra = switch ($P.Report) {
+        'Locked' { '(lockoutTime>=1)' }
+        'Disabled' { '(userAccountControl:1.2.840.113556.1.4.803:=2)' }
+        'Inactive' { "(|(lastLogonTimestamp<=$ft)(&(!(lastLogonTimestamp=*))(whenCreated<=$gen)))" }
+        'NeverLogged' { '(!(lastLogonTimestamp=*))' }
+        'PwdExpiring' { '(!(userAccountControl:1.2.840.113556.1.4.803:=65536))' }
+        'PwdExpired' { '(!(userAccountControl:1.2.840.113556.1.4.803:=65536))' }
+        'PwdNever' { '(userAccountControl:1.2.840.113556.1.4.803:=65536)' }
+        'AccExpiring' { '(accountExpires>=1)(!(accountExpires=9223372036854775807))' }
+        'Created' { "(whenCreated>=$gen)" }
+        'Privileged' { '(adminCount=1)' }
+    }
+    if ($P.OnlyEnabled -and @('Locked', 'Disabled', 'Privileged') -notcontains $P.Report) { $extra += $enabledOnly }
+    $q = @{
+        LDAPFilter = "(&$base$extra)"
+        Properties = @('DisplayName', 'Enabled', 'LockedOut', 'LastLogonDate', 'PasswordLastSet', 'PasswordNeverExpires', 'PasswordExpired', 'msDS-UserPasswordExpiryTimeComputed', 'AccountExpirationDate', 'whenCreated', 'Department', 'Title', 'mail', 'Description', 'AccountLockoutTime')
+    }
+    if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+    $users = @(Get-ADUser @q @ad)
+    $stateScript = [scriptblock]::Create($P.StateScript)
+    foreach ($u in $users) {
+        $st = & $stateScript $u
+        # Uwaga: "continue" wewnątrz switch dotyczy switch, nie pętli - stąd osobna zmienna
+        $include = switch ($P.Report) {
+            'Locked' { [bool]$u.LockedOut }
+            'PwdExpiring' { [bool]($st.Expiry -and $st.Expiry -ge $now -and $st.Expiry -le $now.AddDays($days)) }
+            'PwdExpired' { [bool]$u.PasswordExpired }
+            'AccExpiring' { [bool]($u.AccountExpirationDate -and $u.AccountExpirationDate -le $now.AddDays($days)) }
+            default { $true }
+        }
+        if (-not $include) { continue }
+        [pscustomobject][ordered]@{
+            'Login'              = $u.SamAccountName
+            'Nazwa'              = $u.DisplayName
+            'Stan'               = $st.State
+            'Włączone'           = [bool]$u.Enabled
+            'Zablokowane'        = [bool]$u.LockedOut
+            'Ostatnie logowanie' = $u.LastLogonDate
+            'Dni bez logowania'  = $(if ($u.LastLogonDate) { [int]($now - $u.LastLogonDate).TotalDays } else { $null })
+            'Hasło ustawione'    = $u.PasswordLastSet
+            'Hasło wygasa'       = $st.Expiry
+            'Hasło nigdy nie wygasa' = [bool]$u.PasswordNeverExpires
+            'Konto wygasa'       = $u.AccountExpirationDate
+            'Utworzono'          = $u.whenCreated
+            'Dział'              = $u.Department
+            'Stanowisko'         = $u.Title
+            'E-mail'             = $u.mail
+            'Opis'               = $u.Description
+            'DN'                 = $u.DistinguishedName
+            '__tone'             = $st.Tone
+        }
+    }
+}
+
 Register-Module -Workspace 'AdUsers' -Category 'Raporty' -Key 'UserReports' -Title 'Raporty kont' -Icon 'E9F9' `
     -Description 'Zestawienia z całej domeny lub jednostki: zablokowane, wyłączone, nieaktywne, z wygasającym hasłem, wygasające, nowe i uprzywilejowane. Wyniki można przenieść na listę kont i wykonać na nich operacje.' -Build {
     param($m)
@@ -12454,67 +12723,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Raporty' -Key 'UserReports' -Tit
         param($m)
         $report = $script:UserReports[$m.Report.SelectedIndex]
         $params = @{ Report = $report.Key; Days = (Get-Num $m.Days); OnlyEnabled = (Test-Checked $m.OnlyEnabled); SearchBase = $m.Ou.Text.Trim(); StateScript = $script:UserStateScript.ToString() }
-        Start-AdOperation -Module $m -Name $report.Name -Targets @('AD') -Parameters $params -ScriptBlock {
-            $now = Get-Date
-            $days = [int]$P.Days
-            $enabledOnly = '(!(userAccountControl:1.2.840.113556.1.4.803:=2))'
-            $base = '(objectCategory=person)(objectClass=user)'
-            $cut = $now.AddDays(-$days)
-            $ft = $cut.ToFileTimeUtc()
-            $gen = $cut.ToUniversalTime().ToString('yyyyMMddHHmmss.0Z')
-            $extra = switch ($P.Report) {
-                'Locked' { '(lockoutTime>=1)' }
-                'Disabled' { '(userAccountControl:1.2.840.113556.1.4.803:=2)' }
-                'Inactive' { "(|(lastLogonTimestamp<=$ft)(&(!(lastLogonTimestamp=*))(whenCreated<=$gen)))" }
-                'NeverLogged' { '(!(lastLogonTimestamp=*))' }
-                'PwdExpiring' { '(!(userAccountControl:1.2.840.113556.1.4.803:=65536))' }
-                'PwdExpired' { '(!(userAccountControl:1.2.840.113556.1.4.803:=65536))' }
-                'PwdNever' { '(userAccountControl:1.2.840.113556.1.4.803:=65536)' }
-                'AccExpiring' { '(accountExpires>=1)(!(accountExpires=9223372036854775807))' }
-                'Created' { "(whenCreated>=$gen)" }
-                'Privileged' { '(adminCount=1)' }
-            }
-            if ($P.OnlyEnabled -and @('Locked', 'Disabled', 'Privileged') -notcontains $P.Report) { $extra += $enabledOnly }
-            $q = @{
-                LDAPFilter = "(&$base$extra)"
-                Properties = @('DisplayName', 'Enabled', 'LockedOut', 'LastLogonDate', 'PasswordLastSet', 'PasswordNeverExpires', 'PasswordExpired', 'msDS-UserPasswordExpiryTimeComputed', 'AccountExpirationDate', 'whenCreated', 'Department', 'Title', 'mail', 'Description', 'AccountLockoutTime')
-            }
-            if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
-            $users = @(Get-ADUser @q @ad)
-            $stateScript = [scriptblock]::Create($P.StateScript)
-            foreach ($u in $users) {
-                $st = & $stateScript $u
-                # Uwaga: "continue" wewnątrz switch dotyczy switch, nie pętli - stąd osobna zmienna
-                $include = switch ($P.Report) {
-                    'Locked' { [bool]$u.LockedOut }
-                    'PwdExpiring' { [bool]($st.Expiry -and $st.Expiry -ge $now -and $st.Expiry -le $now.AddDays($days)) }
-                    'PwdExpired' { [bool]$u.PasswordExpired }
-                    'AccExpiring' { [bool]($u.AccountExpirationDate -and $u.AccountExpirationDate -le $now.AddDays($days)) }
-                    default { $true }
-                }
-                if (-not $include) { continue }
-                [pscustomobject][ordered]@{
-                    'Login'              = $u.SamAccountName
-                    'Nazwa'              = $u.DisplayName
-                    'Stan'               = $st.State
-                    'Włączone'           = [bool]$u.Enabled
-                    'Zablokowane'        = [bool]$u.LockedOut
-                    'Ostatnie logowanie' = $u.LastLogonDate
-                    'Dni bez logowania'  = $(if ($u.LastLogonDate) { [int]($now - $u.LastLogonDate).TotalDays } else { $null })
-                    'Hasło ustawione'    = $u.PasswordLastSet
-                    'Hasło wygasa'       = $st.Expiry
-                    'Hasło nigdy nie wygasa' = [bool]$u.PasswordNeverExpires
-                    'Konto wygasa'       = $u.AccountExpirationDate
-                    'Utworzono'          = $u.whenCreated
-                    'Dział'              = $u.Department
-                    'Stanowisko'         = $u.Title
-                    'E-mail'             = $u.mail
-                    'Opis'               = $u.Description
-                    'DN'                 = $u.DistinguishedName
-                    '__tone'             = $st.Tone
-                }
-            }
-        } -OnComplete {
+        Start-AdOperation -Module $m -Name $report.Name -Targets @('AD') -Parameters $params -ScriptBlock $script:UserReportScript -OnComplete {
             param($m)
             Set-StatTile -Module $m -Key 'count' -Value ([string]$m.Table.Rows.Count) -Tone $(if ($m.Table.Rows.Count) { 'warn' } else { 'ok' })
             Set-StatTile -Module $m -Key 'locked' -Value ([string]@($m.Table.Rows | Where-Object { $m.Table.Columns.Contains('Zablokowane') -and [string]$_['Zablokowane'] -eq 'Tak' }).Count)
@@ -13148,6 +13357,74 @@ $script:ComputerReports = @(
     @{ Key = 'All'; Name = 'Wszystkie komputery' }
 )
 
+# Raporty komputerów (blok operacji AD: $P.Report, Days, OnlyEnabled, SearchBase, UnsupportedOs) - moduł i raporty cykliczne
+$script:ComputerReportScript = {
+    $now = Get-Date
+    $days = [int]$P.Days
+    $cut = $now.AddDays(-$days)
+    $ft = $cut.ToFileTimeUtc()
+    $gen = $cut.ToUniversalTime().ToString('yyyyMMddHHmmss.0Z')
+    $extra = switch ($P.Report) {
+        'Inactive' { "(|(lastLogonTimestamp<=$ft)(&(!(lastLogonTimestamp=*))(whenCreated<=$gen)))" }
+        'Disabled' { '(userAccountControl:1.2.840.113556.1.4.803:=2)' }
+        'Created' { "(whenCreated>=$gen)" }
+        'Servers' { '(operatingSystem=*Server*)' }
+        'NoLaps' { '(!(ms-Mcs-AdmPwdExpirationTime=*))(!(msLAPS-PasswordExpirationTime=*))' }
+        default { '' }
+    }
+    if ($P.OnlyEnabled -and $P.Report -ne 'Disabled') { $extra += '(!(userAccountControl:1.2.840.113556.1.4.803:=2))' }
+    $q = @{
+        LDAPFilter = "(&(objectCategory=computer)$extra)"
+        Properties = @('OperatingSystem', 'OperatingSystemVersion', 'Enabled', 'LastLogonDate', 'PasswordLastSet', 'whenCreated', 'Description', 'IPv4Address')
+    }
+    if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+    try { $computers = @(Get-ADComputer @q @ad) }
+    catch {
+        # Brak schematu LAPS (atrybut nieznany) - raport bez filtra jednego z atrybutów
+        if ($P.Report -eq 'NoLaps') { $q.LDAPFilter = $q.LDAPFilter -replace '\(!\(msLAPS-PasswordExpirationTime=\*\)\)', ''; $computers = @(Get-ADComputer @q @ad) } else { throw }
+    }
+    if ($P.Report -eq 'OsSummary') {
+        $computers | Group-Object { '{0}|{1}' -f $_.OperatingSystem, $_.OperatingSystemVersion } | Sort-Object Count -Descending | ForEach-Object {
+            $parts = $_.Name -split '\|'
+            [pscustomobject][ordered]@{ 'System' = $(if ($parts[0]) { $parts[0] } else { '(nieznany)' }); 'Wersja' = $parts[1]; 'Liczba' = $_.Count; 'Włączone' = @($_.Group | Where-Object { $_.Enabled }).Count }
+        }
+        return
+    }
+    $withKey = $null
+    if ($P.Report -eq 'NoBitLocker') {
+        $withKey = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $kq = @{ LDAPFilter = '(objectClass=msFVE-RecoveryInformation)' }
+        if ($P.SearchBase) { $kq.SearchBase = $P.SearchBase }
+        foreach ($k in @(Get-ADObject @kq @ad)) { [void]$withKey.Add(($k.DistinguishedName -replace '^CN=(?:\\.|[^,])+,', '')) }
+    }
+    $unsupported = [string]$P.UnsupportedOs
+    foreach ($c in $computers) {
+        $include = switch ($P.Report) {
+            'Unsupported' { [string]$c.OperatingSystem -match $unsupported }
+            'NoBitLocker' { -not $withKey.Contains($c.DistinguishedName) }
+            default { $true }
+        }
+        if (-not $include) { continue }
+        $daysIdle = if ($c.LastLogonDate) { [int]($now - $c.LastLogonDate).TotalDays } else { $null }
+        $state = if (-not $c.Enabled) { 'Wyłączone' } elseif ($null -eq $daysIdle) { 'Nigdy nie logowane' } elseif ($daysIdle -gt $days) { "Nieaktywne ($daysIdle dni)" } else { 'Aktywne' }
+        [pscustomobject][ordered]@{
+            'Komputer'              = $c.Name
+            'Stan'                  = $state
+            'System'                = $c.OperatingSystem
+            'Wersja'                = $c.OperatingSystemVersion
+            'Włączone'              = [bool]$c.Enabled
+            'Ostatnie logowanie'    = $c.LastLogonDate
+            'Dni bez logowania'     = $daysIdle
+            'Hasło konta zmienione' = $c.PasswordLastSet
+            'Utworzono'             = $c.whenCreated
+            'IPv4'                  = $c.IPv4Address
+            'Opis'                  = $c.Description
+            'DN'                    = $c.DistinguishedName
+            '__tone'                = $(if (-not $c.Enabled) { '' } elseif ($state -eq 'Aktywne') { 'ok' } else { 'warn' })
+        }
+    }
+}
+
 Register-Module -Workspace 'AdComputers' -Category 'Raporty' -Key 'ComputerReports' -Title 'Raporty komputerów' -Icon 'E9F9' `
     -Description 'Zestawienia z domeny lub jednostki: nieaktywne, wyłączone, nowe, systemy operacyjne, nieobsługiwane systemy, brak LAPS i kluczy BitLocker. Wyniki można przenieść na listę komputerów, wyłączyć, przenieść lub usunąć.' -Build {
     param($m)
@@ -13170,72 +13447,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Raporty' -Key 'ComputerRepor
         $report = $script:ComputerReports[$m.Report.SelectedIndex]
         $params = @{ Report = $report.Key; Days = (Get-Num $m.Days); OnlyEnabled = (Test-Checked $m.OnlyEnabled); SearchBase = $m.Ou.Text.Trim(); UnsupportedOs = $script:UnsupportedOsPattern }
         Reset-StatTiles $m
-        Start-AdOperation -Module $m -Name $report.Name -Targets @('AD') -Parameters $params -ScriptBlock {
-            $now = Get-Date
-            $days = [int]$P.Days
-            $cut = $now.AddDays(-$days)
-            $ft = $cut.ToFileTimeUtc()
-            $gen = $cut.ToUniversalTime().ToString('yyyyMMddHHmmss.0Z')
-            $extra = switch ($P.Report) {
-                'Inactive' { "(|(lastLogonTimestamp<=$ft)(&(!(lastLogonTimestamp=*))(whenCreated<=$gen)))" }
-                'Disabled' { '(userAccountControl:1.2.840.113556.1.4.803:=2)' }
-                'Created' { "(whenCreated>=$gen)" }
-                'Servers' { '(operatingSystem=*Server*)' }
-                'NoLaps' { '(!(ms-Mcs-AdmPwdExpirationTime=*))(!(msLAPS-PasswordExpirationTime=*))' }
-                default { '' }
-            }
-            if ($P.OnlyEnabled -and $P.Report -ne 'Disabled') { $extra += '(!(userAccountControl:1.2.840.113556.1.4.803:=2))' }
-            $q = @{
-                LDAPFilter = "(&(objectCategory=computer)$extra)"
-                Properties = @('OperatingSystem', 'OperatingSystemVersion', 'Enabled', 'LastLogonDate', 'PasswordLastSet', 'whenCreated', 'Description', 'IPv4Address')
-            }
-            if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
-            try { $computers = @(Get-ADComputer @q @ad) }
-            catch {
-                # Brak schematu LAPS (atrybut nieznany) - raport bez filtra jednego z atrybutów
-                if ($P.Report -eq 'NoLaps') { $q.LDAPFilter = $q.LDAPFilter -replace '\(!\(msLAPS-PasswordExpirationTime=\*\)\)', ''; $computers = @(Get-ADComputer @q @ad) } else { throw }
-            }
-            if ($P.Report -eq 'OsSummary') {
-                $computers | Group-Object { '{0}|{1}' -f $_.OperatingSystem, $_.OperatingSystemVersion } | Sort-Object Count -Descending | ForEach-Object {
-                    $parts = $_.Name -split '\|'
-                    [pscustomobject][ordered]@{ 'System' = $(if ($parts[0]) { $parts[0] } else { '(nieznany)' }); 'Wersja' = $parts[1]; 'Liczba' = $_.Count; 'Włączone' = @($_.Group | Where-Object { $_.Enabled }).Count }
-                }
-                return
-            }
-            $withKey = $null
-            if ($P.Report -eq 'NoBitLocker') {
-                $withKey = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-                $kq = @{ LDAPFilter = '(objectClass=msFVE-RecoveryInformation)' }
-                if ($P.SearchBase) { $kq.SearchBase = $P.SearchBase }
-                foreach ($k in @(Get-ADObject @kq @ad)) { [void]$withKey.Add(($k.DistinguishedName -replace '^CN=(?:\\.|[^,])+,', '')) }
-            }
-            $unsupported = [string]$P.UnsupportedOs
-            foreach ($c in $computers) {
-                $include = switch ($P.Report) {
-                    'Unsupported' { [string]$c.OperatingSystem -match $unsupported }
-                    'NoBitLocker' { -not $withKey.Contains($c.DistinguishedName) }
-                    default { $true }
-                }
-                if (-not $include) { continue }
-                $daysIdle = if ($c.LastLogonDate) { [int]($now - $c.LastLogonDate).TotalDays } else { $null }
-                $state = if (-not $c.Enabled) { 'Wyłączone' } elseif ($null -eq $daysIdle) { 'Nigdy nie logowane' } elseif ($daysIdle -gt $days) { "Nieaktywne ($daysIdle dni)" } else { 'Aktywne' }
-                [pscustomobject][ordered]@{
-                    'Komputer'              = $c.Name
-                    'Stan'                  = $state
-                    'System'                = $c.OperatingSystem
-                    'Wersja'                = $c.OperatingSystemVersion
-                    'Włączone'              = [bool]$c.Enabled
-                    'Ostatnie logowanie'    = $c.LastLogonDate
-                    'Dni bez logowania'     = $daysIdle
-                    'Hasło konta zmienione' = $c.PasswordLastSet
-                    'Utworzono'             = $c.whenCreated
-                    'IPv4'                  = $c.IPv4Address
-                    'Opis'                  = $c.Description
-                    'DN'                    = $c.DistinguishedName
-                    '__tone'                = $(if (-not $c.Enabled) { '' } elseif ($state -eq 'Aktywne') { 'ok' } else { 'warn' })
-                }
-            }
-        } -OnComplete {
+        Start-AdOperation -Module $m -Name $report.Name -Targets @('AD') -Parameters $params -ScriptBlock $script:ComputerReportScript -OnComplete {
             param($m)
             $count = $m.Table.Rows.Count
             Set-StatTile -Module $m -Key 'count' -Value ([string]$count)
@@ -18756,6 +18968,24 @@ $script:NtfsExpandScript = {
     }
 }
 
+function Add-NtfsScanResult {
+    # Rekordy skanu (acl / sid / skip / stat) jednego zadania w danych skanu; błąd zadania trafia do $Scan.Errors
+    param([hashtable]$Scan, $Result)
+    if (-not $Result.Ok) { [void]$Scan.Errors.Add(('{0}: {1}' -f $Result.Target, ((@($Result.Errors)) -join ' '))); return }
+    foreach ($d in @($Result.Data)) {
+        if ($null -eq $d) { continue }
+        switch ([string](Get-ObjectValue $d '__rec')) {
+            'acl' { [void]$Scan.Acl.Add($d) }
+            'sid' { if ($d.Resolved -or -not $Scan.Names.ContainsKey([string]$d.Sid)) { $Scan.Names[[string]$d.Sid] = [string]$d.Name } }
+            'skip' {
+                [void]$Scan.Skipped.Add($d)
+                if ([string]$d.Kind -ne 'link') { Write-Log ('Pominięto (brak dostępu): {0} – {1}' -f $d.Path, $d.Reason) 'WARN' }
+            }
+            'stat' { $Scan.Items += [int]$d.Items }
+        }
+    }
+}
+
 function Start-NtfsScan {
     <#
         Skan drzewa w trybie $Params.Mode. Na serwerze (-Computer) jedno zadanie; lokalnie/UNC folder główny i każdy
@@ -18773,23 +19003,7 @@ function Start-NtfsScan {
     if (-not $base.ContainsKey('Privileged')) { $base.Privileged = [bool]($m['Privileged'] -and (Test-Checked $m.Privileged)) }
     $base.Core = Get-NtfsToolCore $script:NtfsAclScanBody
     $m.Data.NtfsScan = @{ Root = $Path; Computer = $Computer; Acl = New-Object System.Collections.ArrayList; Names = @{}; Skipped = New-Object System.Collections.ArrayList; Items = 0; Errors = New-Object System.Collections.ArrayList; OnDone = $OnDone }
-    $onResult = {
-        param($m, $r)
-        $scan = $m.Data.NtfsScan
-        if (-not $r.Ok) { [void]$scan.Errors.Add(('{0}: {1}' -f $r.Target, ((@($r.Errors)) -join ' '))); return }
-        foreach ($d in @($r.Data)) {
-            if ($null -eq $d) { continue }
-            switch ([string](Get-ObjectValue $d '__rec')) {
-                'acl' { [void]$scan.Acl.Add($d) }
-                'sid' { if ($d.Resolved -or -not $scan.Names.ContainsKey([string]$d.Sid)) { $scan.Names[[string]$d.Sid] = [string]$d.Name } }
-                'skip' {
-                    [void]$scan.Skipped.Add($d)
-                    if ([string]$d.Kind -ne 'link') { Write-Log ('Pominięto (brak dostępu): {0} – {1}' -f $d.Path, $d.Reason) 'WARN' }
-                }
-                'stat' { $scan.Items += [int]$d.Items }
-            }
-        }
-    }
+    $onResult = { param($m, $r) Add-NtfsScanResult -Scan $m.Data.NtfsScan -Result $r }
     $onComplete = {
         param($m)
         $scan = $m.Data.NtfsScan
@@ -19722,6 +19936,44 @@ function Get-NtfsRiskFindings {
     return $out.ToArray()
 }
 
+function Get-NtfsDomainSids([object[]]$Acl) {
+    # SID-y domenowe (wpisy i właściciele) ze skanu - do sprawdzenia rodzaju konta w AD
+    $sids = @{}
+    foreach ($rec in $Acl) {
+        $sd = New-NtfsAclFromSddl ([string]$rec.Sddl)
+        foreach ($r in (Get-NtfsRules $sd)) { if ($r.Sid -match '^S-1-5-21-') { $sids[$r.Sid] = $true } }
+        try { $o = $sd.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if ($o -match '^S-1-5-21-') { $sids[$o] = $true } } catch { }
+    }
+    return $sids
+}
+
+# Rodzaj obiektu AD (user / group / computer) i nazwa dla listy SID-ów ($P.Sids, zapytania po 40)
+$script:NtfsSidClassScript = {
+    $list = @($P.Sids)
+    for ($i = 0; $i -lt $list.Count; $i += 40) {
+        $chunk = @($list[$i..([Math]::Min($i + 39, $list.Count - 1))])
+        $filter = '(|' + ((@($chunk | ForEach-Object { "(objectSid=$_)" })) -join '') + ')'
+        foreach ($o in @(Get-ADObject -LDAPFilter $filter -Properties objectSid, sAMAccountName @ad)) { [pscustomobject]@{ Sid = [string]$o.objectSid; Class = [string]$o.ObjectClass; Name = [string]$o.sAMAccountName } }
+    }
+}
+
+function Add-NtfsSidClassResult {
+    param([hashtable]$Scan, [hashtable]$Classes, $Result)
+    if (-not $Result.Ok) { Write-Log ('Rodzajów kont nie sprawdzono w AD: ' + ((@($Result.Errors)) -join ' ')) 'WARN'; return }
+    foreach ($d in @($Result.Data)) {
+        $Classes[[string]$d.Sid] = [string]$d.Class
+        if (-not $Scan.Names.ContainsKey([string]$d.Sid) -or [string]$Scan.Names[[string]$d.Sid] -eq [string]$d.Sid) { $Scan.Names[[string]$d.Sid] = [string]$d.Name }
+    }
+}
+
+function Get-NtfsRiskRows {
+    # Ryzyka posortowane: wysokie, średnie, niskie (w obrębie ścieżki)
+    param([hashtable]$Scan, [hashtable]$Classes, [int]$FullLimit = 3)
+    $rows = @(Get-NtfsRiskFindings -Acl @($Scan.Acl) -Names $Scan.Names -Classes $Classes -FullLimit $FullLimit)
+    $order = @{ 'Wysokie' = 0; 'Średnie' = 1; 'Niskie' = 2 }
+    return @($rows | Sort-Object @{ Expression = { $order[$_.'Ryzyko'] } }, 'Ścieżka')
+}
+
 Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsRisks' -Title 'Raport ryzyk' -Icon 'E7BA' -Badge 'nowe' `
     -Description 'Ryzykowne uprawnienia w drzewie folderów: zapis dla Wszystkich / Użytkowników domeny, pełna kontrola dla zwykłych kont, zbyt wiele kont z pełną kontrolą, wpisy dla użytkowników zamiast grup, usunięte konta, odmowy i użytkownicy jako właściciele – z oceną i zaleceniem.' -Build {
     param($m)
@@ -19740,20 +19992,13 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsRisk
         Start-NtfsScan -Module $m -Name 'Raport ryzyk' -Path $pf.Path -Computer $pf.Computer -Params @{ Mode = 'Explicit'; Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files) } -OnDone {
             param($m)
             $scan = $m.Data.NtfsScan
-            $sids = @{}
-            foreach ($rec in $scan.Acl) {
-                $acl = New-NtfsAclFromSddl ([string]$rec.Sddl)
-                foreach ($r in (Get-NtfsRules $acl)) { if ($r.Sid -match '^S-1-5-21-') { $sids[$r.Sid] = $true } }
-                try { $o = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if ($o -match '^S-1-5-21-') { $sids[$o] = $true } } catch { }
-            }
+            $sids = Get-NtfsDomainSids -Acl @($scan.Acl)
             $m.Data.RiskClasses = @{}
             $finish = {
                 param($m)
                 $scan = $m.Data.NtfsScan
                 Reset-ResultTable -Module $m
-                $rows = @(Get-NtfsRiskFindings -Acl @($scan.Acl) -Names $scan.Names -Classes $m.Data.RiskClasses -FullLimit (Get-Num $m.FullLimit))
-                $order = @{ 'Wysokie' = 0; 'Średnie' = 1; 'Niskie' = 2 }
-                $rows = @($rows | Sort-Object @{ Expression = { $order[$_.'Ryzyko'] } }, 'Ścieżka')
+                $rows = @(Get-NtfsRiskRows -Scan $scan -Classes $m.Data.RiskClasses -FullLimit (Get-Num $m.FullLimit))
                 if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
                 foreach ($k in 'Wysokie', 'Średnie', 'Niskie') { Set-StatTile -Module $m -Key $k -Value ([string]@($rows | Where-Object { $_.'Ryzyko' -eq $k }).Count) -Tone $(if (@($rows | Where-Object { $_.'Ryzyko' -eq $k }).Count) { @{ 'Wysokie' = 'crit'; 'Średnie' = 'warn'; 'Niskie' = 'info' }[$k] } else { '' }) }
                 Set-StatTile -Module $m -Key 'checked' -Value ([string]$scan.Items)
@@ -19762,17 +20007,9 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsRisk
             }
             $m.Data.RiskFinish = $finish
             if ($sids.Count -and (Get-Module -ListAvailable -Name ActiveDirectory)) {
-                Start-AdOperation -Module $m -Name 'Rodzaje kont (AD)' -Targets @('AD') -Output None -Parameters @{ Sids = @($sids.Keys) } -ScriptBlock {
-                    $list = @($P.Sids)
-                    for ($i = 0; $i -lt $list.Count; $i += 40) {
-                        $chunk = @($list[$i..([Math]::Min($i + 39, $list.Count - 1))])
-                        $filter = '(|' + ((@($chunk | ForEach-Object { "(objectSid=$_)" })) -join '') + ')'
-                        foreach ($o in @(Get-ADObject -LDAPFilter $filter -Properties objectSid, sAMAccountName @ad)) { [pscustomobject]@{ Sid = [string]$o.objectSid; Class = [string]$o.ObjectClass; Name = [string]$o.sAMAccountName } }
-                    }
-                } -OnResult {
+                Start-AdOperation -Module $m -Name 'Rodzaje kont (AD)' -Targets @('AD') -Output None -Parameters @{ Sids = @($sids.Keys) } -ScriptBlock $script:NtfsSidClassScript -OnResult {
                     param($m, $r)
-                    if (-not $r.Ok) { Write-Log ('Rodzajów kont nie sprawdzono w AD: ' + ((@($r.Errors)) -join ' ')) 'WARN'; return }
-                    foreach ($d in @($r.Data)) { $m.Data.RiskClasses[[string]$d.Sid] = [string]$d.Class; if (-not $m.Data.NtfsScan.Names.ContainsKey([string]$d.Sid) -or [string]$m.Data.NtfsScan.Names[[string]$d.Sid] -eq [string]$d.Sid) { $m.Data.NtfsScan.Names[[string]$d.Sid] = [string]$d.Name } }
+                    Add-NtfsSidClassResult -Scan $m.Data.NtfsScan -Classes $m.Data.RiskClasses -Result $r
                 } -OnComplete { param($m) & $m.Data.RiskFinish $m }
             }
             else { & $finish $m }
@@ -20780,11 +21017,33 @@ function Get-AdAuditScore([object[]]$Rows) {
     return @{ Score = $score; Grade = $grade; Tone = $tone }
 }
 
-function Show-AdAuditResults {
-    param([hashtable]$Module)
-    $m = $Module
-    $a = $m.Data.Audit
-    Reset-ResultTable -Module $m
+function New-AdAuditData([hashtable]$Params) {
+    return @{ Checks = [ordered]@{}; Objects = @{}; Errors = New-Object System.Collections.ArrayList; Params = $Params; At = (Get-Date); Domain = ''; Score = $null }
+}
+
+function Add-AdAuditResult {
+    # Wynik jednej grupy kontroli (rekordy domain / check / obj) w danych audytu
+    param([hashtable]$Audit, $Result)
+    $a = $Audit
+    if (-not $Result.Ok) { [void]$a.Errors.Add(@{ Category = [string]$Result.Target; Message = ((@($Result.Errors)) -join ' ') }); return }
+    foreach ($d in @($Result.Data)) {
+        if ($null -eq $d) { continue }
+        switch ([string](Get-ObjectValue $d '__rec')) {
+            'domain' { $a.Domain = [string]$d.Name }
+            'check' { $a.Checks[[string]$d.Key] = $d }
+            'obj' {
+                $k = [string]$d.'__check'
+                if (-not $a.Objects.ContainsKey($k)) { $a.Objects[$k] = New-Object System.Collections.ArrayList }
+                [void]$a.Objects[$k].Add(([pscustomobject][ordered]@{ 'Nazwa' = $d.'Nazwa'; 'Login' = $d.'Login'; 'Typ' = $d.'Typ'; 'Włączone' = $d.'Włączone'; 'Szczegóły' = $d.'Szczegóły'; 'DN' = $d.'DN' }))
+            }
+        }
+    }
+}
+
+function Get-AdAuditRows {
+    # Zestawienie kontroli (z grupami, których nie sprawdzono) posortowane od najwyższego ryzyka; ustawia $Audit.Score
+    param([hashtable]$Audit)
+    $a = $Audit
     $catOrder = @{}
     for ($i = 0; $i -lt $script:AdAuditCategories.Count; $i++) { $catOrder[$script:AdAuditCategories[$i]] = $i }
     $keyOrder = @{}
@@ -20811,9 +21070,18 @@ function Show-AdAuditResults {
         $rows = @($rows) + [pscustomobject][ordered]@{ 'Ocena' = 'Błąd'; 'Kategoria' = $err.Category; 'Kontrola' = '(cała grupa kontroli)'; 'Wynik' = 'Nie sprawdzono: ' + $err.Message; 'Obiekty' = 0; 'Przykłady' = ''; 'Zalecenie' = 'Sprawdź połączenie z kontrolerem domeny i uprawnienia konta.'; '__key' = ''; '__tone' = 'crit'; '__sort' = ('{0}{1:00}' -f 3, $catOrder[$err.Category]) }
     }
     $rows = @($rows | Sort-Object '__sort')
+    $a.Score = Get-AdAuditScore $rows
+    return $rows
+}
+
+function Show-AdAuditResults {
+    param([hashtable]$Module)
+    $m = $Module
+    $a = $m.Data.Audit
+    Reset-ResultTable -Module $m
+    $rows = @(Get-AdAuditRows -Audit $a)
     if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
-    $sc = Get-AdAuditScore $rows
-    $a.Score = $sc
+    $sc = $a.Score
     Set-StatTile -Module $m -Key 'score' -Value ('{0}/100' -f $sc.Score) -Tone $sc.Tone
     foreach ($k in 'Wysokie', 'Średnie', 'Niskie') {
         $n = @($rows | Where-Object { $_.'Ocena' -eq $k }).Count
@@ -20825,54 +21093,62 @@ function Show-AdAuditResults {
     if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
 }
 
-function Get-AdAuditRowObjects([hashtable]$Module, $Rows) {
+function Get-AdAuditObjects([hashtable]$Audit, $Rows) {
+    # Obiekty wskazane przez wybrane kontrole (wiersze zestawienia z kolumną __key)
     $out = New-Object System.Collections.ArrayList
     foreach ($r in @($Rows)) {
         $key = [string](Get-ObjectValue $r '__key')
-        if ($key -and $Module.Data.Audit.Objects.ContainsKey($key)) { foreach ($o in $Module.Data.Audit.Objects[$key]) { [void]$out.Add($o) } }
+        if ($key -and $Audit.Objects.ContainsKey($key)) { foreach ($o in $Audit.Objects[$key]) { [void]$out.Add($o) } }
     }
     return $out.ToArray()
 }
 
-function Save-AdAuditReport {
-    # Raport HTML audytu: ocena, zestawienie kontroli i karta każdej niespełnionej kontroli z listą obiektów
-    param([hashtable]$Module, [string]$Path)
-    $a = $Module.Data.Audit
-    $rows = @(Get-ResultRowsAll -Module $Module)
+function Get-AdAuditRowObjects([hashtable]$Module, $Rows) {
+    return @(Get-AdAuditObjects -Audit $Module.Data.Audit -Rows $Rows)
+}
+
+function Get-AdAuditReportHtml {
+    # Raport HTML audytu: ocena, zestawienie kontroli i karta każdej niespełnionej kontroli z listą obiektów.
+    # -Extra: dodatkowy fragment HTML pod kafelkami (raporty cykliczne: zmiany od poprzedniego uruchomienia)
+    param([hashtable]$Audit, [object[]]$CheckRows, [string]$Extra = '', [string]$ReportTitle = '')
+    $a = $Audit
+    $rows = @($CheckRows)
     $enc = { param($t) ConvertTo-HtmlText $t }
     $sc = $a.Score
     $sb = New-Object System.Text.StringBuilder
     $meta = 'Domain Ops {0} • {1:yyyy-MM-dd HH:mm} • {2}\{3} • domena {4} • progi: nieaktywność {5} dni, hasło administratora {6} dni, krbtgt {7} dni, konta uprzywilejowane {8}' -f $script:AppVersion, $a.At, $env:USERDOMAIN, $env:USERNAME, $a.Domain, $a.Params.InactiveDays, $a.Params.AdminPwdDays, $a.Params.KrbtgtDays, $a.Params.AdminLimit
-    [void]$sb.Append((Get-ReportHead -Title ('Audyt bezpieczeństwa Active Directory – ' + $a.Domain) -Meta $meta))
+    if (-not $ReportTitle) { $ReportTitle = 'Audyt bezpieczeństwa Active Directory – ' + $a.Domain }
+    [void]$sb.Append((Get-ReportHead -Title $ReportTitle -Meta $meta))
     [void]$sb.Append('<div class="tiles"><div class="tile ').Append($sc.Tone).Append('"><b>').Append($sc.Score).Append('/100</b><span>Ocena: ').Append((& $enc $sc.Grade)).Append('</span></div>')
     foreach ($k in 'Wysokie', 'Średnie', 'Niskie', 'OK') {
-        $n = @($rows | Where-Object { [string]$_['Ocena'] -eq $k }).Count
+        $n = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Ocena') -eq $k }).Count
         [void]$sb.Append('<div class="tile ').Append($(if ($k -eq 'OK') { 'ok' } else { $script:AdAuditSeverity[$k].Tone })).Append('"><b>').Append($n).Append('</b><span>').Append($(if ($k -eq 'OK') { 'Kontrole bez uwag' } else { "Ryzyko $($k.ToLowerInvariant())" })).Append('</span></div>')
     }
     [void]$sb.Append('</div>')
+    [void]$sb.Append($Extra)
     [void]$sb.Append((Get-ReportBar -Mode 'cards' -Placeholder 'Szukaj (kontrola, konto, komputer…)' -Buttons @('expand', 'collapse', 'print')))
     [void]$sb.Append('<div class="box toc"><table class="dt" data-filters="no"><thead><tr><th>Ocena</th><th>Kategoria</th><th>Kontrola</th><th>Wynik</th><th>Obiekty</th></tr></thead><tbody>')
     $n = 0
     foreach ($r in $rows) {
         $n++
-        $tone = $script:AdAuditSeverity[[string]$r['Ocena']].Tone
-        $title = & $enc ([string]$r['Kontrola'])
-        if ([string]$r['Ocena'] -ne 'OK') { $title = '<a href="#c' + $n + '">' + $title + '</a>' }
-        [void]$sb.Append('<tr><td><span class="pill ').Append($(if ($tone) { $tone } else { 'mute' })).Append('">').Append((& $enc ([string]$r['Ocena']))).Append('</span></td><td>').Append((& $enc ([string]$r['Kategoria']))).Append('</td><td>').Append($title)
-        [void]$sb.Append('</td><td>').Append((& $enc ([string]$r['Wynik']))).Append('</td><td>').Append([string]$r['Obiekty']).Append('</td></tr>')
+        $tone = $script:AdAuditSeverity[[string](Get-ObjectValue $r 'Ocena')].Tone
+        $title = & $enc ([string](Get-ObjectValue $r 'Kontrola'))
+        if ([string](Get-ObjectValue $r 'Ocena') -ne 'OK') { $title = '<a href="#c' + $n + '">' + $title + '</a>' }
+        [void]$sb.Append('<tr><td><span class="pill ').Append($(if ($tone) { $tone } else { 'mute' })).Append('">').Append((& $enc ([string](Get-ObjectValue $r 'Ocena')))).Append('</span></td><td>').Append((& $enc ([string](Get-ObjectValue $r 'Kategoria')))).Append('</td><td>').Append($title)
+        [void]$sb.Append('</td><td>').Append((& $enc ([string](Get-ObjectValue $r 'Wynik')))).Append('</td><td>').Append([string](Get-ObjectValue $r 'Obiekty')).Append('</td></tr>')
     }
     [void]$sb.Append('</tbody></table></div>')
     $n = 0
     foreach ($r in $rows) {
         $n++
-        if ([string]$r['Ocena'] -eq 'OK') { continue }
-        $tone = $script:AdAuditSeverity[[string]$r['Ocena']].Tone
-        [void]$sb.Append('<section class="card" id="c').Append($n).Append('"><div class="head"><div><h2>').Append((& $enc ([string]$r['Kontrola']))).Append('</h2><div class="sub">').Append((& $enc ([string]$r['Kategoria']))).Append('</div></div>')
-        [void]$sb.Append('<div style="text-align:right"><span class="pill ').Append($(if ($tone) { $tone } else { 'mute' })).Append('">').Append((& $enc ([string]$r['Ocena']))).Append('</span><div class="cacts"><button data-act="copy-card" title="Kopiuj kartę jako tekst">⧉ Kopiuj</button><button data-act="open-card" title="Otwórz kartę w osobnym oknie">↗ Okno</button></div><div class="top"><a href="#">↑ do góry</a></div></div></div>')
-        [void]$sb.Append('<div class="grid"><div class="sec"><h3>Wynik</h3><dl><dt>Wynik</dt><dd>').Append((& $enc ([string]$r['Wynik']))).Append('</dd><dt>Obiekty</dt><dd>').Append([string]$r['Obiekty']).Append('</dd></dl></div>')
-        if ([string]$r['Zalecenie']) { [void]$sb.Append('<div class="sec"><h3>Zalecenie</h3><div>').Append((& $enc ([string]$r['Zalecenie']))).Append('</div></div>') }
+        if ([string](Get-ObjectValue $r 'Ocena') -eq 'OK') { continue }
+        $tone = $script:AdAuditSeverity[[string](Get-ObjectValue $r 'Ocena')].Tone
+        [void]$sb.Append('<section class="card" id="c').Append($n).Append('"><div class="head"><div><h2>').Append((& $enc ([string](Get-ObjectValue $r 'Kontrola')))).Append('</h2><div class="sub">').Append((& $enc ([string](Get-ObjectValue $r 'Kategoria')))).Append('</div></div>')
+        [void]$sb.Append('<div style="text-align:right"><span class="pill ').Append($(if ($tone) { $tone } else { 'mute' })).Append('">').Append((& $enc ([string](Get-ObjectValue $r 'Ocena')))).Append('</span><div class="cacts"><button data-act="copy-card" title="Kopiuj kartę jako tekst">⧉ Kopiuj</button><button data-act="open-card" title="Otwórz kartę w osobnym oknie">↗ Okno</button></div><div class="top"><a href="#">↑ do góry</a></div></div></div>')
+        [void]$sb.Append('<div class="grid"><div class="sec"><h3>Wynik</h3><dl><dt>Wynik</dt><dd>').Append((& $enc ([string](Get-ObjectValue $r 'Wynik')))).Append('</dd><dt>Obiekty</dt><dd>').Append([string](Get-ObjectValue $r 'Obiekty')).Append('</dd></dl></div>')
+        if ([string](Get-ObjectValue $r 'Zalecenie')) { [void]$sb.Append('<div class="sec"><h3>Zalecenie</h3><div>').Append((& $enc ([string](Get-ObjectValue $r 'Zalecenie')))).Append('</div></div>') }
         [void]$sb.Append('</div>')
-        $objs = @(Get-AdAuditRowObjects -Module $Module -Rows @($r))
+        $objs = @(Get-AdAuditObjects -Audit $a -Rows @($r))
         if ($objs.Count) {
             $shown = @($objs | Select-Object -First 1000)
             [void]$sb.Append($(if ($shown.Count -le 50) { '<details open>' } else { '<details>' })).Append('<summary>Obiekty<span class="n">').Append($objs.Count).Append('</span></summary>')
@@ -20889,7 +21165,14 @@ function Save-AdAuditReport {
         [void]$sb.Append('</section>')
     }
     [void]$sb.Append((Get-ReportTail))
-    [System.IO.File]::WriteAllText($Path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+    return $sb.ToString()
+}
+
+function Save-AdAuditReport {
+    param([hashtable]$Module, [string]$Path)
+    $a = $Module.Data.Audit
+    $html = Get-AdAuditReportHtml -Audit $a -CheckRows @(Get-AdAuditRows -Audit $a)
+    [System.IO.File]::WriteAllText($Path, $html, (New-Object System.Text.UTF8Encoding($true)))
     Write-Log "Zapisano raport audytu AD: $Path" 'OK' -Module $Module.Title
 }
 
@@ -20912,23 +21195,10 @@ Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdAudit' -
         $params = @{ InactiveDays = (Get-Num $m.InactiveDays); AdminPwdDays = (Get-Num $m.AdminPwdDays); KrbtgtDays = (Get-Num $m.KrbtgtDays); AdminLimit = (Get-Num $m.AdminLimit); UnsupportedOs = $script:UnsupportedOsPattern }
         foreach ($k in 'InactiveDays', 'AdminPwdDays', 'KrbtgtDays', 'AdminLimit') { Set-ModuleSetting -Module $m -Name $k -Value $params[$k] }
         Reset-ResultTable -Module $m
-        $m.Data.Audit = @{ Checks = [ordered]@{}; Objects = @{}; Errors = New-Object System.Collections.ArrayList; Params = $params; At = (Get-Date); Domain = ''; Score = $null }
+        $m.Data.Audit = New-AdAuditData $params
         Start-AdOperation -Module $m -Name 'Audyt bezpieczeństwa AD' -Targets $script:AdAuditCategories -Output None -Parameters $params -ScriptBlock $script:AdAuditScript -OnResult {
             param($m, $r)
-            $a = $m.Data.Audit
-            if (-not $r.Ok) { [void]$a.Errors.Add(@{ Category = [string]$r.Target; Message = ((@($r.Errors)) -join ' ') }); return }
-            foreach ($d in @($r.Data)) {
-                if ($null -eq $d) { continue }
-                switch ([string](Get-ObjectValue $d '__rec')) {
-                    'domain' { $a.Domain = [string]$d.Name }
-                    'check' { $a.Checks[[string]$d.Key] = $d }
-                    'obj' {
-                        $k = [string]$d.'__check'
-                        if (-not $a.Objects.ContainsKey($k)) { $a.Objects[$k] = New-Object System.Collections.ArrayList }
-                        [void]$a.Objects[$k].Add(([pscustomobject][ordered]@{ 'Nazwa' = $d.'Nazwa'; 'Login' = $d.'Login'; 'Typ' = $d.'Typ'; 'Włączone' = $d.'Włączone'; 'Szczegóły' = $d.'Szczegóły'; 'DN' = $d.'DN' }))
-                    }
-                }
-            }
+            Add-AdAuditResult -Audit $m.Data.Audit -Result $r
         } -OnComplete {
             param($m)
             if (-not $m.Data.Audit.Domain) { $m.Data.Audit.Domain = [string]$env:USERDNSDOMAIN }
@@ -21158,6 +21428,34 @@ function Get-AdDelegationRows {
     return @($rows | Sort-Object @{ Expression = { $order[$_.'Ocena'] } }, 'DN', 'Tożsamość')
 }
 
+function New-AdDelegationData([string]$DomainSid) {
+    return @{ Aces = New-Object System.Collections.ArrayList; Objects = New-Object System.Collections.ArrayList; Errors = New-Object System.Collections.ArrayList; Sids = @{}; Guids = @{}; DomainSid = $DomainSid }
+}
+
+function Add-AdDelegationResult {
+    # Rekordy z $script:AdDelegationScript (guids / ace / obj / sid / err) w danych raportu
+    param([hashtable]$Deleg, $Result)
+    $d = $Deleg
+    if (-not $Result.Ok) { [void]$d.Errors.Add((@($Result.Errors)) -join ' '); return }
+    foreach ($x in @($Result.Data)) {
+        switch ([string](Get-ObjectValue $x '__rec')) {
+            'guids' { foreach ($k in $x.Map.Keys) { $d.Guids[[string]$k] = [string]$x.Map[$k] } }
+            'ace' { [void]$d.Aces.Add($x) }
+            'obj' { [void]$d.Objects.Add($x) }
+            'sid' { $d.Sids[[string]$x.Sid] = @{ Name = [string]$x.Name; Class = [string]$x.Class; Resolved = [bool]$x.Resolved } }
+            'err' { [void]$d.Errors.Add(('{0}: {1}' -f $x.Dn, $x.Error)) }
+        }
+    }
+}
+
+function Get-AdDelegationResultRows([hashtable]$Deleg) {
+    # Nazwy ze schematu (pobrane z domeny) uzupełniają wbudowany słownik GUID
+    $guids = @{}
+    foreach ($k in $script:AdGuidNames.Keys) { $guids[$k] = $script:AdGuidNames[$k] }
+    foreach ($k in $Deleg.Guids.Keys) { if (-not $script:AdGuidNames.ContainsKey($k)) { $guids[$k] = $Deleg.Guids[$k] } }
+    return @(Get-AdDelegationRows -Aces @($Deleg.Aces) -Objects @($Deleg.Objects) -Guids $guids -Sids $Deleg.Sids -DomainSid $Deleg.DomainSid)
+}
+
 Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdDelegation' -Title 'Delegacje uprawnień w AD' -Icon 'E8D7' -Badge 'nowe' `
     -Description 'Kto ma jakie uprawnienia do jednostek organizacyjnych, katalogu głównego domeny i AdminSDHolder: reset haseł, tworzenie kont, zapis członkostwa, pełna kontrola, prawa replikacji (DCSync). Wpisy opisane po polsku (nazwy klas, atrybutów i praw ze schematu) z oceną ryzyka; wpisy domyślne ukryte. Tylko odczyt.' -Build {
     param($m)
@@ -21170,30 +21468,16 @@ Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdDelegati
         param($m)
         if (-not (Test-AdAvailable)) { return }
         Reset-ResultTable -Module $m
-        $m.Data.Deleg = @{ Aces = New-Object System.Collections.ArrayList; Objects = New-Object System.Collections.ArrayList; Errors = New-Object System.Collections.ArrayList; Sids = @{}; Guids = @{}; DomainSid = '' }
         $dsid = Invoke-WithWaitCursor { Import-AdModule; $ad = Get-AdSplat; [string](Get-ADDomain @ad).DomainSID.Value }
-        $m.Data.Deleg.DomainSid = $dsid
+        $m.Data.Deleg = New-AdDelegationData $dsid
         $params = @{ Containers = (Test-Checked $m.Containers); IncludeRead = (Test-Checked $m.IncludeRead); HideStandard = (Test-Checked $m.HideStandard); Std = (Get-AdStandardTrustees $dsid) }
         Start-AdOperation -Module $m -Name 'Delegacje uprawnień w AD' -Targets @('AD') -Output None -Parameters $params -ScriptBlock $script:AdDelegationScript -OnResult {
             param($m, $r)
-            $d = $m.Data.Deleg
-            if (-not $r.Ok) { [void]$d.Errors.Add((@($r.Errors)) -join ' '); return }
-            foreach ($x in @($r.Data)) {
-                switch ([string](Get-ObjectValue $x '__rec')) {
-                    'guids' { foreach ($k in $x.Map.Keys) { $d.Guids[[string]$k] = [string]$x.Map[$k] } }
-                    'ace' { [void]$d.Aces.Add($x) }
-                    'obj' { [void]$d.Objects.Add($x) }
-                    'sid' { $d.Sids[[string]$x.Sid] = @{ Name = [string]$x.Name; Class = [string]$x.Class; Resolved = [bool]$x.Resolved } }
-                    'err' { [void]$d.Errors.Add(('{0}: {1}' -f $x.Dn, $x.Error)) }
-                }
-            }
+            Add-AdDelegationResult -Deleg $m.Data.Deleg -Result $r
         } -OnComplete {
             param($m)
             $d = $m.Data.Deleg
-            $guids = @{}
-            foreach ($k in $script:AdGuidNames.Keys) { $guids[$k] = $script:AdGuidNames[$k] }
-            foreach ($k in $d.Guids.Keys) { if (-not $script:AdGuidNames.ContainsKey($k)) { $guids[$k] = $d.Guids[$k] } }
-            $rows = @(Get-AdDelegationRows -Aces @($d.Aces) -Objects @($d.Objects) -Guids $guids -Sids $d.Sids -DomainSid $d.DomainSid)
+            $rows = @(Get-AdDelegationResultRows -Deleg $d)
             if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
             foreach ($k in 'Wysokie', 'Średnie', 'Niskie') { $n = @($rows | Where-Object { $_.'Ocena' -eq $k }).Count; Set-StatTile -Module $m -Key $k -Value ([string]$n) -Tone $(if ($n) { @{ 'Wysokie' = 'crit'; 'Średnie' = 'warn'; 'Niskie' = 'info' }[$k] } else { '' }) }
             Set-StatTile -Module $m -Key 'objects' -Value ([string]$d.Objects.Count)
@@ -21384,6 +21668,51 @@ $script:DcHealthScript = {
     try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop; Out-Row 'Kontrolery' 'Info' ('uruchomiony {0:N0} dni temu' -f ((Get-Date) - $os.LastBootUpTime).TotalDays) ([string]$os.Caption) } catch { }
 }
 
+function New-DomainHealthData {
+    param([hashtable]$Params, [bool]$Remote, [int]$EventHours)
+    return @{ Params = $Params; Dcs = New-Object System.Collections.ArrayList; Rows = New-Object System.Collections.ArrayList; Times = New-Object System.Collections.ArrayList; Backups = New-Object System.Collections.ArrayList; Pdc = ''; Domain = ''; Remote = $Remote; EventHours = $EventHours }
+}
+
+function Add-DomainHealthAdResult {
+    # Wynik części AD ($script:DomainHealthScript): domena, kontrolery, kopie zapasowe i wiersze ocen
+    param([hashtable]$Health, $Result)
+    $h = $Health
+    if (-not $Result.Ok) { [void]$h.Rows.Add([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Domena'; 'Obiekt' = 'AD'; 'Wynik' = 'nie odczytano danych domeny'; 'Szczegóły' = ((@($Result.Errors)) -join ' ') }); return }
+    foreach ($d in @($Result.Data)) {
+        switch ([string](Get-ObjectValue $d '__rec')) {
+            'domain' { $h.Domain = [string]$d.Name; $h.Pdc = [string]$d.Pdc }
+            'dc' { [void]$h.Dcs.Add($d) }
+            'backup' { [void]$h.Backups.Add($d) }
+            'row' { [void]$h.Rows.Add($d) }
+        }
+    }
+}
+
+function Get-DcHealthResultRows {
+    # Wynik jednego kontrolera ($script:DcHealthScript): wiersze ocen; pomiar czasu trafia do $Health.Times
+    param([hashtable]$Health, $Result)
+    if (-not $Result.Ok) { return @([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Kontrolery'; 'Obiekt' = (([string]$Result.Target) -split '\.')[0]; 'Wynik' = 'brak połączenia WinRM'; 'Szczegóły' = ((@($Result.Errors)) -join ' ') }) }
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($d in @($Result.Data)) {
+        switch ([string](Get-ObjectValue $d '__rec')) {
+            'row' { [void]$rows.Add($d) }
+            'time' { [void]$Health.Times.Add([pscustomobject]@{ Computer = [string]$d.Computer; Utc = [datetime]$d.Utc; Received = [datetime]::UtcNow; Source = [string]$d.Source }) }
+        }
+    }
+    return $rows.ToArray()
+}
+
+function Get-DomainHealthSortedRows {
+    # Kolejność: błędy, ostrzeżenia, informacje, OK - w obrębie obszarów (wiersze tabeli albo obiekty)
+    param([object[]]$Rows)
+    $all = @(foreach ($r in $Rows) {
+            $sev = $script:DomainHealthSeverity[[string](Get-ObjectValue $r 'Ocena')]
+            [pscustomobject][ordered]@{ 'Ocena' = (Get-ObjectValue $r 'Ocena'); 'Obszar' = (Get-ObjectValue $r 'Obszar'); 'Obiekt' = (Get-ObjectValue $r 'Obiekt'); 'Wynik' = (Get-ObjectValue $r 'Wynik'); 'Szczegóły' = (Get-ObjectValue $r 'Szczegóły'); '__tone' = $(if ($sev) { $sev.Tone } else { '' }) }
+        })
+    $areas = @{ 'Kontrolery' = 0; 'Łączność' = 1; 'Replikacja' = 2; 'Role FSMO' = 3; 'Czas' = 4; 'SYSVOL' = 5; 'Usługi' = 6; 'DNS' = 7; 'Kopia zapasowa' = 8; 'Dyski' = 9; 'Zdarzenia' = 10; 'Domena' = 11 }
+    return @($all | Sort-Object @{ Expression = { $r = $script:DomainHealthSeverity[[string]$_.'Ocena']; if ($r) { $r.Rank } else { 9 } } }, @{ Expression = { $areas[[string]$_.'Obszar'] } }, 'Obiekt')
+}
+
 function Add-DomainHealthRows {
     param([hashtable]$Module, [object[]]$Rows)
     $out = @(foreach ($r in $Rows) {
@@ -21452,20 +21781,11 @@ Register-Module -Workspace 'Domain' -Category 'Stan domeny' -Key 'DomainHealth' 
         param($m)
         if (-not (Test-AdAvailable)) { return }
         $params = @{ Ports = (Test-Checked $m.Ports); ReplWarnHours = (Get-Num $m.ReplWarn); ReplCritHours = (Get-Num $m.ReplCrit); BackupWarnDays = (Get-Num $m.BackupWarn); BackupCritDays = (Get-Num $m.BackupCrit); UnsupportedOs = $script:UnsupportedOsPattern }
-        $m.Data.Health = @{ Params = $params; Dcs = New-Object System.Collections.ArrayList; Rows = New-Object System.Collections.ArrayList; Times = New-Object System.Collections.ArrayList; Backups = New-Object System.Collections.ArrayList; Pdc = ''; Domain = ''; Remote = (Test-Checked $m.Remote); EventHours = (Get-Num $m.EventHours) }
+        $m.Data.Health = New-DomainHealthData -Params $params -Remote (Test-Checked $m.Remote) -EventHours (Get-Num $m.EventHours)
         Reset-ResultTable -Module $m
         Start-AdOperation -Module $m -Name 'Stan domeny' -Targets @('AD') -Output None -Parameters $params -ScriptBlock $script:DomainHealthScript -OnResult {
             param($m, $r)
-            $h = $m.Data.Health
-            if (-not $r.Ok) { [void]$h.Rows.Add([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Domena'; 'Obiekt' = 'AD'; 'Wynik' = 'nie odczytano danych domeny'; 'Szczegóły' = ((@($r.Errors)) -join ' ') }); return }
-            foreach ($d in @($r.Data)) {
-                switch ([string](Get-ObjectValue $d '__rec')) {
-                    'domain' { $h.Domain = [string]$d.Name; $h.Pdc = [string]$d.Pdc }
-                    'dc' { [void]$h.Dcs.Add($d) }
-                    'backup' { [void]$h.Backups.Add($d) }
-                    'row' { [void]$h.Rows.Add($d) }
-                }
-            }
+            Add-DomainHealthAdResult -Health $m.Data.Health -Result $r
         } -OnComplete {
             param($m)
             $h = $m.Data.Health
@@ -21475,16 +21795,7 @@ Register-Module -Workspace 'Domain' -Category 'Stan domeny' -Key 'DomainHealth' 
             if (-not $h.Remote -or $hostsList.Count -eq 0) { & $m.Actions.Finish $m; return }
             Start-HostOperation -Module $m -Name 'Kontrolery domeny (WinRM)' -Targets $hostsList -Output None -Parameters @{ EventHours = $h.EventHours } -ScriptBlock $script:DcHealthScript -OnResult {
                 param($m, $r)
-                $h = $m.Data.Health
-                if (-not $r.Ok) { Add-DomainHealthRows -Module $m -Rows @([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Kontrolery'; 'Obiekt' = (([string]$r.Target) -split '\.')[0]; 'Wynik' = 'brak połączenia WinRM'; 'Szczegóły' = ((@($r.Errors)) -join ' ') }); return }
-                $rows = @()
-                foreach ($d in @($r.Data)) {
-                    switch ([string](Get-ObjectValue $d '__rec')) {
-                        'row' { $rows += $d }
-                        'time' { [void]$h.Times.Add([pscustomobject]@{ Computer = [string]$d.Computer; Utc = [datetime]$d.Utc; Received = [datetime]::UtcNow; Source = [string]$d.Source }) }
-                    }
-                }
-                Add-DomainHealthRows -Module $m -Rows $rows
+                Add-DomainHealthRows -Module $m -Rows @(Get-DcHealthResultRows -Health $m.Data.Health -Result $r)
             } -OnComplete { param($m) & $m.Actions.Finish $m }
         }
     }
@@ -21493,9 +21804,7 @@ Register-Module -Workspace 'Domain' -Category 'Stan domeny' -Key 'DomainHealth' 
         $h = $m.Data.Health
         Add-DomainHealthRows -Module $m -Rows @(Get-DomainTimeRows -Times @($h.Times) -Pdc $h.Pdc)
         # Kolejność: błędy, ostrzeżenia, informacje, OK - w obrębie obszarów
-        $all = @(Get-ResultRowsAll -Module $m | ForEach-Object { [pscustomobject][ordered]@{ 'Ocena' = $_['Ocena']; 'Obszar' = $_['Obszar']; 'Obiekt' = $_['Obiekt']; 'Wynik' = $_['Wynik']; 'Szczegóły' = $_['Szczegóły']; '__tone' = $_['__tone'] } })
-        $areas = @{ 'Kontrolery' = 0; 'Łączność' = 1; 'Replikacja' = 2; 'Role FSMO' = 3; 'Czas' = 4; 'SYSVOL' = 5; 'Usługi' = 6; 'DNS' = 7; 'Kopia zapasowa' = 8; 'Dyski' = 9; 'Zdarzenia' = 10; 'Domena' = 11 }
-        $sorted = @($all | Sort-Object @{ Expression = { $script:DomainHealthSeverity[[string]$_.'Ocena'].Rank } }, @{ Expression = { $areas[[string]$_.'Obszar'] } }, 'Obiekt')
+        $sorted = @(Get-DomainHealthSortedRows -Rows @(Get-ResultRowsAll -Module $m))
         Reset-ResultTable -Module $m
         if ($sorted.Count) { Add-ResultRows -Module $m -Objects $sorted -TargetColumn '' }
         Update-DomainHealthTiles -Module $m
@@ -21527,6 +21836,1772 @@ Register-Module -Workspace 'Domain' -Category 'Stan domeny' -Key 'DomainHealth' 
     Add-StatTile -Module $m -Key 'repl' -Label 'Błędy replikacji' -Icon 'E895' | Out-Null
     Add-StatTile -Module $m -Key 'backup' -Label 'Ostatnia kopia AD' -Icon 'E81C' | Out-Null
     $m.EmptyHint = 'Kliknij «Sprawdź» (F5). Kontrole po stronie kontrolerów wymagają WinRM i uprawnień administratora domeny; bez nich zostaje przegląd z AD (kontrolery, replikacja, FSMO, DNS, kopia zapasowa).'
+}
+#endregion
+
+#region Raporty cykliczne – rdzeń (rodzaje raportów, wykonanie bez okna, zmiany, HTML, poczta, Harmonogram zadań)
+# Definicja raportu to plik JSON w folderze zadań (domyślnie %APPDATA%\AD-ManagerDiamond\Reports). Zadanie Harmonogramu
+# uruchamia kopię programu z tego folderu z parametrem -RunReport <definicja.json>: program bez okna wykonuje te same
+# zapytania co moduły (Invoke-SyncOperation), zapisuje raport HTML (i CSV), porównuje wyniki z poprzednim uruchomieniem
+# (plik <id>.state.json), wysyła pocztę i kończy pracę z kodem 0 / 1 / 2. Dziennik przebiegów: Logs\<id>.log.
+# Własne rodzaje raportów: Register-ReportType w pliku z folderu AD-ManagerDiamond.Modules.
+
+$script:ReportTaskPath = '\Domain Ops\'
+$script:ReportTypes = [ordered]@{}
+$script:ReportMailModes = [ordered]@{ Never = 'Nie wysyłaj'; Always = 'Zawsze'; Findings = 'Gdy raport ma wyniki'; Changes = 'Gdy są zmiany od poprzedniego raportu' }
+$script:ReportRunAsModes = [ordered]@{
+    Password    = 'Wskazane konto – także po wylogowaniu (hasło zapisane w zadaniu)'
+    Interactive = 'Bieżący użytkownik – tylko gdy jest zalogowany'
+    System      = 'Konto SYSTEM (w domenie działa jako konto komputera)'
+    Gmsa        = 'Konto usługi zarządzanej (gMSA)'
+}
+$script:ReportFrequencies = [ordered]@{ Daily = 'Codziennie'; Weekly = 'Co tydzień'; Monthly = 'Co miesiąc'; Manual = 'Tylko ręcznie (bez zadania w Harmonogramie)' }
+$script:ReportWeekDays = [ordered]@{ Monday = 'pn'; Tuesday = 'wt'; Wednesday = 'śr'; Thursday = 'cz'; Friday = 'pt'; Saturday = 'so'; Sunday = 'nd' }
+$script:ReportPrivilegedGroups = @('Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators', 'Account Operators', 'Backup Operators',
+    'Server Operators', 'Print Operators', 'DnsAdmins', 'Group Policy Creator Owners', 'Key Admins', 'Enterprise Key Admins')
+
+function Register-ReportType {
+    <#
+        Rodzaj raportu cyklicznego.
+        -Options : pola formularza (jak w Show-FormDialog: Key, Label, Type = Text|Multi|Combo|Check|Ou|Number, Value = wartość
+                   domyślna, Items, Hint, Placeholder, Min, Max, Required)
+        -Run { param([hashtable]$O) } zwraca hashtablę:
+                   Title, Subtitle, Summary (krótki opis do tematu wiadomości), Rows (wiersze tabeli), Findings (wiersze liczone
+                   jako wyniki – domyślnie Rows), Tiles (@{ Label; Value; Tone }), PillColumns, Errors (problemy częściowe),
+                   Data (dowolne dane dla -Render). Wyjątek = raport nie powstał.
+        -KeyColumns / -KeyScript { param($row) } : klucz wiersza do porównania z poprzednim uruchomieniem
+        -Render { param($Result, [string]$Extra, [string]$Title) } : własny dokument HTML ($Extra - zmiany i problemy)
+        -MailMode : domyślny tryb wysyłki dla nowych definicji
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Title,
+        [string]$Description = '',
+        [string]$Icon = 'E9F9',
+        [object[]]$Options = @(),
+        [string[]]$KeyColumns = @(),
+        [scriptblock]$KeyScript,
+        [Parameter(Mandatory)][scriptblock]$Run,
+        [scriptblock]$Render,
+        [string]$MailMode = 'Findings',
+        [string]$Requires = 'AD'
+    )
+    $script:ReportTypes[$Key] = @{ Key = $Key; Title = $Title; Description = $Description; Icon = $Icon; Options = @($Options); KeyColumns = @($KeyColumns)
+        KeyScript = $KeyScript; Run = $Run; Render = $Render; MailMode = $MailMode; Requires = $Requires }
+}
+
+#region Pliki definicji i stanu
+function ConvertTo-PlainData {
+    # Wynik ConvertFrom-Json -> hashtable/tablice (pod StrictMode brakujące pola hashtabli są bezpieczne); daty jako tekst ISO
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $Value.PSObject.Properties) { $h[$p.Name] = ConvertTo-PlainData $p.Value }
+        return $h
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $h = @{}
+        foreach ($k in $Value.Keys) { $h[[string]$k] = ConvertTo-PlainData $Value[$k] }
+        return $h
+    }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [datetime]) { return $Value.ToString('s') }
+    if ($Value -is [System.Collections.IEnumerable]) { return , @(foreach ($x in $Value) { ConvertTo-PlainData $x }) }
+    return $Value
+}
+
+function Get-ReportJobsDir {
+    $d = [string]$script:Settings.ReportJobsDir
+    if (-not $d) { $d = Join-Path $script:App.DataDir 'Reports' }
+    return [Environment]::ExpandEnvironmentVariables($d)
+}
+
+function Get-ReportOutputDir([hashtable]$Job, [string]$JobsDir = '') {
+    $f = [string]$Job.Output.Folder
+    if ($f) { return [Environment]::ExpandEnvironmentVariables($f) }
+    if (-not $JobsDir) { $JobsDir = if ($Job['Path']) { Split-Path -Parent ([string]$Job.Path) } else { Get-ReportJobsDir } }
+    return (Join-Path (Join-Path $JobsDir 'Output') (Get-SafeFileName ([string]$Job.Name)))
+}
+
+function New-ReportJob {
+    # Nowa definicja z wartościami domyślnymi rodzaju raportu
+    param([Parameter(Mandatory)][string]$Type)
+    $t = $script:ReportTypes[$Type]
+    if (-not $t) { throw "Nieznany rodzaj raportu: $Type" }
+    $opts = @{}
+    foreach ($o in $t.Options) { $opts[[string]$o.Key] = $o['Value'] }
+    return @{
+        Version  = 1
+        Id       = [guid]::NewGuid().ToString('N').Substring(0, 10)
+        Name     = $t.Title
+        Type     = $Type
+        Options  = $opts
+        Server   = [string]$script:Settings.DomainController
+        Output   = @{ Folder = ''; Keep = 30; Latest = $true; Csv = $false }
+        Mail     = @{ Mode = $t.MailMode; To = ''; Cc = ''; From = ''; Server = ''; Port = 25; Ssl = $false; Auth = 'None'; User = ''; Password = ''; PasswordOwner = ''; Attach = $true; MaxRows = 50 }
+        Schedule = @{ Frequency = 'Weekly'; Time = '07:00'; Days = @('Monday'); DayOfMonth = '1' }
+        RunAs    = @{ Mode = 'Password'; Account = ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME); Highest = $true }
+        TaskName = ''
+        TaskSignature = ''
+        Created  = (Get-Date).ToString('s')
+        CreatedBy = ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME)
+        Modified = ''
+        Path     = ''
+    }
+}
+
+function ConvertTo-ReportJob {
+    # Definicja z pliku uzupełniona o brakujące pola (zgodność z wcześniejszymi wersjami) i sprawdzona
+    param($Data, [string]$Path = '')
+    $d = ConvertTo-PlainData $Data
+    if (-not ($d -is [hashtable]) -or -not [string]$d['Type']) { throw 'Plik nie jest definicją raportu cyklicznego Domain Ops.' }
+    $type = [string]$d.Type
+    if (-not $script:ReportTypes.Contains($type)) { throw "Nieznany rodzaj raportu «$type» (moduł własny nie został wczytany?)." }
+    $job = New-ReportJob -Type $type
+    foreach ($k in @($d.Keys)) {
+        if (@('Options', 'Output', 'Mail', 'Schedule', 'RunAs') -contains $k) {
+            if ($d[$k] -is [hashtable]) { foreach ($kk in $d[$k].Keys) { $job[$k][$kk] = $d[$k][$kk] } }
+        }
+        elseif ($k -ne 'Path') { $job[$k] = $d[$k] }
+    }
+    $job.Schedule.Days = @($job.Schedule.Days | ForEach-Object { [string]$_ } | Where-Object { $script:ReportWeekDays.Contains($_) })
+    $job.Path = $Path
+    if (-not [string]$job.Id) { throw 'Definicja raportu nie ma identyfikatora.' }
+    return $job
+}
+
+function Read-ReportJob([string]$Path) {
+    $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    return (ConvertTo-ReportJob -Data ($raw | ConvertFrom-Json) -Path $Path)
+}
+
+function Save-ReportJob {
+    param([Parameter(Mandatory)][hashtable]$Job, [string]$JobsDir = '')
+    if (-not $JobsDir) { $JobsDir = Get-ReportJobsDir }
+    if (-not (Test-Path -LiteralPath $JobsDir)) { New-Item -ItemType Directory -Path $JobsDir -Force | Out-Null }
+    $path = Join-Path $JobsDir ('{0}.json' -f $Job.Id)
+    $Job.Modified = (Get-Date).ToString('s')
+    $out = @{}
+    foreach ($k in $Job.Keys) { if ($k -ne 'Path') { $out[$k] = $Job[$k] } }
+    [System.IO.File]::WriteAllText($path, ($out | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+    $Job.Path = $path
+    return $path
+}
+
+function Get-ReportJobs([string]$JobsDir = '') {
+    # Wszystkie definicje z folderu zadań; pliki uszkodzone zwracane z polem Error
+    if (-not $JobsDir) { $JobsDir = Get-ReportJobsDir }
+    if (-not (Test-Path -LiteralPath $JobsDir)) { return @() }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($f in @(Get-ChildItem -LiteralPath $JobsDir -Filter '*.json' -File | Where-Object { $_.Name -notlike '*.state.json' } | Sort-Object Name)) {
+        try { [void]$out.Add((Read-ReportJob $f.FullName)) }
+        catch { [void]$out.Add(@{ Id = $f.BaseName; Name = $f.Name; Type = ''; Path = $f.FullName; Error = $_.Exception.Message }) }
+    }
+    return $out.ToArray()
+}
+
+function Get-ReportStatePath([hashtable]$Job) { return ([string]$Job.Path -replace '\.json$', '.state.json') }
+function Get-ReportItemsPath([hashtable]$Job) { return ([string]$Job.Path -replace '\.json$', '.items.txt') }
+
+function Read-ReportState {
+    # Stan ostatniego uruchomienia (podsumowanie, historia) i - bez -NoItems - elementy do porównania z pliku .items.txt
+    # (osobny plik tekstowy: tysiące elementów przekroczyłyby limit ConvertFrom-Json w Windows PowerShell 5.1)
+    param([hashtable]$Job, [switch]$NoItems)
+    $p = Get-ReportStatePath $Job
+    if (-not $p -or -not (Test-Path -LiteralPath $p)) { return $null }
+    $s = $null
+    try { $s = ConvertTo-PlainData ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8) | ConvertFrom-Json) }
+    catch { Write-Log ("Nie można odczytać stanu raportu {0}: {1}" -f $p, $_.Exception.Message) 'WARN'; return $null }
+    if (-not ($s -is [hashtable])) { return $null }
+    $ip = Get-ReportItemsPath $Job
+    if (-not $NoItems -and (Test-Path -LiteralPath $ip)) {
+        $s.Items = @(foreach ($line in [System.IO.File]::ReadAllLines($ip, [System.Text.Encoding]::UTF8)) {
+                if (-not $line) { continue }
+                $parts = $line.Split([char]9, 2)
+                @{ K = $parts[0]; L = $(if ($parts.Count -gt 1) { $parts[1] } else { '' }) }
+            })
+    }
+    return $s
+}
+
+function Save-ReportState([hashtable]$Job, [hashtable]$State) {
+    $copy = @{}
+    foreach ($k in $State.Keys) { if ($k -ne 'Items') { $copy[$k] = $State[$k] } }
+    if ($State.ContainsKey('Items') -and $null -ne $State['Items']) {
+        $lines = @(foreach ($i in @($State.Items)) { ([string]$i.K -replace '[\t\r\n]+', ' ') + [char]9 + ([string]$i.L -replace '[\t\r\n]+', ' ') })
+        [System.IO.File]::WriteAllLines((Get-ReportItemsPath $Job), [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    [System.IO.File]::WriteAllText((Get-ReportStatePath $Job), ($copy | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Protect-ReportSecret([System.Security.SecureString]$Secret) {
+    # DPAPI bieżącego użytkownika: odczyta tylko to samo konto na tym samym komputerze
+    return (ConvertFrom-SecureString -SecureString $Secret)
+}
+
+function Unprotect-ReportSecret([string]$Text) {
+    return (ConvertTo-SecureString -String $Text)
+}
+#endregion
+
+#region Opisy (lista definicji, temat wiadomości)
+function Get-ReportScheduleText([hashtable]$Schedule) {
+    $time = [string]$Schedule.Time
+    switch ([string]$Schedule.Frequency) {
+        'Daily' { return "codziennie $time" }
+        'Weekly' { return ('co tydzień ({0}) {1}' -f ((@($Schedule.Days | ForEach-Object { $script:ReportWeekDays[[string]$_] })) -join ', '), $time) }
+        'Monthly' { return ('co miesiąc ({0}) {1}' -f $(if ([string]$Schedule.DayOfMonth -eq 'Last') { 'ostatni dzień' } else { '{0}. dzień' -f $Schedule.DayOfMonth }), $time) }
+        default { return 'tylko ręcznie' }
+    }
+}
+
+function Get-ReportRunAsText([hashtable]$RunAs) {
+    switch ([string]$RunAs.Mode) {
+        'Password' { return ('{0} (hasło zapisane w zadaniu)' -f $RunAs.Account) }
+        'Interactive' { return ('{0} (gdy zalogowany)' -f $(if ($RunAs.Account) { $RunAs.Account } else { "$env:USERDOMAIN\$env:USERNAME" })) }
+        'System' { return 'SYSTEM (konto komputera)' }
+        'Gmsa' { return ('{0} (gMSA)' -f $RunAs.Account) }
+        default { return [string]$RunAs.Mode }
+    }
+}
+
+function Get-ReportTaskName([hashtable]$Job) {
+    $n = ([string]$Job.Name -replace '[\\/:*?"<>|]+', ' ' -replace '\s+', ' ').Trim()
+    if ($n.Length -gt 80) { $n = $n.Substring(0, 80).Trim() }
+    return ('{0} ({1})' -f $n, $Job.Id)
+}
+#endregion
+
+#region Wspólne elementy rodzajów raportów
+function Assert-ReportAd {
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { throw 'Brak modułu ActiveDirectory (RSAT) na komputerze, na którym działa raport.' }
+}
+
+function Get-ReportOption([hashtable]$O, [string]$Key, $Default = $null) {
+    if ($O.ContainsKey($Key) -and $null -ne $O[$Key] -and [string]$O[$Key] -ne '') { return $O[$Key] }
+    return $Default
+}
+
+function Invoke-ReportAd {
+    # Jedna operacja AD (cel 'AD'); błąd całej operacji = wyjątek z komunikatem z AD
+    param([scriptblock]$ScriptBlock, [hashtable]$Parameters = @{})
+    Assert-ReportAd
+    $r = @(Invoke-SyncOperation -Targets @('AD') -Ad -ScriptBlock $ScriptBlock -Parameters $Parameters)[0]
+    if (-not $r.Ok) { throw ((@($r.Errors)) -join ' ') }
+    return $r
+}
+
+function Get-ReportComputerTargets {
+    # Lista komputerów z opcji albo włączone serwery z AD (logowanie w ostatnich 45 dniach)
+    param([string]$Computers, [string]$SearchBase)
+    $list = @(Split-ListText $Computers | Select-Object -Unique)
+    if ($list.Count) { return $list }
+    $r = Invoke-ReportAd -Parameters @{ SearchBase = $SearchBase } -ScriptBlock {
+        $ft = (Get-Date).AddDays(-45).ToFileTimeUtc()
+        $q = @{ LDAPFilter = "(&(objectCategory=computer)(operatingSystem=*Server*)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(lastLogonTimestamp>=$ft))"; Properties = @('dNSHostName') }
+        if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+        foreach ($c in @(Get-ADComputer @q @ad)) { if ($c.DNSHostName) { [string]$c.DNSHostName } else { [string]$c.Name } }
+    }
+    $names = @($r.Data | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)
+    if (-not $names.Count) { throw 'Nie znaleziono w AD włączonych serwerów (wpisz listę komputerów w definicji raportu).' }
+    return $names
+}
+
+function Get-ReportSeverityRows {
+    # Wiersze z oceną nie niższą niż próg (kolejność od najwyższej: Wysokie, Średnie, Niskie, Info)
+    param([object[]]$Rows, [string]$Column, [string]$Min)
+    $rank = @{ 'Wysokie' = 0; 'Średnie' = 1; 'Niskie' = 2; 'Info' = 3 }
+    $limit = if ($rank.ContainsKey($Min)) { $rank[$Min] } else { 2 }
+    return @($Rows | Where-Object { $rank.ContainsKey([string](Get-ObjectValue $_ $Column)) -and $rank[[string](Get-ObjectValue $_ $Column)] -le $limit })
+}
+
+function New-ReportSeverityTiles([object[]]$Rows, [string]$Column) {
+    $tones = @{ 'Wysokie' = 'crit'; 'Średnie' = 'warn'; 'Niskie' = 'info' }
+    return @(foreach ($k in 'Wysokie', 'Średnie', 'Niskie') {
+            $n = @($Rows | Where-Object { [string](Get-ObjectValue $_ $Column) -eq $k }).Count
+            @{ Label = "Ryzyko $($k.ToLowerInvariant())"; Value = $n; Tone = $(if ($n) { $tones[$k] } else { '' }) }
+        })
+}
+
+$script:ReportSeverityItems = @('Wysokie', 'Średnie', 'Niskie')
+#endregion
+
+#region Rodzaje raportów
+Register-ReportType -Key 'AdAudit' -Title 'Audyt bezpieczeństwa AD' -Icon 'EA18' -MailMode 'Changes' `
+    -Description 'Ponad 30 kontroli bezpieczeństwa domeny z oceną punktową (jak moduł «Audyt bezpieczeństwa AD»); zmiany: nowe obiekty w niespełnionych kontrolach i nowe niespełnione kontrole.' `
+    -KeyColumns @('Kontrola', 'Obiekt') -Options @(
+    @{ Key = 'InactiveDays'; Label = 'Nieaktywność kont (dni)'; Type = 'Number'; Value = 90; Min = 7; Max = 3650 }
+    @{ Key = 'AdminPwdDays'; Label = 'Hasło administratora starsze niż (dni)'; Type = 'Number'; Value = 365; Min = 30; Max = 3650 }
+    @{ Key = 'KrbtgtDays'; Label = 'Hasło krbtgt starsze niż (dni)'; Type = 'Number'; Value = 180; Min = 30; Max = 3650 }
+    @{ Key = 'AdminLimit'; Label = 'Konta uprzywilejowane – próg liczby kont'; Type = 'Number'; Value = 10; Min = 1; Max = 1000 }
+    @{ Key = 'MinSeverity'; Label = 'Wyniki (powiadomienia i zmiany) od poziomu ryzyka'; Type = 'Combo'; Items = $script:ReportSeverityItems; Value = 'Niskie' }
+) -Run {
+    param($O)
+    Assert-ReportAd
+    $params = @{ InactiveDays = [int](Get-ReportOption $O 'InactiveDays' 90); AdminPwdDays = [int](Get-ReportOption $O 'AdminPwdDays' 365); KrbtgtDays = [int](Get-ReportOption $O 'KrbtgtDays' 180); AdminLimit = [int](Get-ReportOption $O 'AdminLimit' 10); UnsupportedOs = $script:UnsupportedOsPattern }
+    $a = New-AdAuditData $params
+    foreach ($r in @(Invoke-SyncOperation -Targets $script:AdAuditCategories -Ad -ScriptBlock $script:AdAuditScript -Parameters $params)) { Add-AdAuditResult -Audit $a -Result $r }
+    if ($a.Errors.Count -ge $script:AdAuditCategories.Count) { throw ('Nie sprawdzono żadnej grupy kontroli: ' + ((@($a.Errors | ForEach-Object { $_.Message } | Select-Object -Unique)) -join ' ')) }
+    if (-not $a.Domain) { $a.Domain = [string]$env:USERDNSDOMAIN }
+    $rows = @(Get-AdAuditRows -Audit $a)
+    $failed = Get-ReportSeverityRows -Rows $rows -Column 'Ocena' -Min ([string](Get-ReportOption $O 'MinSeverity' 'Niskie'))
+    $findings = New-Object System.Collections.ArrayList
+    foreach ($c in $failed) {
+        $objs = @(Get-AdAuditObjects -Audit $a -Rows @($c))
+        if (-not $objs.Count) { [void]$findings.Add([pscustomobject][ordered]@{ 'Ocena' = $c.'Ocena'; 'Kontrola' = $c.'Kontrola'; 'Obiekt' = ''; 'Typ' = ''; 'Szczegóły' = $c.'Wynik'; '__tone' = $c.'__tone' }); continue }
+        foreach ($ob in $objs) { [void]$findings.Add([pscustomobject][ordered]@{ 'Ocena' = $c.'Ocena'; 'Kontrola' = $c.'Kontrola'; 'Obiekt' = [string]$ob.'Nazwa'; 'Typ' = [string]$ob.'Typ'; 'Szczegóły' = [string]$ob.'Szczegóły'; '__tone' = $c.'__tone' }) }
+    }
+    $sc = $a.Score
+    $tiles = @(@{ Label = 'Ocena: ' + $sc.Grade; Value = ('{0}/100' -f $sc.Score); Tone = $sc.Tone }) + @(New-ReportSeverityTiles -Rows $rows -Column 'Ocena')
+    return @{
+        Title = 'Audyt bezpieczeństwa Active Directory – ' + $a.Domain; Subtitle = ('domena {0}' -f $a.Domain); Summary = ('ocena {0}/100 ({1})' -f $sc.Score, $sc.Grade)
+        Rows = $findings.ToArray(); Tiles = $tiles; PillColumns = @('Ocena')
+        Errors = @($a.Errors | ForEach-Object { 'Nie sprawdzono grupy «{0}»: {1}' -f $_.Category, $_.Message })
+        Data = @{ Audit = $a; AuditRows = $rows }
+    }
+} -Render {
+    param($Result, $Extra, $Title)
+    Get-AdAuditReportHtml -Audit $Result.Data.Audit -CheckRows $Result.Data.AuditRows -Extra $Extra -ReportTitle $Title
+}
+
+Register-ReportType -Key 'DomainHealth' -Title 'Stan domeny' -Icon 'E9D9' -MailMode 'Changes' `
+    -Description 'Kontrolery, replikacja, role FSMO, DNS, kopia zapasowa AD, a przez WinRM usługi, SYSVOL, czas, dyski i dzienniki kontrolerów (jak moduł «Stan domeny»). Wyniki: błędy i ostrzeżenia.' `
+    -KeyScript { param($r) '{0}|{1}|{2}|{3}' -f (Get-ObjectValue $r 'Obszar'), (Get-ObjectValue $r 'Obiekt'), (Get-ObjectValue $r 'Ocena'), (([string](Get-ObjectValue $r 'Wynik')) -replace '[\d.,]+', '#') } -Options @(
+    @{ Key = 'Remote'; Label = 'Kontrolery przez WinRM (usługi, SYSVOL, czas, dyski, dzienniki)'; Type = 'Check'; Value = $true }
+    @{ Key = 'Ports'; Label = 'Test portów kontrolerów z komputera, na którym działa raport'; Type = 'Check'; Value = $true }
+    @{ Key = 'ReplWarnHours'; Label = 'Replikacja – ostrzeżenie po (godz.)'; Type = 'Number'; Value = 6; Min = 1; Max = 720 }
+    @{ Key = 'ReplCritHours'; Label = 'Replikacja – błąd po (godz.)'; Type = 'Number'; Value = 24; Min = 1; Max = 2160 }
+    @{ Key = 'BackupWarnDays'; Label = 'Kopia zapasowa AD – ostrzeżenie po (dni)'; Type = 'Number'; Value = 7; Min = 1; Max = 365 }
+    @{ Key = 'BackupCritDays'; Label = 'Kopia zapasowa AD – błąd po (dni)'; Type = 'Number'; Value = 30; Min = 1; Max = 365 }
+    @{ Key = 'EventHours'; Label = 'Błędy w dziennikach z ostatnich (godz.)'; Type = 'Number'; Value = 24; Min = 1; Max = 720 }
+    @{ Key = 'IncludeOk'; Label = 'Pokaż w raporcie także pozycje bez uwag'; Type = 'Check'; Value = $false }
+) -Run {
+    param($O)
+    Assert-ReportAd
+    $params = @{ Ports = [bool](Get-ReportOption $O 'Ports' $true); ReplWarnHours = [int](Get-ReportOption $O 'ReplWarnHours' 6); ReplCritHours = [int](Get-ReportOption $O 'ReplCritHours' 24); BackupWarnDays = [int](Get-ReportOption $O 'BackupWarnDays' 7); BackupCritDays = [int](Get-ReportOption $O 'BackupCritDays' 30); UnsupportedOs = $script:UnsupportedOsPattern }
+    $h = New-DomainHealthData -Params $params -Remote ([bool](Get-ReportOption $O 'Remote' $true)) -EventHours ([int](Get-ReportOption $O 'EventHours' 24))
+    foreach ($r in @(Invoke-SyncOperation -Targets @('AD') -Ad -ScriptBlock $script:DomainHealthScript -Parameters $params)) {
+        if (-not $r.Ok) { throw ('Nie odczytano danych domeny: ' + ((@($r.Errors)) -join ' ')) }
+        Add-DomainHealthAdResult -Health $h -Result $r
+    }
+    $all = New-Object System.Collections.ArrayList
+    foreach ($x in $h.Rows) { [void]$all.Add($x) }
+    $hostsList = @($h.Dcs | ForEach-Object { [string]$_.HostName } | Where-Object { $_ })
+    if ($h.Remote -and $hostsList.Count) {
+        foreach ($r in @(Invoke-SyncOperation -Targets $hostsList -ScriptBlock $script:DcHealthScript -Parameters @{ EventHours = $h.EventHours })) {
+            foreach ($x in @(Get-DcHealthResultRows -Health $h -Result $r)) { [void]$all.Add($x) }
+        }
+    }
+    foreach ($x in @(Get-DomainTimeRows -Times @($h.Times) -Pdc $h.Pdc)) { [void]$all.Add($x) }
+    $sorted = @(Get-DomainHealthSortedRows -Rows $all.ToArray())
+    $findings = @($sorted | Where-Object { @('Błąd', 'Ostrzeżenie') -contains [string]$_.'Ocena' })
+    $shown = if ([bool](Get-ReportOption $O 'IncludeOk' $false)) { $sorted } else { @($sorted | Where-Object { [string]$_.'Ocena' -ne 'OK' }) }
+    $crit = @($findings | Where-Object { $_.'Ocena' -eq 'Błąd' }).Count
+    $warn = $findings.Count - $crit
+    return @{
+        Title = 'Stan domeny ' + $h.Domain; Subtitle = ('domena {0}, kontrolery: {1}' -f $h.Domain, @($h.Dcs).Count)
+        Summary = $(if ($findings.Count) { 'błędy: {0}, ostrzeżenia: {1}' -f $crit, $warn } else { 'bez błędów' })
+        Rows = $shown; Findings = $findings; PillColumns = @('Ocena')
+        Tiles = @(@{ Label = 'Kontrolery domeny'; Value = @($h.Dcs).Count; Tone = '' }, @{ Label = 'Błędy'; Value = $crit; Tone = $(if ($crit) { 'crit' } else { 'ok' }) }, @{ Label = 'Ostrzeżenia'; Value = $warn; Tone = $(if ($warn) { 'warn' } else { '' }) })
+    }
+}
+
+Register-ReportType -Key 'AdDelegation' -Title 'Delegacje uprawnień w AD' -Icon 'E8D7' -MailMode 'Changes' `
+    -Description 'Uprawnienia do jednostek organizacyjnych, katalogu głównego domeny i AdminSDHolder z oceną ryzyka (jak moduł «Delegacje uprawnień w AD»); zmiany: nowe i usunięte delegacje.' `
+    -KeyColumns @('Obiekt', 'Tożsamość', 'Uprawnienia', 'Dotyczy', 'Typ') -Options @(
+    @{ Key = 'HideStandard'; Label = 'Ukryj wpisy domyślne'; Type = 'Check'; Value = $true }
+    @{ Key = 'IncludeRead'; Label = 'Także uprawnienia tylko do odczytu'; Type = 'Check'; Value = $false }
+    @{ Key = 'Containers'; Label = 'Także kontenery Users i Computers'; Type = 'Check'; Value = $false }
+    @{ Key = 'MinSeverity'; Label = 'Wyniki (powiadomienia i zmiany) od poziomu ryzyka'; Type = 'Combo'; Items = @('Wysokie', 'Średnie', 'Niskie', 'Info'); Value = 'Info' }
+) -Run {
+    param($O)
+    $dsid = [string](Invoke-ReportAd -ScriptBlock { [string](Get-ADDomain @ad).DomainSID.Value }).Data[0]
+    $d = New-AdDelegationData $dsid
+    $params = @{ Containers = [bool](Get-ReportOption $O 'Containers' $false); IncludeRead = [bool](Get-ReportOption $O 'IncludeRead' $false); HideStandard = [bool](Get-ReportOption $O 'HideStandard' $true); Std = (Get-AdStandardTrustees $dsid) }
+    foreach ($r in @(Invoke-SyncOperation -Targets @('AD') -Ad -ScriptBlock $script:AdDelegationScript -Parameters $params)) {
+        if (-not $r.Ok) { throw ((@($r.Errors)) -join ' ') }
+        Add-AdDelegationResult -Deleg $d -Result $r
+    }
+    $rows = @(Get-AdDelegationResultRows -Deleg $d)
+    $findings = Get-ReportSeverityRows -Rows $rows -Column 'Ocena' -Min ([string](Get-ReportOption $O 'MinSeverity' 'Info'))
+    $high = @($rows | Where-Object { $_.'Ocena' -eq 'Wysokie' }).Count
+    return @{
+        Title = 'Delegacje uprawnień w Active Directory'; Subtitle = ('sprawdzone obiekty: {0}' -f $d.Objects.Count)
+        Summary = ('wpisy: {0}, ryzyko wysokie: {1}' -f $rows.Count, $high)
+        Rows = $rows; Findings = $findings; PillColumns = @('Ocena')
+        Tiles = @(New-ReportSeverityTiles -Rows $rows -Column 'Ocena') + @(@{ Label = 'Sprawdzone obiekty'; Value = $d.Objects.Count; Tone = '' })
+        Errors = @($d.Errors | ForEach-Object { 'Nie odczytano uprawnień: ' + $_ })
+    }
+}
+
+# Członkowie grup: rekurencyjnie, z drogą przez grupy zagnieżdżone; $P.Groups - nazwy, loginy albo DN grup
+$script:ReportGroupMembersScript = {
+    $now = Get-Date
+    foreach ($name in @($P.Groups)) {
+        try { $g = Get-ADGroup -Identity $name @ad }
+        catch { [pscustomobject]@{ '__rec' = 'err'; Group = $name; Error = $_.Exception.Message }; continue }
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        [void]$seen.Add([string]$g.DistinguishedName)
+        $queue = New-Object System.Collections.Queue
+        $queue.Enqueue(@{ Dn = [string]$g.DistinguishedName; Path = '' })
+        while ($queue.Count -gt 0) {
+            $cur = $queue.Dequeue()
+            $members = @(Get-ADObject -LDAPFilter ('(memberOf={0})' -f (ConvertTo-LdapValue $cur.Dn)) -Properties objectClass, sAMAccountName, displayName, userAccountControl, lastLogonTimestamp, pwdLastSet @ad)
+            foreach ($o in $members) {
+                $cls = [string]@($o.ObjectClass)[-1]
+                $isGroup = $cls -eq 'group'
+                $uac = 0; try { $uac = [int]$o.userAccountControl } catch { }
+                $last = $null; try { if ($o.lastLogonTimestamp) { $last = [datetime]::FromFileTime([int64]$o.lastLogonTimestamp) } } catch { }
+                $pwdSet = $null; try { if ([int64]$o.pwdLastSet -gt 0) { $pwdSet = [datetime]::FromFileTime([int64]$o.pwdLastSet) } } catch { }
+                $enabled = if (@('user', 'computer', 'inetOrgPerson', 'msDS-GroupManagedServiceAccount', 'msDS-ManagedServiceAccount') -contains $cls) { -not ($uac -band 2) } else { $null }
+                $tone = if ($isGroup) { 'info' } elseif ($enabled -eq $false) { 'warn' } elseif ($null -ne $enabled -and (-not $last -or ($now - $last).TotalDays -gt 90)) { 'warn' } else { '' }
+                [pscustomobject][ordered]@{
+                    'Grupa'              = [string]$g.Name
+                    'Członek'            = $(if ($o.displayName) { [string]$o.displayName } else { Get-DnName ([string]$o.DistinguishedName) })
+                    'Login'              = [string]$o.sAMAccountName
+                    'Typ'                = (Get-ObjectKind $cls)
+                    'Członkostwo'        = $(if ($cur.Path) { 'przez: ' + $cur.Path } else { 'bezpośrednie' })
+                    'Włączone'           = $enabled
+                    'Ostatnie logowanie' = $last
+                    'Hasło ustawione'    = $pwdSet
+                    'DN'                 = [string]$o.DistinguishedName
+                    '__tone'             = $tone
+                }
+                if ($isGroup -and $P.Recursive -and $seen.Add([string]$o.DistinguishedName)) {
+                    $queue.Enqueue(@{ Dn = [string]$o.DistinguishedName; Path = $(if ($cur.Path) { $cur.Path + ' › ' } else { '' }) + (Get-DnName ([string]$o.DistinguishedName)) })
+                }
+            }
+        }
+    }
+}
+
+Register-ReportType -Key 'GroupMembers' -Title 'Członkowie grup uprzywilejowanych' -Icon 'E902' -MailMode 'Changes' `
+    -Description 'Pełna lista członków wybranych grup (także przez grupy zagnieżdżone). Z wysyłką «gdy są zmiany» działa jak alarm: wiadomość przychodzi, gdy ktoś zostanie dodany do grupy administratorów albo z niej usunięty.' `
+    -KeyColumns @('Grupa', 'DN') -Options @(
+    @{ Key = 'Groups'; Label = 'Grupy (po jednej w wierszu)'; Type = 'Multi'; Value = ($script:ReportPrivilegedGroups -join "`r`n"); Required = $true; Hint = 'Nazwy, loginy (sAMAccountName) albo DN grup. Grupy, których nie ma w domenie (np. Key Admins w starszych domenach), są pomijane z ostrzeżeniem.' }
+    @{ Key = 'Recursive'; Label = 'Członkowie grup zagnieżdżonych (z drogą członkostwa)'; Type = 'Check'; Value = $true }
+) -Run {
+    param($O)
+    $groups = @(Split-ListText ([string](Get-ReportOption $O 'Groups' '')) | Select-Object -Unique)
+    if (-not $groups.Count) { throw 'Nie podano grup.' }
+    $r = Invoke-ReportAd -ScriptBlock $script:ReportGroupMembersScript -Parameters @{ Groups = $groups; Recursive = [bool](Get-ReportOption $O 'Recursive' $true) }
+    $rows = @($r.Data | Where-Object { [string](Get-ObjectValue $_ '__rec') -ne 'err' })
+    $errs = @($r.Data | Where-Object { [string](Get-ObjectValue $_ '__rec') -eq 'err' } | ForEach-Object { 'Grupa «{0}»: {1}' -f $_.Group, $_.Error })
+    if ($errs.Count -ge $groups.Count) { throw ('Nie odczytano żadnej grupy. ' + ($errs -join ' ')) }
+    $people = @($rows | Where-Object { $_.'Typ' -ne 'Grupa' } | ForEach-Object { $_.'DN' } | Select-Object -Unique).Count
+    $disabled = @($rows | Where-Object { $_.'Włączone' -eq $false } | ForEach-Object { $_.'DN' } | Select-Object -Unique).Count
+    return @{
+        Title = 'Członkowie grup uprzywilejowanych'; Subtitle = ('grupy: {0}' -f ($groups -join ', '))
+        Summary = ('członkowie: {0}' -f $people)
+        Rows = $rows; Errors = $errs
+        Tiles = @(@{ Label = 'Sprawdzone grupy'; Value = ($groups.Count - $errs.Count); Tone = '' }, @{ Label = 'Konta (bez powtórzeń)'; Value = $people; Tone = 'info' }, @{ Label = 'Konta wyłączone'; Value = $disabled; Tone = $(if ($disabled) { 'warn' } else { '' }) })
+    }
+}
+
+Register-ReportType -Key 'UserReport' -Title 'Raport kont użytkowników' -Icon 'E716' `
+    -Description 'Zestawienie z modułu «Raporty kont»: wygasające i wygasłe hasła, zablokowane, wyłączone, nieaktywne, nigdy nie logowane, wygasające konta, nowe i uprzywilejowane.' `
+    -KeyColumns @('Login') -Options @(
+    @{ Key = 'Report'; Label = 'Raport'; Type = 'Combo'; Items = @($script:UserReports | ForEach-Object { $_.Name }); Value = 'Hasło wygasa w ciągu N dni' }
+    @{ Key = 'Days'; Label = 'N (dni)'; Type = 'Number'; Value = 14; Min = 1; Max = 3650 }
+    @{ Key = 'OnlyEnabled'; Label = 'Tylko włączone konta'; Type = 'Check'; Value = $true }
+    @{ Key = 'SearchBase'; Label = 'Zakres (jednostka organizacyjna)'; Type = 'Ou'; Value = ''; Placeholder = 'Cała domena' }
+) -Run {
+    param($O)
+    $name = [string](Get-ReportOption $O 'Report' 'Hasło wygasa w ciągu N dni')
+    $def = @($script:UserReports | Where-Object { $_.Name -eq $name -or $_.Key -eq $name })
+    if (-not $def.Count) { throw "Nieznany raport kont: $name" }
+    $days = [int](Get-ReportOption $O 'Days' 14)
+    $base = [string](Get-ReportOption $O 'SearchBase' '')
+    $r = Invoke-ReportAd -ScriptBlock $script:UserReportScript -Parameters @{ Report = $def[0].Key; Days = $days; OnlyEnabled = [bool](Get-ReportOption $O 'OnlyEnabled' $true); SearchBase = $base; StateScript = $script:UserStateScript.ToString() }
+    $rows = @($r.Data)
+    $title = $def[0].Name -replace '\bN dni\b', "$days dni"
+    return @{
+        Title = 'Konta użytkowników: ' + $title; Subtitle = ('zakres: {0}' -f $(if ($base) { $base } else { 'cała domena' }))
+        Summary = ('kont: {0}' -f $rows.Count); Rows = $rows; PillColumns = @('Stan')
+        Tiles = @(@{ Label = 'Konta w raporcie'; Value = $rows.Count; Tone = $(if ($rows.Count) { 'warn' } else { 'ok' }) }, @{ Label = 'Zablokowane'; Value = @($rows | Where-Object { $_.'Zablokowane' -eq $true }).Count; Tone = '' }, @{ Label = 'Wyłączone'; Value = @($rows | Where-Object { $_.'Włączone' -eq $false }).Count; Tone = '' })
+    }
+}
+
+Register-ReportType -Key 'ComputerReport' -Title 'Raport komputerów' -Icon 'E977' `
+    -Description 'Zestawienie z modułu «Raporty komputerów»: nieaktywne, wyłączone, nowe, systemy operacyjne, nieobsługiwane systemy, brak LAPS i kluczy BitLocker.' `
+    -KeyScript { param($r) if ($null -ne (Get-ObjectValue $r 'Komputer')) { [string](Get-ObjectValue $r 'Komputer') } else { '{0}|{1}' -f (Get-ObjectValue $r 'System'), (Get-ObjectValue $r 'Wersja') } } -Options @(
+    @{ Key = 'Report'; Label = 'Raport'; Type = 'Combo'; Items = @($script:ComputerReports | ForEach-Object { $_.Name }); Value = 'Nieaktywne (brak logowania od N dni)' }
+    @{ Key = 'Days'; Label = 'N (dni)'; Type = 'Number'; Value = 90; Min = 1; Max = 3650 }
+    @{ Key = 'OnlyEnabled'; Label = 'Tylko włączone konta komputerów'; Type = 'Check'; Value = $true }
+    @{ Key = 'SearchBase'; Label = 'Zakres (jednostka organizacyjna)'; Type = 'Ou'; Value = ''; Placeholder = 'Cała domena' }
+) -Run {
+    param($O)
+    $name = [string](Get-ReportOption $O 'Report' 'Nieaktywne (brak logowania od N dni)')
+    $def = @($script:ComputerReports | Where-Object { $_.Name -eq $name -or $_.Key -eq $name })
+    if (-not $def.Count) { throw "Nieznany raport komputerów: $name" }
+    $days = [int](Get-ReportOption $O 'Days' 90)
+    $base = [string](Get-ReportOption $O 'SearchBase' '')
+    $r = Invoke-ReportAd -ScriptBlock $script:ComputerReportScript -Parameters @{ Report = $def[0].Key; Days = $days; OnlyEnabled = [bool](Get-ReportOption $O 'OnlyEnabled' $true); SearchBase = $base; UnsupportedOs = $script:UnsupportedOsPattern }
+    $rows = @($r.Data)
+    $title = $def[0].Name -replace '\bN dni\b', "$days dni"
+    $isSummary = $def[0].Key -eq 'OsSummary'
+    return @{
+        Title = 'Komputery: ' + $title; Subtitle = ('zakres: {0}' -f $(if ($base) { $base } else { 'cała domena' }))
+        Summary = $(if ($isSummary) { 'systemy: {0}' -f $rows.Count } else { 'komputerów: {0}' -f $rows.Count }); Rows = $rows; PillColumns = @('Stan')
+        Tiles = @(@{ Label = $(if ($isSummary) { 'Systemy i wersje' } else { 'Komputery w raporcie' }); Value = $rows.Count; Tone = $(if ($rows.Count -and -not $isSummary) { 'warn' } else { '' }) })
+    }
+}
+
+Register-ReportType -Key 'NtfsRisks' -Title 'Ryzyka uprawnień NTFS' -Icon 'E7BA' -MailMode 'Changes' -Requires 'Files' `
+    -Description 'Ryzykowne uprawnienia w drzewie folderów (jak moduł «Raport ryzyk»): zapis dla szerokich grup, pełna kontrola dla zwykłych kont, wpisy dla użytkowników zamiast grup, usunięte konta, odmowy.' `
+    -KeyColumns @('Ścieżka', 'Problem', 'Tożsamość') -Options @(
+    @{ Key = 'Path'; Label = 'Folder'; Type = 'Text'; Value = ''; Required = $true; Placeholder = 'D:\Dane albo \\serwer\udział'; Hint = 'Ścieżka lokalna na serwerze (z polem «Serwer») albo ścieżka UNC / lokalna na komputerze, na którym działa raport.' }
+    @{ Key = 'Computer'; Label = 'Serwer (puste – komputer, na którym działa raport)'; Type = 'Text'; Value = ''; Placeholder = 'np. FS01 – skan przez WinRM na serwerze (szybciej niż przez sieć)' }
+    @{ Key = 'Depth'; Label = 'Głębokość (0 – tylko folder, -1 – całe drzewo)'; Type = 'Number'; Value = 3; Min = -1; Max = 50 }
+    @{ Key = 'Files'; Label = 'Także pliki (wolniej)'; Type = 'Check'; Value = $false }
+    @{ Key = 'Privileged'; Label = 'Tryb kopii zapasowej (odczyt folderów bez uprawnień – wymaga najwyższych uprawnień zadania)'; Type = 'Check'; Value = $false }
+    @{ Key = 'FullLimit'; Label = 'Pełna kontrola – ostrzegaj powyżej (kont)'; Type = 'Number'; Value = 3; Min = 1; Max = 50 }
+    @{ Key = 'MinSeverity'; Label = 'Wyniki (powiadomienia i zmiany) od poziomu ryzyka'; Type = 'Combo'; Items = $script:ReportSeverityItems; Value = 'Średnie' }
+) -Run {
+    param($O)
+    $path = ([string](Get-ReportOption $O 'Path' '')).Trim()
+    if (-not $path) { throw 'Nie podano folderu.' }
+    $computer = ([string](Get-ReportOption $O 'Computer' '')).Trim()
+    $p = @{ Mode = 'Explicit'; Path = $path; BaseLevel = 0; RootOnly = $false; Depth = [int](Get-ReportOption $O 'Depth' 3); Files = [bool](Get-ReportOption $O 'Files' $false); Sids = @(); Inherited = $false; Privileged = [bool](Get-ReportOption $O 'Privileged' $false); Core = (Get-NtfsToolCore $script:NtfsAclScanBody) }
+    $scan = @{ Root = $path; Computer = $computer; Acl = New-Object System.Collections.ArrayList; Names = @{}; Skipped = New-Object System.Collections.ArrayList; Items = 0; Errors = New-Object System.Collections.ArrayList }
+    $results = if ($computer) { @(Invoke-SyncOperation -Targets @($computer) -Parameters $p -ScriptBlock { param($P) & ([scriptblock]::Create($P.Core)) $P }) }
+    else {
+        if (-not (Test-Path -LiteralPath $path)) { throw "Ścieżka nie istnieje lub jest niedostępna: $path" }
+        @(Invoke-SyncOperation -Targets @($path) -Local -Parameters $p -ScriptBlock { param($Target, $P, $Ctx) & ([scriptblock]::Create($P.Core)) $P })
+    }
+    foreach ($r in $results) { Add-NtfsScanResult -Scan $scan -Result $r }
+    if ($scan.Errors.Count -and -not $scan.Acl.Count) { throw ((@($scan.Errors)) -join ' ') }
+    $classes = @{}
+    $sids = Get-NtfsDomainSids -Acl @($scan.Acl)
+    $errs = New-Object System.Collections.ArrayList
+    foreach ($e in $scan.Errors) { [void]$errs.Add([string]$e) }
+    if ($sids.Count -and (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        foreach ($r in @(Invoke-SyncOperation -Targets @('AD') -Ad -ScriptBlock $script:NtfsSidClassScript -Parameters @{ Sids = @($sids.Keys) })) {
+            if (-not $r.Ok) { [void]$errs.Add('Rodzajów kont nie sprawdzono w AD: ' + ((@($r.Errors)) -join ' ')) }
+            Add-NtfsSidClassResult -Scan $scan -Classes $classes -Result $r
+        }
+    }
+    $rows = @(Get-NtfsRiskRows -Scan $scan -Classes $classes -FullLimit ([int](Get-ReportOption $O 'FullLimit' 3)))
+    $skipped = @($scan.Skipped | Where-Object { [string]$_.Kind -ne 'link' })
+    if ($skipped.Count) { [void]$errs.Add(('Pominięto (brak dostępu): {0} – np. {1}' -f $skipped.Count, ((@($skipped | Select-Object -First 3 | ForEach-Object { $_.Path })) -join ', '))) }
+    $where = if ($computer) { "$computer`: $path" } else { $path }
+    return @{
+        Title = 'Ryzyka uprawnień NTFS – ' + $where; Subtitle = ('sprawdzone elementy: {0}' -f $scan.Items)
+        Summary = ('ryzyka: {0}, wysokie: {1}' -f $rows.Count, @($rows | Where-Object { $_.'Ryzyko' -eq 'Wysokie' }).Count)
+        Rows = $rows; Findings = (Get-ReportSeverityRows -Rows $rows -Column 'Ryzyko' -Min ([string](Get-ReportOption $O 'MinSeverity' 'Średnie'))); PillColumns = @('Ryzyko')
+        Tiles = @(New-ReportSeverityTiles -Rows $rows -Column 'Ryzyko') + @(@{ Label = 'Sprawdzone elementy'; Value = $scan.Items; Tone = '' })
+        Errors = $errs.ToArray()
+    }
+}
+
+function Get-ReportRemoteRows {
+    # Wyniki zdalnej operacji na wielu komputerach z kolumną «Komputer»; brak połączenia jako wiersz (i błąd częściowy)
+    param([object[]]$Results, [hashtable]$Failed)
+    $rows = New-Object System.Collections.ArrayList
+    $errs = New-Object System.Collections.ArrayList
+    foreach ($r in $Results) {
+        if (-not $r.Ok) {
+            $o = [ordered]@{ 'Komputer' = [string]$r.Target }
+            foreach ($k in $Failed.Keys) { $o[$k] = $Failed[$k] }
+            $o['Szczegóły'] = ((@($r.Errors)) -join ' ')
+            $o['__tone'] = 'crit'
+            [void]$rows.Add([pscustomobject]$o)
+            [void]$errs.Add(('{0}: {1}' -f $r.Target, ((@($r.Errors)) -join ' ')))
+            continue
+        }
+        foreach ($d in @($r.Data)) {
+            if ($null -eq $d) { continue }
+            $o = [ordered]@{ 'Komputer' = [string]$r.Target }
+            foreach ($p in $d.PSObject.Properties) { if ($script:HiddenProperties -notcontains $p.Name) { $o[$p.Name] = $p.Value } }
+            [void]$rows.Add([pscustomobject]$o)
+        }
+    }
+    return @{ Rows = $rows.ToArray(); Errors = $errs.ToArray() }
+}
+
+Register-ReportType -Key 'DiskSpace' -Title 'Wolne miejsce na dyskach serwerów' -Icon 'EDA2' -Requires 'Remote' `
+    -Description 'Zajętość dysków lokalnych na serwerach (WinRM). Bez listy komputerów – wszystkie włączone serwery z AD (z jednostki albo całej domeny).' `
+    -KeyColumns @('Komputer', 'Dysk', 'Stan') -Options @(
+    @{ Key = 'Computers'; Label = 'Komputery (po jednym w wierszu)'; Type = 'Multi'; Value = ''; Hint = 'Puste – włączone serwery z AD, które logowały się w ostatnich 45 dniach.' }
+    @{ Key = 'SearchBase'; Label = 'Jednostka organizacyjna serwerów (gdy lista jest pusta)'; Type = 'Ou'; Value = ''; Placeholder = 'Cała domena' }
+    @{ Key = 'WarnPct'; Label = 'Ostrzeżenie poniżej (% wolnego)'; Type = 'Number'; Value = 15; Min = 1; Max = 90 }
+    @{ Key = 'CritPct'; Label = 'Stan krytyczny poniżej (% wolnego)'; Type = 'Number'; Value = 5; Min = 1; Max = 90 }
+    @{ Key = 'OnlyProblems'; Label = 'Pokaż w raporcie tylko dyski z małą ilością miejsca'; Type = 'Check'; Value = $true }
+) -Run {
+    param($O)
+    $targets = @(Get-ReportComputerTargets -Computers ([string](Get-ReportOption $O 'Computers' '')) -SearchBase ([string](Get-ReportOption $O 'SearchBase' '')))
+    $res = @(Invoke-SyncOperation -Targets $targets -ScriptBlock $script:DiskSpaceScript -Parameters @{ WarnPct = [double](Get-ReportOption $O 'WarnPct' 15); CritPct = [double](Get-ReportOption $O 'CritPct' 5) })
+    $x = Get-ReportRemoteRows -Results $res -Failed @{ 'Dysk' = ''; 'Stan' = 'brak połączenia' }
+    $all = @($x.Rows)
+    $findings = @($all | Where-Object { @('crit', 'warn') -contains [string](Get-ObjectValue $_ '__tone') })
+    $crit = @($all | Where-Object { $_.'Stan' -eq 'krytycznie mało' }).Count
+    $low = @($all | Where-Object { $_.'Stan' -eq 'mało miejsca' }).Count
+    $off = @($res | Where-Object { -not $_.Ok }).Count
+    return @{
+        Title = 'Wolne miejsce na dyskach serwerów'; Subtitle = ('komputery: {0}' -f $targets.Count)
+        Summary = $(if ($findings.Count) { 'krytycznie: {0}, mało miejsca: {1}, bez połączenia: {2}' -f $crit, $low, $off } else { 'bez uwag' })
+        Rows = $(if ([bool](Get-ReportOption $O 'OnlyProblems' $true)) { $findings } else { $all }); Findings = $findings; PillColumns = @('Stan')
+        Tiles = @(@{ Label = 'Komputery'; Value = $targets.Count; Tone = '' }, @{ Label = 'Krytycznie mało miejsca'; Value = $crit; Tone = $(if ($crit) { 'crit' } else { 'ok' }) }, @{ Label = 'Mało miejsca'; Value = $low; Tone = $(if ($low) { 'warn' } else { '' }) }, @{ Label = 'Bez połączenia'; Value = $off; Tone = $(if ($off) { 'crit' } else { '' }) })
+        Errors = $x.Errors
+    }
+}
+
+Register-ReportType -Key 'Certificates' -Title 'Wygasające certyfikaty serwerów' -Icon 'EB95' -Requires 'Remote' `
+    -Description 'Certyfikaty z magazynów komputera (WinRM), które wygasły albo wygasają w ciągu N dni. Bez listy komputerów – wszystkie włączone serwery z AD.' `
+    -KeyColumns @('Komputer', 'Magazyn', 'Odcisk palca') -Options @(
+    @{ Key = 'Computers'; Label = 'Komputery (po jednym w wierszu)'; Type = 'Multi'; Value = ''; Hint = 'Puste – włączone serwery z AD, które logowały się w ostatnich 45 dniach.' }
+    @{ Key = 'SearchBase'; Label = 'Jednostka organizacyjna serwerów (gdy lista jest pusta)'; Type = 'Ou'; Value = ''; Placeholder = 'Cała domena' }
+    @{ Key = 'Days'; Label = 'Wygasające w ciągu (dni)'; Type = 'Number'; Value = 45; Min = 1; Max = 3650 }
+    @{ Key = 'Stores'; Label = 'Magazyny LocalMachine'; Type = 'Text'; Value = 'My, WebHosting, Remote Desktop'; Hint = 'Np. My, WebHosting, Remote Desktop, CA, Root – nieistniejące magazyny są pomijane.' }
+    @{ Key = 'Filter'; Label = 'Filtr (podmiot, wystawca, odcisk)'; Type = 'Text'; Value = '' }
+) -Run {
+    param($O)
+    $targets = @(Get-ReportComputerTargets -Computers ([string](Get-ReportOption $O 'Computers' '')) -SearchBase ([string](Get-ReportOption $O 'SearchBase' '')))
+    $days = [int](Get-ReportOption $O 'Days' 45)
+    $stores = @(Split-ListText ([string](Get-ReportOption $O 'Stores' 'My')))
+    if (-not $stores.Count) { $stores = @('My') }
+    $res = @(Invoke-SyncOperation -Targets $targets -ScriptBlock $script:CertificatesScript -Parameters @{ Stores = $stores; Store = $stores[0]; Filter = [string](Get-ReportOption $O 'Filter' ''); ExpiringDays = $days; WarnDays = $days })
+    $x = Get-ReportRemoteRows -Results $res -Failed @{ 'Podmiot' = ''; 'Ważność' = 'brak połączenia' }
+    $rows = @($x.Rows | Sort-Object @{ Expression = { $v = Get-ObjectValue $_ 'Dni do wygaśnięcia'; if ($null -eq $v) { -99999 } else { [int]$v } } })
+    $expired = @($rows | Where-Object { $_.'Ważność' -eq 'Wygasł' }).Count
+    $soon = @($rows | Where-Object { [string]$_.'Ważność' -like 'Wygasa*' }).Count
+    return @{
+        Title = "Certyfikaty wygasające w ciągu $days dni"; Subtitle = ('komputery: {0}, magazyny: {1}' -f $targets.Count, ($stores -join ', '))
+        Summary = ('wygasłe: {0}, wygasające: {1}' -f $expired, $soon)
+        Rows = $rows; PillColumns = @('Ważność')
+        Tiles = @(@{ Label = 'Komputery'; Value = $targets.Count; Tone = '' }, @{ Label = 'Wygasłe'; Value = $expired; Tone = $(if ($expired) { 'crit' } else { 'ok' }) }, @{ Label = "Wygasające (≤ $days dni)"; Value = $soon; Tone = $(if ($soon) { 'warn' } else { '' }) })
+        Errors = $x.Errors
+    }
+}
+#endregion
+
+#region Zmiany od poprzedniego uruchomienia
+function Get-ReportRowColumns([object[]]$Rows) {
+    # Kolumny w kolejności pierwszego wiersza (+ dodatkowe z kolejnych), bez kolumn technicznych __*
+    $cols = New-Object System.Collections.ArrayList
+    foreach ($r in $Rows) {
+        $names = if ($r -is [System.Collections.IDictionary]) { @($r.Keys) } else { @($r.PSObject.Properties | ForEach-Object { $_.Name }) }
+        foreach ($n in $names) { if (-not ([string]$n).StartsWith('__') -and -not $cols.Contains([string]$n)) { [void]$cols.Add([string]$n) } }
+    }
+    return $cols.ToArray()
+}
+
+function Get-ReportRowText($Row, [string]$Column) {
+    $v = ConvertTo-CellValue (Get-ObjectValue $Row $Column)
+    if ($v -is [System.DBNull]) { return '' }
+    return [string]$v
+}
+
+function Get-ReportRowKey {
+    param($Row, [hashtable]$Type)
+    if ($Type.KeyScript) { return [string](& $Type.KeyScript $Row) }
+    $cols = @($Type.KeyColumns)
+    if (-not $cols.Count) { $cols = @(Get-ReportRowColumns @($Row)) }
+    return ((@($cols | ForEach-Object { Get-ReportRowText $Row $_ })) -join ' | ')
+}
+
+function Get-ReportRowLabel($Row) {
+    # Krótki opis wiersza (pierwsze kolumny) - do listy «ustąpiło»
+    $parts = @(Get-ReportRowColumns @($Row) | Select-Object -First 4 | ForEach-Object { Get-ReportRowText $Row $_ } | Where-Object { $_ })
+    return ($parts -join ' • ')
+}
+
+function Compare-ReportFindings {
+    <#
+        Porównuje wyniki z elementami zapisanymi przy poprzednim uruchomieniu (stan: Items = @(@{ K; L })).
+        Zwraca Baseline (brak poprzednich danych), NewKeys (HashSet), New (wiersze), Resolved (@{ K; L }), Items (do zapisu).
+    #>
+    param([object[]]$Findings, [hashtable]$Type, $State)
+    $cmp = [System.StringComparer]::OrdinalIgnoreCase
+    $items = New-Object System.Collections.ArrayList
+    $current = New-Object 'System.Collections.Generic.HashSet[string]' $cmp
+    $rowKeys = New-Object System.Collections.ArrayList
+    foreach ($r in $Findings) {
+        $k = (Get-ReportRowKey -Row $r -Type $Type) -replace '[\t\r\n]+', ' '
+        [void]$rowKeys.Add($k)
+        if ($current.Add($k)) { [void]$items.Add(@{ K = $k; L = (Get-ReportRowLabel $r) }) }
+    }
+    $baseline = -not ($State -is [hashtable]) -or -not $State.ContainsKey('Items') -or $null -eq $State['Items']
+    $prev = New-Object 'System.Collections.Generic.HashSet[string]' $cmp
+    $resolved = New-Object System.Collections.ArrayList
+    if (-not $baseline) {
+        foreach ($i in @($State.Items)) { if ($i -is [hashtable]) { [void]$prev.Add([string]$i.K) } }
+        foreach ($i in @($State.Items)) { if ($i -is [hashtable] -and -not $current.Contains([string]$i.K)) { [void]$resolved.Add(@{ K = [string]$i.K; L = [string]$i.L }) } }
+    }
+    $newKeys = New-Object 'System.Collections.Generic.HashSet[string]' $cmp
+    $newRows = New-Object System.Collections.ArrayList
+    if (-not $baseline) {
+        for ($i = 0; $i -lt $Findings.Count; $i++) {
+            if (-not $prev.Contains([string]$rowKeys[$i]) -and $newKeys.Add([string]$rowKeys[$i])) { [void]$newRows.Add($Findings[$i]) }
+        }
+    }
+    return @{
+        Baseline = $baseline; NewKeys = $newKeys; New = $newRows.ToArray(); Resolved = $resolved.ToArray(); Items = $items.ToArray()
+        PreviousRun = $(if (-not $baseline -and $State['LastSuccess']) { [string]$State.LastSuccess } else { '' })
+        PreviousSummary = $(if ($State -is [hashtable] -and $State['Summary']) { [string]$State.Summary } else { '' })
+    }
+}
+#endregion
+
+#region Raport HTML i wiadomość
+function ConvertTo-ReportTableHtml {
+    # Tabela class="dt" (sortowanie, filtry kolumn, akcje wiersza ze wspólnego skryptu raportów)
+    param([object[]]$Rows, [string[]]$Columns = @(), [string[]]$PillColumns = @(), $NewKeys = $null, [hashtable]$Type = $null, [string]$Id = 'rows', [switch]$NoFilters)
+    if (-not $Columns.Count) { $Columns = @(Get-ReportRowColumns $Rows) }
+    $enc = { param($t) ConvertTo-HtmlText $t }
+    $mark = $null -ne $NewKeys -and $NewKeys.Count -gt 0 -and $null -ne $Type
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<table class="dt" id="').Append($Id).Append('"').Append($(if ($NoFilters -or $Rows.Count -le 15) { ' data-filters="no"' } else { '' })).Append('><thead><tr>')
+    if ($mark) { [void]$sb.Append('<th>Zmiana</th>') }
+    foreach ($c in $Columns) { [void]$sb.Append('<th>').Append((& $enc $c)).Append('</th>') }
+    [void]$sb.Append('</tr></thead><tbody>')
+    foreach ($r in $Rows) {
+        $tone = [string](Get-ObjectValue $r '__tone')
+        [void]$sb.Append('<tr>')
+        if ($mark) { [void]$sb.Append('<td>').Append($(if ($NewKeys.Contains(((Get-ReportRowKey -Row $r -Type $Type) -replace '[\t\r\n]+', ' '))) { '<span class="pill info">nowe</span>' } else { '' })).Append('</td>') }
+        foreach ($c in $Columns) {
+            $v = & $enc (Get-ReportRowText $r $c)
+            if ($PillColumns -contains $c -and $v) { $v = '<span class="pill ' + $(if (@('ok', 'warn', 'crit', 'info') -contains $tone) { $tone } else { '' }) + '">' + $v + '</span>' }
+            [void]$sb.Append('<td>').Append($v).Append('</td>')
+        }
+        [void]$sb.Append('</tr>')
+    }
+    [void]$sb.Append('</tbody></table>')
+    return $sb.ToString()
+}
+
+function Get-ReportChangesHtml {
+    # Sekcja zmian od poprzedniego uruchomienia i problemów (wstawiana pod kafelkami)
+    param([hashtable]$Result, [hashtable]$Changes, [hashtable]$Type)
+    $enc = { param($t) ConvertTo-HtmlText $t }
+    $sb = New-Object System.Text.StringBuilder
+    if (@($Result.Errors).Count) {
+        [void]$sb.Append('<div class="box errs"><h2>Problemy podczas tworzenia raportu (').Append(@($Result.Errors).Count).Append(')</h2><table><tbody>')
+        foreach ($e in @($Result.Errors)) { [void]$sb.Append('<tr><td>').Append((& $enc $e)).Append('</td></tr>') }
+        [void]$sb.Append('</tbody></table></div>')
+    }
+    [void]$sb.Append('<section class="card"><div class="head"><div><h2>Zmiany od poprzedniego raportu</h2><div class="sub">')
+    if ($Changes.Baseline) {
+        [void]$sb.Append('Pierwsze uruchomienie – zapisano stan odniesienia. Kolejne raporty pokażą, co się pojawiło i co ustąpiło.</div></div></div></section>')
+        return $sb.ToString()
+    }
+    $prevText = if ($Changes.PreviousRun) { 'poprzedni raport: ' + ($Changes.PreviousRun -replace 'T', ' ') } else { 'poprzedni raport' }
+    if ($Changes.PreviousSummary) { $prevText += ' (' + $Changes.PreviousSummary + ')' }
+    [void]$sb.Append((& $enc ('{0} • nowe: {1} • ustąpiło: {2}' -f $prevText, @($Changes.New).Count, @($Changes.Resolved).Count))).Append('</div></div></div>')
+    if (-not @($Changes.New).Count -and -not @($Changes.Resolved).Count) { [void]$sb.Append('<div class="empty" style="padding:10px 0 0">Bez zmian.</div></section>'); return $sb.ToString() }
+    if (@($Changes.New).Count) {
+        [void]$sb.Append('<details open><summary>Nowe<span class="n">').Append(@($Changes.New).Count).Append('</span></summary>')
+        [void]$sb.Append((ConvertTo-ReportTableHtml -Rows @($Changes.New) -PillColumns @($Result.PillColumns) -Id 'chgnew'))
+        [void]$sb.Append('</details>')
+    }
+    if (@($Changes.Resolved).Count) {
+        [void]$sb.Append('<details').Append($(if (@($Changes.Resolved).Count -le 30) { ' open' } else { '' })).Append('><summary>Ustąpiło (nie występuje w tym raporcie)<span class="n">').Append(@($Changes.Resolved).Count).Append('</span></summary><table class="dt" data-filters="no"><thead><tr><th>Pozycja</th></tr></thead><tbody>')
+        foreach ($i in @($Changes.Resolved)) { [void]$sb.Append('<tr><td>').Append((& $enc $(if ($i.L) { $i.L } else { $i.K }))).Append('</td></tr>') }
+        [void]$sb.Append('</tbody></table></details>')
+    }
+    [void]$sb.Append('</section>')
+    return $sb.ToString()
+}
+
+function Get-ReportMeta([hashtable]$Job, [hashtable]$Result, [datetime]$At) {
+    $m = 'Domain Ops {0} • raport cykliczny «{1}» • {2:yyyy-MM-dd HH:mm} • {3}\{4} na {5}' -f $script:AppVersion, $Job.Name, $At, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME
+    if ($Result['Subtitle']) { $m += ' • ' + [string]$Result.Subtitle }
+    return $m
+}
+
+function New-ScheduledReportHtml {
+    param([hashtable]$Job, [hashtable]$Type, [hashtable]$Result, [hashtable]$Changes, [datetime]$At = (Get-Date))
+    $extra = Get-ReportChangesHtml -Result $Result -Changes $Changes -Type $Type
+    $title = if ($Result['Title']) { [string]$Result.Title } else { [string]$Job.Name }
+    if ($Type.Render) { return [string](& $Type.Render $Result $extra $title) }
+    $rows = @($Result.Rows)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append((Get-ReportHead -Title $title -Meta (Get-ReportMeta -Job $Job -Result $Result -At $At)))
+    [void]$sb.Append('<div class="tiles">')
+    $tiles = @($Result.Tiles)
+    if (-not $Changes.Baseline) { $tiles += @(@{ Label = 'Nowe od poprzedniego'; Value = @($Changes.New).Count; Tone = $(if (@($Changes.New).Count) { 'warn' } else { '' }) }, @{ Label = 'Ustąpiło'; Value = @($Changes.Resolved).Count; Tone = $(if (@($Changes.Resolved).Count) { 'ok' } else { '' }) }) }
+    foreach ($t in $tiles) { [void]$sb.Append('<div class="tile ').Append([string]$t.Tone).Append('"><b>').Append((ConvertTo-HtmlText ([string]$t.Value))).Append('</b><span>').Append((ConvertTo-HtmlText ([string]$t.Label))).Append('</span></div>') }
+    [void]$sb.Append('</div>').Append($extra)
+    [void]$sb.Append((Get-ReportBar -Mode 'rows' -Placeholder 'Szukaj we wszystkich kolumnach…' -Buttons @('copy', 'clear', 'print') -Extra ('<span class="cnt">wiersze: <b data-count-for="rows">' + $rows.Count + '</b></span>')))
+    if ($rows.Count) { [void]$sb.Append('<div class="box">').Append((ConvertTo-ReportTableHtml -Rows $rows -PillColumns @($Result.PillColumns) -NewKeys $Changes.NewKeys -Type $Type -Id 'rows')).Append('</div>') }
+    else { [void]$sb.Append('<div class="box"><div class="empty" style="padding:14px">Brak wyników – nic nie wymaga uwagi.</div></div>') }
+    [void]$sb.Append((Get-ReportTail))
+    return $sb.ToString()
+}
+
+function New-ReportMailBody {
+    # Treść wiadomości: style wpisane w elementy (programy pocztowe pomijają arkusze stylów), jasny motyw
+    param([hashtable]$Job, [hashtable]$Result, [hashtable]$Changes, [string]$OutputPath, [bool]$Attached, [datetime]$At = (Get-Date), [string]$Failure = '')
+    $enc = { param($t) ConvertTo-HtmlText $t }
+    $max = [Math]::Max(5, [int]$Job.Mail.MaxRows)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;padding:18px;background:#ffffff">')
+    [void]$sb.Append('<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#1f2328;max-width:980px">')
+    $title = if ($Result -and $Result['Title']) { [string]$Result.Title } else { [string]$Job.Name }
+    [void]$sb.Append('<h2 style="margin:0 0 4px;font-size:20px;font-weight:600">').Append((& $enc $title)).Append('</h2>')
+    [void]$sb.Append('<div style="color:#656d76;margin-bottom:14px;font-size:12.5px">').Append((& $enc ('Raport cykliczny «{0}» • {1:yyyy-MM-dd HH:mm} • {2}\{3} na {4}' -f $Job.Name, $At, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME))).Append('</div>')
+    if ($Failure) {
+        [void]$sb.Append('<div style="border:1px solid #ffcecb;background:#ffebe9;color:#82071e;border-radius:8px;padding:12px 14px;margin-bottom:14px"><b>Raport nie powstał.</b><br>').Append((& $enc $Failure)).Append('</div>')
+    }
+    else {
+        $tones = @{ ok = '#1a7f37'; warn = '#9a6700'; crit = '#cf222e'; info = '#0969da' }
+        $tiles = @($Result.Tiles)
+        if (-not $Changes.Baseline) { $tiles += @(@{ Label = 'Nowe od poprzedniego'; Value = @($Changes.New).Count; Tone = $(if (@($Changes.New).Count) { 'warn' } else { '' }) }, @{ Label = 'Ustąpiło'; Value = @($Changes.Resolved).Count; Tone = $(if (@($Changes.Resolved).Count) { 'ok' } else { '' }) }) }
+        [void]$sb.Append('<table cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0 0;margin-bottom:14px"><tr>')
+        foreach ($t in $tiles) {
+            $c = if ($tones.ContainsKey([string]$t.Tone)) { $tones[[string]$t.Tone] } else { '#1f2328' }
+            [void]$sb.Append('<td style="border:1px solid #d0d7de;border-radius:8px;padding:8px 16px;vertical-align:top"><div style="font-size:20px;font-weight:600;color:').Append($c).Append('">').Append((& $enc ([string]$t.Value))).Append('</div><div style="font-size:12px;color:#656d76">').Append((& $enc ([string]$t.Label))).Append('</div></td><td style="width:8px"></td>')
+        }
+        [void]$sb.Append('</tr></table>')
+        if (@($Result.Errors).Count) {
+            [void]$sb.Append('<div style="border:1px solid #ffcecb;background:#fff8f7;border-radius:8px;padding:10px 14px;margin-bottom:14px;color:#82071e"><b>Problemy podczas tworzenia raportu:</b><ul style="margin:6px 0 0 18px;padding:0">')
+            foreach ($e in @($Result.Errors | Select-Object -First 10)) { [void]$sb.Append('<li>').Append((& $enc $e)).Append('</li>') }
+            if (@($Result.Errors).Count -gt 10) { [void]$sb.Append('<li>… i ').Append(@($Result.Errors).Count - 10).Append(' więcej (w raporcie)</li>') }
+            [void]$sb.Append('</ul></div>')
+        }
+        $list = $null
+        $heading = ''
+        if ($Changes.Baseline) {
+            [void]$sb.Append('<p style="margin:0 0 12px;color:#656d76">Pierwsze uruchomienie – zapisano stan odniesienia; kolejne wiadomości pokażą zmiany.</p>')
+            $list = @($Result.Findings); $heading = 'Wyniki'
+        }
+        else {
+            $prev = if ($Changes.PreviousRun) { ' (poprzedni: ' + ($Changes.PreviousRun -replace 'T', ' ') + $(if ($Changes.PreviousSummary) { ', ' + $Changes.PreviousSummary } else { '' }) + ')' } else { '' }
+            [void]$sb.Append('<p style="margin:0 0 12px">').Append((& $enc ('Od poprzedniego raportu{0}: nowe – {1}, ustąpiło – {2}.' -f $prev, @($Changes.New).Count, @($Changes.Resolved).Count))).Append('</p>')
+            if (@($Changes.New).Count) { $list = @($Changes.New); $heading = 'Nowe' } elseif ($Job.Mail.Mode -ne 'Changes') { $list = @($Result.Findings); $heading = 'Wyniki' }
+        }
+        if ($null -ne $list -and $list.Count) {
+            $cols = @(Get-ReportRowColumns $list | Where-Object { $_ -ne 'DN' } | Select-Object -First 7)
+            [void]$sb.Append('<h3 style="margin:16px 0 6px;font-size:15px">').Append((& $enc $heading)).Append(' (').Append($list.Count).Append(')</h3>')
+            [void]$sb.Append('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;width:100%"><tr>')
+            foreach ($c in $cols) { [void]$sb.Append('<th style="text-align:left;background:#f6f8fa;border:1px solid #d0d7de;padding:5px 8px;font-weight:600">').Append((& $enc $c)).Append('</th>') }
+            [void]$sb.Append('</tr>')
+            foreach ($r in @($list | Select-Object -First $max)) {
+                $tone = [string](Get-ObjectValue $r '__tone')
+                $color = if ($tones.ContainsKey($tone) -and $tone -ne 'ok') { $tones[$tone] } else { '#1f2328' }
+                [void]$sb.Append('<tr>')
+                foreach ($c in $cols) { [void]$sb.Append('<td style="border:1px solid #d0d7de;padding:4px 8px;vertical-align:top;color:').Append($color).Append('">').Append((& $enc (Get-ReportRowText $r $c))).Append('</td>') }
+                [void]$sb.Append('</tr>')
+            }
+            [void]$sb.Append('</table>')
+            if ($list.Count -gt $max) { [void]$sb.Append('<p style="color:#656d76;font-size:12.5px;margin:6px 0 0">Pokazano ').Append($max).Append(' z ').Append($list.Count).Append(' – pełna lista w raporcie.</p>') }
+        }
+        if (-not $Changes.Baseline -and @($Changes.Resolved).Count) {
+            [void]$sb.Append('<h3 style="margin:16px 0 6px;font-size:15px">Ustąpiło (').Append(@($Changes.Resolved).Count).Append(')</h3><ul style="margin:0 0 0 18px;padding:0;color:#1a7f37">')
+            foreach ($i in @($Changes.Resolved | Select-Object -First $max)) { [void]$sb.Append('<li>').Append((& $enc $(if ($i.L) { $i.L } else { $i.K }))).Append('</li>') }
+            [void]$sb.Append('</ul>')
+        }
+        if (@($Result.Findings).Count -eq 0 -and $Changes.Baseline) { [void]$sb.Append('<p style="color:#1a7f37">Brak wyników – nic nie wymaga uwagi.</p>') }
+    }
+    if ($OutputPath) {
+        # Ścieżka UNC działa jako odnośnik u adresata; lokalna - tylko jako informacja, gdzie leży raport
+        [void]$sb.Append('<p style="margin:18px 0 0">Pełny raport')
+        if ($Attached) { [void]$sb.Append(' w załączniku;') }
+        if ($OutputPath -like '\\*') { [void]$sb.Append(' w folderze: <a href="').Append((& $enc ('file:' + ($OutputPath -replace '\\', '/')))).Append('">').Append((& $enc $OutputPath)).Append('</a>') }
+        else { [void]$sb.Append(' zapisany na komputerze ').Append((& $enc $env:COMPUTERNAME)).Append(': ').Append((& $enc $OutputPath)) }
+        [void]$sb.Append('</p>')
+    }
+    [void]$sb.Append('<p style="margin:18px 0 0;color:#8c959f;font-size:11.5px">Wiadomość wygenerowana automatycznie przez Domain Ops ').Append($script:AppVersion).Append(' (').Append((& $enc (Get-ReportScheduleText $Job.Schedule))).Append(').</p>')
+    [void]$sb.Append('</div></body></html>')
+    return $sb.ToString()
+}
+
+function Get-ReportMailSubject([hashtable]$Job, [hashtable]$Result, [hashtable]$Changes, [string]$Failure = '') {
+    if ($Failure) { return ('[Domain Ops] {0}: BŁĄD – raport nie powstał' -f $Job.Name) }
+    $parts = New-Object System.Collections.ArrayList
+    if ($Result['Summary']) { [void]$parts.Add([string]$Result.Summary) } else { [void]$parts.Add(('wyniki: {0}' -f @($Result.Findings).Count)) }
+    if (-not $Changes.Baseline) {
+        if (@($Changes.New).Count) { [void]$parts.Add(('nowe: {0}' -f @($Changes.New).Count)) }
+        if (@($Changes.Resolved).Count) { [void]$parts.Add(('ustąpiło: {0}' -f @($Changes.Resolved).Count)) }
+    }
+    if (@($Result.Errors).Count) { [void]$parts.Add('z problemami') }
+    return ('[Domain Ops] {0}: {1}' -f $Job.Name, ($parts -join ', '))
+}
+
+function Test-ReportMailNeeded([hashtable]$Job, [hashtable]$Result, [hashtable]$Changes) {
+    switch ([string]$Job.Mail.Mode) {
+        'Always' { return $true }
+        'Findings' { return (@($Result.Findings).Count -gt 0 -or @($Result.Errors).Count -gt 0) }
+        'Changes' { return ($Changes.Baseline -or @($Changes.New).Count -gt 0 -or @($Changes.Resolved).Count -gt 0 -or @($Result.Errors).Count -gt 0) }
+        default { return $false }
+    }
+}
+
+function Send-ReportMail {
+    param([Parameter(Mandatory)][hashtable]$Mail, [Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$Body, [string[]]$Attachments = @())
+    $msg = New-Object System.Net.Mail.MailMessage
+    $client = $null
+    try {
+        $msg.From = New-Object System.Net.Mail.MailAddress([string]$Mail.From)
+        foreach ($a in @(Split-ListText ([string]$Mail.To))) { $msg.To.Add($a) }
+        foreach ($a in @(Split-ListText ([string]$Mail.Cc))) { $msg.CC.Add($a) }
+        if ($msg.To.Count -eq 0) { throw 'Brak adresatów wiadomości.' }
+        $msg.Subject = $Subject
+        $msg.SubjectEncoding = [System.Text.Encoding]::UTF8
+        $msg.Body = $Body
+        $msg.BodyEncoding = [System.Text.Encoding]::UTF8
+        $msg.IsBodyHtml = $true
+        foreach ($f in @($Attachments | Where-Object { $_ })) {
+            $att = New-Object System.Net.Mail.Attachment($f, 'text/html')
+            $att.Name = [System.IO.Path]::GetFileName($f)
+            $att.NameEncoding = [System.Text.Encoding]::UTF8
+            $att.ContentDisposition.FileName = $att.Name
+            $msg.Attachments.Add($att)
+        }
+        $client = New-Object System.Net.Mail.SmtpClient([string]$Mail.Server, [int]$Mail.Port)
+        $client.EnableSsl = [bool]$Mail.Ssl
+        $client.Timeout = 100000
+        $client.DeliveryMethod = [System.Net.Mail.SmtpDeliveryMethod]::Network
+        switch ([string]$Mail.Auth) {
+            'Windows' { $client.UseDefaultCredentials = $true }
+            'Login' {
+                $client.UseDefaultCredentials = $false
+                $secret = $null
+                try { $secret = Unprotect-ReportSecret ([string]$Mail.Password) }
+                catch { throw ('Nie można odszyfrować hasła SMTP – zapisał je {0}, a raport działa jako {1}\{2}. Wpisz hasło ponownie z konta, na którym działa zadanie, albo użyj uwierzytelniania Windows / przekaźnika bez hasła.' -f $Mail.PasswordOwner, $env:USERDOMAIN, $env:USERNAME) }
+                $client.Credentials = New-Object System.Net.NetworkCredential([string]$Mail.User, $secret)
+            }
+            default { $client.UseDefaultCredentials = $false }
+        }
+        $client.Send($msg)
+    }
+    finally {
+        $msg.Dispose()
+        if ($client) { $client.Dispose() }
+    }
+}
+#endregion
+
+#region Wykonanie raportu
+function Remove-OldReportFiles([string]$Folder, [string]$Prefix, [int]$Keep) {
+    # Retencja: zostaje $Keep najnowszych raportów (HTML i CSV z tym samym znacznikiem czasu)
+    if ($Keep -le 0) { return }
+    $files = @(Get-ChildItem -LiteralPath $Folder -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match ('^' + [regex]::Escape($Prefix) + '_\d{8}_\d{6}\.html$') } | Sort-Object Name -Descending)
+    foreach ($f in @($files | Select-Object -Skip $Keep)) {
+        try {
+            Remove-Item -LiteralPath $f.FullName -Force
+            $csv = [System.IO.Path]::ChangeExtension($f.FullName, '.csv')
+            if (Test-Path -LiteralPath $csv) { Remove-Item -LiteralPath $csv -Force }
+        }
+        catch { Write-Log ("Nie usunięto starego raportu {0}: {1}" -f $f.Name, $_.Exception.Message) 'WARN' }
+    }
+}
+
+function Export-ReportCsv([object[]]$Rows, [string]$Path) {
+    $cols = @(Get-ReportRowColumns $Rows)
+    $objects = foreach ($r in $Rows) {
+        $o = [ordered]@{}
+        foreach ($c in $cols) { $o[$c] = Get-ReportRowText $r $c }
+        [pscustomobject]$o
+    }
+    $encoding = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
+    @($objects) | Export-Csv -LiteralPath $Path -NoTypeInformation -UseCulture -Encoding $encoding
+}
+
+function Invoke-ScheduledReport {
+    <#
+        Wykonuje raport z definicji: zapytania, raport HTML (+ CSV), porównanie z poprzednim uruchomieniem, poczta, stan.
+        Zwraca @{ ExitCode; Status; Message; Output; Findings; New; Resolved; Mail }. Nie pokazuje okien (tryb bez okna).
+    #>
+    param([Parameter(Mandatory)][hashtable]$Job)
+    $at = Get-Date
+    $type = $script:ReportTypes[[string]$Job.Type]
+    $state = Read-ReportState $Job
+    if (-not ($state -is [hashtable])) { $state = @{} }
+    $out = @{ ExitCode = 0; Status = 'OK'; Message = ''; Output = ''; Findings = 0; New = 0; Resolved = 0; Mail = '' }
+    $savedServer = $script:Settings.DomainController
+    if ([string]$Job.Server) { $script:Settings.DomainController = [string]$Job.Server }
+    $result = $null
+    $failure = ''
+    try {
+        if (-not $type) { throw "Nieznany rodzaj raportu: $($Job.Type)" }
+        $result = & $type.Run ($Job.Options.Clone())
+        if (-not ($result -is [hashtable])) { throw 'Rodzaj raportu nie zwrócił wyniku.' }
+    }
+    catch { $failure = $_.Exception.Message }
+    finally { $script:Settings.DomainController = $savedServer }
+
+    $history = @(if ($state.ContainsKey('History')) { @($state.History) | Where-Object { $_ -is [hashtable] } })
+    if ($failure) {
+        $out.ExitCode = 2; $out.Status = 'Błąd'; $out.Message = $failure
+        Write-Log ("Raport «{0}» nie powstał: {1}" -f $Job.Name, $failure) 'ERROR'
+        if ([string]$Job.Mail.Mode -ne 'Never') {
+            try {
+                Send-ReportMail -Mail $Job.Mail -Subject (Get-ReportMailSubject -Job $Job -Result @{} -Changes @{ Baseline = $true } -Failure $failure) -Body (New-ReportMailBody -Job $Job -Result $null -Changes @{ Baseline = $true } -OutputPath '' -Attached $false -At $at -Failure $failure)
+                $out.Mail = 'wysłano powiadomienie o błędzie'
+            }
+            catch { $out.Mail = 'nie wysłano: ' + $_.Exception.Message; Write-Log ("Nie wysłano wiadomości: {0}" -f $_.Exception.Message) 'ERROR' }
+        }
+        $state.LastRun = $at.ToString('s'); $state.Status = $out.Status; $state.Message = $failure; $state.Mail = $out.Mail
+        $state.History = @(@(@{ At = $at.ToString('s'); Status = $out.Status; Findings = $null; New = $null; Resolved = $null; Output = ''; Mail = $out.Mail; Message = $failure }) + $history | Select-Object -First 60)
+        try { Save-ReportState -Job $Job -State $state } catch { Write-Log ("Nie zapisano stanu raportu: {0}" -f $_.Exception.Message) 'ERROR' }
+        return $out
+    }
+
+    if (-not $result.ContainsKey('Rows') -or $null -eq $result.Rows) { $result.Rows = @() }
+    $result.Rows = @($result.Rows)
+    if (-not $result.ContainsKey('Findings') -or $null -eq $result.Findings) { $result.Findings = $result.Rows }
+    $result.Findings = @($result.Findings)
+    foreach ($k in 'Tiles', 'Errors', 'PillColumns') { if (-not $result.ContainsKey($k) -or $null -eq $result[$k]) { $result[$k] = @() } else { $result[$k] = @($result[$k]) } }
+    $changes = Compare-ReportFindings -Findings $result.Findings -Type $type -State $state
+
+    # Raport HTML (+ CSV) w folderze wyników, kopia «najnowszy», retencja
+    $folder = Get-ReportOutputDir -Job $Job
+    $prefix = Get-SafeFileName ([string]$Job.Name)
+    if (-not $prefix) { $prefix = [string]$Job.Id }
+    try {
+        if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+        $file = Join-Path $folder ('{0}_{1:yyyyMMdd_HHmmss}.html' -f $prefix, $at)
+        $html = New-ScheduledReportHtml -Job $Job -Type $type -Result $result -Changes $changes -At $at
+        [System.IO.File]::WriteAllText($file, $html, (New-Object System.Text.UTF8Encoding($true)))
+        $out.Output = $file
+        if ([bool]$Job.Output.Csv) { Export-ReportCsv -Rows $result.Rows -Path ([System.IO.Path]::ChangeExtension($file, '.csv')) }
+        if ([bool]$Job.Output.Latest) { Copy-Item -LiteralPath $file -Destination (Join-Path $folder ('{0}_najnowszy.html' -f $prefix)) -Force }
+        Remove-OldReportFiles -Folder $folder -Prefix $prefix -Keep ([int]$Job.Output.Keep)
+    }
+    catch {
+        $out.ExitCode = 2; $out.Status = 'Błąd'; $out.Message = 'Nie zapisano raportu w folderze {0}: {1}' -f $folder, $_.Exception.Message
+        Write-Log $out.Message 'ERROR'
+    }
+
+    # Poczta (raport, który nie dał się zapisać, wysyła powiadomienie o błędzie)
+    if ($out.ExitCode -eq 2 -and [string]$Job.Mail.Mode -ne 'Never') {
+        try {
+            Send-ReportMail -Mail $Job.Mail -Subject (Get-ReportMailSubject -Job $Job -Result @{} -Changes @{ Baseline = $true } -Failure $out.Message) -Body (New-ReportMailBody -Job $Job -Result $null -Changes @{ Baseline = $true } -OutputPath '' -Attached $false -At $at -Failure $out.Message)
+            $out.Mail = 'wysłano powiadomienie o błędzie'
+        }
+        catch { $out.Mail = 'nie wysłano: ' + $_.Exception.Message; Write-Log ("Nie wysłano wiadomości: {0}" -f $_.Exception.Message) 'ERROR' }
+    }
+    elseif ($out.ExitCode -ne 2 -and (Test-ReportMailNeeded -Job $Job -Result $result -Changes $changes)) {
+        try {
+            $attach = @()
+            $attached = $false
+            if ([bool]$Job.Mail.Attach -and $out.Output) {
+                if ((Get-Item -LiteralPath $out.Output).Length -le 15MB) { $attach = @($out.Output); $attached = $true }
+                else { Write-Log 'Raport jest większy niż 15 MB – wysłano wiadomość bez załącznika.' 'WARN' }
+            }
+            Send-ReportMail -Mail $Job.Mail -Subject (Get-ReportMailSubject -Job $Job -Result $result -Changes $changes) -Body (New-ReportMailBody -Job $Job -Result $result -Changes $changes -OutputPath $out.Output -Attached $attached -At $at) -Attachments $attach
+            $out.Mail = 'wysłano (' + [string]$Job.Mail.To + ')'
+            Write-Log ("Wysłano raport do: {0}" -f $Job.Mail.To) 'OK'
+        }
+        catch {
+            $out.Mail = 'nie wysłano: ' + $_.Exception.Message
+            if ($out.ExitCode -eq 0) { $out.ExitCode = 1 }
+            Write-Log ("Nie wysłano wiadomości: {0}" -f $_.Exception.Message) 'ERROR'
+        }
+    }
+    elseif ([string]$Job.Mail.Mode -ne 'Never' -and $out.ExitCode -ne 2) { $out.Mail = 'bez wysyłki (brak wyników lub zmian)' }
+
+    $out.Findings = @($result.Findings).Count
+    $out.New = @($changes.New).Count
+    $out.Resolved = @($changes.Resolved).Count
+    if ($out.ExitCode -eq 0 -and @($result.Errors).Count) { $out.ExitCode = 1 }
+    if ($out.ExitCode -eq 1) { $out.Status = 'Ostrzeżenie' }
+    if (-not $out.Message) {
+        $out.Message = if ($result['Summary']) { [string]$result.Summary } else { 'wyniki: {0}' -f $out.Findings }
+        if (@($result.Errors).Count) { $out.Message += ' • problemy: ' + (@($result.Errors | Select-Object -First 2) -join ' | ') }
+    }
+
+    $state.LastRun = $at.ToString('s'); $state.Status = $out.Status; $state.Message = $out.Message; $state.Output = $out.Output; $state.Mail = $out.Mail
+    if ($out.ExitCode -ne 2) {
+        $state.LastSuccess = $at.ToString('s')
+        $state.Summary = if ($result['Summary']) { [string]$result.Summary } else { '' }
+        $state.Findings = $out.Findings; $state.New = $out.New; $state.Resolved = $out.Resolved
+        $state.Items = @($changes.Items)
+    }
+    $state.History = @(@(@{ At = $at.ToString('s'); Status = $out.Status; Findings = $out.Findings; New = $(if ($changes.Baseline) { $null } else { $out.New }); Resolved = $(if ($changes.Baseline) { $null } else { $out.Resolved }); Output = $out.Output; Mail = $out.Mail; Message = $out.Message }) + $history | Select-Object -First 60)
+    try { Save-ReportState -Job $Job -State $state } catch { Write-Log ("Nie zapisano stanu raportu: {0}" -f $_.Exception.Message) 'ERROR' }
+    Write-Log ("Raport «{0}»: {1}{2} → {3}" -f $Job.Name, $out.Message, $(if ($changes.Baseline) { ' (stan odniesienia)' } else { " (nowe: $($out.New), ustąpiło: $($out.Resolved))" }), $out.Output) $(if ($out.ExitCode -eq 0) { 'OK' } else { 'WARN' })
+    return $out
+}
+
+function Invoke-ScheduledReportFile {
+    # Tryb bez okna: -RunReport <definicja.json>. Zwraca kod wyjścia procesu.
+    param([Parameter(Mandatory)][string]$Path)
+    $script:App.Headless = $true
+    try { Import-Settings } catch { }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $logDir = Join-Path (Split-Path -Parent $full) 'Logs'
+        if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        $script:App.RunLog = Join-Path $logDir (([System.IO.Path]::GetFileNameWithoutExtension($full)) + '.log')
+        if ((Test-Path -LiteralPath $script:App.RunLog) -and (Get-Item -LiteralPath $script:App.RunLog).Length -gt 1MB) {
+            $keep = @(Get-Content -LiteralPath $script:App.RunLog -Encoding UTF8 | Select-Object -Last 2000)
+            [System.IO.File]::WriteAllLines($script:App.RunLog, [string[]]$keep, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    }
+    catch { $script:App.RunLog = '' }
+    try {
+        Write-Log ('Raport cykliczny – start: {0} (konto {1}\{2}, komputer {3}, PowerShell {4})' -f $Path, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME, $PSVersionTable.PSVersion)
+        foreach ($err in @($script:PluginErrors)) { Write-Log "Błąd modułu własnego $err" 'ERROR' }
+        $job = Read-ReportJob $Path
+        $r = Invoke-ScheduledReport -Job $job
+        Write-Log ('Raport cykliczny – koniec (kod {0})' -f $r.ExitCode) $(if ($r.ExitCode -eq 0) { 'OK' } else { 'WARN' })
+        return [int]$r.ExitCode
+    }
+    catch {
+        Write-Log ('Raport cykliczny nie został wykonany: {0}' -f $_.Exception.Message) 'ERROR'
+        return 2
+    }
+}
+#endregion
+
+#region Harmonogram zadań
+function Get-ReportNextStart([string]$Time, [datetime]$Now = (Get-Date)) {
+    # Najbliższe wystąpienie godziny (dzisiaj albo jutro) - początek wyzwalacza zadania
+    $t = [datetime]::ParseExact($Time, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+    $start = $Now.Date.AddHours($t.Hour).AddMinutes($t.Minute)
+    if ($start -le $Now) { $start = $start.AddDays(1) }
+    return $start
+}
+
+function New-ReportTaskXml {
+    <#
+        Definicja zadania Harmonogramu (schemat 1.2): wyzwalacz kalendarzowy, konto, ustawienia i akcja
+        powershell.exe -File <program> -RunReport <definicja>. Konto gMSA ustawia Register-ReportTask osobno.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Job, [Parameter(Mandatory)][string]$ScriptPath, [Parameter(Mandatory)][string]$DefinitionPath, [datetime]$Now = (Get-Date))
+    $x = { param($t) ConvertTo-XmlText ([string]$t) }
+    $s = $Job.Schedule
+    $start = (Get-ReportNextStart -Time ([string]$s.Time) -Now $Now).ToString('yyyy-MM-ddTHH:mm:ss')
+    $trigger = switch ([string]$s.Frequency) {
+        'Daily' { '<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>' }
+        'Weekly' { '<ScheduleByWeek><DaysOfWeek>' + ((@($s.Days | ForEach-Object { "<$_ />" })) -join '') + '</DaysOfWeek><WeeksInterval>1</WeeksInterval></ScheduleByWeek>' }
+        'Monthly' { '<ScheduleByMonth><DaysOfMonth><Day>' + (& $x $s.DayOfMonth) + '</Day></DaysOfMonth><Months><January /><February /><March /><April /><May /><June /><July /><August /><September /><October /><November /><December /></Months></ScheduleByMonth>' }
+        default { throw 'Raport bez harmonogramu nie ma zadania.' }
+    }
+    $mode = [string]$Job.RunAs.Mode
+    $user = switch ($mode) {
+        'Password' { [string]$Job.RunAs.Account }
+        'Interactive' { $(if ($Job.RunAs.Account) { [string]$Job.RunAs.Account } else { "$env:USERDOMAIN\$env:USERNAME" }) }
+        default { 'S-1-5-18' }
+    }
+    $logon = switch ($mode) { 'Password' { 'Password' } 'Interactive' { 'InteractiveToken' } default { 'ServiceAccount' } }
+    $level = if ([bool]$Job.RunAs.Highest -or $mode -eq 'System' -or $mode -eq 'Gmsa') { 'HighestAvailable' } else { 'LeastPrivilege' }
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -RunReport "{1}"' -f $ScriptPath, $DefinitionPath
+    $desc = 'Domain Ops – raport cykliczny «{0}» ({1}). Definicja: {2}' -f $Job.Name, $script:ReportTypes[[string]$Job.Type].Title, $DefinitionPath
+    return @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>$(& $x ("$env:USERDOMAIN\$env:USERNAME"))</Author>
+    <Description>$(& $x $desc)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>$start</StartBoundary>
+      <Enabled>true</Enabled>
+      $trigger
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$(& $x $user)</UserId>
+      <LogonType>$logon</LogonType>
+      <RunLevel>$level</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT4H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>$(& $x $arguments)</Arguments>
+      <WorkingDirectory>$(& $x (Split-Path -Parent $DefinitionPath))</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"@
+}
+
+function Protect-ReportProgramFolder {
+    <#
+        Folder z kopią programu i modułami własnymi wykonuje się na koncie zadania (np. SYSTEM) - zapis do niego
+        oznaczałby wykonanie dowolnego kodu na tym koncie. Uprawnienia bez dziedziczenia: SYSTEM, Administratorzy
+        i bieżący użytkownik - pełna kontrola, konto zadania - odczyt i wykonanie.
+    #>
+    param([string]$Path, [string]$Account = '')
+    try {
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $none = [System.Security.AccessControl.PropagationFlags]::None
+        $sd = New-Object System.Security.AccessControl.DirectorySecurity
+        $sd.SetAccessRuleProtection($true, $false)
+        $ids = @((New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'), (New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'), [System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+        foreach ($id in $ids) { $sd.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', $inherit, $none, 'Allow'))) }
+        if ($Account) {
+            try { $sd.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.NTAccount $Account), 'ReadAndExecute', $inherit, $none, 'Allow'))) }
+            catch { Write-Log ("Nie dodano uprawnień odczytu dla konta {0} do folderu programu: {1}" -f $Account, $_.Exception.Message) 'WARN' }
+        }
+        Set-Acl -LiteralPath $Path -AclObject $sd
+    }
+    catch { Write-Log ("Nie ustawiono uprawnień folderu programu {0}: {1} – folder powinien być zapisywalny tylko dla administratorów." -f $Path, $_.Exception.Message) 'WARN' }
+}
+
+function Copy-ReportProgram {
+    # Kopia programu (i modułów własnych) w folderze zadań - zadanie nie zależy od miejsca, z którego uruchamiasz program
+    param([string]$JobsDir = '', [string]$Account = '')
+    if (-not $JobsDir) { $JobsDir = Get-ReportJobsDir }
+    $src = [string]$script:App.ScriptPath
+    if (-not $src -or -not (Test-Path -LiteralPath $src)) { throw 'Nie można ustalić pliku programu (uruchom Domain Ops z pliku .ps1).' }
+    $dir = Join-Path $JobsDir 'Program'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Protect-ReportProgramFolder -Path $dir -Account $Account
+    $dest = Join-Path $dir 'AD-ManagerDiamond.ps1'
+    if ([System.IO.Path]::GetFullPath($src) -ne [System.IO.Path]::GetFullPath($dest)) { Copy-Item -LiteralPath $src -Destination $dest -Force }
+    $mods = [string]$script:App.ModulesDir
+    $destMods = Join-Path $dir 'AD-ManagerDiamond.Modules'
+    if ($mods -and (Test-Path -LiteralPath $mods) -and [System.IO.Path]::GetFullPath($mods) -ne [System.IO.Path]::GetFullPath($destMods)) {
+        if (Test-Path -LiteralPath $destMods) { Remove-Item -LiteralPath $destMods -Recurse -Force }
+        Copy-Item -LiteralPath $mods -Destination $destMods -Recurse -Force
+    }
+    return $dest
+}
+
+function Register-ReportTask {
+    # Tworzy albo aktualizuje zadanie Harmonogramu; -Password dla konta z zapisanym hasłem
+    param([Parameter(Mandatory)][hashtable]$Job, [System.Security.SecureString]$Password)
+    $name = Get-ReportTaskName $Job
+    if ($Job.TaskName -and $Job.TaskName -ne $name) { Unregister-ReportTask -TaskName ([string]$Job.TaskName) }
+    if ([string]$Job.Schedule.Frequency -eq 'Manual') { Unregister-ReportTask -TaskName $name; $Job.TaskName = ''; return }
+    $prog = Copy-ReportProgram -JobsDir (Split-Path -Parent ([string]$Job.Path)) -Account $(if (@('Password', 'Gmsa') -contains [string]$Job.RunAs.Mode) { [string]$Job.RunAs.Account } else { '' })
+    $xml = New-ReportTaskXml -Job $Job -ScriptPath $prog -DefinitionPath ([string]$Job.Path)
+    $rp = @{ TaskName = $name; TaskPath = $script:ReportTaskPath; Xml = $xml; Force = $true; ErrorAction = 'Stop' }
+    if ([string]$Job.RunAs.Mode -eq 'Password') {
+        if (-not $Password) { throw 'Podaj hasło konta, na którym ma działać zadanie.' }
+        $rp.User = [string]$Job.RunAs.Account
+        $rp.Password = (New-Object System.Net.NetworkCredential('', $Password)).Password
+    }
+    Register-ScheduledTask @rp | Out-Null
+    if ([string]$Job.RunAs.Mode -eq 'Gmsa') {
+        $principal = New-ScheduledTaskPrincipal -UserId ([string]$Job.RunAs.Account) -LogonType Password -RunLevel Highest
+        Set-ScheduledTask -TaskName $name -TaskPath $script:ReportTaskPath -Principal $principal -ErrorAction Stop | Out-Null
+    }
+    $Job.TaskName = $name
+}
+
+function Unregister-ReportTask([string]$TaskName) {
+    if (-not $TaskName) { return }
+    try {
+        $t = Get-ScheduledTask -TaskName $TaskName -TaskPath $script:ReportTaskPath -ErrorAction SilentlyContinue
+        if ($t) { Unregister-ScheduledTask -TaskName $TaskName -TaskPath $script:ReportTaskPath -Confirm:$false -ErrorAction Stop }
+    }
+    catch { Write-Log ("Nie usunięto zadania Harmonogramu «{0}»: {1}" -f $TaskName, $_.Exception.Message) 'WARN' }
+}
+
+function Get-ReportTaskInfo {
+    # Zadania z folderu \Domain Ops\: nazwa -> @{ State; NextRun; LastRun; LastResult }
+    $map = @{}
+    try {
+        foreach ($t in @(Get-ScheduledTask -TaskPath $script:ReportTaskPath -ErrorAction Stop)) {
+            $info = $null
+            try { $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $script:ReportTaskPath -ErrorAction Stop } catch { }
+            $map[[string]$t.TaskName] = @{
+                State      = [string]$t.State
+                NextRun    = $(if ($info -and $info.NextRunTime -and ([datetime]$info.NextRunTime).Year -gt 2000) { [datetime]$info.NextRunTime } else { $null })
+                LastRun    = $(if ($info -and $info.LastRunTime -and ([datetime]$info.LastRunTime).Year -gt 2000) { [datetime]$info.LastRunTime } else { $null })
+                LastResult = $(if ($info) { [int64]$info.LastTaskResult } else { $null })
+            }
+        }
+    }
+    catch { }
+    return $map
+}
+#endregion
+#endregion
+
+#region Raporty cykliczne – moduł (lista definicji, edytor, uruchamianie, zadania Harmonogramu)
+$script:ReportEditorContext = $null
+
+function Get-ReportEditorFields {
+    # Pola edytora: rodzaj raportu (opcje z prefiksem o_), wynik, poczta, harmonogram, konto zadania
+    param([hashtable]$Job, [hashtable]$Type)
+    $never = $script:ReportMailModes.Never
+    $mailOn = @{ Key = 'MailMode'; NotIn = @($never) }
+    $scheduled = @{ Key = 'Frequency'; NotIn = @($script:ReportFrequencies.Manual) }
+    $fields = New-Object System.Collections.ArrayList
+    [void]$fields.Add(@{ Type = 'Header'; Label = ('Raport: ' + $Type.Title); Hint = $Type.Description })
+    [void]$fields.Add(@{ Key = 'Name'; Label = 'Nazwa (nazwa plików raportu i zadania w Harmonogramie)'; Value = [string]$Job.Name })
+    foreach ($o in $Type.Options) {
+        $f = @{}
+        foreach ($k in $o.Keys) { $f[$k] = $o[$k] }
+        $f.Key = 'o_' + [string]$o.Key
+        $v = if ($Job.Options.ContainsKey([string]$o.Key)) { $Job.Options[[string]$o.Key] } else { $o['Value'] }
+        $f.Value = $(if ([string]$o['Type'] -eq 'Check') { [bool]$v } else { [string]$v })
+        [void]$fields.Add($f)
+    }
+    $defOut = Get-ReportOutputDir -Job @{ Name = $(if ($Job.Name) { $Job.Name } else { 'Raport' }); Output = @{ Folder = '' }; Path = [string]$Job.Path }
+    [void]$fields.Add(@{ Type = 'Header'; Label = 'Wynik' })
+    [void]$fields.Add(@{ Key = 'OutFolder'; Label = 'Folder raportów'; Type = 'Folder'; Value = [string]$Job.Output.Folder; Placeholder = $defOut; Hint = 'Puste – podfolder Output w folderze zadań. Może to być udział sieciowy (\\serwer\raporty) – konto zadania musi mieć do niego prawo zapisu.' })
+    [void]$fields.Add(@{ Key = 'Keep'; Label = 'Zachowaj ostatnich raportów (0 – wszystkie)'; Type = 'Number'; Value = [string]$Job.Output.Keep })
+    [void]$fields.Add(@{ Key = 'Latest'; Label = 'Stała kopia ostatniego raportu (…_najnowszy.html) – do zakładki w przeglądarce lub intranetu'; Type = 'Check'; Value = [bool]$Job.Output.Latest })
+    [void]$fields.Add(@{ Key = 'Csv'; Label = 'Także plik CSV z wynikami (Excel)'; Type = 'Check'; Value = [bool]$Job.Output.Csv })
+    [void]$fields.Add(@{ Type = 'Header'; Label = 'Poczta' })
+    [void]$fields.Add(@{ Key = 'MailMode'; Label = 'Wysyłka e-mail'; Type = 'Combo'; Items = @($script:ReportMailModes.Values); Value = $script:ReportMailModes[[string]$Job.Mail.Mode]; Hint = 'Błąd raportu jest wysyłany zawsze, gdy wysyłka jest włączona. «Gdy są zmiany» – także przy pierwszym uruchomieniu (stan odniesienia).' })
+    [void]$fields.Add(@{ Key = 'MailTo'; Label = 'Do (adresy rozdzielone przecinkami)'; Value = [string]$Job.Mail.To; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Key = 'MailCc'; Label = 'DW'; Value = [string]$Job.Mail.Cc; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Key = 'MailFrom'; Label = 'Od'; Value = [string]$Job.Mail.From; Placeholder = 'np. domainops@contoso.pl'; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Key = 'SmtpServer'; Label = 'Serwer SMTP'; Value = [string]$Job.Mail.Server; Placeholder = 'np. smtp.contoso.local albo smtp.office365.com'; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Key = 'SmtpPort'; Label = 'Port'; Type = 'Number'; Value = [string]$Job.Mail.Port; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Key = 'SmtpSsl'; Label = 'Szyfrowanie TLS (STARTTLS)'; Type = 'Check'; Value = [bool]$Job.Mail.Ssl; EnabledWhen = $mailOn })
+    $auth = [ordered]@{ None = 'Bez uwierzytelniania (przekaźnik w sieci firmy)'; Windows = 'Konto, na którym działa zadanie (Windows)'; Login = 'Login i hasło' }
+    [void]$fields.Add(@{ Key = 'SmtpAuth'; Label = 'Uwierzytelnianie SMTP'; Type = 'Combo'; Items = @($auth.Values); Value = $auth[[string]$Job.Mail.Auth]; EnabledWhen = $mailOn })
+    $loginOn = @($mailOn, @{ Key = 'SmtpAuth'; In = @($auth.Login) })
+    [void]$fields.Add(@{ Key = 'SmtpUser'; Label = 'Login SMTP'; Value = [string]$Job.Mail.User; EnabledWhen = $loginOn })
+    $pwHint = if ([string]$Job.Mail.Password) { ('Hasło jest zapisane (zaszyfrował je {0}) – puste pole zostawia je bez zmian.' -f $Job.Mail.PasswordOwner) } else { 'Hasło zostanie zaszyfrowane (DPAPI) – odczyta je tylko to samo konto na tym komputerze, więc zadanie musi działać na Twoim koncie.' }
+    [void]$fields.Add(@{ Key = 'SmtpPassword'; Label = 'Hasło SMTP'; Type = 'Password'; Hint = $pwHint; EnabledWhen = $loginOn })
+    [void]$fields.Add(@{ Key = 'Attach'; Label = 'Załącz raport HTML (do 15 MB)'; Type = 'Check'; Value = [bool]$Job.Mail.Attach; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Key = 'MaxRows'; Label = 'Wierszy w treści wiadomości (najwyżej)'; Type = 'Number'; Value = [string]$Job.Mail.MaxRows; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Type = 'Header'; Label = 'Harmonogram'; Hint = 'Zadanie trafia do Harmonogramu zadań (folder «Domain Ops») i uruchamia kopię programu z folderu zadań – bez okna.' })
+    [void]$fields.Add(@{ Key = 'Frequency'; Label = 'Uruchamiaj'; Type = 'Combo'; Items = @($script:ReportFrequencies.Values); Value = $script:ReportFrequencies[[string]$Job.Schedule.Frequency] })
+    [void]$fields.Add(@{ Key = 'Time'; Label = 'Godzina (GG:MM)'; Type = 'Number'; Value = [string]$Job.Schedule.Time; EnabledWhen = $scheduled })
+    [void]$fields.Add(@{ Key = 'Days'; Label = 'Dni tygodnia'; Type = 'Flags'; Items = @($script:ReportWeekDays.Values); Value = @($Job.Schedule.Days | ForEach-Object { $script:ReportWeekDays[[string]$_] }); EnabledWhen = @{ Key = 'Frequency'; In = @($script:ReportFrequencies.Weekly) } })
+    $dom = @(1..28 | ForEach-Object { [string]$_ }) + @('ostatni dzień miesiąca')
+    [void]$fields.Add(@{ Key = 'DayOfMonth'; Label = 'Dzień miesiąca'; Type = 'Combo'; Items = $dom; Value = $(if ([string]$Job.Schedule.DayOfMonth -eq 'Last') { 'ostatni dzień miesiąca' } else { [string]$Job.Schedule.DayOfMonth }); EnabledWhen = @{ Key = 'Frequency'; In = @($script:ReportFrequencies.Monthly) } })
+    [void]$fields.Add(@{ Key = 'RunAs'; Label = 'Konto zadania'; Type = 'Combo'; Items = @($script:ReportRunAsModes.Values); Value = $script:ReportRunAsModes[[string]$Job.RunAs.Mode]; EnabledWhen = $scheduled
+            Hint = 'Konto musi czytać AD (każde konto domenowe), a dla WinRM, NTFS i stanu kontrolerów mieć prawa administratora na serwerach. SYSTEM działa w domenie jako konto komputera – wystarcza do większości raportów AD tylko do odczytu. gMSA trzeba wcześniej zainstalować na tym komputerze (Install-ADServiceAccount).' })
+    [void]$fields.Add(@{ Key = 'Account'; Label = 'Konto (DOMENA\login, dla gMSA z $ na końcu)'; Value = [string]$Job.RunAs.Account; EnabledWhen = @($scheduled, @{ Key = 'RunAs'; In = @($script:ReportRunAsModes.Password, $script:ReportRunAsModes.Gmsa) }) })
+    [void]$fields.Add(@{ Key = 'Highest'; Label = 'Z najwyższymi uprawnieniami (m.in. tryb kopii zapasowej NTFS)'; Type = 'Check'; Value = [bool]$Job.RunAs.Highest; EnabledWhen = $scheduled })
+    [void]$fields.Add(@{ Type = 'Header'; Label = 'Połączenie' })
+    [void]$fields.Add(@{ Key = 'Server'; Label = 'Kontroler domeny'; Value = [string]$Job.Server; Placeholder = 'puste – wybór automatyczny' })
+    return $fields.ToArray()
+}
+
+function Test-ReportEditorValues {
+    # Opis pierwszego błędu w formularzu albo pusty tekst ($script:ReportEditorContext: Job, Type)
+    param([hashtable]$Values)
+    $ctx = $script:ReportEditorContext
+    $isEmail = { param($a) try { [void](New-Object System.Net.Mail.MailAddress($a)); return ($a -match '^[^@\s]+@[^@\s]+$') } catch { return $false } }
+    if (-not $Values.Name) { return 'Podaj nazwę raportu.' }
+    foreach ($o in $ctx.Type.Options) {
+        $v = $Values['o_' + [string]$o.Key]
+        if ($o['Required'] -and [string]::IsNullOrWhiteSpace([string]$v)) { return ('Uzupełnij pole «{0}».' -f $o.Label) }
+        if ([string]$o['Type'] -eq 'Number') {
+            $n = 0
+            if (-not [int]::TryParse([string]$v, [ref]$n)) { return ('Pole «{0}»: podaj liczbę całkowitą.' -f $o.Label) }
+            if (($null -ne $o['Min'] -and $n -lt [int]$o.Min) -or ($null -ne $o['Max'] -and $n -gt [int]$o.Max)) { return ('Pole «{0}»: liczba od {1} do {2}.' -f $o.Label, $o.Min, $o.Max) }
+        }
+    }
+    $keep = 0
+    if (-not [int]::TryParse([string]$Values.Keep, [ref]$keep) -or $keep -lt 0 -or $keep -gt 10000) { return 'Liczba zachowywanych raportów: od 0 do 10000.' }
+    if ($Values.OutFolder -and -not ([System.IO.Path]::IsPathRooted([Environment]::ExpandEnvironmentVariables($Values.OutFolder)))) { return 'Folder raportów: podaj pełną ścieżkę (np. D:\Raporty albo \\serwer\raporty).' }
+    if ($Values.MailMode -ne $script:ReportMailModes.Never) {
+        $to = @(Split-ListText $Values.MailTo)
+        if (-not $to.Count) { return 'Podaj adresatów wiadomości (Do).' }
+        foreach ($a in @($to + @(Split-ListText $Values.MailCc))) { if (-not (& $isEmail $a)) { return "Niepoprawny adres e-mail: $a" } }
+        if (-not (& $isEmail $Values.MailFrom)) { return 'Podaj poprawny adres nadawcy (Od).' }
+        if (-not $Values.SmtpServer) { return 'Podaj serwer SMTP.' }
+        $port = 0
+        if (-not [int]::TryParse([string]$Values.SmtpPort, [ref]$port) -or $port -lt 1 -or $port -gt 65535) { return 'Port SMTP: liczba od 1 do 65535.' }
+        $rows = 0
+        if (-not [int]::TryParse([string]$Values.MaxRows, [ref]$rows) -or $rows -lt 5 -or $rows -gt 1000) { return 'Wierszy w treści wiadomości: od 5 do 1000.' }
+        if ($Values.SmtpAuth -eq 'Login i hasło') {
+            if (-not $Values.SmtpUser) { return 'Podaj login SMTP.' }
+            if ($Values.SmtpPassword.Length -eq 0 -and -not [string]$ctx.Job.Mail.Password) { return 'Podaj hasło SMTP.' }
+        }
+    }
+    if ($Values.Frequency -ne $script:ReportFrequencies.Manual) {
+        if ([string]$Values.Time -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') { return 'Godzina w formacie GG:MM, np. 06:30.' }
+        if ($Values.Frequency -eq $script:ReportFrequencies.Weekly -and -not @($Values.Days).Count) { return 'Wybierz co najmniej jeden dzień tygodnia.' }
+        $mode = @($script:ReportRunAsModes.Keys | Where-Object { $script:ReportRunAsModes[$_] -eq $Values.RunAs })[0]
+        if ($mode -eq 'Password' -and -not $Values.Account) { return 'Podaj konto, na którym ma działać zadanie.' }
+        if ($mode -eq 'Gmsa' -and $Values.Account -notmatch '\$$') { return 'Konto gMSA podaj z $ na końcu, np. CONTOSO\gmsa-raporty$.' }
+        # Hasło SMTP (DPAPI) odczyta tylko konto, które je zaszyfrowało
+        $me = "$env:USERDOMAIN\$env:USERNAME"
+        $foreign = ($mode -eq 'System' -or $mode -eq 'Gmsa' -or ($mode -eq 'Password' -and $Values.Account -ne $me))
+        if ($Values.MailMode -ne $script:ReportMailModes.Never -and $Values.SmtpAuth -eq 'Login i hasło' -and $foreign) {
+            return ('Hasło SMTP zostanie zaszyfrowane dla konta {0} – zadanie działające na innym koncie go nie odczyta. Uruchamiaj zadanie na swoim koncie albo wybierz uwierzytelnianie kontem zadania (Windows) lub przekaźnik bez hasła.' -f $me)
+        }
+    }
+    return ''
+}
+
+function Show-ReportJobEditor {
+    # Edytor definicji; zwraca zaktualizowaną kopię definicji albo $null (anulowano)
+    param([Parameter(Mandatory)][hashtable]$Job, [switch]$IsNew)
+    $type = $script:ReportTypes[[string]$Job.Type]
+    $script:ReportEditorContext = @{ Job = $Job; Type = $type }
+    $v = Show-FormDialog -Title $(if ($IsNew) { 'Nowy raport cykliczny' } else { 'Raport cykliczny: ' + $Job.Name }) -Subtitle $type.Title -Icon $type.Icon -OkText 'Zapisz' -Width 660 -MaxHeight 620 `
+        -Fields (Get-ReportEditorFields -Job $Job -Type $type) -Validate { param($values) Test-ReportEditorValues $values }
+    $script:ReportEditorContext = $null
+    if ($null -eq $v) { return $null }
+    $j = @{}
+    foreach ($k in $Job.Keys) { $j[$k] = $Job[$k] }
+    foreach ($k in 'Options', 'Output', 'Mail', 'Schedule', 'RunAs') { $j[$k] = $Job[$k].Clone() }
+    $j.Name = [string]$v.Name
+    foreach ($o in $type.Options) {
+        $raw = $v['o_' + [string]$o.Key]
+        $j.Options[[string]$o.Key] = switch ([string]$o['Type']) { 'Number' { [int]$raw } 'Check' { [bool]$raw } default { [string]$raw } }
+    }
+    $j.Output = @{ Folder = [string]$v.OutFolder; Keep = [int]$v.Keep; Latest = [bool]$v.Latest; Csv = [bool]$v.Csv }
+    $modeKey = { param($map, $text) @($map.Keys | Where-Object { $map[$_] -eq $text })[0] }
+    $mail = $j.Mail
+    $mail.Mode = & $modeKey $script:ReportMailModes $v.MailMode
+    $mail.To = [string]$v.MailTo; $mail.Cc = [string]$v.MailCc; $mail.From = [string]$v.MailFrom; $mail.Server = [string]$v.SmtpServer
+    $mail.Port = $(if ([string]$v.SmtpPort -match '^\d+$') { [int]$v.SmtpPort } else { 25 })
+    $mail.Ssl = [bool]$v.SmtpSsl; $mail.Attach = [bool]$v.Attach
+    $mail.MaxRows = $(if ([string]$v.MaxRows -match '^\d+$') { [int]$v.MaxRows } else { 50 })
+    $mail.Auth = switch ([string]$v.SmtpAuth) { 'Login i hasło' { 'Login' } 'Konto, na którym działa zadanie (Windows)' { 'Windows' } default { 'None' } }
+    $mail.User = [string]$v.SmtpUser
+    if ($mail.Auth -eq 'Login') {
+        if ($v.SmtpPassword -and $v.SmtpPassword.Length -gt 0) { $mail.Password = Protect-ReportSecret $v.SmtpPassword; $mail.PasswordOwner = "$env:USERDOMAIN\$env:USERNAME" }
+    }
+    else { $mail.Password = ''; $mail.PasswordOwner = '' }
+    $s = $j.Schedule
+    $s.Frequency = & $modeKey $script:ReportFrequencies $v.Frequency
+    if ([string]$v.Time -match '^(\d{1,2}):(\d{2})$') { $s.Time = '{0:00}:{1}' -f [int]$Matches[1], $Matches[2] }
+    $s.Days = @($script:ReportWeekDays.Keys | Where-Object { @($v.Days) -contains $script:ReportWeekDays[$_] })
+    $s.DayOfMonth = $(if ([string]$v.DayOfMonth -match '^\d+$') { [string]$v.DayOfMonth } else { 'Last' })
+    $r = $j.RunAs
+    $r.Mode = & $modeKey $script:ReportRunAsModes $v.RunAs
+    $r.Account = $(if ($r.Mode -eq 'System') { '' } elseif ($r.Mode -eq 'Interactive' -and -not $v.Account) { "$env:USERDOMAIN\$env:USERNAME" } else { [string]$v.Account })
+    $r.Highest = [bool]$v.Highest
+    $j.Server = [string]$v.Server
+    return $j
+}
+
+function Get-ReportTaskSignature([hashtable]$Job) {
+    # Zmiana któregoś z tych pól wymaga ponownej rejestracji zadania (w przeciwnym razie wystarczy zapis definicji)
+    $s = $Job.Schedule; $r = $Job.RunAs
+    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $s.Frequency, $s.Time, ((@($s.Days)) -join ','), $s.DayOfMonth, $r.Mode, $r.Account, [bool]$r.Highest, $Job.Path, (Get-ReportTaskName $Job))
+}
+
+function Save-ReportJobWithTask {
+    # Zapis definicji i (gdy trzeba) rejestracja zadania; -ForceTask: zawsze rejestruje od nowa. Zwraca opis wyniku.
+    param([Parameter(Mandatory)][hashtable]$Job, [switch]$ForceTask)
+    $dir = if ($Job.Path) { Split-Path -Parent ([string]$Job.Path) } else { Get-ReportJobsDir }
+    [void](Save-ReportJob -Job $Job -JobsDir $dir)
+    if ([string]$Job.Schedule.Frequency -eq 'Manual') {
+        if ($Job.TaskName) { Unregister-ReportTask -TaskName ([string]$Job.TaskName); $Job.TaskName = ''; $Job.TaskSignature = ''; [void](Save-ReportJob -Job $Job -JobsDir $dir) }
+        return 'Zapisano – raport uruchamiany tylko ręcznie.'
+    }
+    $tasks = Get-ReportTaskInfo
+    $name = Get-ReportTaskName $Job
+    $exists = $tasks.ContainsKey($name)
+    if ($exists -and -not $ForceTask -and [string]$Job['TaskSignature'] -eq (Get-ReportTaskSignature $Job)) {
+        try { [void](Copy-ReportProgram -JobsDir $dir) } catch { Write-Log ('Nie odświeżono kopii programu: ' + $_.Exception.Message) 'WARN' }
+        return 'Zapisano – zadanie w Harmonogramie bez zmian.'
+    }
+    $password = $null
+    if ([string]$Job.RunAs.Mode -eq 'Password') {
+        $cred = Show-CredentialDialog -Message ('Hasło konta, na którym będzie działać raport «{0}». Trafia tylko do Harmonogramu zadań (Windows przechowuje je zaszyfrowane).' -f $Job.Name) -UserName ([string]$Job.RunAs.Account)
+        if (-not $cred) { return 'Zapisano definicję, ale bez zadania w Harmonogramie (nie podano hasła) – użyj «Utwórz zadanie ponownie».' }
+        $Job.RunAs.Account = $cred.UserName
+        $password = $cred.Password
+    }
+    try {
+        Invoke-WithWaitCursor { Register-ReportTask -Job $Job -Password $password }
+        $Job.TaskSignature = Get-ReportTaskSignature $Job
+        [void](Save-ReportJob -Job $Job -JobsDir $dir)
+        Write-Log ('Zadanie Harmonogramu «{0}{1}»: {2}, konto {3}' -f $script:ReportTaskPath, $Job.TaskName, (Get-ReportScheduleText $Job.Schedule), (Get-ReportRunAsText $Job.RunAs)) 'OK'
+        # Inne konto niż bieżące nie ma dostępu do folderu w profilu użytkownika (SYSTEM ma)
+        $me = "$env:USERDOMAIN\$env:USERNAME"
+        $other = ([string]$Job.RunAs.Mode -eq 'Gmsa') -or ([string]$Job.RunAs.Mode -eq 'Password' -and [string]$Job.RunAs.Account -ne $me)
+        if ($other -and $env:USERPROFILE -and ([System.IO.Path]::GetFullPath($dir)).StartsWith([System.IO.Path]::GetFullPath($env:USERPROFILE), [System.StringComparison]::OrdinalIgnoreCase)) {
+            Show-Warning ('Zadanie działa na koncie {0}, a folder zadań leży w Twoim profilu ({1}) – to konto nie odczyta definicji i nie zapisze raportu. Zmień folder zadań (np. C:\ProgramData\DomainOps\Raporty), nadaj kontu zadania prawo zapisu i zapisz raport ponownie.' -f $Job.RunAs.Account, $dir)
+        }
+        return ('Zapisano i zaplanowano: {0}.' -f (Get-ReportScheduleText $Job.Schedule))
+    }
+    catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'access is denied|odmowa dost') { $msg += ' – uruchom Domain Ops jako administrator (zadania z najwyższymi uprawnieniami, SYSTEM i gMSA tego wymagają).' }
+        Show-Error 'Definicja raportu została zapisana, ale nie utworzono zadania w Harmonogramie.' $msg
+        return 'Zapisano definicję – bez zadania w Harmonogramie.'
+    }
+}
+
+function Get-ReportJobRows {
+    # Wiersze listy: definicja + stan ostatniego uruchomienia + zadanie Harmonogramu
+    param([object[]]$Jobs, [hashtable]$Tasks)
+    $states = @{ 'Ready' = 'Gotowe'; 'Disabled' = 'Wyłączone'; 'Running' = 'Działa'; 'Queued' = 'W kolejce' }
+    foreach ($j in $Jobs) {
+        if ($j['Error']) {
+            [pscustomobject][ordered]@{ 'Nazwa' = $j.Name; 'Raport' = '(błąd definicji)'; 'Harmonogram' = ''; 'Zadanie' = ''; 'Następne uruchomienie' = $null; 'Ostatnie uruchomienie' = $null; 'Wynik' = 'Błąd'; 'Opis wyniku' = $j.Error; 'Wyniki' = $null; 'Nowe' = $null; 'Poczta' = ''; 'Konto' = ''; 'Folder raportów' = ''; '__id' = $j.Id; '__tone' = 'crit' }
+            continue
+        }
+        $st = Read-ReportState $j -NoItems
+        if (-not ($st -is [hashtable])) { $st = @{} }
+        $t = $null
+        $taskText = 'tylko ręcznie'
+        if ([string]$j.Schedule.Frequency -ne 'Manual') {
+            $t = if ($j.TaskName -and $Tasks.ContainsKey([string]$j.TaskName)) { $Tasks[[string]$j.TaskName] } else { $null }
+            $taskText = if ($t) { $(if ($states.ContainsKey($t.State)) { $states[$t.State] } else { $t.State }) } else { 'brak zadania' }
+            if ($t -and $null -ne $t.LastResult -and @(0, 267011, 267009) -notcontains $t.LastResult) { $taskText += (' (ostatni kod 0x{0:X})' -f $t.LastResult) }
+        }
+        $status = [string]$st['Status']
+        $tone = switch ($status) { 'OK' { 'ok' } 'Ostrzeżenie' { 'warn' } 'Błąd' { 'crit' } default { '' } }
+        $mailText = $script:ReportMailModes[[string]$j.Mail.Mode]
+        if ([string]$j.Mail.Mode -ne 'Never') { $mailText += ' → ' + [string]$j.Mail.To }
+        [pscustomobject][ordered]@{
+            'Nazwa'                 = $j.Name
+            'Raport'                = $script:ReportTypes[[string]$j.Type].Title
+            'Harmonogram'           = (Get-ReportScheduleText $j.Schedule)
+            'Zadanie'               = $taskText
+            'Następne uruchomienie' = $(if ($t) { $t.NextRun } else { $null })
+            'Ostatnie uruchomienie' = $(if ($st['LastRun']) { [datetime]$st.LastRun } else { $null })
+            'Wynik'                 = $(if ($status) { $status } else { 'nie uruchamiano' })
+            'Opis wyniku'           = [string]$st['Message']
+            'Wyniki'                = $st['Findings']
+            'Nowe'                  = $st['New']
+            'Poczta'                = $mailText
+            'Konto'                 = $(if ([string]$j.Schedule.Frequency -ne 'Manual') { Get-ReportRunAsText $j.RunAs } else { '' })
+            'Folder raportów'       = (Get-ReportOutputDir -Job $j)
+            '__id'                  = $j.Id
+            '__tone'                = $tone
+        }
+    }
+}
+
+function Get-ReportJobsFromRows {
+    param([hashtable]$Module, $Rows)
+    $ids = @($Rows | ForEach-Object { [string](Get-ObjectValue $_ '__id') } | Where-Object { $_ })
+    $all = @(Get-ReportJobs)
+    return @($all | Where-Object { $ids -contains [string]$_.Id -and -not $_['Error'] })
+}
+
+function Start-ReportRun {
+    # Uruchamia raporty w osobnych procesach programu (ta sama ścieżka co zadanie Harmonogramu, ale na bieżącym koncie)
+    param([hashtable]$Module, [object[]]$Jobs)
+    $m = $Module
+    if (-not $Jobs.Count) { return }
+    $scriptFile = [string]$script:App.ScriptPath
+    if (-not $scriptFile -or -not (Test-Path -LiteralPath $scriptFile)) {
+        foreach ($j in $Jobs) { [void](Invoke-WithWaitCursor { Invoke-ScheduledReport -Job $j }) }
+        & $m.Actions.Refresh $m
+        return
+    }
+    $exe = (Get-Process -Id $PID).Path
+    $per = @{}
+    foreach ($j in $Jobs) { $per[[string]$j.Id] = @{ Exe = $exe; Script = $scriptFile; Def = [string]$j.Path; Name = [string]$j.Name } }
+    $m.Data.RunNames = @{}
+    foreach ($j in $Jobs) { $m.Data.RunNames[[string]$j.Id] = [string]$j.Name }
+    Start-HostOperation -Module $m -Name 'Raporty cykliczne' -Targets @($per.Keys) -PerTarget $per -Local -Output None -ScriptBlock {
+        param($Target, $P, $Ctx)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $P.Exe
+        $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -RunReport "{1}"' -f $P.Script, $P.Def
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        try { while (-not $proc.WaitForExit(500)) { } }
+        finally { if (-not $proc.HasExited) { try { $proc.Kill() } catch { } } }
+        [pscustomobject]@{ ExitCode = $proc.ExitCode }
+    } -OnResult {
+        param($m, $r)
+        $name = $m.Data.RunNames[[string]$r.Target]
+        if (-not $r.Ok) { Write-Log ("Raport «{0}» – nie uruchomiono: {1}" -f $name, ((@($r.Errors)) -join ' ')) 'ERROR'; return }
+        $code = [int]@($r.Data)[0].ExitCode
+        $txt = switch ($code) { 0 { 'gotowy' } 1 { 'gotowy z ostrzeżeniami (szczegóły w kolumnie «Opis wyniku»)' } default { "nie powstał (kod $code) – szczegóły w kolumnie «Opis wyniku» i w dzienniku przebiegów" } }
+        Write-Log ("Raport «{0}»: {1}" -f $name, $txt) $(if ($code -eq 0) { 'OK' } elseif ($code -eq 1) { 'WARN' } else { 'ERROR' })
+    } -OnComplete {
+        param($m)
+        & $m.Actions.Refresh $m
+        Show-Toast 'Raporty cykliczne: gotowe – prawy przycisk na wierszu otwiera raport.' 'ok'
+    }
+}
+
+Register-Module -Workspace 'Domain' -Category 'Automatyzacja' -Key 'ScheduledReports' -Title 'Raporty cykliczne' -Icon 'E787' -Badge 'nowe' `
+    -Description 'Raporty tworzone według harmonogramu (Harmonogram zadań Windows, bez okna): audyt AD, stan domeny, delegacje, członkowie grup uprzywilejowanych, konta i komputery, ryzyka NTFS, wolne miejsce i certyfikaty serwerów. Raport HTML trafia do folderu albo pocztą – z listą zmian od poprzedniego uruchomienia (co nowego, co ustąpiło).' -Build {
+    param($m)
+    $m.PillColumns = @('Wynik')
+    $row = Add-ToolbarRow -Module $m -Title 'Raporty'
+    $items = @(foreach ($t in $script:ReportTypes.Values) { @{ Text = $t.Title; Icon = $t.Icon; Value = $t.Key; Action = { param($m, $v) & $m.Actions.New $m $v } } })
+    Add-MenuButton -Parent $row -Text 'Nowy raport' -Icon 'E710' -Module $m -Items $items | Out-Null
+    Add-Button -Parent $row -Text 'Edytuj' -Icon 'E70F' -Module $m -OnClick { param($m) & $m.Actions.Edit $m @(Get-SelectedResultRows -Module $m) } | Out-Null
+    Add-Button -Parent $row -Text 'Uruchom teraz' -Icon 'E768' -Module $m -ToolTip 'Raport powstaje w tle na Twoim koncie – tak jak w zadaniu (folder, poczta, porównanie z poprzednim)' -OnClick { param($m) & $m.Actions.RunNow $m @(Get-SelectedResultRows -Module $m) } | Out-Null
+    Add-Button -Parent $row -Text 'Odśwież' -Icon 'E72C' -Module $m -Primary -OnClick { param($m) & $m.Actions.Refresh $m } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Folder zadań'
+    $m.DirLabel = Add-Label -Parent $row2 -Text (Get-ReportJobsDir) -MaxWidth 620
+    Add-Button -Parent $row2 -Text 'Otwórz' -Icon 'E838' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $d = Get-ReportJobsDir
+        if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+        Open-Folder $d
+    } | Out-Null
+    Add-Button -Parent $row2 -Text 'Zmień…' -Icon 'E8B7' -Module $m -OnClick {
+        param($m)
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Folder definicji raportów cyklicznych (dla kont SYSTEM i gMSA wybierz folder poza profilem użytkownika, np. C:\ProgramData\DomainOps\Raporty)'
+        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $script:Settings.ReportJobsDir = $dlg.SelectedPath
+        Export-Settings
+        & $m.Actions.Refresh $m
+        Show-Toast 'Zmieniono folder zadań. Zadania już utworzone dalej korzystają z poprzedniego folderu.' 'info'
+    } | Out-Null
+    Add-Label -Parent $row2 -Text 'Definicje (*.json), stan, dziennik przebiegów i kopia programu dla zadań.' -Hint -MaxWidth 420 | Out-Null
+
+    $m.Actions.Refresh = {
+        param($m)
+        $m.DirLabel.Text = Get-ReportJobsDir
+        $jobs = @(Get-ReportJobs)
+        $tasks = Get-ReportTaskInfo
+        $rows = @(Get-ReportJobRows -Jobs $jobs -Tasks $tasks)
+        Reset-ResultTable -Module $m
+        if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+        $scheduled = @($rows | Where-Object { $_.'Zadanie' -notin @('tylko ręcznie', 'brak zadania', '') }).Count
+        $failed = @($rows | Where-Object { $_.'Wynik' -eq 'Błąd' }).Count
+        $new = 0
+        foreach ($r in $rows) { if ($null -ne $r.'Nowe') { $new += [int]$r.'Nowe' } }
+        Set-StatTile -Module $m -Key 'jobs' -Value ([string]$rows.Count)
+        Set-StatTile -Module $m -Key 'scheduled' -Value ([string]$scheduled) -Tone $(if ($scheduled) { 'ok' } else { '' })
+        Set-StatTile -Module $m -Key 'failed' -Value ([string]$failed) -Tone $(if ($failed) { 'crit' } else { '' })
+        Set-StatTile -Module $m -Key 'new' -Value ([string]$new) -Tone $(if ($new) { 'warn' } else { '' })
+    }
+    $m.Actions.Save = {
+        param($m, $job, [bool]$Force)
+        $msg = Save-ReportJobWithTask -Job $job -ForceTask:$Force
+        & $m.Actions.Refresh $m
+        Show-Toast $msg $(if ($msg -like 'Zapisano i zaplanowano*' -or $msg -like '*bez zmian*' -or $msg -like '*tylko ręcznie*') { 'ok' } else { 'warn' })
+    }
+    $m.Actions.New = {
+        param($m, [string]$TypeKey)
+        $job = New-ReportJob -Type $TypeKey
+        $edited = Show-ReportJobEditor -Job $job -IsNew
+        if ($edited) { & $m.Actions.Save $m $edited $false }
+    }
+    $m.Actions.Edit = {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { Show-Warning 'Zaznacz raport na liście.'; return }
+        $edited = Show-ReportJobEditor -Job $jobs[0]
+        if ($edited) { & $m.Actions.Save $m $edited $false }
+    }
+    $m.Actions.RunNow = {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { Show-Warning 'Zaznacz raporty na liście.'; return }
+        Start-ReportRun -Module $m -Jobs $jobs
+    }
+    $m.RowDoubleClick = { param($m, $row) & $m.Actions.Edit $m @($row) }
+
+    Add-RowAction -Module $m -Text 'Edytuj…' -Icon 'E70F' -Action { param($m, $rows) & $m.Actions.Edit $m $rows }
+    Add-RowAction -Module $m -Text 'Uruchom teraz' -Icon 'E768' -Action { param($m, $rows) & $m.Actions.RunNow $m $rows }
+    Add-RowAction -Module $m -Text 'Uruchom zadanie w Harmonogramie (na koncie zadania)' -Icon 'E787' -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows | Where-Object { $_.TaskName })
+        if (-not $jobs.Count) { Show-Warning 'Wybrane raporty nie mają zadania w Harmonogramie.'; return }
+        foreach ($j in $jobs) {
+            try { Start-ScheduledTask -TaskName ([string]$j.TaskName) -TaskPath $script:ReportTaskPath -ErrorAction Stop; Write-Log ("Uruchomiono zadanie «{0}»" -f $j.TaskName) 'OK' }
+            catch { Write-Log ("Nie uruchomiono zadania «{0}»: {1}" -f $j.TaskName, $_.Exception.Message) 'ERROR' }
+        }
+        Show-Toast 'Zadania uruchomione – wynik pojawi się po zakończeniu (Odśwież, F5).' 'info'
+    }
+    Add-RowAction -Module $m -Text 'Otwórz ostatni raport' -Icon 'E8A5' -Separator -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { return }
+        $st = Read-ReportState $jobs[0]
+        $file = if ($st -is [hashtable]) { [string]$st['Output'] } else { '' }
+        if (-not $file -or -not (Test-Path -LiteralPath $file)) { Show-Warning 'Ten raport nie ma jeszcze zapisanego pliku (albo plik usunięto).'; return }
+        try { Start-Process -FilePath $file } catch { Show-Error 'Nie można otworzyć raportu.' $_ }
+    }
+    Add-RowAction -Module $m -Text 'Otwórz folder raportów' -Icon 'E838' -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { return }
+        $d = Get-ReportOutputDir -Job $jobs[0]
+        if (-not (Test-Path -LiteralPath $d)) { Show-Warning "Folder jeszcze nie istnieje (raport nie był uruchamiany): $d"; return }
+        Open-Folder $d
+    }
+    Add-RowAction -Module $m -Text 'Historia uruchomień' -Icon 'E81C' -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { return }
+        $st = Read-ReportState $jobs[0]
+        $hist = @(if ($st -is [hashtable] -and $st.ContainsKey('History')) { @($st.History) | Where-Object { $_ -is [hashtable] } })
+        if (-not $hist.Count) { Show-Message -Text 'Ten raport nie był jeszcze uruchamiany.' -Title 'Historia'; return }
+        $list = foreach ($h in $hist) {
+            [pscustomobject][ordered]@{ 'Uruchomienie' = $(if ($h['At']) { [datetime]$h.At } else { $null }); 'Wynik' = [string]$h['Status']; 'Wyniki' = $h['Findings']; 'Nowe' = $h['New']; 'Ustąpiło' = $h['Resolved']; 'Poczta' = [string]$h['Mail']; 'Opis' = [string]$h['Message']; 'Plik' = [string]$h['Output']
+                '__tone' = $(switch ([string]$h['Status']) { 'OK' { 'ok' } 'Ostrzeżenie' { 'warn' } 'Błąd' { 'crit' } default { '' } }) }
+        }
+        Show-GridDialog -Title ('Historia: ' + $jobs[0].Name) -Subtitle 'Ostatnie 60 uruchomień (zadanie i «Uruchom teraz»)' -Rows @($list) -PillColumns @('Wynik')
+    }
+    Add-RowAction -Module $m -Text 'Dziennik przebiegów' -Icon 'E9F9' -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { return }
+        $log = Join-Path (Join-Path (Split-Path -Parent ([string]$jobs[0].Path)) 'Logs') ('{0}.log' -f $jobs[0].Id)
+        if (-not (Test-Path -LiteralPath $log)) { Show-Message -Text 'Dziennik jest pusty – raport nie był jeszcze uruchamiany.' -Title 'Dziennik przebiegów'; return }
+        $text = (@(Get-Content -LiteralPath $log -Encoding UTF8 | Select-Object -Last 400)) -join "`r`n"
+        Show-TextDialog -Title ('Dziennik: ' + $jobs[0].Name) -Subtitle $log -Text $text
+    }
+    Add-RowAction -Module $m -Text 'Duplikuj…' -Icon 'E8C8' -Separator -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { return }
+        $copy = Read-ReportJob ([string]$jobs[0].Path)
+        $copy.Id = [guid]::NewGuid().ToString('N').Substring(0, 10)
+        $copy.Name = [string]$copy.Name + ' (kopia)'
+        $copy.TaskName = ''; $copy.TaskSignature = ''; $copy.Path = ''
+        $copy.Created = (Get-Date).ToString('s'); $copy.CreatedBy = "$env:USERDOMAIN\$env:USERNAME"
+        $edited = Show-ReportJobEditor -Job $copy -IsNew
+        if ($edited) { & $m.Actions.Save $m $edited $false }
+    }
+    Add-RowAction -Module $m -Text 'Utwórz zadanie ponownie' -Icon 'E787' -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { return }
+        & $m.Actions.Save $m $jobs[0] $true
+    }
+    Add-RowAction -Module $m -Text 'Włącz / wyłącz zadanie' -Icon 'E7E8' -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows | Where-Object { $_.TaskName })
+        if (-not $jobs.Count) { Show-Warning 'Wybrane raporty nie mają zadania w Harmonogramie.'; return }
+        $tasks = Get-ReportTaskInfo
+        foreach ($j in $jobs) {
+            $t = $tasks[[string]$j.TaskName]
+            try {
+                if ($t -and $t.State -eq 'Disabled') { Enable-ScheduledTask -TaskName ([string]$j.TaskName) -TaskPath $script:ReportTaskPath -ErrorAction Stop | Out-Null; Write-Log ("Włączono zadanie «{0}»" -f $j.TaskName) 'OK' }
+                else { Disable-ScheduledTask -TaskName ([string]$j.TaskName) -TaskPath $script:ReportTaskPath -ErrorAction Stop | Out-Null; Write-Log ("Wyłączono zadanie «{0}»" -f $j.TaskName) 'OK' }
+            }
+            catch { Write-Log ("Nie zmieniono stanu zadania «{0}»: {1}" -f $j.TaskName, $_.Exception.Message) 'ERROR' }
+        }
+        & $m.Actions.Refresh $m
+    }
+    Add-RowAction -Module $m -Text 'Usuń…' -Icon 'E74D' -Danger -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        $broken = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Raport') -eq '(błąd definicji)' })
+        if (-not $jobs.Count -and -not $broken.Count) { return }
+        $names = @($jobs | ForEach-Object { $_.Name }) + @($broken | ForEach-Object { [string](Get-ObjectValue $_ 'Nazwa') })
+        if (-not (Confirm-Action -Text 'Usunąć definicje raportów i ich zadania w Harmonogramie? Zapisane raporty HTML zostają w swoich folderach.' -Items $names -ConfirmText 'Usuń' -Danger)) { return }
+        foreach ($j in $jobs) {
+            Unregister-ReportTask -TaskName ([string]$j.TaskName)
+            $base = [string]$j.Path -replace '\.json$', ''
+            foreach ($f in @([string]$j.Path, ($base + '.state.json'), ($base + '.items.txt'), (Join-Path (Join-Path (Split-Path -Parent ([string]$j.Path)) 'Logs') ('{0}.log' -f $j.Id)))) {
+                if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force }
+            }
+            Write-Log ("Usunięto raport cykliczny «{0}»" -f $j.Name) 'OK'
+        }
+        foreach ($b in $broken) {
+            $f = Join-Path (Get-ReportJobsDir) ('{0}.json' -f [string](Get-ObjectValue $b '__id'))
+            if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force }
+        }
+        & $m.Actions.Refresh $m
+    }
+    Add-StatTile -Module $m -Key 'jobs' -Label 'Raporty' -Icon 'E9F9' | Out-Null
+    Add-StatTile -Module $m -Key 'scheduled' -Label 'Zaplanowane w Harmonogramie' -Icon 'E787' | Out-Null
+    Add-StatTile -Module $m -Key 'failed' -Label 'Ostatnio z błędem' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'new' -Label 'Nowe wyniki (ostatnie przebiegi)' -Icon 'E7BA' | Out-Null
+    $m.EmptyHint = 'Kliknij «Nowy raport» i wybierz rodzaj. Raport można uruchomić od razu («Uruchom teraz») albo zaplanować – zadanie w Harmonogramie utworzy raport bez otwierania programu.'
+    & $m.Actions.Refresh $m
 }
 #endregion
 
@@ -21595,6 +23670,8 @@ foreach ($pluginFile in $script:PluginFiles) {
     catch { [void]$script:PluginErrors.Add(('{0}: {1}' -f $pluginFile.Name, $_.Exception.Message)) }
 }
 
+# -RunReport: raport cykliczny bez okna (zadanie Harmonogramu); kod wyjścia 0 / 1 / 2
+if ($RunReport) { exit (Invoke-ScheduledReportFile -Path $RunReport) }
 # DOMAINOPS_NOSTART=1 - tylko wczytanie funkcji (testy, osadzanie)
 if ($env:DOMAINOPS_NOSTART -ne '1') { Start-DomainOps }
 #endregion
