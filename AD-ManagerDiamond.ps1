@@ -12577,8 +12577,88 @@ function Get-GroupMemberObjects {
 }
 '@
 
-# Funkcje tekstowe programu (transliteracja, sAMAccountName) dostępne także w wątkach operacji AD
-foreach ($fn in 'ConvertTo-AsciiText', 'ConvertTo-SamName', 'Expand-Template', 'ConvertTo-RdnValue') {
+function Get-DcDirectoryInfo {
+    <#
+        Kontrolery domeny prosto z katalogu, bez Get-ADDomainController (ten potrafi zakończyć się błędem «Specified argument
+        was out of the range of valid values. Parameter name: index», gdy w lokacjach zostały metadane usuniętego kontrolera):
+        obiekty NTDS Settings (nTDSDSA) w CN=Sites, ich obiekty serwerów i konta komputerów kontrolerów.
+        Zwraca @{ Dcs = obiekty z polami jak Get-ADDomainController (role FSMO puste); Issues = niespójności metadanych
+        (Severity, Object, Result, Details) }. -AdParams: Server / Credential / ErrorAction dla poleceń AD.
+    #>
+    param([Parameter(Mandatory)][string]$DomainDn, [Parameter(Mandatory)][string]$ConfigDn, [hashtable]$AdParams = @{})
+    $rdn = { param($dn) (([regex]::Match([string]$dn, '^(?:\\.|[^,])+').Value -replace '^[^=]+=', '') -replace '\\(.)', '$1') }
+    $parent = { param($dn) ([string]$dn -replace '^(?:\\.|[^,])+,', '') }
+    # Atrybut bez wartości może nie mieć właściwości w obiekcie (StrictMode w wątku okna)
+    $pv = { param($o, [string]$n) if ($null -eq $o) { return $null }; $p = $o.PSObject.Properties[$n]; if ($p) { $p.Value } }
+    $sitesDn = "CN=Sites,$ConfigDn"
+    $domLower = $DomainDn.ToLowerInvariant()
+    $servers = @{}
+    foreach ($sv in @(Get-ADObject -SearchBase $sitesDn -LDAPFilter '(objectClass=server)' -Properties dNSHostName, serverReference @AdParams)) { $servers[([string]$sv.DistinguishedName).ToLowerInvariant()] = $sv }
+    $dsas = @(Get-ADObject -SearchBase $sitesDn -LDAPFilter '(objectClass=nTDSDSA)' -Properties options, 'msDS-isRODC', 'msDS-HasDomainNCs', hasMasterNCs @AdParams)
+    # Konta kontrolerów: SERVER_TRUST_ACCOUNT (8192) albo RODC (PARTIAL_SECRETS_ACCOUNT, 67108864)
+    $comps = @{}
+    foreach ($c in @(Get-ADObject -SearchBase $DomainDn -LDAPFilter '(&(objectCategory=computer)(|(userAccountControl:1.2.840.113556.1.4.803:=8192)(userAccountControl:1.2.840.113556.1.4.803:=67108864)))' -Properties dNSHostName, operatingSystem, userAccountControl @AdParams)) { $comps[([string]$c.DistinguishedName).ToLowerInvariant()] = $c }
+    $dcs = New-Object System.Collections.ArrayList
+    $issues = New-Object System.Collections.ArrayList
+    $serversWithDsa = @{}
+    $accountsWithDsa = @{}
+    foreach ($d in $dsas) {
+        $srvDn = & $parent $d.DistinguishedName
+        $serversWithDsa[$srvDn.ToLowerInvariant()] = $true
+        $sv = $servers[$srvDn.ToLowerInvariant()]
+        $ref = [string](& $pv $sv 'serverReference')
+        $ncs = @(@(& $pv $d 'msDS-HasDomainNCs') + @(& $pv $d 'hasMasterNCs') | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        $ours = ($ncs -contains $domLower) -or ($ref -and $ref.ToLowerInvariant().EndsWith(',' + $domLower))
+        if (-not $ours) { continue }   # kontroler innej domeny lasu
+        $name = & $rdn $srvDn
+        $comp = if ($ref) { $comps[$ref.ToLowerInvariant()] } else { $null }
+        if (-not $comp) {
+            [void]$issues.Add([pscustomobject]@{ Severity = 'Błąd'; Object = $name; Result = 'pozostałość po usuniętym kontrolerze: NTDS Settings bez konta kontrolera'
+                    Details = ('{0} – oczyść metadane (ntdsutil → metadata cleanup albo usunięcie obiektu serwera w «Lokacje i usługi AD»)' -f $(if ($ref) { "konto $ref nie istnieje albo nie jest kontem kontrolera" } else { 'obiekt serwera bez odwołania do konta komputera' })) })
+            continue
+        }
+        $accountsWithDsa[$ref.ToLowerInvariant()] = $true
+        $hostName = @([string](& $pv $sv 'dNSHostName'), [string](& $pv $comp 'dNSHostName'), $name | Where-Object { $_ })[0]
+        $ip = ''
+        try { $ip = [string]@([System.Net.Dns]::GetHostAddresses($hostName) | Where-Object { $_.AddressFamily -eq 'InterNetwork' })[0] } catch { }
+        [void]$dcs.Add([pscustomobject]@{
+                Name = $name; HostName = $hostName; Site = (& $rdn (& $parent (& $parent $srvDn))); OperatingSystem = [string](& $pv $comp 'operatingSystem'); IPv4Address = $ip
+                IsGlobalCatalog = (([int](& $pv $d 'options') -band 1) -eq 1); IsReadOnly = [bool](& $pv $d 'msDS-isRODC'); OperationMasterRoles = @(); ComputerObjectDN = $ref
+            })
+    }
+    foreach ($k in @($servers.Keys)) {
+        if ($serversWithDsa.ContainsKey($k)) { continue }
+        $ref = [string](& $pv $servers[$k] 'serverReference')
+        if ($ref -and -not $ref.ToLowerInvariant().EndsWith(',' + $domLower)) { continue }   # serwer innej domeny lasu
+        [void]$issues.Add([pscustomobject]@{ Severity = 'Ostrzeżenie'; Object = (& $rdn $servers[$k].DistinguishedName); Result = 'obiekt serwera w lokacji bez NTDS Settings'
+                Details = 'pozostałość po obniżeniu lub usunięciu kontrolera (do usunięcia w «Lokacje i usługi AD») albo przygotowane konto RODC przed promowaniem' })
+    }
+    foreach ($k in @($comps.Keys)) {
+        if ($accountsWithDsa.ContainsKey($k)) { continue }
+        $c = $comps[$k]
+        $rodc = ([int64](& $pv $c 'userAccountControl') -band 67108864) -ne 0
+        [void]$issues.Add([pscustomobject]@{ Severity = 'Ostrzeżenie'; Object = (& $rdn $c.DistinguishedName); Result = $(if ($rodc) { 'konto RODC bez kontrolera (NTDS Settings)' } else { 'konto komputera kontrolera bez NTDS Settings' })
+                Details = $(if ($rodc) { 'przygotowane konto RODC przed promowaniem albo pozostałość po usuniętym RODC' } else { 'kontroler usunięty bez obniżenia – oczyść metadane (ntdsutil → metadata cleanup) i usuń konto komputera' }) })
+    }
+    return @{ Dcs = @($dcs | Sort-Object HostName); Issues = @($issues) }
+}
+
+function Get-DomainControllerHosts {
+    # Nazwy DNS kontrolerów domeny w wątku okna: Get-ADDomainController, a gdy zgłosi błąd - kontrolery z katalogu
+    param([hashtable]$AdParams = @{})
+    try { return @(Get-ADDomainController -Filter * @AdParams | ForEach-Object { [string]$_.HostName }) }
+    catch {
+        $msg = $_.Exception.Message
+        $d = Get-ADDomain @AdParams
+        $dse = Get-ADRootDSE @AdParams
+        $dir = Get-DcDirectoryInfo -DomainDn ([string]$d.DistinguishedName) -ConfigDn ([string]$dse.configurationNamingContext) -AdParams $AdParams
+        Write-Log ('Get-ADDomainController zgłosił błąd ({0}) – lista kontrolerów z katalogu: {1}' -f $msg, ((@($dir.Dcs | ForEach-Object { $_.HostName })) -join ', ')) 'WARN' -Module ''
+        return @($dir.Dcs | ForEach-Object { [string]$_.HostName })
+    }
+}
+
+# Funkcje tekstowe programu (transliteracja, sAMAccountName) i odczyt kontrolerów z katalogu dostępne także w wątkach operacji AD
+foreach ($fn in 'ConvertTo-AsciiText', 'ConvertTo-SamName', 'Expand-Template', 'ConvertTo-RdnValue', 'Get-DcDirectoryInfo') {
     $script:AdHelpers += "`nfunction $fn {`n" + (Get-Item "function:$fn").ScriptBlock.ToString() + "`n}"
 }
 
@@ -13468,7 +13548,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Raporty' -Key 'LockoutSource' -T
         $ad = Get-AdSplat
         $info = Invoke-WithWaitCursor {
             $domain = Get-ADDomain @ad
-            $list = if (Test-Checked $m.AllDcs) { @(Get-ADDomainController -Filter * @ad | ForEach-Object { $_.HostName }) } else { @($domain.PDCEmulator) }
+            $list = if (Test-Checked $m.AllDcs) { @(Get-DomainControllerHosts -AdParams $ad) } else { @($domain.PDCEmulator) }
             @{ Dcs = $list }
         }
         $users = @(Get-TargetUsers -Quiet | Where-Object { $_ -notmatch "['""]" })
@@ -22225,12 +22305,41 @@ $script:DomainHealthScript = {
         return ('{0} dni temu' -f [int]$span.TotalDays)
     }
     $domain = Get-ADDomain @ad
-    $forest = Get-ADForest @ad
-    $dse = Get-ADRootDSE @ad
+    # Las i RootDSE z zapasem: ich błąd nie przerywa całego przeglądu
+    $forest = $null
+    try { $forest = Get-ADForest @ad } catch { Out-Row 'Domena' 'Las' 'Info' 'nie odczytano informacji o lesie (Get-ADForest)' $_.Exception.Message }
+    $configDn = ''
+    $schemaDn = ''
+    try { $dse = Get-ADRootDSE @ad; $configDn = [string]$dse.configurationNamingContext; $schemaDn = [string]$dse.schemaNamingContext }
+    catch { Out-Row 'Domena' 'RootDSE' 'Info' 'nie odczytano RootDSE' $_.Exception.Message }
+    if (-not $configDn) {
+        $rootDn = if ($forest -and $forest.RootDomain) { 'DC=' + (([string]$forest.RootDomain).Split('.') -join ',DC=') } else { [string]$domain.DistinguishedName }
+        $configDn = "CN=Configuration,$rootDn"
+        $schemaDn = "CN=Schema,$configDn"
+    }
     [pscustomobject]@{ '__rec' = 'domain'; Name = [string]$domain.DNSRoot; Pdc = [string]$domain.PDCEmulator }
 
-    # Kontrolery domeny
-    $dcs = @(Get-ADDomainController -Filter * @ad | Sort-Object HostName)
+    # Kontrolery domeny: Get-ADDomainController, a gdy zgłosi błąd (np. przy metadanych usuniętego kontrolera) - lista
+    # z katalogu. Metadane (obiekty serwerów, NTDS Settings, konta kontrolerów) sprawdzane zawsze.
+    $dcErr = ''
+    $dcs = @()
+    try { $dcs = @(Get-ADDomainController -Filter * @ad | Sort-Object HostName) } catch { $dcErr = $_.Exception.Message }
+    $dir = $null
+    try { $dir = Get-DcDirectoryInfo -DomainDn ([string]$domain.DistinguishedName) -ConfigDn $configDn -AdParams $ad }
+    catch { Out-Row 'Kontrolery' 'Metadane kontrolerów' 'Info' 'nie sprawdzono obiektów kontrolerów w lokacjach' $_.Exception.Message }
+    if ($dcErr) {
+        $dcs = @(if ($dir) { $dir.Dcs })
+        foreach ($dc in $dcs) {
+            $h = ([string]$dc.HostName).ToLowerInvariant()
+            $dc.OperationMasterRoles = @(@(foreach ($rk in 'PDCEmulator', 'RIDMaster', 'InfrastructureMaster') { if (([string]$domain.$rk).ToLowerInvariant() -eq $h) { $rk } }) +
+                @(if ($forest) { foreach ($rk in 'SchemaMaster', 'DomainNamingMaster') { if (([string]$forest.$rk).ToLowerInvariant() -eq $h) { $rk } } }))
+        }
+        Out-Row 'Kontrolery' ([string]$domain.DNSRoot) $(if ($dcs.Count) { 'Ostrzeżenie' } else { 'Błąd' }) $(if ($dcs.Count) { 'Get-ADDomainController zgłosił błąd – lista kontrolerów z katalogu ({0})' -f $dcs.Count } else { 'nie ustalono listy kontrolerów domeny' }) $dcErr
+    }
+    if ($dir) {
+        foreach ($i in $dir.Issues) { Out-Row 'Kontrolery' ([string]$i.Object) ([string]$i.Severity) ([string]$i.Result) ([string]$i.Details) }
+        if (-not $dir.Issues.Count) { Out-Row 'Kontrolery' 'Metadane kontrolerów' 'OK' ('obiekty serwerów, NTDS Settings i konta kontrolerów są zgodne ({0})' -f @($dir.Dcs).Count) }
+    }
     foreach ($dc in $dcs) {
         $roles = (@($dc.OperationMasterRoles | ForEach-Object { [string]$_ })) -join ', '
         [pscustomobject]@{ '__rec' = 'dc'; Name = [string]$dc.Name; HostName = [string]$dc.HostName; Site = [string]$dc.Site; Os = [string]$dc.OperatingSystem; Ip = [string]$dc.IPv4Address; GC = [bool]$dc.IsGlobalCatalog; Rodc = [bool]$dc.IsReadOnly; Roles = $roles }
@@ -22242,11 +22351,13 @@ $script:DomainHealthScript = {
 
     # Role FSMO
     $hosts = @($dcs | ForEach-Object { ([string]$_.HostName).ToLowerInvariant() })
-    $roleList = [ordered]@{ 'Emulator PDC' = $domain.PDCEmulator; 'Wzorzec RID' = $domain.RIDMaster; 'Wzorzec infrastruktury' = $domain.InfrastructureMaster; 'Wzorzec schematu' = $forest.SchemaMaster; 'Wzorzec nazw domen' = $forest.DomainNamingMaster }
+    $roleList = [ordered]@{ 'Emulator PDC' = $domain.PDCEmulator; 'Wzorzec RID' = $domain.RIDMaster; 'Wzorzec infrastruktury' = $domain.InfrastructureMaster }
+    if ($forest) { $roleList['Wzorzec schematu'] = $forest.SchemaMaster; $roleList['Wzorzec nazw domen'] = $forest.DomainNamingMaster }
     foreach ($r in $roleList.Keys) {
         $h = [string]$roleList[$r]
         $known = $hosts -contains $h.ToLowerInvariant()
         $forestRole = @('Wzorzec schematu', 'Wzorzec nazw domen') -contains $r
+        if (-not $hosts.Count -and -not $forestRole) { Out-Row 'Role FSMO' $r 'Info' $h 'nie sprawdzono (brak listy kontrolerów)'; continue }
         Out-Row 'Role FSMO' $r $(if ($known -or $forestRole) { 'OK' } else { 'Błąd' }) $h $(if ($known) { '' } elseif ($forestRole) { 'rola lasu (kontroler w domenie głównej lasu)' } else { 'właściciel roli nie jest na liście kontrolerów – rola mogła zostać po usuniętym serwerze (przejęcie roli: Move-ADDirectoryServerOperationMasterRole -Force)' })
     }
 
@@ -22284,7 +22395,7 @@ $script:DomainHealthScript = {
     }
 
     # Kopia zapasowa AD (atrybut dSASignature partycji - jak repadmin /showbackup)
-    $ncs = [ordered]@{ 'domena' = [string]$domain.DistinguishedName; 'konfiguracja' = [string]$dse.configurationNamingContext; 'schemat' = [string]$dse.schemaNamingContext }
+    $ncs = [ordered]@{ 'domena' = [string]$domain.DistinguishedName; 'konfiguracja' = $configDn; 'schemat' = $schemaDn }
     foreach ($k in $ncs.Keys) {
         try {
             $md = @(Get-ADReplicationAttributeMetadata -Object $ncs[$k] -Server ([string]$domain.PDCEmulator) -Properties dSASignature @ad | Where-Object { [string]$_.AttributeName -eq 'dSASignature' })
@@ -22297,7 +22408,7 @@ $script:DomainHealthScript = {
         catch { Out-Row 'Kopia zapasowa' $k 'Info' 'nie sprawdzono' $_.Exception.Message }
     }
     try {
-        $ds = Get-ADObject -Identity ('CN=Directory Service,CN=Windows NT,CN=Services,' + [string]$dse.configurationNamingContext) -Properties tombstoneLifetime @ad
+        $ds = Get-ADObject -Identity ('CN=Directory Service,CN=Windows NT,CN=Services,' + $configDn) -Properties tombstoneLifetime @ad
         $tl = [int]$ds.tombstoneLifetime
         Out-Row 'Kopia zapasowa' 'Okres przechowywania usuniętych obiektów' 'Info' $(if ($tl) { "$tl dni" } else { 'domyślny (60 dni w starszych lasach)' }) 'kopia starsza niż ten okres nie nadaje się do przywrócenia kontrolera'
     }
@@ -22312,7 +22423,7 @@ $script:DomainHealthScript = {
     }
     catch { Out-Row 'DNS' ([string]$domain.DNSRoot) 'Info' 'nie sprawdzono rekordów SRV' $_.Exception.Message }
 
-    Out-Row 'Domena' 'Poziom funkcjonalny' 'Info' ('domena: {0}, las: {1}' -f $domain.DomainMode, $forest.ForestMode)
+    Out-Row 'Domena' 'Poziom funkcjonalny' 'Info' ('domena: {0}, las: {1}' -f $domain.DomainMode, $(if ($forest) { $forest.ForestMode } else { '?' }))
 }
 
 # Część na każdym kontrolerze (WinRM). $P: EventHours
