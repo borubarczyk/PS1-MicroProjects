@@ -3200,6 +3200,166 @@ function Show-Toast {
 $script:ToastTimers = New-Object 'System.Collections.Generic.Dictionary[object,object]'
 #endregion
 
+#region Odblokowanie programu (PIN)
+# Ekran PIN przed oknem głównym: zabezpieczenie przed przypadkowym uruchomieniem programu przez osobę postronną,
+# nie przed administratorem komputera (skrypt jest zwykłym plikiem tekstowym). W skrypcie jest tylko skrót SHA-256
+# tekstu 'DomainOps|<PIN>'. Zmiana PIN-u: wpisz tu wynik polecenia
+#   -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes('DomainOps|NOWY_PIN')) | ForEach-Object { $_.ToString('x2') })
+# i ustaw długość PIN-u. Pusty skrót wyłącza blokadę. Tryb bez okna (-RunReport) nie pyta o PIN.
+$script:UnlockPinHash = 'e57ba83a98fac469e360db6045d7adfce273fa0faf2697fbc3528ebff51b52e5'
+$script:UnlockPinLength = 5
+$script:UnlockMaxAttempts = 5
+$script:UnlockTitle = 'Domain Ops – odblokowanie'
+
+$script:UnlockXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="340" SizeToContent="Height" ResizeMode="NoResize" WindowStartupLocation="CenterScreen"
+        Background="#12171D" Foreground="#E4E8EF" FontFamily="Segoe UI" FontSize="13"
+        UseLayoutRounding="True" SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display">
+  <Grid Background="#12171D">
+    <StackPanel Margin="28,26,28,22">
+      <Border Width="52" Height="52" CornerRadius="14" Background="#1A2640" HorizontalAlignment="Center">
+        <TextBlock x:Name="lockIcon" Style="{StaticResource Glyph}" FontSize="22" Foreground="#8CB0FF" HorizontalAlignment="Center"/>
+      </Border>
+      <TextBlock Text="Domain Ops" FontSize="18" FontWeight="SemiBold" Foreground="White" HorizontalAlignment="Center" Margin="0,14,0,0"/>
+      <TextBlock Text="Wpisz PIN, aby odblokować program" Foreground="#8791A5" HorizontalAlignment="Center" Margin="0,4,0,0"/>
+      <StackPanel x:Name="lockDots" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,22,0,0"/>
+      <TextBlock x:Name="lockMsg" Foreground="#FF7A86" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" MinHeight="18" Margin="0,12,0,0"/>
+      <UniformGrid x:Name="lockPad" Columns="3" Margin="0,12,0,0"/>
+      <Button x:Name="lockClose" Content="Zamknij" Style="{StaticResource GhostButton}" HorizontalAlignment="Center" MinWidth="110" Margin="0,14,0,0" Focusable="False"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+
+function Get-UnlockPinHash([string]$Pin) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes('DomainOps|' + $Pin)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return (-join ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })) }
+    finally { $sha.Dispose() }
+}
+
+function Test-UnlockPin([string]$Pin) {
+    if (-not $Pin) { return $false }
+    return ((Get-UnlockPinHash $Pin) -eq ([string]$script:UnlockPinHash).ToLowerInvariant())
+}
+
+$script:UnlockEvents = @{
+    Key     = { param($s, $e) Add-UnlockKey -Window ([System.Windows.Window]::GetWindow($s)) -Key ([string]$s.Tag) }
+    KeyDown = {
+        param($s, $e)
+        # Cyfry z górnego rzędu (bez Shift) i z klawiatury numerycznej; Backspace kasuje cyfrę, Esc i Delete wszystkie
+        $k = [string]$e.Key
+        $key = ''
+        if ($k -match '^NumPad(\d)$') { $key = $Matches[1] }
+        elseif ($k -match '^D(\d)$' -and -not ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Shift)) { $key = $Matches[1] }
+        elseif ($k -eq 'Back') { $key = 'Back' }
+        elseif ($k -eq 'Escape' -or $k -eq 'Delete') { $key = 'Clear' }
+        if (-not $key) { return }
+        $e.Handled = $true
+        Add-UnlockKey -Window $s -Key $key
+    }
+    Close   = { param($s, $e) Close-Dialog -Window ([System.Windows.Window]::GetWindow($s)) -Ok $false }
+}
+
+function New-UnlockWindow {
+    $w = New-UiElement $script:UnlockXaml
+    $w.Title = $script:UnlockTitle
+    $w.FindName('lockIcon').Text = Get-Glyph 'E72E'
+    $dots = $w.FindName('lockDots')
+    for ($i = 0; $i -lt $script:UnlockPinLength; $i++) {
+        $d = New-Object System.Windows.Shapes.Ellipse
+        $d.Width = 14
+        $d.Height = 14
+        $d.Margin = New-Object System.Windows.Thickness(7, 0, 7, 0)
+        $d.StrokeThickness = 2
+        [void]$dots.Children.Add($d)
+    }
+    $pad = $w.FindName('lockPad')
+    foreach ($key in '1', '2', '3', '4', '5', '6', '7', '8', '9', 'Clear', '0', 'Back') {
+        $b = New-Object System.Windows.Controls.Button
+        $b.Tag = $key
+        $b.Height = 46
+        $b.Margin = New-Object System.Windows.Thickness(4)
+        # Bez fokusu: spacja lub Enter nie «klikają» ponownie ostatnio użytego przycisku
+        $b.Focusable = $false
+        if ($key -match '^\d$') {
+            $b.Content = $key
+            $b.FontSize = 18
+        }
+        else {
+            $b.Content = New-GlyphBlock -Code $(if ($key -eq 'Back') { 'E750' } else { 'E894' }) -Size 15
+            $b.ToolTip = $(if ($key -eq 'Back') { 'Usuń ostatnią cyfrę (Backspace)' } else { 'Wyczyść (Esc)' })
+        }
+        $b.add_Click($script:UnlockEvents.Key)
+        [void]$pad.Children.Add($b)
+    }
+    $w.FindName('lockClose').add_Click($script:UnlockEvents.Close)
+    $w.add_PreviewKeyDown($script:UnlockEvents.KeyDown)
+    $w.Tag = @{ Result = $false; Modal = $false; Pin = ''; Attempts = 0; Error = $false; Locked = $false }
+    Update-UnlockView -Window $w
+    return $w
+}
+
+function Update-UnlockView {
+    param([Parameter(Mandatory)]$Window)
+    $st = $Window.Tag
+    $i = 0
+    foreach ($d in $Window.FindName('lockDots').Children) {
+        $filled = $i -lt $st.Pin.Length
+        $color = if ($st.Error) { '#FF7A86' } elseif ($filled) { '#8CB0FF' } else { '#3A4556' }
+        $d.Stroke = Get-Brush $color
+        $d.Fill = $(if ($filled) { Get-Brush $color } else { [System.Windows.Media.Brushes]::Transparent })
+        $i++
+    }
+}
+
+function Add-UnlockKey {
+    # Cyfra, 'Back' albo 'Clear'; po wpisaniu pełnego PIN-u od razu sprawdzenie
+    param([Parameter(Mandatory)]$Window, [Parameter(Mandatory)][string]$Key)
+    $st = $Window.Tag
+    if ($st.Locked) { return }
+    if ($st.Error) { $st.Error = $false }
+    switch -Regex ($Key) {
+        '^\d$' { if ($st.Pin.Length -lt $script:UnlockPinLength) { $st.Pin += $Key } }
+        '^Back$' { if ($st.Pin.Length) { $st.Pin = $st.Pin.Substring(0, $st.Pin.Length - 1) } }
+        '^Clear$' { $st.Pin = '' }
+    }
+    $msg = $Window.FindName('lockMsg')
+    if ($st.Pin.Length -lt $script:UnlockPinLength) { Update-UnlockView -Window $Window; return }
+    if (Test-UnlockPin $st.Pin) {
+        $st.Pin = ''
+        Close-Dialog -Window $Window -Ok $true
+        return
+    }
+    $st.Attempts++
+    $st.Pin = ''
+    $st.Error = $true
+    $left = $script:UnlockMaxAttempts - $st.Attempts
+    Update-UnlockView -Window $Window
+    if ($left -le 0) {
+        # Komunikat widoczny przez chwilę, potem zamknięcie (bez odblokowania)
+        $msg.Text = 'Zbyt wiele błędnych prób – program zostanie zamknięty.'
+        $st.Locked = $true
+        $Window.FindName('lockPad').IsEnabled = $false
+        $t = New-Object System.Windows.Threading.DispatcherTimer
+        $t.Interval = [TimeSpan]::FromMilliseconds(1500)
+        $t.Tag = $Window
+        $t.add_Tick({ param($s, $e) $s.Stop(); Close-Dialog -Window $s.Tag -Ok $false })
+        $t.Start()
+        return
+    }
+    $msg.Text = 'Nieprawidłowy PIN. Pozostało prób: {0}' -f $left
+}
+
+function Unlock-DomainOps {
+    # $true: można uruchomić program (PIN poprawny albo blokada wyłączona)
+    if (-not $script:UnlockPinHash) { return $true }
+    return (Invoke-Dialog -Window (New-UnlockWindow))
+}
+#endregion
+
 #region Widok modułu i tabela wyników (DataTable + DataView + DataGrid)
 # Kolumny tabeli tworzone są w kodzie w chwili pojawienia się nowej właściwości w wynikach
 # (bez ponownego wiązania siatki - sortowanie i przewinięcie zostają). Kolumny ukryte zaczynają się od "__":
@@ -24911,6 +25071,8 @@ function Initialize-MainWindow {
 }
 
 function Start-DomainOps {
+    # PIN przed zbudowaniem okna głównego (bez poprawnego PIN-u program się kończy)
+    if (-not (Unlock-DomainOps)) { return }
     $w = Initialize-MainWindow
     try {
         [void]$w.ShowDialog()
