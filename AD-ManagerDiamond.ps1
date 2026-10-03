@@ -17573,6 +17573,48 @@ function Get-AclOwner($Acl) {
     try { return [string]$Acl.GetOwner([System.Security.Principal.NTAccount]) }
     catch { try { return [string]$Acl.GetOwner([System.Security.Principal.SecurityIdentifier]) } catch { return '' } }
 }
+function Set-ItemOwner($Item, [string]$Sid) {
+    # Tylko sekcja właściciela - obiekt zabezpieczeń bez DACL zapisuje wyłącznie zmienione sekcje
+    $sec = if ($Item.PSIsContainer) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
+    $sec.SetOwner((New-Object System.Security.Principal.SecurityIdentifier($Sid)))
+    Set-ItemAcl $Item $sec
+}
+# Tryb kopii zapasowej ($P.Privileged): włączenie przywilejów, które administrator ma, ale Windows domyślnie wyłącza -
+# SeBackupPrivilege (odczyt uprawnień i zawartości mimo braku dostępu), SeRestorePrivilege (zapis uprawnień, dowolny właściciel),
+# SeTakeOwnershipPrivilege (przejęcie własności). Dotyczy całego procesu (lokalnie programu, zdalnie sesji WinRM).
+$__privilegeCs = '
+using System;
+using System.Runtime.InteropServices;
+public static class DomainOpsPrivilege {
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] struct TokenPrivilege { public int Count; public long Luid; public int Attributes; }
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, int access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivilege state, int length, IntPtr previous, IntPtr returnLength);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    public static bool Enable(string name) {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) { return false; }
+        try {
+            TokenPrivilege tp; tp.Count = 1; tp.Attributes = 2;
+            if (!LookupPrivilegeValue(null, name, out tp.Luid)) { return false; }
+            if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) { return false; }
+            return Marshal.GetLastWin32Error() == 0;
+        }
+        finally { CloseHandle(token); }
+    }
+}'
+function Enable-NtfsPrivileges {
+    if (-not ('DomainOpsPrivilege' -as [type])) { try { Add-Type -TypeDefinition $__privilegeCs -ErrorAction Stop } catch { return @() } }
+    $ok = @()
+    foreach ($n in 'SeBackupPrivilege', 'SeRestorePrivilege', 'SeTakeOwnershipPrivilege') { try { if ([DomainOpsPrivilege]::Enable($n)) { $ok += $n } } catch { } }
+    return $ok
+}
+$__privileges = @()
+if ($P -and $P['Privileged']) {
+    $__privileges = @(Enable-NtfsPrivileges)
+    if ($__privileges.Count -lt 3) { Write-Error ('Tryb kopii zapasowej: nie udało się włączyć wszystkich przywilejów (włączone: {0}) – uruchom jako administrator z podniesionymi uprawnieniami.' -f $(if ($__privileges.Count) { $__privileges -join ', ' } else { 'brak' })) }
+}
 '@
 
 $script:NtfsApplyCore = @'
@@ -18036,6 +18078,7 @@ Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsReport
     $m.Unlimited = Add-CheckBox -Parent $row -Text 'Bez limitu'
     $m.Files = Add-CheckBox -Parent $row -Text 'Także pliki'
     $m.SkipDenied = Add-CheckBox -Parent $row -Text 'Pomiń miejsca bez dostępu (zapisz w dzienniku)' -Checked $true -ToolTip 'Np. System Volume Information, $RECYCLE.BIN, profile innych użytkowników – nawet administrator często nie ma tam uprawnień. Pominięte ścieżki z przyczyną trafiają do dziennika, na kafelek i do raportu HTML zamiast do tabeli.'
+    $m.Privileged = Add-CheckBox -Parent $row -Text 'Tryb kopii zapasowej' -ToolTip 'Czyta uprawnienia i zawartość także tam, gdzie Administratorzy nie mają dostępu (przywileje kopii zapasowej administratora) – bez przejmowania własności. Wymaga uruchomienia jako administrator.'
     $row2 = Add-ToolbarRow -Module $m -Title 'Filtry'
     $m.Explicit = Add-CheckBox -Parent $row2 -Text 'Tylko jawne wpisy (bez dziedziczonych)' -Checked $true
     $m.HideSystem = Add-CheckBox -Parent $row2 -Text 'Ukryj konta systemowe' -Checked $true
@@ -18054,7 +18097,7 @@ Register-Module -Workspace 'Files' -Category 'Uprawnienia NTFS' -Key 'NtfsReport
         $path = $m.Path.Text.Trim()
         if (-not $path) { Show-Warning 'Podaj folder.'; return }
         $depth = if (Test-Checked $m.Unlimited) { -1 } else { Get-Num $m.Depth }
-        $base = @{ Depth = $depth; Files = (Test-Checked $m.Files); ExplicitOnly = (Test-Checked $m.Explicit); HideSystem = (Test-Checked $m.HideSystem); HideSids = (Test-Checked $m.HideSids); SkipDenied = (Test-Checked $m.SkipDenied); Hidden = @($script:Settings.NtfsHiddenIdentities); Core = (Get-NtfsCore $script:NtfsScanCore) }
+        $base = @{ Depth = $depth; Files = (Test-Checked $m.Files); ExplicitOnly = (Test-Checked $m.Explicit); HideSystem = (Test-Checked $m.HideSystem); HideSids = (Test-Checked $m.HideSids); SkipDenied = (Test-Checked $m.SkipDenied); Privileged = (Test-Checked $m.Privileged); Hidden = @($script:Settings.NtfsHiddenIdentities); Core = (Get-NtfsCore $script:NtfsScanCore) }
         $computer = $m.Computer.Text.Trim()
         Reset-StatTiles $m
         Reset-ResultTable -Module $m
@@ -18407,7 +18450,7 @@ foreach ($tp in $targets) {
     catch { [pscustomobject]@{ '__rec' = 'skip'; Path = [string]$tp; Level = 0; Kind = 'acl'; Reason = $_.Exception.Message } }
 }
 foreach ($k in @($state.Seen.Keys)) { $n = Get-SidName $k; [pscustomobject]@{ '__rec' = 'sid'; Sid = $k; Name = $n; Resolved = ($n -ne $k) } }
-[pscustomobject]@{ '__rec' = 'stat'; Items = $state.N }
+[pscustomobject]@{ '__rec' = 'stat'; Items = $state.N; Privileges = (@($__privileges) -join ', ') }
 '@
 
 $script:NtfsChangeBody = @'
@@ -18438,6 +18481,44 @@ function Edit-RawDacl($Acl, [scriptblock]$ShouldRemove) {
     }
     $Acl.SetSecurityDescriptorSddlForm($raw.GetSddlForm($accessOnly), $accessOnly)
     return $removed
+}
+if ([string]$P.Op -eq 'TakeOwnership') {
+    # Przejęcie własności drzewa jednym przejściem: folder dostaje właściciela (i w razie potrzeby wpis Administratorów)
+    # zanim zostanie wyświetlona jego zawartość, więc kolejne poziomy stają się dostępne w tym samym przebiegu
+    $admins = 'S-1-5-32-544'
+    $state = @{ Changed = 0; Same = 0; Errors = 0 }
+    $visit = {
+        param($Item, [int]$Level)
+        $res = [ordered]@{ Path = $Item.FullName; Status = 'Zmieniono'; Tone = 'ok'; Detail = ''; Before = '' }
+        try {
+            $acl = $null
+            try { $acl = Get-ItemAcl $Item -WithOwner; $res.Before = Get-AclSddl $acl } catch { }
+            $owner = ''
+            if ($acl) { try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { } }
+            $done = @()
+            if ($owner -ne $admins) { Set-ItemOwner $Item $admins; $done += 'właściciel: Administratorzy' }
+            if ($P.Grant) {
+                # Wpis tylko tam, gdzie Administratorzy nie mieli dostępu - reszta drzewa dziedziczy go z folderu wyżej
+                $hasAdmins = $false
+                if ($acl) { foreach ($r in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) { if ($r.IdentityReference.Value -eq $admins -and $r.AccessControlType -eq 'Allow' -and (([int]$r.FileSystemRights -band 0x1F01FF) -eq 0x1F01FF)) { $hasAdmins = $true } } }
+                if (-not $hasAdmins -and (-not $acl -or $acl.AreAccessRulesProtected -or $Level -eq 0)) {
+                    $a2 = Get-ItemAcl $Item
+                    $a2.AddAccessRule((New-Rule @{ Sid = $admins; Rights = 0x1F01FF; Deny = $false; Inherit = $(if ($Item.PSIsContainer) { 3 } else { 0 }); Propagate = 0 }))
+                    Set-ItemAcl $Item $a2
+                    $done += 'pełna kontrola dla Administratorów'
+                }
+            }
+            if ($done.Count -eq 0) { $state.Same++; return }
+            $state.Changed++
+            $res.Detail = $done -join '; '
+        }
+        catch { $state.Errors++; $res.Status = 'Błąd – ' + $_.Exception.Message; $res.Tone = 'crit' }
+        [pscustomobject]$res
+    }
+    try { Invoke-NtfsWalk -Visit $visit }
+    catch { [pscustomobject]@{ Path = [string]$P.Path; Status = 'Błąd – ' + $_.Exception.Message; Tone = 'crit'; Detail = ''; Before = '' } }
+    [pscustomobject]@{ Path = ''; Status = 'Podsumowanie'; Tone = ''; Detail = ('zmienione: {0}, bez zmian: {1}, błędy: {2}; przywileje: {3}' -f $state.Changed, $state.Same, $state.Errors, $(if (@($__privileges).Count) { $__privileges -join ', ' } else { 'brak' })); Before = '' }
+    return
 }
 foreach ($it in @($P.Items)) {
     $res = [ordered]@{ Path = [string]$it.Path; Status = ''; Tone = 'ok'; Detail = ''; Before = '' }
@@ -18689,6 +18770,7 @@ function Start-NtfsScan {
     if (-not $base.ContainsKey('Files')) { $base.Files = $false }
     if (-not $base.ContainsKey('Sids')) { $base.Sids = @() }
     if (-not $base.ContainsKey('Inherited')) { $base.Inherited = $false }
+    if (-not $base.ContainsKey('Privileged')) { $base.Privileged = [bool]($m['Privileged'] -and (Test-Checked $m.Privileged)) }
     $base.Core = Get-NtfsToolCore $script:NtfsAclScanBody
     $m.Data.NtfsScan = @{ Root = $Path; Computer = $Computer; Acl = New-Object System.Collections.ArrayList; Names = @{}; Skipped = New-Object System.Collections.ArrayList; Items = 0; Errors = New-Object System.Collections.ArrayList; OnDone = $OnDone }
     $onResult = {
@@ -18757,6 +18839,7 @@ function Start-NtfsChange {
     param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Name, [string]$Computer = '', [Parameter(Mandatory)][hashtable]$Params, [scriptblock]$OnDone)
     $m = $Module
     $p = $Params.Clone()
+    if (-not $p.ContainsKey('Privileged')) { $p.Privileged = [bool]($m['Privileged'] -and (Test-Checked $m.Privileged)) }
     $p.Core = Get-NtfsToolCore $script:NtfsChangeBody
     $m.Data.NtfsChange = @{ Results = New-Object System.Collections.ArrayList; OnDone = $OnDone }
     $onResult = {
@@ -18767,7 +18850,15 @@ function Start-NtfsChange {
     $onComplete = {
         param($m)
         $res = @($m.Data.NtfsChange.Results)
-        foreach ($x in $res) { Write-Log ('{0}: {1}{2}' -f $x.Path, $x.Status, $(if ($x.Detail) { " ($($x.Detail))" } else { '' })) $(@{ ok = 'OK'; warn = 'WARN'; crit = 'ERROR' }[[string]$x.Tone]) }
+        # Wpis dziennika na element (do 200 - przejęcie własności dużego drzewa zwraca tysiące), rekord podsumowania bez ścieżki
+        $n = 0
+        foreach ($x in $res) {
+            $level = @{ ok = 'OK'; warn = 'WARN'; crit = 'ERROR' }[[string]$x.Tone]
+            if (-not $level) { $level = 'INFO' }
+            if (-not $x.Path) { Write-Log ('{0}: {1}' -f $x.Status, $x.Detail) $level; continue }
+            if (++$n -le 200) { Write-Log ('{0}: {1}{2}' -f $x.Path, $x.Status, $(if ($x.Detail) { " ($($x.Detail))" } else { '' })) $level }
+        }
+        if ($n -gt 200) { Write-Log ('… oraz {0} kolejnych elementów (pełna lista w wyniku operacji)' -f ($n - 200)) }
         if ($m.Data.NtfsChange.OnDone) { & $m.Data.NtfsChange.OnDone $m $res }
     }
     if ($Computer) {
@@ -18824,6 +18915,7 @@ function Add-NtfsDepthRow {
     $Module.Depth = Add-Numeric -Parent $row -Value $Depth -Minimum 0 -Maximum 100 -Width 60
     $Module.Unlimited = Add-CheckBox -Parent $row -Text 'Bez limitu' -Checked $Unlimited
     $Module.Files = Add-CheckBox -Parent $row -Text 'Także pliki'
+    $Module.Privileged = Add-CheckBox -Parent $row -Text 'Tryb kopii zapasowej' -ToolTip 'Włącza przywileje kopii zapasowej i przywracania administratora: odczyt i zmiana uprawnień także tam, gdzie Administratorzy nie mają dostępu – bez przejmowania własności. Wymaga uruchomienia jako administrator.'
     return $row
 }
 
@@ -19417,8 +19509,25 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsRepa
         $rows = @(Get-ResultRowsAll -Module $m | Where-Object { @('Do zmiany', 'Do usunięcia', 'Brak dostępu') -contains [string]$_['Stan'] })
         if ($rows.Count -eq 0) { Show-Message -Text 'Podgląd nie wskazał miejsc do naprawy.' -Title 'Brak zmian'; return }
         if ($rp.Op -eq 3) {
-            $text = "Przejąć własność całego drzewa:`r`n$($rp.Path)`r`n(na komputerze: $(if ($rp.Computer) { $rp.Computer } else { 'ten' }))?`r`nWłaścicielem zostanie grupa Administratorzy$(if (Test-Checked $m.Grant) { ', która dostanie też pełną kontrolę' }). Do odczytu, a potem zmiany uprawnień potrzebne są prawa administratora."
+            $privileged = Test-Checked $m.Privileged
+            $grantText = if (-not (Test-Checked $m.Grant)) { '' } elseif ($privileged) { ', a tam, gdzie Administratorzy nie mieli dostępu, dostanie też pełną kontrolę (reszta drzewa ją odziedziczy)' } else { ', która dostanie też pełną kontrolę (wpis w każdym elemencie – icacls)' }
+            $text = "Przejąć własność całego drzewa:`r`n$($rp.Path)`r`n(na komputerze: $(if ($rp.Computer) { $rp.Computer } else { 'ten' }))?`r`nWłaścicielem zostanie grupa Administratorzy$grantText. Potrzebne są prawa administratora."
             if (-not (Confirm-Action -Text $text -Items @("$($rows.Count) elementów do zmiany (z podglądu)") -ConfirmText 'Przejmij własność' -Danger)) { return }
+            if ($privileged) {
+                # Jedno przejście w trybie kopii zapasowej; kopia uprawnień ze stanu każdego zmienionego elementu sprzed zmiany
+                Start-NtfsChange -Module $m -Name 'Przejęcie własności' -Computer $rp.Computer -Params @{ Op = 'TakeOwnership'; Path = $rp.Path; Depth = (Get-NtfsDepth $m); Files = (Test-Checked $m.Files); Grant = (Test-Checked $m.Grant); Privileged = $true } -OnDone {
+                    param($m, $results)
+                    $rp = $m.Data.Repair
+                    $items = @($results | Where-Object { $_.Path })
+                    $before = @($items | Where-Object { $_.Status -eq 'Zmieniono' -and $_.Before })
+                    if ($before.Count) { [void](Save-NtfsBackup -Operation 'Przejęcie własności – stan przed' -Computer $rp.Computer -Root $rp.Path -Items @($before | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Before } })) }
+                    $sum = @($results | Where-Object { $_.Status -eq 'Podsumowanie' } | ForEach-Object { [string]$_.Detail })
+                    $rows = @($items | Select-Object -First 2000 | ForEach-Object { [pscustomobject][ordered]@{ 'Ścieżka' = $_.Path; 'Wynik' = $(if ($_.Status -eq 'Zmieniono') { 'Zmieniono' } else { 'Błąd' }); 'Szczegóły' = $(if ($_.Status -eq 'Zmieniono') { $_.Detail } else { $_.Status }); '__tone' = $_.Tone } })
+                    Show-GridDialog -Title 'Przejęcie własności' -Subtitle ((@($sum) + @($(if ($items.Count -gt 2000) { "pokazano 2000 z $($items.Count)" }))) -join ' • ') -Rows $rows -PillColumns @('Wynik')
+                    & $m.Actions.Preview $m
+                }
+                return
+            }
             $readable = @($rows | Where-Object { [string]$_['__sddl'] })
             if ($readable.Count) { if (-not (Save-NtfsBackup -Operation 'Przejęcie własności' -Computer $rp.Computer -Root $rp.Path -Items @($readable | ForEach-Object { @{ Path = [string]$_['Ścieżka']; Sddl = [string]$_['__sddl'] } }))) { return } }
             Start-NtfsOwnershipFix -Module $m -Path $rp.Path -Computer $rp.Computer -Grant (Test-Checked $m.Grant)
@@ -19763,6 +19872,7 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsTemp
     $m.Mode = Add-ComboBox -Parent $row -Items @('jawne wpisy', 'wszystkie wpisy (z dziedziczonymi)') -Width 260
     $m.CmpProtect = Add-CheckBox -Parent $row -Text 'Dziedziczenie' -Checked $true
     $m.CmpOwner = Add-CheckBox -Parent $row -Text 'Właściciel'
+    $m.Privileged = Add-CheckBox -Parent $row -Text 'Tryb kopii zapasowej' -ToolTip 'Odczyt i zmiana uprawnień także folderów, do których Administratorzy nie mają dostępu (przywileje kopii zapasowej i przywracania). Wymaga uruchomienia jako administrator.'
     Add-Button -Parent $row -Text 'Wstaw podfoldery…' -Icon 'E8F4' -Module $m -AlwaysEnabled -ToolTip 'Dopisuje do listy podfoldery wskazanego folderu (np. wszystkie foldery działów)' -OnClick {
         param($m)
         $comp = $m.Computer.Text.Trim()
