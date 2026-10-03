@@ -11789,7 +11789,7 @@ function Invoke-AdRead {
 $__exported = (Get-Module -Name ActiveDirectory).ExportedCommands
 foreach ($__c in 'Get-ADUser', 'Get-ADComputer', 'Get-ADGroup', 'Get-ADObject', 'Get-ADOrganizationalUnit', 'Get-ADGroupMember', 'Get-ADPrincipalGroupMembership',
     'Get-ADDomain', 'Get-ADForest', 'Get-ADRootDSE', 'Get-ADDomainController', 'Search-ADAccount', 'Get-ADDefaultDomainPasswordPolicy', 'Get-ADFineGrainedPasswordPolicy',
-    'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata', 'Get-ADOptionalFeature') {
+    'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata', 'Get-ADOptionalFeature', 'Get-ADReplicationPartnerMetadata', 'Get-ADReplicationFailure') {
     if (-not $__exported.ContainsKey($__c)) { continue }
     Set-Item -Path "function:$__c" -Value ([scriptblock]::Create("if (`$MyInvocation.ExpectingInput) { Invoke-AdRead 'ActiveDirectory\$__c' `$args @(`$input) `$true } else { Invoke-AdRead 'ActiveDirectory\$__c' `$args `$null `$false }"))
 }
@@ -21215,6 +21215,318 @@ Register-Module -Workspace 'Domain' -Category 'Bezpieczeństwo' -Key 'AdDelegati
     Add-StatTile -Module $m -Key 'objects' -Label 'Sprawdzone obiekty' -Icon 'E8B7' | Out-Null
     Add-StatTile -Module $m -Key 'trustees' -Label 'Konta i grupy z delegacjami' -Icon 'E902' | Out-Null
     $m.EmptyHint = 'Kliknij «Analizuj» (F5). Wpisy «Info» to zwykłe delegacje (np. reset haseł w jednostce dla helpdesku) – warto sprawdzić, czy nadal są potrzebne.'
+}
+#endregion
+
+#region Domena: stan kontrolerów, replikacji, ról FSMO, czasu, SYSVOL i kopii zapasowej
+
+$script:DomainHealthSeverity = [ordered]@{ 'Błąd' = @{ Rank = 0; Tone = 'crit' }; 'Ostrzeżenie' = @{ Rank = 1; Tone = 'warn' }; 'Info' = @{ Rank = 2; Tone = '' }; 'OK' = @{ Rank = 3; Tone = 'ok' } }
+
+# Część z komputera administratora (moduł ActiveDirectory). $P: Ports, ReplWarnHours, ReplCritHours, BackupWarnDays, BackupCritDays, UnsupportedOs
+$script:DomainHealthScript = {
+    $now = Get-Date
+    function Out-Row([string]$Area, [string]$Object, [string]$Severity, [string]$Result, [string]$Details = '') {
+        [pscustomobject][ordered]@{ '__rec' = 'row'; 'Ocena' = $Severity; 'Obszar' = $Area; 'Obiekt' = $Object; 'Wynik' = $Result; 'Szczegóły' = $Details }
+    }
+    function Get-Ago([datetime]$When) {
+        $span = $now - $When
+        if ($span.TotalMinutes -lt 1) { return 'przed chwilą' }
+        if ($span.TotalHours -lt 1) { return ('{0} min temu' -f [int]$span.TotalMinutes) }
+        if ($span.TotalDays -lt 2) { return ('{0:N1} godz. temu' -f $span.TotalHours) }
+        return ('{0} dni temu' -f [int]$span.TotalDays)
+    }
+    $domain = Get-ADDomain @ad
+    $forest = Get-ADForest @ad
+    $dse = Get-ADRootDSE @ad
+    [pscustomobject]@{ '__rec' = 'domain'; Name = [string]$domain.DNSRoot; Pdc = [string]$domain.PDCEmulator }
+
+    # Kontrolery domeny
+    $dcs = @(Get-ADDomainController -Filter * @ad | Sort-Object HostName)
+    foreach ($dc in $dcs) {
+        $roles = (@($dc.OperationMasterRoles | ForEach-Object { [string]$_ })) -join ', '
+        [pscustomobject]@{ '__rec' = 'dc'; Name = [string]$dc.Name; HostName = [string]$dc.HostName; Site = [string]$dc.Site; Os = [string]$dc.OperatingSystem; Ip = [string]$dc.IPv4Address; GC = [bool]$dc.IsGlobalCatalog; Rodc = [bool]$dc.IsReadOnly; Roles = $roles }
+        $flags = @(); if ($dc.IsGlobalCatalog) { $flags += 'wykaz globalny' }; if ($dc.IsReadOnly) { $flags += 'tylko do odczytu (RODC)' }
+        $old = [string]$dc.OperatingSystem -match $P.UnsupportedOs
+        Out-Row 'Kontrolery' ([string]$dc.Name) $(if ($old) { 'Ostrzeżenie' } else { 'OK' }) ('{0}, lokacja {1}{2}' -f $dc.OperatingSystem, $dc.Site, $(if ($flags.Count) { ', ' + ($flags -join ', ') } else { '' })) $(if ($old) { 'system bez wsparcia producenta' } elseif ($roles) { "role FSMO: $roles" } else { [string]$dc.IPv4Address })
+    }
+    if ($dcs.Count -eq 1) { Out-Row 'Kontrolery' ([string]$domain.DNSRoot) 'Ostrzeżenie' 'tylko jeden kontroler domeny' 'awaria serwera zatrzymuje logowanie i całą domenę – dodaj drugi kontroler' }
+
+    # Role FSMO
+    $hosts = @($dcs | ForEach-Object { ([string]$_.HostName).ToLowerInvariant() })
+    $roleList = [ordered]@{ 'Emulator PDC' = $domain.PDCEmulator; 'Wzorzec RID' = $domain.RIDMaster; 'Wzorzec infrastruktury' = $domain.InfrastructureMaster; 'Wzorzec schematu' = $forest.SchemaMaster; 'Wzorzec nazw domen' = $forest.DomainNamingMaster }
+    foreach ($r in $roleList.Keys) {
+        $h = [string]$roleList[$r]
+        $known = $hosts -contains $h.ToLowerInvariant()
+        $forestRole = @('Wzorzec schematu', 'Wzorzec nazw domen') -contains $r
+        Out-Row 'Role FSMO' $r $(if ($known -or $forestRole) { 'OK' } else { 'Błąd' }) $h $(if ($known) { '' } elseif ($forestRole) { 'rola lasu (kontroler w domenie głównej lasu)' } else { 'właściciel roli nie jest na liście kontrolerów – rola mogła zostać po usuniętym serwerze (przejęcie roli: Move-ADDirectoryServerOperationMasterRole -Force)' })
+    }
+
+    # Porty (z tego komputera)
+    if ($P.Ports) {
+        foreach ($dc in $dcs) {
+            $ports = [ordered]@{ 53 = 'DNS'; 88 = 'Kerberos'; 389 = 'LDAP'; 445 = 'SMB'; 9389 = 'ADWS' }
+            if ($dc.IsGlobalCatalog) { $ports[3268] = 'GC' }
+            $closed = @()
+            foreach ($port in $ports.Keys) {
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                try { $task = $tcp.ConnectAsync([string]$dc.HostName, [int]$port); if (-not $task.Wait(1500) -or -not $tcp.Connected) { $closed += "$($ports[$port]) ($port)" } }
+                catch { $closed += "$($ports[$port]) ($port)" }
+                finally { $tcp.Dispose() }
+            }
+            Out-Row 'Łączność' ([string]$dc.Name) $(if ($closed.Count -eq 0) { 'OK' } elseif ($closed.Count -eq $ports.Count) { 'Błąd' } else { 'Ostrzeżenie' }) $(if ($closed.Count -eq 0) { 'wszystkie porty odpowiadają' } else { 'nie odpowiada: ' + ($closed -join ', ') }) (($ports.Values) -join ', ')
+        }
+    }
+
+    # Replikacja przychodząca (każdy kontroler, każdy partner i partycja)
+    $short = { param($dn) switch -Regex ([string]$dn) { '^CN=Schema,' { 'schemat' } '^CN=Configuration,' { 'konfiguracja' } '^DC=DomainDnsZones,' { 'strefy DNS domeny' } '^DC=ForestDnsZones,' { 'strefy DNS lasu' } default { 'domena' } } }
+    foreach ($dc in $dcs) {
+        try { $meta = @(Get-ADReplicationPartnerMetadata -Target ([string]$dc.HostName) -Scope Server -PartnerType Inbound @ad) }
+        catch { Out-Row 'Replikacja' ([string]$dc.Name) 'Błąd' 'nie odczytano metadanych replikacji' $_.Exception.Message; continue }
+        if ($meta.Count -eq 0 -and $dcs.Count -gt 1) { Out-Row 'Replikacja' ([string]$dc.Name) 'Ostrzeżenie' 'brak partnerów replikacji' 'sprawdź połączenia w lokacjach (KCC)' }
+        foreach ($x in $meta) {
+            $partner = ([string]$x.Partner -replace '^CN=NTDS Settings,CN=([^,]+),.*$', '$1')
+            $last = $x.LastReplicationSuccess
+            $hours = if ($last) { ($now - [datetime]$last).TotalHours } else { [double]::MaxValue }
+            $res = [int]$x.LastReplicationResult
+            $sev = if ($res -ne 0 -or $hours -gt [double]$P.ReplCritHours) { 'Błąd' } elseif ($hours -gt [double]$P.ReplWarnHours) { 'Ostrzeżenie' } else { 'OK' }
+            Out-Row 'Replikacja' ('{0} ← {1}' -f $dc.Name, $partner) $sev ('{0}: ostatnia udana {1}' -f (& $short $x.Partition), $(if ($last) { Get-Ago ([datetime]$last) } else { 'nigdy' })) $(if ($res -ne 0) { 'ostatni wynik: błąd {0}, kolejne niepowodzenia: {1}' -f $res, $x.ConsecutiveReplicationFailures } else { '' })
+        }
+        try { foreach ($f in @(Get-ADReplicationFailure -Target ([string]$dc.HostName) @ad | Where-Object { [int]$_.FailureCount -gt 0 })) { Out-Row 'Replikacja' ('{0} ← {1}' -f $dc.Name, ([string]$f.Partner -replace '^CN=NTDS Settings,CN=([^,]+),.*$', '$1')) 'Błąd' ('błąd {0} ({1} prób)' -f $f.LastError, $f.FailureCount) ('od {0:yyyy-MM-dd HH:mm}' -f $f.FirstFailureTime) } } catch { }
+    }
+
+    # Kopia zapasowa AD (atrybut dSASignature partycji - jak repadmin /showbackup)
+    $ncs = [ordered]@{ 'domena' = [string]$domain.DistinguishedName; 'konfiguracja' = [string]$dse.configurationNamingContext; 'schemat' = [string]$dse.schemaNamingContext }
+    foreach ($k in $ncs.Keys) {
+        try {
+            $md = @(Get-ADReplicationAttributeMetadata -Object $ncs[$k] -Server ([string]$domain.PDCEmulator) -Properties dSASignature @ad | Where-Object { [string]$_.AttributeName -eq 'dSASignature' })
+            $t = if ($md.Count) { [datetime]$md[0].LastOriginatingChangeTime } else { [datetime]::MinValue }
+            if ($t.Year -le 1601) { Out-Row 'Kopia zapasowa' $k 'Błąd' 'brak kopii zapasowej stanu systemu' 'kontroler nigdy nie był kopiowany narzędziem obsługującym AD (np. Kopia zapasowa systemu Windows Server)'; continue }
+            $days = ($now - $t).TotalDays
+            [pscustomobject]@{ '__rec' = 'backup'; Nc = $k; Days = [int]$days }
+            Out-Row 'Kopia zapasowa' $k $(if ($days -gt [double]$P.BackupCritDays) { 'Błąd' } elseif ($days -gt [double]$P.BackupWarnDays) { 'Ostrzeżenie' } else { 'OK' }) ('ostatnia kopia {0}' -f (Get-Ago $t)) ('{0:yyyy-MM-dd HH:mm}' -f $t)
+        }
+        catch { Out-Row 'Kopia zapasowa' $k 'Info' 'nie sprawdzono' $_.Exception.Message }
+    }
+    try {
+        $ds = Get-ADObject -Identity ('CN=Directory Service,CN=Windows NT,CN=Services,' + [string]$dse.configurationNamingContext) -Properties tombstoneLifetime @ad
+        $tl = [int]$ds.tombstoneLifetime
+        Out-Row 'Kopia zapasowa' 'Okres przechowywania usuniętych obiektów' 'Info' $(if ($tl) { "$tl dni" } else { 'domyślny (60 dni w starszych lasach)' }) 'kopia starsza niż ten okres nie nadaje się do przywrócenia kontrolera'
+    }
+    catch { }
+
+    # DNS: rekordy SRV kontrolerów
+    try {
+        $srv = @(Resolve-DnsName -Name ('_ldap._tcp.dc._msdcs.' + [string]$domain.DNSRoot) -Type SRV -ErrorAction Stop | Where-Object { [string]$_.Type -eq 'SRV' } | ForEach-Object { ([string]$_.NameTarget).TrimEnd('.').ToLowerInvariant() })
+        $missing = @($hosts | Where-Object { $srv -notcontains $_ })
+        $stale = @($srv | Where-Object { $hosts -notcontains $_ } | Select-Object -Unique)
+        Out-Row 'DNS' ('_ldap._tcp.dc._msdcs.' + [string]$domain.DNSRoot) $(if ($missing.Count) { 'Błąd' } elseif ($stale.Count) { 'Ostrzeżenie' } else { 'OK' }) ('rekordy SRV: {0}' -f @($srv | Select-Object -Unique).Count) ((@($(if ($missing.Count) { 'brak rekordu dla: ' + ($missing -join ', ') }), $(if ($stale.Count) { 'rekordy nieistniejących kontrolerów: ' + ($stale -join ', ') }) | Where-Object { $_ })) -join '; ')
+    }
+    catch { Out-Row 'DNS' ([string]$domain.DNSRoot) 'Info' 'nie sprawdzono rekordów SRV' $_.Exception.Message }
+
+    Out-Row 'Domena' 'Poziom funkcjonalny' 'Info' ('domena: {0}, las: {1}' -f $domain.DomainMode, $forest.ForestMode)
+}
+
+# Część na każdym kontrolerze (WinRM). $P: EventHours
+$script:DcHealthScript = {
+    param($P)
+    $me = $env:COMPUTERNAME
+    function Out-Row([string]$Area, [string]$Severity, [string]$Result, [string]$Details = '') {
+        [pscustomobject][ordered]@{ '__rec' = 'row'; 'Ocena' = $Severity; 'Obszar' = $Area; 'Obiekt' = $me; 'Wynik' = $Result; 'Szczegóły' = $Details }
+    }
+    # Usługi
+    $names = [ordered]@{ NTDS = 'AD DS'; Netlogon = 'Netlogon'; Kdc = 'Kerberos KDC'; W32Time = 'Czas'; ADWS = 'ADWS'; LanmanServer = 'Serwer'; DNS = 'DNS'; DFSR = 'DFSR' }
+    $bad = @(); $okList = @(); $missing = @()
+    foreach ($n in $names.Keys) {
+        $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+        if (-not $s) { $missing += $names[$n]; continue }
+        if ([string]$s.Status -ne 'Running') { $bad += ('{0} ({1})' -f $names[$n], $s.Status) } else { $okList += $names[$n] }
+    }
+    $hardMissing = @($missing | Where-Object { @('DNS', 'DFSR') -notcontains $_ })
+    Out-Row 'Usługi' $(if ($bad.Count -or $hardMissing.Count) { 'Błąd' } else { 'OK' }) $(if ($bad.Count) { 'zatrzymane: ' + ($bad -join ', ') } elseif ($hardMissing.Count) { 'brak usług: ' + ($hardMissing -join ', ') } else { 'działają: ' + ($okList -join ', ') }) $(if ($missing.Count) { 'nie zainstalowano: ' + ($missing -join ', ') } else { '' })
+    # SYSVOL i NETLOGON
+    $shares = @(Get-CimInstance -ClassName Win32_Share -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.Name })
+    $noShare = @(@('SYSVOL', 'NETLOGON') | Where-Object { $shares -notcontains $_ })
+    Out-Row 'SYSVOL' $(if ($noShare.Count) { 'Błąd' } else { 'OK' }) $(if ($noShare.Count) { 'nieudostępnione: ' + ($noShare -join ', ') } else { 'SYSVOL i NETLOGON udostępnione' }) $(if ($noShare.Count) { 'kontroler nie obsługuje zasad grupy i skryptów logowania – sprawdź replikację SYSVOL' } else { '' })
+    try {
+        $rf = @(Get-CimInstance -Namespace 'root\microsoftdfs' -ClassName DfsrReplicatedFolderInfo -Filter "ReplicatedFolderName='SYSVOL Share'" -ErrorAction Stop)
+        if ($rf.Count) {
+            $st = [int]$rf[0].State
+            $txt = @{ 0 = 'niezainicjowany'; 1 = 'zainicjowany'; 2 = 'synchronizacja początkowa'; 3 = 'automatyczne odzyskiwanie'; 4 = 'normalny'; 5 = 'błąd' }[$st]
+            Out-Row 'SYSVOL' $(if ($st -eq 4) { 'OK' } elseif ($st -eq 5) { 'Błąd' } else { 'Ostrzeżenie' }) "replikacja DFSR: $txt" ''
+        }
+        elseif ((Get-Service -Name NtFrs -ErrorAction SilentlyContinue).Status -eq 'Running') { Out-Row 'SYSVOL' 'Ostrzeżenie' 'replikacja SYSVOL przez FRS' 'FRS jest przestarzały i nieobsługiwany od Windows Server 2019 – migracja: dfsrmig' }
+    }
+    catch {
+        if ((Get-Service -Name NtFrs -ErrorAction SilentlyContinue).Status -eq 'Running') { Out-Row 'SYSVOL' 'Ostrzeżenie' 'replikacja SYSVOL przez FRS' 'FRS jest przestarzały i nieobsługiwany od Windows Server 2019 – migracja: dfsrmig' }
+    }
+    # Czas
+    $source = ''
+    try { $source = ((& w32tm.exe /query /source 2>$null) | Out-String).Trim() } catch { }
+    [pscustomobject]@{ '__rec' = 'time'; Computer = $me; Utc = [datetime]::UtcNow; Source = $source }
+    # Dyski (także dysk bazy NTDS)
+    $dbDrive = ''
+    try { $dbDrive = ([string](Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' -ErrorAction Stop).'DSA Database file').Substring(0, 2).ToUpperInvariant() } catch { }
+    foreach ($d in @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue)) {
+        if (-not $d.Size) { continue }
+        $pct = [Math]::Round(100 * [double]$d.FreeSpace / [double]$d.Size, 1)
+        Out-Row 'Dyski' $(if ($pct -lt 10) { 'Błąd' } elseif ($pct -lt 20) { 'Ostrzeżenie' } else { 'OK' }) ('{0} wolne {1}% ({2:N1} GB)' -f $d.DeviceID, $pct, ([double]$d.FreeSpace / 1GB)) $(if ([string]$d.DeviceID -eq $dbDrive) { 'dysk bazy NTDS' } else { '' })
+    }
+    # Błędy w dziennikach AD z ostatnich godzin
+    $since = (Get-Date).AddHours(-[int]$P.EventHours)
+    $events = @()
+    foreach ($log in 'Directory Service', 'DFS Replication', 'DNS Server', 'System') {
+        try { $events += @(Get-WinEvent -FilterHashtable @{ LogName = $log; Level = 1, 2; StartTime = $since } -MaxEvents 200 -ErrorAction Stop) } catch { }
+    }
+    $groups = @($events | Group-Object { '{0}|{1}' -f $_.LogName, $_.Id } | Sort-Object Count -Descending)
+    $top = @($groups | Select-Object -First 3 | ForEach-Object { $e = $_.Group[0]; '{0} {1} (x{2}): {3}' -f $e.LogName, $e.Id, $_.Count, ((([string]$e.Message) -split "`n")[0]).Trim() })
+    Out-Row 'Zdarzenia' $(if ($events.Count) { 'Ostrzeżenie' } else { 'OK' }) $(if ($events.Count) { "błędy w ostatnich $($P.EventHours) godz.: $($events.Count)" } else { "brak błędów w ostatnich $($P.EventHours) godz." }) ($top -join ' | ')
+    # Czas działania
+    try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop; Out-Row 'Kontrolery' 'Info' ('uruchomiony {0:N0} dni temu' -f ((Get-Date) - $os.LastBootUpTime).TotalDays) ([string]$os.Caption) } catch { }
+}
+
+function Add-DomainHealthRows {
+    param([hashtable]$Module, [object[]]$Rows)
+    $out = @(foreach ($r in $Rows) {
+            $sev = $script:DomainHealthSeverity[[string]$r.'Ocena']
+            [pscustomobject][ordered]@{ 'Ocena' = $r.'Ocena'; 'Obszar' = $r.'Obszar'; 'Obiekt' = $r.'Obiekt'; 'Wynik' = $r.'Wynik'; 'Szczegóły' = $r.'Szczegóły'; '__tone' = $(if ($sev) { $sev.Tone } else { '' }) }
+        })
+    if ($out.Count) { Add-ResultRows -Module $Module -Objects $out -TargetColumn '' }
+}
+
+function Get-DomainTimeRows {
+    # Odchylenie zegarów kontrolerów względem emulatora PDC (pomiary w tym samym przebiegu); źródło czasu PDC - zewnętrzne
+    param([object[]]$Times, [string]$Pdc)
+    $rows = New-Object System.Collections.ArrayList
+    if (@($Times).Count -eq 0) { return $rows.ToArray() }
+    $pdcName = ($Pdc -split '\.')[0]
+    $ref = @($Times | Where-Object { [string]$_.Computer -ieq $pdcName })
+    $base = if ($ref.Count) { $ref[0] } else { $null }
+    foreach ($t in $Times) {
+        $skew = if ($base) { ([datetime]$t.Utc - [datetime]$base.Utc) - ([datetime]$t.Received - [datetime]$base.Received) } else { [datetime]$t.Utc - [datetime]$t.Received }
+        $sec = [Math]::Abs($skew.TotalSeconds)
+        $isPdc = $base -and [string]$t.Computer -ieq $pdcName
+        $local = [string]$t.Source -match 'Local CMOS Clock|Free-running System Clock|Lokalny zegar CMOS|Zegar systemowy'
+        $sev = if ($isPdc) { $(if ($local) { 'Ostrzeżenie' } else { 'OK' }) } elseif ($sec -gt 300) { 'Błąd' } elseif ($sec -gt 30) { 'Ostrzeżenie' } else { 'OK' }
+        $result = if ($isPdc) { 'emulator PDC – wzorzec czasu domeny' } else { 'odchylenie od PDC: {0:N1} s' -f $skew.TotalSeconds }
+        $details = 'źródło: ' + $(if ($t.Source) { [string]$t.Source } else { 'nieznane' })
+        if ($isPdc -and $local) { $details += ' – PDC powinien synchronizować czas z zewnętrznym serwerem NTP (w32tm /config /manualpeerlist)' }
+        if (-not $isPdc -and $sec -gt 300) { $details += ' – powyżej 5 minut Kerberos odrzuca logowanie' }
+        [void]$rows.Add([pscustomobject][ordered]@{ 'Ocena' = $sev; 'Obszar' = 'Czas'; 'Obiekt' = [string]$t.Computer; 'Wynik' = $result; 'Szczegóły' = $details })
+    }
+    return $rows.ToArray()
+}
+
+function Update-DomainHealthTiles([hashtable]$Module) {
+    $m = $Module
+    $rows = @(Get-ResultRowsAll -Module $m)
+    $crit = @($rows | Where-Object { [string]$_['Ocena'] -eq 'Błąd' }).Count
+    $warn = @($rows | Where-Object { [string]$_['Ocena'] -eq 'Ostrzeżenie' }).Count
+    Set-StatTile -Module $m -Key 'dcs' -Value ([string]@($m.Data.Health.Dcs).Count)
+    Set-StatTile -Module $m -Key 'crit' -Value ([string]$crit) -Tone $(if ($crit) { 'crit' } else { 'ok' })
+    Set-StatTile -Module $m -Key 'warn' -Value ([string]$warn) -Tone $(if ($warn) { 'warn' } else { '' })
+    $repl = @($rows | Where-Object { [string]$_['Obszar'] -eq 'Replikacja' -and [string]$_['Ocena'] -eq 'Błąd' }).Count
+    Set-StatTile -Module $m -Key 'repl' -Value ([string]$repl) -Tone $(if ($repl) { 'crit' } else { 'ok' })
+    $bk = @($m.Data.Health.Backups | Where-Object { $_.Nc -eq 'domena' })
+    Set-StatTile -Module $m -Key 'backup' -Value $(if ($bk.Count) { '{0} dni' -f $bk[0].Days } else { '—' }) -Tone $(if (-not $bk.Count) { 'crit' } elseif ($bk[0].Days -gt [int]$m.Data.Health.Params.BackupWarnDays) { 'warn' } else { 'ok' })
+}
+
+Register-Module -Workspace 'Domain' -Category 'Stan domeny' -Key 'DomainHealth' -Title 'Stan domeny' -Icon 'E9D9' -Badge 'nowe' `
+    -Description 'Przegląd zdrowia domeny: kontrolery i porty, replikacja (każdy partner i partycja), role FSMO, rekordy SRV w DNS, ostatnia kopia zapasowa AD, a na kontrolerach przez WinRM – usługi, SYSVOL/NETLOGON i stan DFSR, odchylenie zegara od PDC, wolne miejsce i błędy w dziennikach. Każdy problem z oceną i wskazówką.' -Build {
+    param($m)
+    $m.PillColumns = @('Ocena')
+    $row = Add-ToolbarRow -Module $m -Title 'Zakres'
+    $m.Remote = Add-CheckBox -Parent $row -Text 'Kontrolery przez WinRM (usługi, SYSVOL, czas, dyski, dzienniki)' -Checked $true
+    $m.Ports = Add-CheckBox -Parent $row -Text 'Test portów z tego komputera' -Checked $true
+    $row2 = Add-ToolbarRow -Module $m -Title 'Progi'
+    Add-Label -Parent $row2 -Text 'Replikacja – ostrzeżenie (godz.)' | Out-Null
+    $m.ReplWarn = Add-Numeric -Parent $row2 -Value 6 -Minimum 1 -Maximum 720 -Width 60
+    Add-Label -Parent $row2 -Text '   błąd (godz.)' | Out-Null
+    $m.ReplCrit = Add-Numeric -Parent $row2 -Value 24 -Minimum 1 -Maximum 2160 -Width 60
+    Add-Label -Parent $row2 -Text '   Kopia AD – ostrzeżenie (dni)' | Out-Null
+    $m.BackupWarn = Add-Numeric -Parent $row2 -Value 7 -Minimum 1 -Maximum 365 -Width 60
+    Add-Label -Parent $row2 -Text '   błąd (dni)' | Out-Null
+    $m.BackupCrit = Add-Numeric -Parent $row2 -Value 30 -Minimum 1 -Maximum 365 -Width 60
+    Add-Label -Parent $row2 -Text '   Dzienniki (godz.)' | Out-Null
+    $m.EventHours = Add-Numeric -Parent $row2 -Value 24 -Minimum 1 -Maximum 720 -Width 60
+    $m.Actions.Run = {
+        param($m)
+        if (-not (Test-AdAvailable)) { return }
+        $params = @{ Ports = (Test-Checked $m.Ports); ReplWarnHours = (Get-Num $m.ReplWarn); ReplCritHours = (Get-Num $m.ReplCrit); BackupWarnDays = (Get-Num $m.BackupWarn); BackupCritDays = (Get-Num $m.BackupCrit); UnsupportedOs = $script:UnsupportedOsPattern }
+        $m.Data.Health = @{ Params = $params; Dcs = New-Object System.Collections.ArrayList; Rows = New-Object System.Collections.ArrayList; Times = New-Object System.Collections.ArrayList; Backups = New-Object System.Collections.ArrayList; Pdc = ''; Domain = ''; Remote = (Test-Checked $m.Remote); EventHours = (Get-Num $m.EventHours) }
+        Reset-ResultTable -Module $m
+        Start-AdOperation -Module $m -Name 'Stan domeny' -Targets @('AD') -Output None -Parameters $params -ScriptBlock $script:DomainHealthScript -OnResult {
+            param($m, $r)
+            $h = $m.Data.Health
+            if (-not $r.Ok) { [void]$h.Rows.Add([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Domena'; 'Obiekt' = 'AD'; 'Wynik' = 'nie odczytano danych domeny'; 'Szczegóły' = ((@($r.Errors)) -join ' ') }); return }
+            foreach ($d in @($r.Data)) {
+                switch ([string](Get-ObjectValue $d '__rec')) {
+                    'domain' { $h.Domain = [string]$d.Name; $h.Pdc = [string]$d.Pdc }
+                    'dc' { [void]$h.Dcs.Add($d) }
+                    'backup' { [void]$h.Backups.Add($d) }
+                    'row' { [void]$h.Rows.Add($d) }
+                }
+            }
+        } -OnComplete {
+            param($m)
+            $h = $m.Data.Health
+            Add-DomainHealthRows -Module $m -Rows @($h.Rows)
+            Update-DomainHealthTiles -Module $m
+            $hostsList = @($h.Dcs | ForEach-Object { [string]$_.HostName } | Where-Object { $_ })
+            if (-not $h.Remote -or $hostsList.Count -eq 0) { & $m.Actions.Finish $m; return }
+            Start-HostOperation -Module $m -Name 'Kontrolery domeny (WinRM)' -Targets $hostsList -Output None -Parameters @{ EventHours = $h.EventHours } -ScriptBlock $script:DcHealthScript -OnResult {
+                param($m, $r)
+                $h = $m.Data.Health
+                if (-not $r.Ok) { Add-DomainHealthRows -Module $m -Rows @([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Kontrolery'; 'Obiekt' = (([string]$r.Target) -split '\.')[0]; 'Wynik' = 'brak połączenia WinRM'; 'Szczegóły' = ((@($r.Errors)) -join ' ') }); return }
+                $rows = @()
+                foreach ($d in @($r.Data)) {
+                    switch ([string](Get-ObjectValue $d '__rec')) {
+                        'row' { $rows += $d }
+                        'time' { [void]$h.Times.Add([pscustomobject]@{ Computer = [string]$d.Computer; Utc = [datetime]$d.Utc; Received = [datetime]::UtcNow; Source = [string]$d.Source }) }
+                    }
+                }
+                Add-DomainHealthRows -Module $m -Rows $rows
+            } -OnComplete { param($m) & $m.Actions.Finish $m }
+        }
+    }
+    $m.Actions.Finish = {
+        param($m)
+        $h = $m.Data.Health
+        Add-DomainHealthRows -Module $m -Rows @(Get-DomainTimeRows -Times @($h.Times) -Pdc $h.Pdc)
+        # Kolejność: błędy, ostrzeżenia, informacje, OK - w obrębie obszarów
+        $all = @(Get-ResultRowsAll -Module $m | ForEach-Object { [pscustomobject][ordered]@{ 'Ocena' = $_['Ocena']; 'Obszar' = $_['Obszar']; 'Obiekt' = $_['Obiekt']; 'Wynik' = $_['Wynik']; 'Szczegóły' = $_['Szczegóły']; '__tone' = $_['__tone'] } })
+        $areas = @{ 'Kontrolery' = 0; 'Łączność' = 1; 'Replikacja' = 2; 'Role FSMO' = 3; 'Czas' = 4; 'SYSVOL' = 5; 'Usługi' = 6; 'DNS' = 7; 'Kopia zapasowa' = 8; 'Dyski' = 9; 'Zdarzenia' = 10; 'Domena' = 11 }
+        $sorted = @($all | Sort-Object @{ Expression = { $script:DomainHealthSeverity[[string]$_.'Ocena'].Rank } }, @{ Expression = { $areas[[string]$_.'Obszar'] } }, 'Obiekt')
+        Reset-ResultTable -Module $m
+        if ($sorted.Count) { Add-ResultRows -Module $m -Objects $sorted -TargetColumn '' }
+        Update-DomainHealthTiles -Module $m
+        $crit = @($sorted | Where-Object { $_.'Ocena' -eq 'Błąd' }).Count
+        $m.ResultHint = 'Domena {0} • {1:yyyy-MM-dd HH:mm} • błędy: {2}' -f $h.Domain, (Get-Date), $crit
+        if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+        Show-Toast $(if ($crit) { "Stan domeny: problemy wymagające uwagi – $crit." } else { 'Stan domeny: bez błędów.' }) $(if ($crit) { 'warn' } else { 'ok' })
+    }
+    Add-Button -Parent $row -Text 'Sprawdź' -Icon 'E9D9' -Module $m -Primary -OnClick $m.Actions.Run | Out-Null
+    Add-RowAction -Module $m -Text 'Uruchom dcdiag na tym kontrolerze' -Icon 'E756' -Action {
+        param($m, $rows)
+        $name = [string](Get-ObjectValue $rows[0] 'Obiekt')
+        if (-not $m.Data['Health']) { Show-Warning 'Najpierw sprawdź stan domeny.'; return }
+        $dc = @($m.Data.Health.Dcs | Where-Object { [string]$_.Name -ieq $name -or [string]$_.HostName -ieq $name })
+        if (-not $dc.Count) { Show-Warning 'Wybierz wiersz kontrolera domeny (kolumna «Obiekt»).'; return }
+        $m.Data.DcDiag = New-Object System.Collections.ArrayList
+        Start-HostOperation -Module $m -Name "dcdiag – $name" -Targets @([string]$dc[0].HostName) -Output None -Parameters @{ Mode = 'EXE'; FilePath = '%SystemRoot%\System32\dcdiag.exe'; Arguments = '/q'; TimeoutSec = 600 } -ScriptBlock $script:RemoteExecScript -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { [void]$m.Data.DcDiag.Add([pscustomobject]@{ 'Wiersz' = 'Błąd: ' + ((@($r.Errors)) -join ' ') }); return }
+            $out = [string]@($r.Data)[0].'Wynik'
+            $lines = @($out -split "`r?`n" | Where-Object { $_.Trim() })
+            if ($lines.Count -eq 0) { $lines = @('dcdiag /q nie zgłosił błędów') }
+            foreach ($l in $lines) { [void]$m.Data.DcDiag.Add([pscustomobject]@{ 'Wiersz' = $l }) }
+        } -OnComplete { param($m) Show-GridDialog -Title 'dcdiag /q' -Subtitle 'Tylko błędy (pełny test: dcdiag /v na kontrolerze)' -Rows @($m.Data.DcDiag) }
+    }
+    Add-StatTile -Module $m -Key 'dcs' -Label 'Kontrolery domeny' -Icon 'E968' | Out-Null
+    Add-StatTile -Module $m -Key 'crit' -Label 'Błędy' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'warn' -Label 'Ostrzeżenia' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'repl' -Label 'Błędy replikacji' -Icon 'E895' | Out-Null
+    Add-StatTile -Module $m -Key 'backup' -Label 'Ostatnia kopia AD' -Icon 'E81C' | Out-Null
+    $m.EmptyHint = 'Kliknij «Sprawdź» (F5). Kontrole po stronie kontrolerów wymagają WinRM i uprawnień administratora domeny; bez nich zostaje przegląd z AD (kontrolery, replikacja, FSMO, DNS, kopia zapasowa).'
 }
 #endregion
 
