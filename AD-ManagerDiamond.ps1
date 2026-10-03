@@ -20,6 +20,7 @@
       - Pliki i uprawnienia - uprawnienia NTFS: nadawanie, raport, uprawnienia efektywne, odbieranie,
                               naprawa, kopie i zmiany uprawnień, ryzyka, wzorce, udziały; sumy kontrolne,
       - Domena              - audyt bezpieczeństwa AD, delegacje uprawnień, stan kontrolerów i replikacji,
+                              zasady grupy (problemy, linki, dziedziczenie, kopie, wynikowe zasady),
                               raporty cykliczne (Harmonogram zadań, HTML do folderu lub pocztą).
     Przestrzenie AD mają listę obiektów docelowych (komputery, użytkownicy albo grupy) z zaznaczaniem,
     a moduły pogrupowane są w kategorie. Wyniki trafiają do tabel z filtrem, sortowaniem, podglądem
@@ -23602,6 +23603,668 @@ Register-Module -Workspace 'Domain' -Category 'Automatyzacja' -Key 'ScheduledRep
     Add-StatTile -Module $m -Key 'new' -Label 'Nowe wyniki (ostatnie przebiegi)' -Icon 'E7BA' | Out-Null
     $m.EmptyHint = 'Kliknij «Nowy raport» i wybierz rodzaj. Raport można uruchomić od razu («Uruchom teraz») albo zaplanować – zadanie w Harmonogramie utworzy raport bez otwierania programu.'
     & $m.Actions.Refresh $m
+}
+#endregion
+
+#region Domena: zasady grupy (obiekty GPO, linki, problemy, dziedziczenie dla OU, kopie zapasowe, wynikowe zasady)
+# Spis i analiza działają na samym module ActiveDirectory (obiekty groupPolicyContainer, atrybuty gPLink/gPOptions
+# jednostek, domeny i lokacji, filtry WMI) oraz folderze Policies w SYSVOL. Kopie i raporty ustawień wymagają konsoli
+# GPMC (moduł GroupPolicy), wynikowe zasady - gpresult na komputerze przez WinRM.
+
+$script:GpoApplyRight = 'edacfd8f-ffb3-11d1-b41d-00a0c968f939'
+$script:GpoSeverity = [ordered]@{ 'Wysokie' = @{ Rank = 0; Tone = 'crit' }; 'Średnie' = @{ Rank = 1; Tone = 'warn' }; 'Niskie' = @{ Rank = 2; Tone = 'info' }; 'OK' = @{ Rank = 3; Tone = 'ok' } }
+
+$script:GpoScanScript = {
+    # $P: SysvolRoot (puste - \\domena\SYSVOL\domena\Policies), CheckSysvol
+    $domain = Get-ADDomain @ad
+    $root = [string]$domain.DistinguishedName
+    $dns = [string]$domain.DNSRoot
+    $dse = Get-ADRootDSE @ad
+    $sysvol = if ($P.SysvolRoot) { [string]$P.SysvolRoot } else { "\\$dns\SYSVOL\$dns\Policies" }
+    [pscustomobject]@{ '__rec' = 'domain'; Name = $dns; Dn = $root; Sid = [string]$domain.DomainSID.Value; Sysvol = $sysvol }
+    $sids = @{}
+    $guids = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $props = @('displayName', 'flags', 'versionNumber', 'gPCFileSysPath', 'gPCMachineExtensionNames', 'gPCUserExtensionNames', 'gPCWQLFilter', 'whenCreated', 'whenChanged', 'nTSecurityDescriptor')
+    foreach ($g in @(Get-ADObject -SearchBase "CN=Policies,CN=System,$root" -SearchScope OneLevel -LDAPFilter '(objectClass=groupPolicyContainer)' -Properties $props @ad)) {
+        $guid = ([string]$g.Name).ToUpperInvariant()
+        [void]$guids.Add($guid)
+        $apply = New-Object System.Collections.ArrayList; $deny = New-Object System.Collections.ArrayList
+        $read = New-Object System.Collections.ArrayList; $edit = New-Object System.Collections.ArrayList
+        $owner = ''; $sdError = ''
+        try {
+            $sd = $g.nTSecurityDescriptor
+            if ($sd -is [string]) { $s2 = New-Object System.DirectoryServices.ActiveDirectorySecurity; $s2.SetSecurityDescriptorSddlForm($sd); $sd = $s2 }
+            try { $owner = $sd.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+            foreach ($r in $sd.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+                $sid = $r.IdentityReference.Value
+                $mask = [int64][int]$r.ActiveDirectoryRights
+                if ($mask -lt 0) { $mask += 4294967296 }
+                $ot = ([string]$r.ObjectType).ToLowerInvariant()
+                $noType = (-not $ot -or $ot -eq '00000000-0000-0000-0000-000000000000')
+                # Pełna kontrola: w ActiveDirectoryRights 0xF01FF (GenericAll), rzadziej surowy bit GENERIC_ALL
+                $all = (($mask -band 0x10000000) -ne 0) -or (($mask -band 0xF01FF) -eq 0xF01FF)
+                $isApply = $all -or (($mask -band 0x100) -and ($noType -or $ot -eq $P.ApplyRight))
+                $isRead = $all -or (($mask -band 0x80000000) -ne 0) -or ((($mask -band 0x10) -ne 0) -and $noType)
+                $isEdit = $all -or (($mask -band (0x40000000 -bor 0x40000 -bor 0x80000)) -ne 0) -or ((($mask -band 0x20) -ne 0) -and $noType)
+                if ([string]$r.AccessControlType -ne 'Allow') { if ($isApply) { [void]$deny.Add($sid); $sids[$sid] = $true }; continue }
+                if ($isApply) { [void]$apply.Add($sid); $sids[$sid] = $true }
+                if ($isRead) { [void]$read.Add($sid) }
+                if ($isEdit) { [void]$edit.Add($sid); $sids[$sid] = $true }
+            }
+        }
+        catch { $sdError = $_.Exception.Message }
+        $sysState = ''; $sysVer = $null
+        if ($P.CheckSysvol) {
+            $folder = Join-Path $sysvol $guid
+            try {
+                if (-not (Test-Path -LiteralPath $folder)) { $sysState = 'Brak folderu' }
+                elseif (-not (Test-Path -LiteralPath (Join-Path $folder 'GPT.INI'))) { $sysState = 'Brak GPT.INI' }
+                else {
+                    $ini = [System.IO.File]::ReadAllText((Join-Path $folder 'GPT.INI'))
+                    $m = [regex]::Match($ini, '(?im)^\s*Version\s*=\s*(\d+)')
+                    if ($m.Success) { $sysVer = [int64]$m.Groups[1].Value; $sysState = 'OK' } else { $sysState = 'Brak wersji w GPT.INI' }
+                }
+            }
+            catch { $sysState = 'Brak dostępu: ' + $_.Exception.Message }
+        }
+        [pscustomobject]@{
+            '__rec' = 'gpo'; Guid = $guid; Name = [string]$g.displayName; Flags = $(if ($null -ne $g.flags) { [int]$g.flags } else { 0 }); Version = $(if ($null -ne $g.versionNumber) { [int64]$g.versionNumber } else { [int64]0 })
+            MachineExt = [string]$g.gPCMachineExtensionNames; UserExt = [string]$g.gPCUserExtensionNames; Wmi = [string]$g.gPCWQLFilter; Created = $g.whenCreated; Changed = $g.whenChanged
+            Apply = @($apply | Select-Object -Unique); Deny = @($deny | Select-Object -Unique); Read = @($read | Select-Object -Unique); Edit = @($edit | Select-Object -Unique); Owner = $owner; SdError = $sdError
+            SysvolState = $sysState; SysvolVersion = $sysVer
+        }
+    }
+    if ($P.CheckSysvol) {
+        try {
+            if (Test-Path -LiteralPath $sysvol) {
+                foreach ($d in @(Get-ChildItem -LiteralPath $sysvol -Directory -ErrorAction Stop)) {
+                    if ($d.Name -match '^\{[0-9A-Fa-f-]{36}\}$' -and -not $guids.Contains($d.Name)) { [pscustomobject]@{ '__rec' = 'orphan'; Guid = $d.Name.ToUpperInvariant(); Path = $d.FullName; Changed = $d.LastWriteTime } }
+                }
+            }
+            else { [pscustomobject]@{ '__rec' = 'err'; Text = "Folder SYSVOL niedostępny: $sysvol" } }
+        }
+        catch { [pscustomobject]@{ '__rec' = 'err'; Text = "Folder SYSVOL niedostępny: $sysvol – $($_.Exception.Message)" } }
+    }
+    # Lokalizacje z linkami albo blokadą dziedziczenia: domena, jednostki, lokacje
+    $soms = New-Object System.Collections.ArrayList
+    foreach ($s in @(Get-ADObject -SearchBase $root -LDAPFilter '(|(gPLink=*)(gPOptions=1))' -Properties gPLink, gPOptions @ad)) { [void]$soms.Add($s) }
+    try { foreach ($s in @(Get-ADObject -SearchBase ('CN=Sites,' + [string]$dse.configurationNamingContext) -LDAPFilter '(&(objectClass=site)(gPLink=*))' -Properties gPLink, gPOptions @ad)) { [void]$soms.Add($s) } } catch { }
+    foreach ($s in $soms) {
+        $dn = [string]$s.DistinguishedName
+        $cls = [string]@($s.ObjectClass)[-1]
+        $kind = switch ($cls) { 'domainDNS' { 'Domena' } 'site' { 'Lokacja' } 'organizationalUnit' { 'OU' } default { 'Kontener' } }
+        $block = $false; try { $block = ([int]$s.gPOptions -band 1) -ne 0 } catch { }
+        [pscustomobject]@{ '__rec' = 'som'; Dn = $dn; Kind = $kind; Name = $(if ($kind -eq 'Domena') { $dns } else { Get-DnName $dn }); Block = $block }
+        $links = @([regex]::Matches([string]$s.gPLink, '\[LDAP://([^;\]]+);(\d+)\]'))
+        for ($i = 0; $i -lt $links.Count; $i++) {
+            $opt = [int]$links[$i].Groups[2].Value
+            $gdn = $links[$i].Groups[1].Value
+            $gm = [regex]::Match($gdn, '\{[0-9A-Fa-f-]{36}\}')
+            # W gPLink ostatni wpis ma kolejność linku 1 (najwyższe pierwszeństwo w tej lokalizacji)
+            [pscustomobject]@{ '__rec' = 'link'; Som = $dn; Kind = $kind; Guid = $(if ($gm.Success) { $gm.Value.ToUpperInvariant() } else { $gdn }); Order = ($links.Count - $i); Enabled = (($opt -band 1) -eq 0); Enforced = (($opt -band 2) -ne 0) }
+        }
+    }
+    try {
+        foreach ($w in @(Get-ADObject -SearchBase "CN=SOM,CN=WMIPolicy,CN=System,$root" -LDAPFilter '(objectClass=msWMI-Som)' -Properties 'msWMI-Name', 'msWMI-Parm2', 'msWMI-ID' @ad)) {
+            $q = [string]$w.'msWMI-Parm2'
+            $qm = [regex]::Match($q, '(?is)select\s.+?(?=;\d+;|;?$)')
+            [pscustomobject]@{ '__rec' = 'wmi'; Id = ([string]$w.'msWMI-ID').ToUpperInvariant(); Name = [string]$w.'msWMI-Name'; Query = $(if ($qm.Success) { $qm.Value.TrimEnd(';') } else { $q }) }
+        }
+    }
+    catch { }
+    $list = @($sids.Keys)
+    $found = @{}
+    for ($i = 0; $i -lt $list.Count; $i += 40) {
+        $chunk = @($list[$i..([Math]::Min($i + 39, $list.Count - 1))])
+        $filter = '(|' + ((@($chunk | ForEach-Object { "(objectSid=$_)" })) -join '') + ')'
+        try { foreach ($x in @(Get-ADObject -LDAPFilter $filter -Properties objectSid, sAMAccountName @ad)) { $found[[string]$x.objectSid] = @{ Name = [string]$x.sAMAccountName; Class = [string]$x.ObjectClass } } } catch { }
+    }
+    foreach ($s in $list) {
+        $name = $s; $class = ''
+        if ($found.ContainsKey($s)) { $name = $found[$s].Name; $class = $found[$s].Class }
+        else { try { $name = (New-Object System.Security.Principal.SecurityIdentifier($s)).Translate([System.Security.Principal.NTAccount]).Value } catch { } }
+        [pscustomobject]@{ '__rec' = 'sid'; Sid = $s; Name = $name; Class = $class }
+    }
+}
+
+function New-GpoScanData {
+    return @{ Domain = $null; Gpos = New-Object System.Collections.ArrayList; Links = New-Object System.Collections.ArrayList; Soms = @{}; Wmi = @{}; Sids = @{}; Orphans = New-Object System.Collections.ArrayList; Errors = New-Object System.Collections.ArrayList; At = (Get-Date) }
+}
+
+function Add-GpoScanResult {
+    param([hashtable]$Scan, $Result)
+    if (-not $Result.Ok) { [void]$Scan.Errors.Add(((@($Result.Errors)) -join ' ')); return }
+    foreach ($d in @($Result.Data)) {
+        switch ([string](Get-ObjectValue $d '__rec')) {
+            'domain' { $Scan.Domain = $d }
+            'gpo' { [void]$Scan.Gpos.Add($d) }
+            'link' { [void]$Scan.Links.Add($d) }
+            'som' { $Scan.Soms[[string]$d.Dn] = $d }
+            'wmi' { $Scan.Wmi[[string]$d.Id] = $d }
+            'sid' { $Scan.Sids[[string]$d.Sid] = $d }
+            'orphan' { [void]$Scan.Orphans.Add($d) }
+            'err' { [void]$Scan.Errors.Add([string]$d.Text) }
+        }
+    }
+}
+
+function Get-GpoStateText([int]$Flags) {
+    switch ($Flags) { 0 { return 'Włączony' } 1 { return 'Ustawienia użytkownika wyłączone' } 2 { return 'Ustawienia komputera wyłączone' } 3 { return 'Wyłączony' } default { return "flags=$Flags" } }
+}
+
+function Get-GpoSidLabel([hashtable]$Scan, [string]$Sid) {
+    # Szerokie grupy wbudowane - stałe nazwy programu (tłumaczenie zależy od języka systemu)
+    if ($script:NtfsBroadSids.Contains($Sid)) { return $script:NtfsBroadSids[$Sid] }
+    if ($Scan.Sids.ContainsKey($Sid) -and $Scan.Sids[$Sid].Name -and $Scan.Sids[$Sid].Name -ne $Sid) { return [string]$Scan.Sids[$Sid].Name }
+    return $Sid
+}
+
+function Get-GpoSomName([hashtable]$Scan, [string]$Dn) {
+    if ($Scan.Soms.ContainsKey($Dn)) { return [string]$Scan.Soms[$Dn].Name }
+    if ($Scan.Domain -and $Dn -ieq [string]$Scan.Domain.Dn) { return [string]$Scan.Domain.Name }
+    return (Get-RdnValue $Dn)
+}
+
+function Get-GpoAnalysis {
+    <#
+        Z danych skanu: wiersze GPO (stan, linki, ustawienia, wersje, filtrowanie, edycja, problemy z oceną),
+        lista problemów (także linki do nieistniejących GPO i osierocone foldery SYSVOL) i lista linków.
+    #>
+    param([hashtable]$Scan)
+    $dsid = [string]$Scan.Domain.Sid
+    $std = @('S-1-5-18', "$dsid-512", "$dsid-519", 'S-1-3-0', 'S-1-5-32-544', 'S-1-5-9')
+    $broad = @('S-1-1-0', 'S-1-5-11', "$dsid-513", 'S-1-5-32-545', "$dsid-515", 'S-1-5-7')
+    $compRead = @('S-1-1-0', 'S-1-5-11', "$dsid-515")
+    $byGuid = @{}
+    foreach ($g in $Scan.Gpos) { $byGuid[[string]$g.Guid] = $g }
+    $linksBy = @{}
+    foreach ($l in $Scan.Links) { if (-not $linksBy.ContainsKey([string]$l.Guid)) { $linksBy[[string]$l.Guid] = New-Object System.Collections.ArrayList }; [void]$linksBy[[string]$l.Guid].Add($l) }
+    $rank = @{ 'Wysokie' = 0; 'Średnie' = 1; 'Niskie' = 2; 'OK' = 3 }
+    $rows = New-Object System.Collections.ArrayList
+    $issues = New-Object System.Collections.ArrayList
+    foreach ($g in @($Scan.Gpos | Sort-Object Name)) {
+        $links = @(if ($linksBy.ContainsKey([string]$g.Guid)) { $linksBy[[string]$g.Guid] })
+        $active = @($links | Where-Object { $_.Enabled })
+        $hasComp = [string]$g.MachineExt -match '\['
+        $hasUser = [string]$g.UserExt -match '\['
+        $compVer = [int64]$g.Version -band 0xFFFF
+        $userVer = ([int64]$g.Version -shr 16) -band 0xFFFF
+        $found = New-Object System.Collections.ArrayList
+        $add = { param($sev, $text, $rec) [void]$found.Add(@{ Sev = $sev; Text = $text; Rec = $rec }) }
+        if (-not $links.Count) { & $add 'Niskie' 'niepodlinkowany – nigdzie nie działa' 'Usuń GPO (najpierw kopia zapasowa) albo podlinkuj go tam, gdzie ma działać.' }
+        elseif (-not $active.Count) { & $add 'Niskie' 'wszystkie linki są wyłączone' 'Usuń zbędne linki albo cały GPO.' }
+        if (-not $hasComp -and -not $hasUser) { & $add 'Niskie' 'pusty – bez ustawień' 'Usuń pusty GPO – każdy GPO wydłuża przetwarzanie zasad.' }
+        if ($g.Flags -eq 3 -and $active.Count) { & $add 'Niskie' 'wyłączony, a podlinkowany' 'Usuń linki albo włącz GPO.' }
+        if ($g.Flags -eq 1 -and $hasUser) { & $add 'Średnie' 'ma ustawienia użytkownika, ale ta część jest wyłączona' 'Ustawienia są pomijane – włącz część użytkownika albo usuń te ustawienia.' }
+        if ($g.Flags -eq 2 -and $hasComp) { & $add 'Średnie' 'ma ustawienia komputera, ale ta część jest wyłączona' 'Ustawienia są pomijane – włącz część komputera albo usuń te ustawienia.' }
+        $sys = [string]$g.SysvolState
+        if ($sys -eq 'Brak folderu') { & $add 'Wysokie' 'brak folderu w SYSVOL – GPO nie zostanie zastosowany' 'Przywróć GPO z kopii zapasowej albo sprawdź replikację SYSVOL (moduł «Stan domeny»).' }
+        elseif ($sys -eq 'Brak GPT.INI' -or $sys -eq 'Brak wersji w GPT.INI') { & $add 'Wysokie' ('SYSVOL: ' + $sys.ToLowerInvariant()) 'Plik GPT.INI jest wymagany – przywróć GPO z kopii zapasowej.' }
+        elseif ($sys -eq 'OK' -and [int64]$g.SysvolVersion -ne [int64]$g.Version) { & $add 'Średnie' ('wersja w AD ({0}) różni się od wersji w SYSVOL ({1})' -f $g.Version, $g.SysvolVersion) 'Replikacja AD albo SYSVOL jest w toku lub zatrzymana – sprawdź moduł «Stan domeny».' }
+        elseif ($sys -like 'Brak dostępu*') { & $add 'Niskie' ('SYSVOL: ' + $sys) 'Uruchom program na koncie z dostępem do SYSVOL.' }
+        # SYSTEM nie przetwarza zasad jako podmiot (komputer robi to swoim kontem) - jego pełna kontrola nie oznacza «Zastosuj»
+        $apply = @($g.Apply | Where-Object { $_ -ne 'S-1-5-18' })
+        if ($active.Count -and -not $apply.Count -and -not $g.SdError) { & $add 'Średnie' 'nikt nie ma prawa «Zastosuj zasady grupy»' 'Dodaj grupę w filtrowaniu zabezpieczeń – teraz GPO nie działa.' }
+        $canRead = @($g.Read | Where-Object { $compRead -contains $_ }).Count -gt 0
+        if ($active.Count -and $hasUser -and $apply.Count -and -not $canRead -and -not $g.SdError) { & $add 'Średnie' 'komputery mogą nie odczytać GPO (MS16-072) – ustawienia użytkownika nie zadziałają' 'Nadaj prawo Odczyt (bez «Zastosuj») grupie Użytkownicy uwierzytelnieni albo Komputery domeny.' }
+        $editors = @($g.Edit | Where-Object { $std -notcontains $_ })
+        $broadEdit = @($editors | Where-Object { $broad -contains $_ })
+        if ($broadEdit.Count) { & $add 'Wysokie' ('edytować mogą szerokie grupy: ' + ((@($broadEdit | ForEach-Object { Get-GpoSidLabel $Scan $_ })) -join ', ')) 'Edycja GPO pozwala uruchomić dowolny kod na komputerach objętych linkami – odbierz to prawo.' }
+        elseif ($editors.Count) { & $add 'Niskie' ('edycja delegowana: ' + ((@($editors | ForEach-Object { Get-GpoSidLabel $Scan $_ })) -join ', ')) 'Sprawdź, czy delegacja jest nadal potrzebna – kto edytuje GPO, wykonuje kod na komputerach z linkiem.' }
+        $wmiId = ([regex]::Match([string]$g.Wmi, '\{[0-9A-Fa-f-]{36}\}')).Value.ToUpperInvariant()
+        $wmiName = ''
+        if ($wmiId) {
+            if ($Scan.Wmi.ContainsKey($wmiId)) { $wmiName = [string]$Scan.Wmi[$wmiId].Name }
+            else { $wmiName = '(nie istnieje)'; & $add 'Średnie' 'przypisany filtr WMI nie istnieje' 'Odłącz filtr albo utwórz go ponownie.' }
+        }
+        if ($g.SdError) { & $add 'Niskie' ('nie odczytano uprawnień: ' + $g.SdError) '' }
+        $sev = 'OK'
+        foreach ($f in $found) { if ($rank[$f.Sev] -lt $rank[$sev]) { $sev = $f.Sev } }
+        $where = @($links | Sort-Object @{ Expression = { Get-GpoSomName $Scan $_.Som } } | ForEach-Object {
+                $n = Get-GpoSomName $Scan $_.Som
+                $flags = @(); if ($_.Enforced) { $flags += 'wymuszony' }; if (-not $_.Enabled) { $flags += 'link wyłączony' }
+                if ($flags.Count) { '{0} ({1})' -f $n, ($flags -join ', ') } else { $n }
+            })
+        [void]$rows.Add([pscustomobject][ordered]@{
+                'Ocena'          = $sev
+                'GPO'            = [string]$g.Name
+                'Stan'           = (Get-GpoStateText $g.Flags)
+                'Linki'          = $active.Count
+                'Podlinkowany do' = ($where -join '; ')
+                'Ustawienia'     = $(if ($hasComp -and $hasUser) { 'komputer, użytkownik' } elseif ($hasComp) { 'komputer' } elseif ($hasUser) { 'użytkownik' } else { 'brak' })
+                'Wersja K/U'     = ('{0} / {1}' -f $compVer, $userVer)
+                'SYSVOL'         = $(if ($sys -eq 'OK') { $(if ([int64]$g.SysvolVersion -eq [int64]$g.Version) { 'zgodny' } else { 'wersja ' + $g.SysvolVersion }) } else { $sys })
+                'Filtr WMI'      = $wmiName
+                'Stosowany do'   = ((@($apply | ForEach-Object { Get-GpoSidLabel $Scan $_ })) -join ', ')
+                'Odmowa dla'     = ((@($g.Deny | ForEach-Object { Get-GpoSidLabel $Scan $_ })) -join ', ')
+                'Edycja (poza administratorami)' = ((@($editors | ForEach-Object { Get-GpoSidLabel $Scan $_ })) -join ', ')
+                'Problemy'       = ((@($found | ForEach-Object { $_.Text })) -join '; ')
+                'Zmieniono'      = $g.Changed
+                'Utworzono'      = $g.Created
+                'GUID'           = [string]$g.Guid
+                '__tone'         = $script:GpoSeverity[$sev].Tone
+                '__guid'         = [string]$g.Guid
+                '__links'        = $links.Count
+            })
+        foreach ($f in $found) {
+            [void]$issues.Add([pscustomobject][ordered]@{ 'Ocena' = $f.Sev; 'GPO' = [string]$g.Name; 'Problem' = $f.Text; 'Zalecenie' = $f.Rec; 'Lokalizacja' = ($where -join '; '); 'GUID' = [string]$g.Guid; '__tone' = $script:GpoSeverity[$f.Sev].Tone; '__guid' = [string]$g.Guid })
+        }
+    }
+    foreach ($l in $Scan.Links) {
+        if ($byGuid.ContainsKey([string]$l.Guid)) { continue }
+        [void]$issues.Add([pscustomobject][ordered]@{ 'Ocena' = 'Średnie'; 'GPO' = ('(nie istnieje) ' + $l.Guid); 'Problem' = 'link do nieistniejącego GPO'; 'Zalecenie' = 'Usuń link – w GPMC widać go jako link bez nazwy.'; 'Lokalizacja' = (Get-GpoSomName $Scan $l.Som); 'GUID' = [string]$l.Guid; '__tone' = 'warn'; '__guid' = '' })
+    }
+    foreach ($o in $Scan.Orphans) {
+        [void]$issues.Add([pscustomobject][ordered]@{ 'Ocena' = 'Niskie'; 'GPO' = ('(brak w AD) ' + $o.Guid); 'Problem' = 'folder w SYSVOL bez obiektu GPO w AD'; 'Zalecenie' = 'Pozostałość po usuniętym GPO – zachowaj kopię folderu i usuń go.'; 'Lokalizacja' = [string]$o.Path; 'GUID' = [string]$o.Guid; '__tone' = 'info'; '__guid' = '' })
+    }
+    $linkRows = foreach ($l in @($Scan.Links | Sort-Object @{ Expression = { Get-GpoSomName $Scan $_.Som } }, Order)) {
+        $g = if ($byGuid.ContainsKey([string]$l.Guid)) { $byGuid[[string]$l.Guid] } else { $null }
+        $som = if ($Scan.Soms.ContainsKey([string]$l.Som)) { $Scan.Soms[[string]$l.Som] } else { $null }
+        [pscustomobject][ordered]@{
+            'Lokalizacja' = (Get-GpoSomName $Scan $l.Som); 'Rodzaj' = $l.Kind; 'Kolejność' = [int]$l.Order
+            'GPO' = $(if ($g) { [string]$g.Name } else { '(nie istnieje) ' + $l.Guid }); 'Link' = $(if ($l.Enabled) { 'włączony' } else { 'wyłączony' }); 'Wymuszony' = [bool]$l.Enforced
+            'Blokada dziedziczenia' = $(if ($som) { [bool]$som.Block } else { $false }); 'Stan GPO' = $(if ($g) { Get-GpoStateText $g.Flags } else { '' }); 'DN' = [string]$l.Som
+            '__tone' = $(if (-not $g) { 'crit' } elseif (-not $l.Enabled -or $g.Flags -eq 3) { 'warn' } else { '' }); '__guid' = [string]$l.Guid
+        }
+    }
+    return @{ Gpos = $rows.ToArray(); Issues = @($issues | Sort-Object @{ Expression = { $rank[$_.'Ocena'] } }, 'GPO'); Links = @($linkRows) }
+}
+
+function Get-GpoInheritance {
+    <#
+        Kolejność GPO dla jednostki (jak karta «Dziedziczenie zasad grupy» w GPMC, bez lokacji): najpierw linki wymuszone
+        (wyższa lokalizacja wygrywa), potem zwykłe od jednostki w górę do domeny, z blokadą dziedziczenia; linki wyłączone pomijane.
+    #>
+    param([hashtable]$Scan, [string]$Dn)
+    $domDn = [string]$Scan.Domain.Dn
+    $chain = New-Object System.Collections.ArrayList
+    $cur = $Dn
+    for ($i = 0; $i -lt 64 -and $cur; $i++) {
+        [void]$chain.Add($cur)
+        if ($cur -ieq $domDn) { break }
+        $parent = Get-ParentDN $cur
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+    $byGuid = @{}
+    foreach ($g in $Scan.Gpos) { $byGuid[[string]$g.Guid] = $g }
+    $enforced = New-Object System.Collections.ArrayList
+    $normal = New-Object System.Collections.ArrayList
+    $blocked = $false
+    $blockedAt = ''
+    for ($i = 0; $i -lt $chain.Count; $i++) {
+        $levelDn = [string]$chain[$i]
+        foreach ($l in @($Scan.Links | Where-Object { [string]$_.Som -ieq $levelDn -and $_.Enabled } | Sort-Object Order)) {
+            if ($l.Enforced) { [void]$enforced.Add(@{ Link = $l; Level = $i }) }
+            elseif (-not $blocked) { [void]$normal.Add(@{ Link = $l; Level = $i }) }
+        }
+        if (-not $blocked -and $Scan.Soms.ContainsKey($levelDn) -and $Scan.Soms[$levelDn].Block) { $blocked = $true; $blockedAt = Get-GpoSomName $Scan $levelDn }
+    }
+    $ordered = @(@($enforced | Sort-Object @{ Expression = { $_.Level }; Descending = $true }, @{ Expression = { [int]$_.Link.Order } }) + @($normal))
+    $seen = @{}
+    $n = 0
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($e in $ordered) {
+        $l = $e.Link
+        if ($seen.ContainsKey([string]$l.Guid)) { continue }
+        $seen[[string]$l.Guid] = $true
+        $n++
+        $g = if ($byGuid.ContainsKey([string]$l.Guid)) { $byGuid[[string]$l.Guid] } else { $null }
+        $notes = @()
+        if (-not $g) { $notes += 'GPO nie istnieje' }
+        elseif ($g.Flags -eq 3) { $notes += 'wyłączony – nie działa' }
+        elseif ($g.Flags -eq 1) { $notes += 'tylko ustawienia komputera' }
+        elseif ($g.Flags -eq 2) { $notes += 'tylko ustawienia użytkownika' }
+        if ($g -and -not ([string]$g.MachineExt -match '\[') -and -not ([string]$g.UserExt -match '\[')) { $notes += 'pusty' }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                'Pierwszeństwo' = $n; 'GPO' = $(if ($g) { [string]$g.Name } else { [string]$l.Guid }); 'Lokalizacja' = (Get-GpoSomName $Scan $l.Som); 'Wymuszony' = [bool]$l.Enforced
+                'Stan GPO' = $(if ($g) { Get-GpoStateText $g.Flags } else { '' }); 'Stosowany do' = $(if ($g) { (@($g.Apply | ForEach-Object { Get-GpoSidLabel $Scan $_ })) -join ', ' } else { '' })
+                'Uwagi' = ($notes -join '; '); '__tone' = $(if ($notes.Count) { 'warn' } else { '' }); '__guid' = [string]$l.Guid
+            })
+    }
+    return @{ Rows = $rows.ToArray(); BlockedAt = $blockedAt; Chain = $chain.ToArray() }
+}
+
+# --- Kopie zapasowe i raporty ustawień (moduł GroupPolicy z konsoli GPMC) ---
+$script:GpoSysvolRoot = ''   # testy: inny folder Policies zamiast \\domena\SYSVOL\domena\Policies
+
+$script:GpoBackupScript = {
+    param($Target, $P, $Ctx)
+    Import-Module GroupPolicy -ErrorAction Stop -Verbose:$false
+    $gp = @{ ErrorAction = 'Stop' }
+    if ($P.Domain) { $gp.Domain = $P.Domain }
+    if ($Ctx.Server) { $gp.Server = $Ctx.Server }
+    $b = Backup-GPO -Guid $Target -Path $P.Path -Comment $P.Comment @gp
+    $report = ''
+    if ($P.Report) {
+        $report = Join-Path $P.Path ('{0}_{1}.html' -f (([string]$b.DisplayName) -replace '[\\/:*?"<>|]+', '_'), $b.Id)
+        Get-GPOReport -Guid $Target -ReportType Html -Path $report @gp
+    }
+    [pscustomobject]@{ 'GPO' = [string]$b.DisplayName; 'Wynik' = 'Utworzono kopię'; 'Identyfikator kopii' = [string]$b.Id; 'Folder' = $P.Path; 'Raport ustawień' = $report; 'Utworzono' = $b.CreationTime }
+}
+
+$script:GpoReportScript = {
+    param($Target, $P, $Ctx)
+    Import-Module GroupPolicy -ErrorAction Stop -Verbose:$false
+    $gp = @{ ErrorAction = 'Stop' }
+    if ($P.Domain) { $gp.Domain = $P.Domain }
+    if ($Ctx.Server) { $gp.Server = $Ctx.Server }
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ('GPO_{0}_{1:yyyyMMdd_HHmmss}.html' -f $Target.Trim('{}'), (Get-Date))
+    Get-GPOReport -Guid $Target -ReportType Html -Path $path @gp
+    [pscustomobject]@{ Path = $path }
+}
+
+function Test-GroupPolicyModule {
+    if (Get-Module -ListAvailable -Name GroupPolicy) { return $true }
+    Show-Warning 'Kopie zapasowe i raporty ustawień GPO wymagają konsoli zarządzania zasadami grupy (RSAT: Group Policy Management Tools – moduł GroupPolicy). Spis, problemy, linki i dziedziczenie działają bez niej.'
+    return $false
+}
+
+function Start-GpoBackup {
+    param([hashtable]$Module, [object[]]$Gpos)
+    $m = $Module
+    if (-not $Gpos.Count) { Show-Warning 'Zaznacz obiekty GPO.'; return }
+    if (-not (Test-GroupPolicyModule)) { return }
+    $default = Join-Path $script:App.DataDir ('GpoBackup\{0:yyyyMMdd_HHmmss}' -f (Get-Date))
+    $f = Show-FormDialog -Title 'Kopia zapasowa GPO' -Subtitle ('GPO: {0} – {1}' -f $Gpos.Count, ((@($Gpos | Select-Object -First 4 | ForEach-Object { $_.Name })) -join ', ') + $(if ($Gpos.Count -gt 4) { ', …' } else { '' })) -Icon 'E81C' -OkText 'Utwórz kopię' -Width 580 -Fields @(
+        @{ Key = 'Path'; Label = 'Folder kopii'; Type = 'Folder'; Value = $default; Hint = 'Kopię przywrócisz w konsoli GPMC (Obiekty zasad grupy → Zarządzaj kopiami zapasowymi) albo poleceniem Restore-GPO -BackupId … -Path ….' }
+        @{ Key = 'Comment'; Label = 'Opis kopii'; Value = ('Domain Ops {0:yyyy-MM-dd HH:mm}' -f (Get-Date)) }
+        @{ Key = 'Report'; Label = 'Także raport ustawień HTML każdego GPO (obok kopii)'; Type = 'Check'; Value = $true }
+    ) -Validate { param($v) if (-not $v.Path) { 'Podaj folder kopii.' } elseif (-not [System.IO.Path]::IsPathRooted($v.Path)) { 'Podaj pełną ścieżkę folderu.' } else { '' } }
+    if (-not $f) { return }
+    try { if (-not (Test-Path -LiteralPath $f.Path)) { New-Item -ItemType Directory -Path $f.Path -Force | Out-Null } }
+    catch { Show-Error 'Nie można utworzyć folderu kopii.' $_; return }
+    $m.Data.GpoBackupRows = New-Object System.Collections.ArrayList
+    $m.Data.GpoBackupPath = $f.Path
+    $names = @{}
+    foreach ($g in $Gpos) { $names[[string]$g.Guid] = [string]$g.Name }
+    $m.Data.GpoBackupNames = $names
+    $domain = if ($m.Data['Gpo'] -and $m.Data.Gpo.Domain) { [string]$m.Data.Gpo.Domain.Name } else { '' }
+    Start-HostOperation -Module $m -Name 'Kopia zapasowa GPO' -Targets @($names.Keys) -Local -Output None -TargetColumn 'GPO' -Parameters @{ Path = $f.Path; Comment = $f.Comment; Report = [bool]$f.Report; Domain = $domain } -ScriptBlock $script:GpoBackupScript -OnResult {
+        param($m, $r)
+        if ($r.Ok) { foreach ($d in @($r.Data)) { [void]$m.Data.GpoBackupRows.Add($d) } }
+        else { [void]$m.Data.GpoBackupRows.Add([pscustomobject]@{ 'GPO' = $m.Data.GpoBackupNames[[string]$r.Target]; 'Wynik' = 'Błąd: ' + ((@($r.Errors)) -join ' '); 'Identyfikator kopii' = ''; 'Folder' = $m.Data.GpoBackupPath; 'Raport ustawień' = ''; 'Utworzono' = $null; '__tone' = 'crit' }) }
+    } -OnComplete {
+        param($m)
+        $rows = @($m.Data.GpoBackupRows)
+        $failed = @($rows | Where-Object { [string]$_.'Wynik' -like 'Błąd*' }).Count
+        Write-Log ('Kopia zapasowa GPO: {0} z {1} w {2}' -f ($rows.Count - $failed), $rows.Count, $m.Data.GpoBackupPath) $(if ($failed) { 'WARN' } else { 'OK' })
+        Show-GridDialog -Title 'Kopia zapasowa GPO – wynik' -Subtitle $m.Data.GpoBackupPath -Rows $rows
+    }
+}
+
+function Open-GpoSettingsReport {
+    param([hashtable]$Module, [string]$Guid)
+    if (-not (Test-GroupPolicyModule)) { return }
+    $domain = if ($Module.Data['Gpo'] -and $Module.Data.Gpo.Domain) { [string]$Module.Data.Gpo.Domain.Name } else { '' }
+    Start-HostOperation -Module $Module -Name 'Raport ustawień GPO' -Targets @($Guid) -Local -Output None -Parameters @{ Domain = $domain } -ScriptBlock $script:GpoReportScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { Show-Error 'Nie utworzono raportu ustawień GPO.' ((@($r.Errors)) -join ' '); return }
+        $path = [string]@($r.Data)[0].Path
+        Write-Log "Raport ustawień GPO: $path" 'OK'
+        try { Start-Process -FilePath $path } catch { Show-Error 'Nie można otworzyć raportu.' $_ }
+    }
+}
+
+# --- Wynikowe zasady (gpresult na komputerze przez WinRM) ---
+$script:GpResultScript = {
+    param($P)
+    $base = Join-Path $env:TEMP ('domainops_gpr_' + [guid]::NewGuid().ToString('N'))
+    $xmlPath = "$base.xml"; $htmlPath = "$base.html"
+    $scope = if ($P.User) { @('/user', [string]$P.User) } else { @('/scope', 'computer') }
+    try {
+        $out = & gpresult.exe @scope /x $xmlPath /f 2>&1
+        if (-not (Test-Path -LiteralPath $xmlPath)) { throw ('gpresult nie utworzył raportu: ' + ((@($out | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })) -join ' ').Trim()) }
+        $xml = [System.IO.File]::ReadAllText($xmlPath)
+        $html = ''
+        if ($P.Html) {
+            $null = & gpresult.exe @scope /h $htmlPath /f 2>&1
+            if (Test-Path -LiteralPath $htmlPath) { $html = [System.IO.File]::ReadAllText($htmlPath) }
+        }
+        [pscustomobject]@{ Xml = $xml; Html = $html }
+    }
+    finally { Remove-Item -LiteralPath $xmlPath, $htmlPath -Force -ErrorAction SilentlyContinue }
+}
+
+function ConvertFrom-GpResultXml {
+    <#
+        Raport gpresult /x (schemat RSoP): dla części komputera i użytkownika - informacje (konto, jednostka, lokacja,
+        wolne łącze), GPO zastosowane (kolejność stosowania) i odrzucone z przyczyną oraz błędy rozszerzeń po stronie klienta.
+    #>
+    param([string]$Xml)
+    $doc = New-Object System.Xml.XmlDocument
+    $doc.LoadXml($Xml)
+    $get = { param($node, [string]$name) $n = $node.SelectSingleNode("*[local-name()='$name']"); if ($n) { [string]$n.InnerText } else { '' } }
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($scope in @(@{ Node = 'ComputerResults'; Label = 'Komputer' }, @{ Node = 'UserResults'; Label = 'Użytkownik' })) {
+        $res = $doc.SelectSingleNode("//*[local-name()='$($scope.Node)']")
+        if (-not $res) { continue }
+        $who = & $get $res 'Name'
+        if (-not $who -and -not $res.SelectSingleNode("*[local-name()='GPO']")) { continue }
+        $details = @()
+        foreach ($k in @(@('SOM', 'jednostka'), @('Site', 'lokacja'), @('SlowLink', 'wolne łącze'), @('Domain', 'domena'))) { $v = & $get $res $k[0]; if ($v) { $details += ('{0}: {1}' -f $k[1], $(if ($v -eq 'true') { 'tak' } elseif ($v -eq 'false') { 'nie' } else { $v })) } }
+        [void]$rows.Add([pscustomobject][ordered]@{ 'Część' = $scope.Label; 'Rodzaj' = 'Informacje'; 'GPO' = ''; 'Wynik' = $who; 'Kolejność stosowania' = $null; 'Lokalizacja linku' = ''; 'Rozszerzenia' = ''; 'Szczegóły' = ($details -join '; '); '__tone' = ''; '__sort' = '0' })
+        $gpos = New-Object System.Collections.ArrayList
+        foreach ($g in @($res.SelectNodes("*[local-name()='GPO']"))) {
+            $link = $g.SelectSingleNode("*[local-name()='Link']")
+            $applied = 0
+            if ($link) { [void][int]::TryParse((& $get $link 'AppliedOrder'), [ref]$applied) }
+            $filterAllowed = (& $get $g 'FilterAllowed') -ne 'false'
+            $accessDenied = (& $get $g 'AccessDenied') -eq 'true'
+            $isValid = (& $get $g 'IsValid') -ne 'false'
+            $enabled = (& $get $g 'Enabled') -ne 'false'
+            $linkEnabled = if ($link) { (& $get $link 'Enabled') -ne 'false' } else { $true }
+            $exts = @($g.SelectNodes("*[local-name()='ExtensionName']") | ForEach-Object { $_.InnerText } | Where-Object { $_ })
+            $filter = & $get $g 'FilterName'
+            $reason = if ($applied -gt 0) { '' } elseif ($accessDenied) { 'odmowa dostępu (filtrowanie zabezpieczeń)' } elseif (-not $filterAllowed) { 'filtr WMI zwrócił fałsz' + $(if ($filter) { " ($filter)" } else { '' }) } elseif (-not $enabled) { 'GPO wyłączony' } elseif (-not $linkEnabled) { 'link wyłączony' } elseif (-not $isValid) { 'nieprawidłowy (np. brak w SYSVOL)' } elseif (-not $exts.Count) { 'pusty – brak ustawień' } else { 'nie zastosowany' }
+            [void]$gpos.Add([pscustomobject][ordered]@{
+                    'Część' = $scope.Label; 'Rodzaj' = 'GPO'; 'GPO' = (& $get $g 'Name'); 'Wynik' = $(if ($applied -gt 0) { 'zastosowany' } else { 'odrzucony: ' + $reason })
+                    'Kolejność stosowania' = $(if ($applied -gt 0) { $applied } else { $null }); 'Lokalizacja linku' = $(if ($link) { & $get $link 'SOMPath' } else { '' })
+                    'Rozszerzenia' = ($exts -join ', '); 'Szczegóły' = ('wersja AD {0}, SYSVOL {1}' -f (& $get $g 'VersionDirectory'), (& $get $g 'VersionSysvol')) + $(if ($filter) { "; filtr WMI: $filter" } else { '' })
+                    '__tone' = $(if ($applied -gt 0) { 'ok' } elseif ($accessDenied -or -not $filterAllowed -or -not $isValid) { 'warn' } else { '' })
+                    '__sort' = $(if ($applied -gt 0) { '1{0:000}' -f $applied } else { '2' })
+                })
+        }
+        foreach ($x in @($gpos | Sort-Object '__sort', 'GPO')) { [void]$rows.Add($x) }
+        foreach ($e in @($res.SelectNodes("*[local-name()='ExtensionStatus']"))) {
+            $err = & $get $e 'Error'
+            if (-not $err -or $err -eq '0') { continue }
+            $code = 0L
+            # Kod HRESULT jako liczba ze znakiem (np. -2147024891 = 0x80070005); maska 32 bitów jako Int64 (0xFFFFFFFF to -1)
+            $hex = if ([int64]::TryParse($err, [ref]$code)) { ' (0x{0:X8})' -f ($code -band [int64]4294967295) } else { '' }
+            [void]$rows.Add([pscustomobject][ordered]@{ 'Część' = $scope.Label; 'Rodzaj' = 'Błąd rozszerzenia'; 'GPO' = ''; 'Wynik' = ('{0}: błąd {1}{2}' -f (& $get $e 'Name'), $err, $hex); 'Kolejność stosowania' = $null; 'Lokalizacja linku' = ''; 'Rozszerzenia' = (& $get $e 'Name'); 'Szczegóły' = ('stan: {0}; koniec: {1}' -f (& $get $e 'LoggingStatus'), (& $get $e 'EndTime')); '__tone' = 'crit'; '__sort' = '3' })
+        }
+    }
+    return $rows.ToArray()
+}
+
+function Show-GpoView {
+    param([hashtable]$Module)
+    $m = $Module
+    $a = $m.Data['GpoAnalysis']
+    if (-not $a) { return }
+    $view = [Math]::Max(0, (Get-SegmentIndex $m.ViewSwitch))
+    Reset-ResultTable -Module $m
+    $rows = @(@($a.Gpos), @($a.Issues), @($a.Links))[$view]
+    $m.PillColumns = @(@('Ocena'), @('Ocena'), @('Link'))[$view]
+    if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+    $s = $m.Data.Gpo
+    $m.ResultHint = @(
+        'Jeden wiersz na GPO – ocena według najpoważniejszego problemu • prawy przycisk: linki, raport ustawień, kopia zapasowa'
+        'Wszystkie problemy z zaleceniami – także linki do nieistniejących GPO i osierocone foldery w SYSVOL'
+        'Linki w domenie, jednostkach i lokacjach – kolejność 1 ma najwyższe pierwszeństwo w danej lokalizacji'
+    )[$view] + (' • domena {0} • {1:yyyy-MM-dd HH:mm}' -f $s.Domain.Name, $s.At)
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+}
+
+function Get-GpoRowsFromSelection {
+    param([hashtable]$Module, $Rows)
+    $guids = @($Rows | ForEach-Object { [string](Get-ObjectValue $_ '__guid') } | Where-Object { $_ } | Select-Object -Unique)
+    return @($Module.Data.Gpo.Gpos | Where-Object { $guids -contains [string]$_.Guid })
+}
+
+Register-Module -Workspace 'Domain' -Category 'Zasady grupy' -Key 'GpoInventory' -Title 'Obiekty zasad grupy' -Icon 'E713' -Badge 'nowe' `
+    -Description 'Wszystkie GPO domeny z linkami do domeny, jednostek i lokacji oraz problemami: niepodlinkowane, puste, wyłączone, z wyłączoną częścią zawierającą ustawienia, niezgodne wersje AD i SYSVOL, brak folderu w SYSVOL, filtrowanie zabezpieczeń bez prawa odczytu dla komputerów (MS16-072), edycja dla szerokich grup, brakujące filtry WMI, linki do nieistniejących GPO i osierocone foldery. Dziedziczenie dla jednostki, kopie zapasowe i raporty ustawień.' -Build {
+    param($m)
+    $m.PillColumns = @('Ocena')
+    $row = Add-ToolbarRow -Module $m -Title 'Analiza'
+    $m.Sysvol = Add-CheckBox -Parent $row -Text 'Sprawdź SYSVOL (wersje, brakujące i osierocone foldery)' -Checked $true
+    $m.Actions.Run = {
+        param($m)
+        if (-not (Test-AdAvailable)) { return }
+        $m.Data.Gpo = New-GpoScanData
+        $m.Data.GpoAnalysis = $null
+        Reset-ResultTable -Module $m
+        Start-AdOperation -Module $m -Name 'Obiekty zasad grupy' -Targets @('AD') -Output None -Parameters @{ CheckSysvol = (Test-Checked $m.Sysvol); SysvolRoot = [string]$script:GpoSysvolRoot; ApplyRight = $script:GpoApplyRight } -ScriptBlock $script:GpoScanScript -OnResult {
+            param($m, $r)
+            Add-GpoScanResult -Scan $m.Data.Gpo -Result $r
+        } -OnComplete {
+            param($m)
+            $s = $m.Data.Gpo
+            foreach ($e in $s.Errors) { Write-Log $e 'WARN' -Module $m.Title }
+            if (-not $s.Domain) { Show-Warning ('Nie odczytano obiektów zasad grupy: ' + ((@($s.Errors)) -join ' ')); return }
+            $a = Get-GpoAnalysis -Scan $s
+            $m.Data.GpoAnalysis = $a
+            Show-GpoView -Module $m
+            $gp = @($a.Gpos)
+            Set-StatTile -Module $m -Key 'gpos' -Value ([string]$gp.Count)
+            $high = @($a.Issues | Where-Object { $_.'Ocena' -eq 'Wysokie' }).Count
+            $mid = @($a.Issues | Where-Object { $_.'Ocena' -eq 'Średnie' }).Count
+            Set-StatTile -Module $m -Key 'high' -Value ([string]$high) -Tone $(if ($high) { 'crit' } else { 'ok' })
+            Set-StatTile -Module $m -Key 'mid' -Value ([string]$mid) -Tone $(if ($mid) { 'warn' } else { '' })
+            Set-StatTile -Module $m -Key 'unlinked' -Value ([string]@($gp | Where-Object { $_.'__links' -eq 0 }).Count)
+            Set-StatTile -Module $m -Key 'empty' -Value ([string]@($gp | Where-Object { $_.'Ustawienia' -eq 'brak' }).Count)
+            Write-Log ('Obiekty zasad grupy: {0} GPO, linki: {1}, problemy wysokie/średnie: {2}/{3}' -f $gp.Count, @($a.Links).Count, $high, $mid) $(if ($high) { 'WARN' } else { 'OK' }) -Module $m.Title
+        }
+    }
+    Add-Button -Parent $row -Text 'Analizuj' -Icon 'E713' -Module $m -Primary -OnClick $m.Actions.Run | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Widok'
+    $m.ViewSwitch = Add-Segmented -Parent $row2 -Items @('Obiekty GPO', 'Problemy', 'Linki') -Module $m -OnChange { param($m) Show-GpoView -Module $m }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Działania'
+    Add-Button -Parent $row3 -Text 'Dziedziczenie dla jednostki…' -Icon 'E8B7' -Module $m -ToolTip 'Kolejność GPO działających w wybranej jednostce (jak karta «Dziedziczenie zasad grupy» w GPMC)' -OnClick {
+        param($m)
+        if (-not $m.Data['GpoAnalysis']) { Show-Warning 'Najpierw kliknij «Analizuj».'; return }
+        $ou = Select-OrganizationalUnit -Title 'Dziedziczenie zasad grupy' -AllowDomainRoot
+        if ($null -eq $ou) { return }
+        if (-not $ou) { $ou = [string]$m.Data.Gpo.Domain.Dn }
+        $inh = Get-GpoInheritance -Scan $m.Data.Gpo -Dn $ou
+        $sub = 'Kolejność od najwyższego pierwszeństwa (linki wymuszone, potem jednostka, jednostki nadrzędne i domena); bez GPO lokacji, które zależą od podsieci komputera.'
+        if ($inh.BlockedAt) { $sub += ' Blokada dziedziczenia w: ' + $inh.BlockedAt + '.' }
+        if (-not @($inh.Rows).Count) { Show-Message -Text 'W tej jednostce nie działa żaden GPO (poza ewentualnymi GPO lokacji).' -Title 'Dziedziczenie zasad grupy'; return }
+        Show-GridDialog -Title ('Dziedziczenie: ' + (Get-GpoSomName $m.Data.Gpo $ou)) -Subtitle $sub -Rows @($inh.Rows)
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Kopia zapasowa zaznaczonych…' -Icon 'E81C' -Module $m -OnClick {
+        param($m)
+        if (-not $m.Data['GpoAnalysis']) { Show-Warning 'Najpierw kliknij «Analizuj».'; return }
+        Start-GpoBackup -Module $m -Gpos @(Get-GpoRowsFromSelection -Module $m -Rows @(Get-SelectedResultRows -Module $m))
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Kopia wszystkich…' -Icon 'E81C' -Module $m -OnClick {
+        param($m)
+        if (-not $m.Data['GpoAnalysis']) { Show-Warning 'Najpierw kliknij «Analizuj».'; return }
+        Start-GpoBackup -Module $m -Gpos @($m.Data.Gpo.Gpos)
+    } | Out-Null
+    Add-Label -Parent $row3 -Text 'Tylko odczyt poza kopią zapasową. Kopie i raporty ustawień wymagają konsoli GPMC (moduł GroupPolicy).' -Hint -MaxWidth 460 | Out-Null
+    Add-RowAction -Module $m -Text 'Linki tego GPO' -Icon 'E71B' -Action {
+        param($m, $rows)
+        $guid = [string](Get-ObjectValue $rows[0] '__guid')
+        $links = @($m.Data.GpoAnalysis.Links | Where-Object { [string]$_.'__guid' -eq $guid })
+        if (-not $links.Count) { Show-Message -Text 'Ten GPO nie jest nigdzie podlinkowany.' -Title 'Linki GPO'; return }
+        Show-GridDialog -Title ('Linki: ' + [string](Get-ObjectValue $rows[0] 'GPO')) -Rows $links
+    }
+    Add-RowAction -Module $m -Text 'Raport ustawień (HTML)' -Icon 'E8A5' -Action {
+        param($m, $rows)
+        $guid = [string](Get-ObjectValue $rows[0] '__guid')
+        if (-not $guid -or -not @($m.Data.Gpo.Gpos | Where-Object { [string]$_.Guid -eq $guid }).Count) { Show-Warning 'Wybierz istniejący GPO.'; return }
+        Open-GpoSettingsReport -Module $m -Guid $guid
+    }
+    Add-RowAction -Module $m -Text 'Kopia zapasowa…' -Icon 'E81C' -Action { param($m, $rows) Start-GpoBackup -Module $m -Gpos @(Get-GpoRowsFromSelection -Module $m -Rows $rows) }
+    Add-RowAction -Module $m -Text 'Kopiuj GUID' -Icon 'E8C8' -Separator -Action {
+        param($m, $rows)
+        $g = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'GUID') } | Where-Object { $_ })
+        if ($g.Count) { Set-ClipboardText ($g -join "`r`n"); Show-Toast 'Skopiowano GUID.' 'ok' }
+    }
+    Add-StatTile -Module $m -Key 'gpos' -Label 'Obiekty GPO' -Icon 'E713' | Out-Null
+    Add-StatTile -Module $m -Key 'high' -Label 'Problemy – ryzyko wysokie' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'mid' -Label 'Problemy – ryzyko średnie' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'unlinked' -Label 'Niepodlinkowane' -Icon 'E71B' | Out-Null
+    Add-StatTile -Module $m -Key 'empty' -Label 'Puste' -Icon 'E7C3' | Out-Null
+    $m.EmptyHint = 'Kliknij «Analizuj» (F5). Wystarczy moduł ActiveDirectory i dostęp do udziału SYSVOL; konsola GPMC jest potrzebna tylko do kopii zapasowych i raportów ustawień.'
+}
+
+Register-Module -Workspace 'Domain' -Category 'Zasady grupy' -Key 'GpoResult' -Title 'Wynikowe zasady (RSoP)' -Icon 'E8A1' -Badge 'nowe' `
+    -Description 'Które GPO zadziałały na komputerze (i opcjonalnie dla użytkownika), w jakiej kolejności i dlaczego inne zostały odrzucone (filtrowanie zabezpieczeń, filtr WMI, GPO lub link wyłączony, pusty GPO) oraz błędy rozszerzeń po stronie klienta – gpresult uruchamiany na komputerach przez WinRM, z raportem HTML.' -Build {
+    param($m)
+    $m.PillColumns = @('Wynik')
+    $m.Computers = Add-StretchTextBox -Module $m -Title 'Komputery' -Multiline -Height 70 -Placeholder 'nazwy komputerów, po jednej w wierszu' -Text ([string](Get-ModuleSetting -Module $m -Name 'Computers' -Default ''))
+    $row = Add-ToolbarRow -Module $m -Title 'Zakres'
+    Add-Label -Parent $row -Text 'Użytkownik' | Out-Null
+    $m.User = Add-TextBox -Parent $row -Width 260 -Placeholder 'DOMENA\login – puste: tylko komputer'
+    $m.Html = Add-CheckBox -Parent $row -Text 'Także raport HTML (gpresult /h)' -Checked $true
+    Add-Button -Parent $row -Text 'Sprawdź' -Icon 'E8A1' -Module $m -Primary -OnClick {
+        param($m)
+        $targets = @(Split-ListText $m.Computers.Text | Select-Object -Unique)
+        if (-not $targets.Count) { Show-Warning 'Wpisz nazwy komputerów.'; return }
+        Set-ModuleSetting -Module $m -Name 'Computers' -Value ($targets -join "`r`n")
+        $m.Data.GpHtml = @{}
+        Reset-StatTiles $m
+        Reset-ResultTable -Module $m
+        Start-HostOperation -Module $m -Name 'Wynikowe zasady' -Targets $targets -Output None -Parameters @{ User = $m.User.Text.Trim(); Html = (Test-Checked $m.Html) } -ScriptBlock $script:GpResultScript -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { Add-ResultRows -Module $m -Computer $r.Target -Objects @([pscustomobject]@{ 'Część' = ''; 'Rodzaj' = 'Błąd'; 'GPO' = ''; 'Wynik' = 'nie odczytano'; 'Szczegóły' = ((@($r.Errors)) -join ' '); '__tone' = 'crit' }); return }
+            $d = @($r.Data)[0]
+            if ([string]$d.Html) { $m.Data.GpHtml[[string]$r.Target] = [string]$d.Html }
+            $rows = @()
+            try { $rows = @(ConvertFrom-GpResultXml -Xml ([string]$d.Xml)) }
+            catch { $rows = @([pscustomobject]@{ 'Część' = ''; 'Rodzaj' = 'Błąd'; 'GPO' = ''; 'Wynik' = 'nieczytelny raport gpresult'; 'Szczegóły' = $_.Exception.Message; '__tone' = 'crit' }) }
+            if ($rows.Count) { Add-ResultRows -Module $m -Computer $r.Target -Objects $rows }
+        } -OnComplete {
+            param($m)
+            $all = @(Get-ResultRowsAll -Module $m)
+            Set-StatTile -Module $m -Key 'computers' -Value ([string]@($all | ForEach-Object { [string]$_['Komputer'] } | Select-Object -Unique).Count)
+            Set-StatTile -Module $m -Key 'applied' -Value ([string]@($all | Where-Object { [string]$_['Wynik'] -eq 'zastosowany' }).Count) -Tone 'ok'
+            $denied = @($all | Where-Object { [string]$_['Wynik'] -like 'odrzucony*' }).Count
+            Set-StatTile -Module $m -Key 'denied' -Value ([string]$denied) -Tone $(if ($denied) { 'warn' } else { '' })
+            $errs = @($all | Where-Object { @('Błąd rozszerzenia', 'Błąd') -contains [string]$_['Rodzaj'] }).Count
+            Set-StatTile -Module $m -Key 'errors' -Value ([string]$errs) -Tone $(if ($errs) { 'crit' } else { 'ok' })
+        }
+    } | Out-Null
+    Add-RowAction -Module $m -Text 'Otwórz raport HTML (gpresult)' -Icon 'E8A5' -Action {
+        param($m, $rows)
+        $c = [string](Get-ObjectValue $rows[0] 'Komputer')
+        if (-not $m.Data['GpHtml'] -or -not $m.Data.GpHtml.ContainsKey($c)) { Show-Warning 'Brak raportu HTML dla tego komputera (zaznacz «Także raport HTML» i sprawdź ponownie).'; return }
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) ('gpresult_{0}_{1:yyyyMMdd_HHmmss}.html' -f (Get-SafeFileName $c), (Get-Date))
+        [System.IO.File]::WriteAllText($path, [string]$m.Data.GpHtml[$c], (New-Object System.Text.UTF8Encoding($true)))
+        try { Start-Process -FilePath $path } catch { Show-Error 'Nie można otworzyć raportu.' $_ }
+    }
+    Add-StatTile -Module $m -Key 'computers' -Label 'Komputery' -Icon 'E977' | Out-Null
+    Add-StatTile -Module $m -Key 'applied' -Label 'GPO zastosowane' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'denied' -Label 'GPO odrzucone' -Icon 'E711' | Out-Null
+    Add-StatTile -Module $m -Key 'errors' -Label 'Błędy rozszerzeń' -Icon 'EA39' | Out-Null
+    $m.EmptyHint = 'Wpisz komputery i kliknij «Sprawdź» (F5). Zasady użytkownika: wpisz konto, które logowało się na komputerze (gpresult /user). Wymaga WinRM i uprawnień administratora na komputerze.'
+}
+
+# Raport cykliczny: problemy z zasadami grupy (zmiany: nowe problemy, np. nowy niepodlinkowany albo pusty GPO)
+Register-ReportType -Key 'GpoHealth' -Title 'Problemy z zasadami grupy' -Icon 'E713' -MailMode 'Changes' `
+    -Description 'Problemy z obiektami zasad grupy (jak moduł «Obiekty zasad grupy»): niepodlinkowane, puste, wyłączone, niezgodne wersje i brak w SYSVOL, MS16-072, edycja dla szerokich grup, linki do nieistniejących GPO i osierocone foldery.' `
+    -KeyColumns @('GPO', 'Problem') -Options @(
+    @{ Key = 'CheckSysvol'; Label = 'Sprawdź SYSVOL (wersje, brakujące i osierocone foldery)'; Type = 'Check'; Value = $true }
+    @{ Key = 'MinSeverity'; Label = 'Wyniki (powiadomienia i zmiany) od poziomu ryzyka'; Type = 'Combo'; Items = $script:ReportSeverityItems; Value = 'Niskie' }
+) -Run {
+    param($O)
+    $scan = New-GpoScanData
+    $r = Invoke-ReportAd -ScriptBlock $script:GpoScanScript -Parameters @{ CheckSysvol = [bool](Get-ReportOption $O 'CheckSysvol' $true); SysvolRoot = [string]$script:GpoSysvolRoot; ApplyRight = $script:GpoApplyRight }
+    Add-GpoScanResult -Scan $scan -Result $r
+    if (-not $scan.Domain) { throw ('Nie odczytano obiektów zasad grupy: ' + ((@($scan.Errors)) -join ' ')) }
+    $a = Get-GpoAnalysis -Scan $scan
+    $issues = @($a.Issues)
+    $high = @($issues | Where-Object { $_.'Ocena' -eq 'Wysokie' }).Count
+    return @{
+        Title = 'Problemy z zasadami grupy – ' + $scan.Domain.Name; Subtitle = ('GPO: {0}, linki: {1}' -f @($a.Gpos).Count, @($a.Links).Count)
+        Summary = ('problemy: {0}, wysokie: {1}' -f $issues.Count, $high)
+        Rows = $issues; Findings = (Get-ReportSeverityRows -Rows $issues -Column 'Ocena' -Min ([string](Get-ReportOption $O 'MinSeverity' 'Niskie'))); PillColumns = @('Ocena')
+        Tiles = @(@{ Label = 'Obiekty GPO'; Value = @($a.Gpos).Count; Tone = '' }) + @(New-ReportSeverityTiles -Rows $issues -Column 'Ocena')
+        Errors = @($scan.Errors)
+    }
 }
 #endregion
 
