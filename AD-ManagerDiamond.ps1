@@ -18895,7 +18895,9 @@ function Save-NtfsBackup {
 
 function Read-NtfsBackup([string]$Path) {
     $doc = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-    return @{ CreatedAt = [string]$doc.CreatedAt; CreatedBy = [string]$doc.CreatedBy; Operation = [string]$doc.Operation; Computer = [string]$doc.Computer; Root = [string]$doc.Root
+    # PowerShell 7 zamienia datę ISO z JSON na DateTime (5.1 zostawia tekst) - zawsze format rrrr-MM-ddTgg:mm:ss
+    $created = if ($doc.CreatedAt -is [datetime]) { $doc.CreatedAt.ToString('s') } else { [string]$doc.CreatedAt }
+    return @{ CreatedAt = $created; CreatedBy = [string]$doc.CreatedBy; Operation = [string]$doc.Operation; Computer = [string]$doc.Computer; Root = [string]$doc.Root
         Items = @($doc.Items | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Sddl } }); File = $Path }
 }
 
@@ -19571,6 +19573,22 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsRepa
 }
 
 # --- Kopie uprawnień ---
+function Start-NtfsRestore {
+    # Przywraca wybrane elementy kopii (indeksy w $Backup.Items); stan sprzed przywrócenia trafia do nowej kopii, wynik w oknie
+    param([hashtable]$Module, [hashtable]$Backup, [int[]]$Indexes, [scriptblock]$OnRestored)
+    $Module.Data.RestoreFrom = $Backup
+    $Module.Data.RestoreAfter = $OnRestored
+    Start-NtfsChange -Module $Module -Name 'Przywracanie uprawnień' -Computer $Backup.Computer -Params @{ Op = 'Restore'; Items = @($Indexes | ForEach-Object { @{ Path = $Backup.Items[$_].Path; Sddl = $Backup.Items[$_].Sddl; Expected = '' } }) } -OnDone {
+        param($m, $results)
+        $from = $m.Data.RestoreFrom
+        $before = @($results | Where-Object { $_.Before })
+        if ($before.Count) { [void](Save-NtfsBackup -Operation 'Stan przed przywróceniem' -Computer $from.Computer -Root $from.Root -Items @($before | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Before } })) }
+        $rows = @($results | ForEach-Object { [pscustomobject][ordered]@{ 'Ścieżka' = $_.Path; 'Wynik' = $(if ($_.Status -eq 'Zmieniono') { 'Przywrócono' } else { $_.Status }); 'Szczegóły' = $_.Detail; '__tone' = $_.Tone } })
+        if ($m.Data['RestoreAfter']) { & $m.Data.RestoreAfter $m }
+        Show-GridDialog -Title 'Przywracanie uprawnień' -Subtitle ('Kopia: ' + [System.IO.Path]::GetFileName($from.File)) -Rows $rows -PillColumns @('Wynik')
+    }
+}
+
 function Update-NtfsBackupList {
     param([hashtable]$Module)
     $m = $Module
@@ -19621,17 +19639,18 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsBack
         $items = @($b.Items | ForEach-Object { $_.Path })
         $chosen = @(Confirm-Action -Text ("Przywrócić uprawnienia z kopii «{0}» ({1}, {2}){3}? Obecne uprawnienia wybranych elementów zostaną zastąpione; ich stan sprzed przywrócenia trafi do nowej kopii." -f $b.Operation, ($b.CreatedAt -replace 'T', ' '), $b.CreatedBy, $(if ($b.Computer) { " na komputerze $($b.Computer)" } else { '' })) -Items $items -ConfirmText 'Przywróć' -Danger -Select -ReturnIndex)
         if ($chosen.Count -eq 0) { return }
-        $m.Data.RestoreFrom = $b
-        Start-NtfsChange -Module $m -Name 'Przywracanie uprawnień' -Computer $b.Computer -Params @{ Op = 'Restore'; Items = @($chosen | ForEach-Object { @{ Path = $b.Items[$_].Path; Sddl = $b.Items[$_].Sddl; Expected = '' } }) } -OnDone {
-            param($m, $results)
-            $before = @($results | Where-Object { $_.Before })
-            if ($before.Count) { [void](Save-NtfsBackup -Operation 'Stan przed przywróceniem' -Computer $m.Data.RestoreFrom.Computer -Root $m.Data.RestoreFrom.Root -Items @($before | ForEach-Object { @{ Path = [string]$_.Path; Sddl = [string]$_.Before } })) }
-            $rows = @($results | ForEach-Object { [pscustomobject][ordered]@{ 'Ścieżka' = $_.Path; 'Wynik' = $(if ($_.Status -eq 'Zmieniono') { 'Przywrócono' } else { $_.Status }); 'Szczegóły' = $_.Detail; '__tone' = $_.Tone } })
-            Update-NtfsBackupList -Module $m
-            Show-GridDialog -Title 'Przywracanie uprawnień' -Subtitle ('Kopia: ' + [System.IO.Path]::GetFileName($m.Data.RestoreFrom.File)) -Rows $rows -PillColumns @('Wynik')
-        }
+        Start-NtfsRestore -Module $m -Backup $b -Indexes $chosen -OnRestored { param($m) Update-NtfsBackupList -Module $m }
     }
     Add-RowAction -Module $m -Text 'Przywróć uprawnienia…' -Icon 'E7A7' -Danger -Action { param($m, $rows) & $m.Actions.Restore $m $rows }
+    Add-RowAction -Module $m -Text 'Porównaj z obecnym stanem' -Icon 'E8F1' -Action {
+        param($m, $rows)
+        $file = [string](Get-ObjectValue $rows[0] '__file')
+        if (-not $file) { return }
+        Show-Module -Key 'NtfsDrift'
+        $dm = $script:UI.Modules['NtfsDrift']
+        Update-NtfsDriftLists -Module $dm -Select $file
+        & $dm.Actions.Compare $dm
+    }
     Add-RowAction -Module $m -Text 'Pokaż zawartość' -Icon 'E8A1' -Action {
         param($m, $rows)
         $b = Read-NtfsBackup ([string](Get-ObjectValue $rows[0] '__file'))
@@ -19658,7 +19677,7 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsBack
         Update-NtfsBackupList -Module $m
     }
     Add-StatTile -Module $m -Key 'count' -Label 'Zapisane kopie' -Icon 'E81C' | Out-Null
-    $m.ResultHint = 'Prawy przycisk na kopii: przywróć (całość lub wybrane foldery), pokaż zawartość, usuń'
+    $m.ResultHint = 'Prawy przycisk na kopii: przywróć (całość lub wybrane foldery), porównaj z obecnym stanem, pokaż zawartość, usuń'
     $m.EmptyHint = 'Kopie powstają automatycznie przed zmianami w modułach NTFS. Własną kopię drzewa zrobisz przyciskiem «Zrób kopię uprawnień».'
     Update-NtfsBackupList -Module $m
 }
@@ -20233,6 +20252,164 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsShar
     Add-StatTile -Module $m -Key 'shares' -Label 'Udziały' -Icon 'E8CE' | Out-Null
     Add-StatTile -Module $m -Key 'risk' -Label 'Zapis dla szerokich grup' -Icon 'EA39' | Out-Null
     $m.EmptyHint = 'Podaj serwer plików i kliknij «Pokaż udziały» (F5). Dostęp przez sieć to mniejsze z uprawnień udziału i NTFS – dla konkretnej osoby z jej grupami użyj «Uprawnienia efektywne».'
+}
+#endregion
+
+#region Uprawnienia NTFS: zmiany uprawnień (kopia a stan obecny albo dwie kopie)
+
+function Resolve-NtfsSidNamesLocal {
+    # Nazwy kont dla SID nieznanych z odczytu (np. wpisy usunięte od czasu kopii) - tłumaczenie na tym komputerze
+    param([string[]]$Sids, [hashtable]$Names = @{})
+    foreach ($s in @($Sids | Where-Object { $_ } | Select-Object -Unique)) {
+        if ($Names.ContainsKey($s) -and [string]$Names[$s] -ne $s) { continue }
+        try { $Names[$s] = (New-Object System.Security.Principal.SecurityIdentifier($s)).Translate([System.Security.Principal.NTAccount]).Value } catch { if (-not $Names.ContainsKey($s)) { $Names[$s] = $s } }
+    }
+    return $Names
+}
+
+function Compare-NtfsSnapshots {
+    # Zmiany między dwoma stanami (ścieżka -> SDDL). -All: także wpisy dziedziczone; -NewItems: elementy obecne tylko w stanie «po»
+    param([System.Collections.IDictionary]$Before, [System.Collections.IDictionary]$After, [hashtable]$Names, [switch]$All, [switch]$NewItems)
+    $kindMap = @{ 'Brak wpisu' = 'Usunięty wpis'; 'Nadmiarowy wpis' = 'Nowy wpis'; 'Inne uprawnienia' = 'Zmienione uprawnienia'; 'Dziedziczenie' = 'Dziedziczenie'; 'Właściciel' = 'Właściciel' }
+    $rows = New-Object System.Collections.ArrayList
+    $same = 0
+    foreach ($path in @($Before.Keys | Sort-Object)) {
+        if (-not $After.Contains($path)) {
+            [void]$rows.Add([pscustomobject][ordered]@{ 'Zmiana' = 'Brak elementu'; 'Folder' = $path; 'Tożsamość' = ''; 'Przed' = ''; 'Po' = 'usunięty, przeniesiony albo bez dostępu'; '__tone' = 'warn'; '__sid' = '' })
+            continue
+        }
+        $diffs = @(Compare-NtfsAcl -Template (New-NtfsAclFromSddl ([string]$Before[$path])) -Target (New-NtfsAclFromSddl ([string]$After[$path])) -All:$All -Names $Names -Protection -Owner)
+        if ($diffs.Count -eq 0) { $same++; continue }
+        foreach ($d in $diffs) {
+            $kind = $kindMap[[string]$d.Kind]
+            $tone = switch ($kind) { 'Nowy wpis' { 'info' } 'Właściciel' { 'info' } default { 'warn' } }
+            # Nowy lub zmieniony wpis dający zapis szerokiej grupie (Wszyscy, Użytkownicy domeny…) - wyróżniony
+            if (@('Nowy wpis', 'Zmienione uprawnienia') -contains $kind -and $d.Sid -and ($script:NtfsBroadSids.Contains([string]$d.Sid) -or [string]$d.Sid -match '^S-1-5-21-.*-513$')) {
+                $acl = New-NtfsAclFromSddl ([string]$After[$path])
+                $mask = [int64]0
+                foreach ($r in (Get-NtfsRules $acl)) { if ($r.Sid -eq [string]$d.Sid -and -not $r.Deny) { $mask = $mask -bor $r.Mask } }
+                if (Test-NtfsWriteMask $mask) { $tone = 'crit' }
+            }
+            [void]$rows.Add([pscustomobject][ordered]@{ 'Zmiana' = $kind; 'Folder' = $path; 'Tożsamość' = $(if ($d.Sid) { Get-NtfsSidLabel $Names ([string]$d.Sid) } else { '' }); 'Przed' = $d.T; 'Po' = $d.G; '__tone' = $tone; '__sid' = [string]$d.Sid })
+        }
+    }
+    if ($NewItems) {
+        foreach ($path in @($After.Keys | Where-Object { -not $Before.Contains($_) } | Sort-Object)) {
+            $acl = New-NtfsAclFromSddl ([string]$After[$path])
+            $explicit = @(Get-NtfsRules $acl | Where-Object { -not $_.Inherited })
+            $text = if ($explicit.Count) { (@($explicit | ForEach-Object { Get-NtfsRuleText $Names $_ })) -join '; ' } else { 'tylko dziedziczone' }
+            [void]$rows.Add([pscustomobject][ordered]@{ 'Zmiana' = 'Nowy element'; 'Folder' = $path; 'Tożsamość' = ''; 'Przed' = '—'; 'Po' = $text; '__tone' = 'info'; '__sid' = '' })
+        }
+    }
+    return @{ Rows = $rows.ToArray(); Same = $same }
+}
+
+function Get-NtfsBackupFiles {
+    # Kopie uprawnień od najnowszej: plik i opis do listy wyboru
+    return @(Get-ChildItem -LiteralPath (Get-DataFolder 'AclBackup') -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | ForEach-Object {
+            $f = $_
+            try { $b = Read-NtfsBackup $f.FullName; [pscustomobject]@{ File = $f.FullName; Label = ('{0} • {1} • {2} ({3})' -f ($b.CreatedAt -replace 'T', ' '), $b.Operation, $b.Root, $b.Items.Count); Operation = $b.Operation } }
+            catch { }
+        })
+}
+
+function Update-NtfsDriftLists {
+    param([hashtable]$Module, [string]$Select = '')
+    $m = $Module
+    $m.Data.BackupFiles = @(Get-NtfsBackupFiles)
+    $m.From.Items.Clear()
+    $m.To.Items.Clear()
+    [void]$m.To.Items.Add('obecnym stanem uprawnień')
+    foreach ($b in $m.Data.BackupFiles) { [void]$m.From.Items.Add($b.Label); [void]$m.To.Items.Add($b.Label) }
+    $i = 0
+    if ($Select) { for ($k = 0; $k -lt $m.Data.BackupFiles.Count; $k++) { if ($m.Data.BackupFiles[$k].File -eq $Select) { $i = $k } } }
+    if ($m.From.Items.Count) { $m.From.SelectedIndex = $i }
+    $m.To.SelectedIndex = 0
+}
+
+function Show-NtfsDrift {
+    param([hashtable]$Module, [System.Collections.IDictionary]$After, [hashtable]$Names)
+    $m = $Module
+    $d = $m.Data.Drift
+    Reset-ResultTable -Module $m
+    $sids = New-Object System.Collections.ArrayList
+    foreach ($sd in @($d.Before.Values) + @($After.Values)) { foreach ($mt in [regex]::Matches([string]$sd, 'S-1-5-21-[\d-]+')) { [void]$sids.Add($mt.Value) } }
+    $allNames = Resolve-NtfsSidNamesLocal -Sids @($sids) -Names $Names
+    $res = Compare-NtfsSnapshots -Before $d.Before -After $After -Names $allNames -All:$d.All -NewItems:$d.NewItems
+    $rows = @($res.Rows)
+    if ($rows.Count) { Add-ResultRows -Module $m -Objects $rows -TargetColumn '' }
+    $changed = @($rows | Where-Object { $_.'Zmiana' -ne 'Nowy element' } | ForEach-Object { $_.'Folder' } | Select-Object -Unique).Count
+    Set-StatTile -Module $m -Key 'changed' -Value ([string]$changed) -Tone $(if ($changed) { 'warn' } else { 'ok' })
+    Set-StatTile -Module $m -Key 'added' -Value ([string]@($rows | Where-Object { $_.'Zmiana' -eq 'Nowy wpis' }).Count) -Tone $(if (@($rows | Where-Object { $_.__tone -eq 'crit' }).Count) { 'crit' } else { '' })
+    Set-StatTile -Module $m -Key 'removed' -Value ([string]@($rows | Where-Object { $_.'Zmiana' -eq 'Usunięty wpis' }).Count)
+    Set-StatTile -Module $m -Key 'same' -Value ([string]$res.Same) -Tone 'ok'
+    $m.ResultHint = 'Kopia: {0} • porównano z: {1}' -f $d.FromLabel, $d.ToLabel
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+    if ($rows.Count -eq 0) { Show-Toast 'Brak zmian uprawnień.' 'ok' }
+}
+
+Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsDrift' -Title 'Zmiany uprawnień' -Icon 'E81C' -Badge 'nowe' `
+    -Description 'Co się zmieniło w uprawnieniach: kopia uprawnień porównana z obecnym stanem albo z inną kopią – nowe, usunięte i zmienione wpisy, dziedziczenie, właściciel, brakujące i (przy skanie drzewa) nowe foldery. Nowy zapis dla szerokich grup jest wyróżniony; wybrane foldery można przywrócić ze stanu z kopii.' -Build {
+    param($m)
+    $m.PillColumns = @('Zmiana')
+    $row = Add-ToolbarRow -Module $m -Title 'Kopia'
+    $m.From = Add-ComboBox -Parent $row -Width 640
+    Add-Button -Parent $row -Text '' -Icon 'E72C' -Module $m -AlwaysEnabled -ToolTip 'Odśwież listę kopii' -OnClick { param($m) Update-NtfsDriftLists -Module $m } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Porównaj z'
+    $m.To = Add-ComboBox -Parent $row2 -Width 640
+    $row3 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.All = Add-CheckBox -Parent $row3 -Text 'Także wpisy dziedziczone'
+    $m.NewItems = Add-CheckBox -Parent $row3 -Text 'Wykryj nowe foldery (skan całego drzewa)' -ToolTip 'Dla pełnych kopii drzewa («Zrób kopię uprawnień»). Kopie zrobione przed zmianami obejmują tylko zmieniane foldery – wtedy pozostałe foldery wyglądałyby na nowe.'
+    $m.Privileged = Add-CheckBox -Parent $row3 -Text 'Tryb kopii zapasowej' -ToolTip 'Odczyt obecnego stanu także tam, gdzie Administratorzy nie mają dostępu. Wymaga uruchomienia jako administrator.'
+    Register-ControlHandler -Control $m.From -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        $i = $m.From.SelectedIndex
+        if ($i -ge 0 -and $i -lt @($m.Data.BackupFiles).Count) { $m.NewItems.IsChecked = ([string]$m.Data.BackupFiles[$i].Operation -eq 'Kopia ręczna') }
+    }
+    $m.Actions.Compare = {
+        param($m)
+        $files = @($m.Data.BackupFiles)
+        if ($m.From.SelectedIndex -lt 0 -or $files.Count -eq 0) { Show-Warning 'Brak kopii uprawnień – zrób kopię w module «Kopie uprawnień».'; return }
+        $b = Read-NtfsBackup $files[$m.From.SelectedIndex].File
+        $before = [ordered]@{}
+        foreach ($it in $b.Items) { $before[[string]$it.Path] = [string]$it.Sddl }
+        $m.Data.Drift = @{ Backup = $b; Before = $before; All = (Test-Checked $m.All); NewItems = (Test-Checked $m.NewItems); FromLabel = [string]$m.From.SelectedItem; ToLabel = [string]$m.To.SelectedItem; Current = ($m.To.SelectedIndex -eq 0) }
+        Reset-ResultTable -Module $m
+        if ($m.To.SelectedIndex -gt 0) {
+            $other = Read-NtfsBackup $files[$m.To.SelectedIndex - 1].File
+            $after = [ordered]@{}
+            foreach ($it in $other.Items) { $after[[string]$it.Path] = [string]$it.Sddl }
+            Show-NtfsDrift -Module $m -After $after -Names @{}
+            return
+        }
+        $params = if ($m.Data.Drift.NewItems) { @{ Mode = 'All'; Depth = -1 } } else { @{ Mode = 'All'; Paths = @($before.Keys) } }
+        Start-NtfsScan -Module $m -Name 'Obecny stan uprawnień' -Path $b.Root -Computer $b.Computer -Params $params -OnDone {
+            param($m)
+            $after = [ordered]@{}
+            foreach ($rec in $m.Data.NtfsScan.Acl) { $after[[string]$rec.Path] = [string]$rec.Sddl }
+            Show-NtfsDrift -Module $m -After $after -Names $m.Data.NtfsScan.Names
+        }
+    }
+    $row4 = Add-ToolbarRow -Module $m -Title ' '
+    Add-Button -Parent $row4 -Text 'Porównaj' -Icon 'E8F1' -Module $m -Primary -OnClick $m.Actions.Compare | Out-Null
+    Add-RowAction -Module $m -Text 'Przywróć te foldery ze stanu z kopii…' -Icon 'E7A7' -Danger -Action {
+        param($m, $rows)
+        $d = $m.Data['Drift']
+        if (-not $d -or -not $d.Current) { Show-Warning 'Przywracanie dotyczy porównania kopii z obecnym stanem.'; return }
+        $paths = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Folder') } | Select-Object -Unique)
+        $idx = @(for ($i = 0; $i -lt $d.Backup.Items.Count; $i++) { if ($paths -contains [string]$d.Backup.Items[$i].Path) { $i } })
+        if ($idx.Count -eq 0) { Show-Warning 'Wybrane foldery nie występują w kopii (nowe foldery nie mają stanu do przywrócenia).'; return }
+        $chosen = @(Confirm-Action -Text ('Przywrócić uprawnienia wybranych folderów ze stanu z kopii «{0}»? Obecny stan trafi do nowej kopii.' -f $d.Backup.Operation) -Items @($idx | ForEach-Object { $d.Backup.Items[$_].Path }) -ConfirmText 'Przywróć' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        Start-NtfsRestore -Module $m -Backup $d.Backup -Indexes @($chosen | ForEach-Object { $idx[$_] }) -OnRestored { param($m) $file = $m.Data.Drift.Backup.File; Update-NtfsDriftLists -Module $m -Select $file; & $m.Actions.Compare $m }
+    }
+    Add-RowAction -Module $m -Text 'Otwórz w Eksploratorze' -Icon 'E838' -Separator -Action { param($m, $rows) Open-Folder ([string](Get-ObjectValue $rows[0] 'Folder')) }
+    Add-StatTile -Module $m -Key 'changed' -Label 'Zmienione foldery' -Icon 'E8F1' | Out-Null
+    Add-StatTile -Module $m -Key 'added' -Label 'Nowe wpisy' -Icon 'E710' | Out-Null
+    Add-StatTile -Module $m -Key 'removed' -Label 'Usunięte wpisy' -Icon 'E738' | Out-Null
+    Add-StatTile -Module $m -Key 'same' -Label 'Bez zmian' -Icon 'E73E' | Out-Null
+    $m.EmptyHint = 'Wybierz kopię uprawnień (np. kopię ręczną drzewa sprzed miesiąca) i kliknij «Porównaj» (F5). Kopię drzewa robi moduł «Kopie uprawnień» – regularne kopie pozwalają śledzić, kto i gdzie dostał dostęp.'
+    Update-NtfsDriftLists -Module $m
 }
 #endregion
 
