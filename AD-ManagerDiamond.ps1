@@ -2171,6 +2171,8 @@ function Invoke-Dialog {
     # Pokazuje okno modalnie; zwraca $true, gdy zatwierdzono
     param([Parameter(Mandatory)][System.Windows.Window]$Window)
     if (-not ($Window.Tag -is [hashtable])) { $Window.Tag = @{} }
+    # Program zablokowany (Lock-DomainOps): okno, np. wynik operacji w tle, pokaże się dopiero po odblokowaniu
+    if ($script:UnlockState.Locked -and -not $Window.Tag['LockScreen']) { Wait-Unlocked }
     $Window.Tag['Result'] = $false
     $Window.Tag['Modal'] = $false
     $main = $script:UI.Window
@@ -3206,10 +3208,15 @@ $script:ToastTimers = New-Object 'System.Collections.Generic.Dictionary[object,o
 # tekstu 'DomainOps|<PIN>'. Zmiana PIN-u: wpisz tu wynik polecenia
 #   -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes('DomainOps|NOWY_PIN')) | ForEach-Object { $_.ToString('x2') })
 # i ustaw długość PIN-u. Pusty skrót wyłącza blokadę. Tryb bez okna (-RunReport) nie pyta o PIN.
+# Ten sam PIN odblokowuje program zablokowany w trakcie pracy (przycisk z kłódką, Ctrl+Shift+L - Lock-DomainOps).
 $script:UnlockPinHash = 'e57ba83a98fac469e360db6045d7adfce273fa0faf2697fbc3528ebff51b52e5'
 $script:UnlockPinLength = 5
 $script:UnlockMaxAttempts = 5
+$script:UnlockCooldownSec = 30
 $script:UnlockTitle = 'Domain Ops – odblokowanie'
+$script:LockTitle = 'Domain Ops – zablokowany'
+# Stan blokady w trakcie pracy (Invoke-Dialog wstrzymuje inne okna, dopóki program jest zablokowany)
+$script:UnlockState = @{ Locked = $false }
 
 $script:UnlockXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -3223,7 +3230,7 @@ $script:UnlockXaml = @'
         <TextBlock x:Name="lockIcon" Style="{StaticResource Glyph}" FontSize="22" Foreground="#8CB0FF" HorizontalAlignment="Center"/>
       </Border>
       <TextBlock Text="Domain Ops" FontSize="18" FontWeight="SemiBold" Foreground="White" HorizontalAlignment="Center" Margin="0,14,0,0"/>
-      <TextBlock Text="Wpisz PIN, aby odblokować program" Foreground="#8791A5" HorizontalAlignment="Center" Margin="0,4,0,0"/>
+      <TextBlock x:Name="lockHint" Text="Wpisz PIN, aby odblokować program" Foreground="#8791A5" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,4,0,0"/>
       <StackPanel x:Name="lockDots" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,22,0,0"/>
       <TextBlock x:Name="lockMsg" Foreground="#FF7A86" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" MinHeight="18" Margin="0,12,0,0"/>
       <UniformGrid x:Name="lockPad" Columns="3" Margin="0,12,0,0"/>
@@ -3261,11 +3268,19 @@ $script:UnlockEvents = @{
         Add-UnlockKey -Window $s -Key $key
     }
     Close   = { param($s, $e) Close-Dialog -Window ([System.Windows.Window]::GetWindow($s)) -Ok $false }
+    # Okno blokady zamyka tylko poprawny PIN (krzyżyk, Alt+F4 są ignorowane)
+    Closing = { param($s, $e) if ($s.Tag.Mode -eq 'Lock' -and -not $s.Tag.Result) { $e.Cancel = $true } }
 }
 
 function New-UnlockWindow {
+    # -Lock: okno blokady w trakcie pracy (bez «Zamknij», po wyczerpaniu prób przerwa zamiast zamknięcia programu)
+    param([switch]$Lock)
     $w = New-UiElement $script:UnlockXaml
-    $w.Title = $script:UnlockTitle
+    $w.Title = $(if ($Lock) { $script:LockTitle } else { $script:UnlockTitle })
+    if ($Lock) {
+        $w.FindName('lockHint').Text = 'Program zablokowany – wpisz PIN'
+        $w.FindName('lockClose').Visibility = 'Collapsed'
+    }
     $w.FindName('lockIcon').Text = Get-Glyph 'E72E'
     $dots = $w.FindName('lockDots')
     for ($i = 0; $i -lt $script:UnlockPinLength; $i++) {
@@ -3297,7 +3312,8 @@ function New-UnlockWindow {
     }
     $w.FindName('lockClose').add_Click($script:UnlockEvents.Close)
     $w.add_PreviewKeyDown($script:UnlockEvents.KeyDown)
-    $w.Tag = @{ Result = $false; Modal = $false; Pin = ''; Attempts = 0; Error = $false; Locked = $false }
+    $w.add_Closing($script:UnlockEvents.Closing)
+    $w.Tag = @{ Result = $false; Modal = $false; Pin = ''; Attempts = 0; Failed = 0; Error = $false; Locked = $false; Mode = $(if ($Lock) { 'Lock' } else { 'Start' }); LockScreen = [bool]$Lock; CooldownEnd = [datetime]::MinValue }
     Update-UnlockView -Window $w
     return $w
 }
@@ -3330,14 +3346,30 @@ function Add-UnlockKey {
     if ($st.Pin.Length -lt $script:UnlockPinLength) { Update-UnlockView -Window $Window; return }
     if (Test-UnlockPin $st.Pin) {
         $st.Pin = ''
+        # Odblokowanie od razu (zanim okno się zamknie): wstrzymane okna mogą się pokazać
+        if ($st.Mode -eq 'Lock') { Restore-AfterLock }
         Close-Dialog -Window $Window -Ok $true
         return
     }
     $st.Attempts++
+    $st.Failed++
     $st.Pin = ''
     $st.Error = $true
     $left = $script:UnlockMaxAttempts - $st.Attempts
     Update-UnlockView -Window $Window
+    if ($left -le 0 -and $st.Mode -eq 'Lock') {
+        # Blokada w trakcie pracy: przerwa zamiast zamknięcia programu (operacje w tle trwają dalej)
+        $st.Locked = $true
+        $st.CooldownEnd = (Get-Date).AddSeconds($script:UnlockCooldownSec)
+        $Window.FindName('lockPad').IsEnabled = $false
+        Update-UnlockCooldown -Window $Window
+        $t = New-Object System.Windows.Threading.DispatcherTimer
+        $t.Interval = [TimeSpan]::FromMilliseconds(250)
+        $t.Tag = $Window
+        $t.add_Tick({ param($s, $e) if (-not (Update-UnlockCooldown -Window $s.Tag)) { $s.Stop() } })
+        $t.Start()
+        return
+    }
     if ($left -le 0) {
         # Komunikat widoczny przez chwilę, potem zamknięcie (bez odblokowania)
         $msg.Text = 'Zbyt wiele błędnych prób – program zostanie zamknięty.'
@@ -3353,10 +3385,68 @@ function Add-UnlockKey {
     $msg.Text = 'Nieprawidłowy PIN. Pozostało prób: {0}' -f $left
 }
 
+function Update-UnlockCooldown {
+    # Odliczanie przerwy po wyczerpaniu prób; $false, gdy przerwa minęła (klawiatura znów aktywna, nowe próby)
+    param([Parameter(Mandatory)]$Window)
+    $st = $Window.Tag
+    $left = ($st.CooldownEnd - (Get-Date)).TotalSeconds
+    $msg = $Window.FindName('lockMsg')
+    if ($left -gt 0) {
+        $msg.Text = 'Zbyt wiele błędnych prób. Spróbuj ponownie za {0} s.' -f [int][Math]::Ceiling($left)
+        return $true
+    }
+    $st.Locked = $false
+    $st.Attempts = 0
+    $st.Error = $false
+    $msg.Text = ''
+    $Window.FindName('lockPad').IsEnabled = $true
+    Update-UnlockView -Window $Window
+    return $false
+}
+
 function Unlock-DomainOps {
     # $true: można uruchomić program (PIN poprawny albo blokada wyłączona)
     if (-not $script:UnlockPinHash) { return $true }
     return (Invoke-Dialog -Window (New-UnlockWindow))
+}
+
+function Restore-AfterLock {
+    # Koniec blokady: zawartość okna głównego z powrotem, wstrzymane okna mogą się pokazać (wywołanie wielokrotne bez skutków)
+    $script:UnlockState.Locked = $false
+    $main = $script:UI.Window
+    if ($main -and $main.Content) { $main.Content.Visibility = 'Visible' }
+}
+
+function Lock-DomainOps {
+    <#
+        Blokada w trakcie pracy: zawartość okna głównego ukryta, nad nim okno PIN (modalne, więc okno główne jest wyłączone).
+        Okna głównego nie da się ukryć - jest pokazane przez ShowDialog, a ukrycie okna modalnego kończy ShowDialog (i program).
+        Operacje w tle trwają; okna, które chcą się pokazać w tym czasie, czekają na odblokowanie (Invoke-Dialog).
+    #>
+    if (-not $script:UnlockPinHash -or $script:UnlockState.Locked) { return }
+    $main = $script:UI.Window
+    if (-not $main) { return }
+    $script:UnlockState.Locked = $true
+    Clear-ClipboardSecret
+    Write-Log 'Program zablokowany.' -Module ''
+    if ($main.Content) { $main.Content.Visibility = 'Hidden' }
+    $w = New-UnlockWindow -Lock
+    try { [void](Invoke-Dialog -Window $w) }
+    finally { Restore-AfterLock }
+    $n = [int]$w.Tag.Failed
+    Write-Log ('Program odblokowany{0}.' -f $(if ($n) { " (nieudane próby: $n)" } else { '' })) $(if ($n) { 'WARN' } else { 'INFO' }) -Module ''
+}
+
+function Wait-Unlocked {
+    # Okno otwierane w czasie blokady (np. wynik operacji w tle) czeka na odblokowanie; okno programu dalej reaguje
+    if (-not $script:UnlockState.Locked) { return }
+    $frame = New-Object System.Windows.Threading.DispatcherFrame
+    $t = New-Object System.Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromMilliseconds(200)
+    $t.Tag = $frame
+    $t.add_Tick({ param($s, $e) if (-not $script:UnlockState.Locked) { $s.Stop(); $s.Tag.Continue = $false } })
+    $t.Start()
+    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
 }
 #endregion
 
@@ -6749,6 +6839,9 @@ $script:MainXaml = @'
               <TextBlock Style="{StaticResource Glyph}" Text="&#xE70D;" FontSize="10" Foreground="#7B8496" Margin="10,0,0,0"/>
             </StackPanel>
           </Button>
+          <Button x:Name="btnLock" Style="{StaticResource GhostButton}" ToolTip="Zablokuj program – odblokowanie PIN-em (Ctrl+Shift+L)" Margin="4,0,0,0" Padding="10,7">
+            <TextBlock Style="{StaticResource Glyph}" Text="&#xE72E;" FontSize="15"/>
+          </Button>
           <Button x:Name="btnSettings" Style="{StaticResource GhostButton}" ToolTip="Ustawienia" Margin="4,0,0,0" Padding="10,7">
             <TextBlock Style="{StaticResource Glyph}" Text="&#xE713;" FontSize="15"/>
           </Button>
@@ -6866,7 +6959,7 @@ function New-MainWindow {
     $w = New-UiElement $script:MainXaml
     $script:UI.Window = $w
     $c = $script:UI.Controls
-    foreach ($n in 'txtVersion', 'txtDomain', 'wsSwitcher', 'txtSubtitle', 'btnCred', 'txtCredUser', 'txtCredMode', 'btnSettings',
+    foreach ($n in 'txtVersion', 'txtDomain', 'wsSwitcher', 'txtSubtitle', 'btnCred', 'txtCredUser', 'txtCredMode', 'btnLock', 'btnSettings',
         'targetColumn', 'targetHost', 'navHost', 'contentHost', 'toastHost', 'logRow', 'logSplitter', 'logPanel', 'logList',
         'btnLogCopy', 'btnLogFile', 'btnLogClear', 'btnLogHide', 'statusDot', 'txtStatus', 'prgStatus', 'btnCancelOps', 'btnLogToggle',
         'logBadge', 'logBadgeText') {
@@ -6895,6 +6988,8 @@ function New-MainWindow {
     }
     if ($script:Settings.WindowMaximized) { $w.WindowState = 'Maximized' }
 
+    $c.btnLock.add_Click({ Lock-DomainOps })
+    if (-not $script:UnlockPinHash) { $c.btnLock.Visibility = 'Collapsed' }
     $c.btnSettings.add_Click({ Invoke-UiAction -Module $null -Action { if (Show-SettingsDialog) { Show-Toast 'Zapisano ustawienia.' 'ok' } } })
     $c.btnCred.add_Click({ param($s, $e) Show-CredentialMenu -Anchor $s })
     $c.btnCancelOps.add_Click({ Stop-AllOperations })
@@ -6941,6 +7036,10 @@ $script:ShellEvents = @{
             elseif ($key -eq [System.Windows.Input.Key]::F -and $mods -eq $ctrl) {
                 if ($m -and $m.FilterBox) { [void]$m.FilterBox.Focus(); $m.FilterBox.SelectAll() }
                 $e.Handled = $true
+            }
+            elseif ($key -eq [System.Windows.Input.Key]::L -and $mods -eq ($ctrl -bor [System.Windows.Input.ModifierKeys]::Shift)) {
+                $e.Handled = $true
+                Lock-DomainOps
             }
             elseif ($key -eq [System.Windows.Input.Key]::L -and $mods -eq $ctrl) {
                 Set-LogVisible (-not $script:Settings.LogVisible)
