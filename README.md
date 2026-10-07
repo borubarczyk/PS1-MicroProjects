@@ -85,6 +85,31 @@ Uruchomienie: `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.
 - **Nawigacja modułów** pogrupowanych w kategorie — każda przestrzeń pamięta ostatnio otwarty moduł; kropka przy module oznacza trwającą operację.
 - **Moduł:** nagłówek z opisem, panel parametrów (zwijany), kafelki z podsumowaniem (np. kandydaci do usunięcia, średni wynik audytu), tabela wyników z sortowaniem, filtrem po wszystkich kolumnach (`Ctrl+F`, słowo z minusem wyklucza wiersze), **filtrami kolumn**, kolorowymi „pigułkami” stanu, panelem szczegółów wiersza, menu pod prawym przyciskiem myszy (akcje modułu, kopiowanie komórki/wierszy) oraz eksportem do **CSV** lub **raportu HTML**. `F5` uruchamia główną akcję modułu.
 - **Filtry kolumn** (jak autofiltr w Excelu) w każdej tabeli wyników, także w oknach z tabelą: lejek w nagłówku kolumny otwiera okienko z listą wartości (z liczbą wierszy, wyszukiwaniem i „Zaznacz wszystkie”) oraz warunkiem: *zawiera*, *nie zawiera*, *równa się*, *różne od*, *zaczyna się od*, *kończy się na*, *większe/mniejsze niż* (liczby i daty), *puste*, *niepuste*. Filtry kilku kolumn i pole „Filtruj wyniki” działają razem; lista wartości pokazuje to, co zostaje po filtrach pozostałych kolumn. Aktywny filtr wyróżnia lejek, a przycisk „Filtry kolumn: N” obok licznika wierszy czyści je jednym kliknięciem. Pod prawym przyciskiem na komórce: *Pokaż tylko «wartość»* / *Ukryj «wartość»*; na nagłówku: sortowanie, filtr, ukrycie kolumny i przywrócenie ukrytych. Eksport, kopiowanie i akcje dotyczą widocznych wierszy (raport HTML opisuje użyte filtry); nowe wyniki modułu zaczynają bez filtrów kolumn.
+- **Akcje pod prawym przyciskiem na wierszach wyników** działają na klikniętym wierszu albo na kilku zaznaczonych (`Ctrl`, `Shift`). Nie trzeba zmieniać zaznaczenia na liście po lewej ani odświeżać całej tabeli.
+  - Podmenu **„Komputer X” / „Komputery (N)”** w każdej tabeli z kolumną *Komputer*:
+    - *Odśwież tylko te komputery* — ponawia ostatnie zapytanie modułu tylko dla tych komputerów i podmienia ich wiersze; reszta tabeli zostaje;
+    - *Zaznacz na liście komputerów*;
+    - pulpit zdalny, zarządzanie komputerem, usługi, podgląd zdarzeń, `C$` (do 5 komputerów naraz).
+  - Podmenu **„Konto X” / „Konta (N)”** w modułach kont: zaznaczenie na liście użytkowników.
+  - **Akcje z paska narzędzi także w menu wiersza.** Wykonują się dla komputerów lub kont z zaznaczonych wierszy. Dane, których wymagają (np. OU, nowe hasło), podaje się jak przy przycisku na pasku; operacje zmieniające stan pytają o potwierdzenie.
+
+    | Moduł | Akcje w menu wiersza |
+    |---|---|
+    | Zasilanie | restart, wyłączenie, anulowanie zaplanowanego restartu |
+    | Pulpit zdalny | włączenie i wyłączenie RDP, wymaganie NLA |
+    | Polecenia zdalne, instalacja, gpupdate | ponowne uruchomienie na tych komputerach |
+    | Usługi | typ uruchamiania |
+    | Dyski | czyszczenie plików tymczasowych |
+    | Sterowniki i urządzenia | urządzenia z problemami |
+    | Windows Update | wyszukanie, historia, instalacja, stan |
+    | Defender | stan, zagrożenia, aktualizacja sygnatur, skanowanie szybkie i pełne |
+    | BitLocker | kopia kluczy do AD |
+    | Stan konta | włączenie, wyłączenie, przeniesienie do OU, data wygaśnięcia |
+    | Hasła | reset, zmiana przy logowaniu, „hasło nigdy nie wygasa” |
+    | Konto komputera | test i naprawa kanału zaufania, włączenie, wyłączenie, przeniesienie, opis, reset, usunięcie |
+    | LAPS | wymuszenie zmiany hasła |
+
+  - Po takiej akcji odświeżane są tylko wiersze jej obiektów.
 - **Górny pasek:** konto używane do operacji (bieżące albo alternatywne — także dla poleceń AD), blokada programu (kłódka, `Ctrl+Shift+L`) i ustawienia (kontroler domeny, liczba równoległych operacji na komputerach i osobno zapytań do AD, limit połączenia WinRM, domyślny próg nieaktywności, foldery dziennika, ustawień i modułów).
 - **Dziennik operacji** (`Ctrl+L`, z licznikiem nowych ostrzeżeń), **pasek stanu** z postępem i przyciskiem „Przerwij” (wszystkie operacje) oraz **powiadomienia** w rogu okna. Trwająca operacja modułu ma też własny przycisk **„Przerwij”** obok wskaźnika w nagłówku modułu. Zadanie, które nie zareaguje na przerwanie (np. zawieszone wywołanie WMI), jest po 10 s porzucane z informacją w tabeli — okno i kolejne operacje nie czekają na nie.
 - **Wybór obiektów przy potwierdzeniu.** Okno potwierdzenia operacji na obiektach z listy po lewej (stan konta, edycja atrybutów, hasła, operacje na komputerach, grupach, polecenia zdalne, instalacje, tworzenie kont i grup z podglądu itd.) ma listę z polami wyboru, filtrem i przyciskami *Zaznacz / Odznacz / Odwróć* — można wykonać operację np. dla 4 z 20 zaznaczonych kont bez zmiany zaznaczenia na liście.
@@ -251,7 +276,7 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'TimeSync' -Tit
 }
 ```
 
-`Register-Workspace -Key -Title -Icon -Target Computer|User|Group|None` dodaje nową przestrzeń; `Start-HostOperation` (zdalnie lub `-Local`) i `Start-AdOperation` (moduł ActiveDirectory z gotową hashtablą `$ad`; typowe polecenia `Get-/Set-/New-/Remove-AD…` idą przez wspólną blokadę, odczyty z ponawianiem) uruchamiają operacje w tle. `Register-ReportType -Key -Title -Options -KeyColumns -Run { param($O) … }` dodaje rodzaj raportu cyklicznego: blok `-Run` (bez okien; zapytania przez `Invoke-SyncOperation`, także `-Ad`) zwraca hashtablę z `Title`, `Rows`, opcjonalnie `Findings`, `Tiles`, `Summary` i `Errors` — porównanie z poprzednim uruchomieniem, raport HTML, poczta i harmonogram działają same. Moduły własne są kopiowane razem z programem do folderu zadań.
+`Register-Workspace -Key -Title -Icon -Target Computer|User|Group|None` dodaje nową przestrzeń; `Start-HostOperation` (zdalnie lub `-Local`) i `Start-AdOperation` (moduł ActiveDirectory z gotową hashtablą `$ad`; typowe polecenia `Get-/Set-/New-/Remove-AD…` idą przez wspólną blokadę, odczyty z ponawianiem) uruchamiają operacje w tle. `Register-ReportType -Key -Title -Options -KeyColumns -Run { param($O) … }` dodaje rodzaj raportu cyklicznego: blok `-Run` (bez okien; zapytania przez `Invoke-SyncOperation`, także `-Ad`) zwraca hashtablę z `Title`, `Rows`, opcjonalnie `Findings`, `Tiles`, `Summary` i `Errors` — porównanie z poprzednim uruchomieniem, raport HTML, poczta i harmonogram działają same. Moduły własne są kopiowane razem z programem do folderu zadań. `Add-RowAction -Module $m -Text … -Action { param($m, $rows) … }` dodaje pozycję do menu wiersza. `Invoke-ForRowTargets -Module $m -Rows $rows -Button $przycisk` (albo `-Action { … }`) wykonuje akcję paska narzędzi dla komputerów z tych wierszy; z `-Kind User` działa na kontach. Po zakończeniu odświeżane są tylko te wiersze. Podmenu „Komputer X” z *Odśwież tylko te komputery* pojawia się samo w każdym module, który wypełnia tabelę przez `Start-HostOperation`; `$m.RowRefresh = $false` je wyłącza.
 
 ## Uwagi bezpieczeństwa
 

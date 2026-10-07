@@ -3720,10 +3720,7 @@ function Update-GridMenu {
     # Menu kontekstowe budowane przy otwarciu: akcje modułu + kopiowanie/eksport
     param([hashtable]$Module)
     $menu = $Module.Grid.ContextMenu
-    foreach ($old in @($menu.Items)) {
-        [void]$script:MenuActions.Remove($old)
-        [void]$script:Handlers.Remove($old)
-    }
+    Remove-MenuItemHandlers -Items $menu.Items
     $menu.Items.Clear()
     if ($Module.MenuCell -and $Module.MenuCell.Header) { Update-HeaderMenu -Module $Module -Menu $menu -Column $Module.MenuCell.Column; return }
     $rows = @(Get-SelectedResultRows -Module $Module)
@@ -3742,6 +3739,7 @@ function Update-GridMenu {
         $script:MenuActions[$item] = $a.Action
         [void]$menu.Items.Add($item)
     }
+    Add-TargetSubMenus -Module $Module -Menu $menu -Rows $rows
     if ($menu.Items.Count -gt 0) { [void]$menu.Items.Add((New-MenuSeparator)) }
     [void]$menu.Items.Add((New-MenuItem -Text 'Szczegóły wiersza' -Icon 'E8A1' -Module $Module -Enabled $hasRows -Action {
                 param($m)
@@ -3766,6 +3764,111 @@ function Update-GridMenu {
     }
 }
 $script:MenuActions = New-Object 'System.Collections.Generic.Dictionary[object,scriptblock]'
+
+function Remove-MenuItemHandlers {
+    # Obsługa zdarzeń pozycji menu (także podmenu) - zwalniana przy przebudowie menu
+    param($Items)
+    foreach ($old in @($Items)) {
+        [void]$script:MenuActions.Remove($old)
+        [void]$script:MenuTools.Remove($old)
+        [void]$script:Handlers.Remove($old)
+        if ($old -is [System.Windows.Controls.MenuItem] -and $old.Items.Count -gt 0) { Remove-MenuItemHandlers -Items $old.Items }
+    }
+}
+
+function Get-RowTargetNames {
+    # Różne niepuste wartości kolumny z wierszy (np. komputery albo loginy zaznaczonych wierszy)
+    param([object[]]$Rows, [string]$Column)
+    return @($Rows | ForEach-Object { [string](Get-ObjectValue $_ $Column) } | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Invoke-ForRowTargets {
+    <#
+        Akcja paska narzędzi wykonana dla obiektów z zaznaczonych wierszy zamiast z listy po lewej: -Button (klik przycisku)
+        albo -Action { param($m) }. Get-TargetComputers / Get-TargetUsers / Get-TargetGroups zwracają w tym czasie te obiekty.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Module, [object[]]$Rows, [ValidateSet('Computer', 'User', 'Group')][string]$Kind = 'Computer', [string]$Column = '', $Button = $null, [scriptblock]$Action = $null)
+    if (-not $Column) { $Column = @{ Computer = 'Komputer'; User = 'Login'; Group = 'Grupa' }[$Kind] }
+    $names = @(Get-RowTargetNames -Rows $Rows -Column $Column)
+    if ($names.Count -eq 0) { Show-Warning 'Zaznaczone wiersze nie wskazują obiektów, których dotyczy ta operacja.'; return }
+    # Własne nazwy: blok wykonuje się wewnątrz Invoke-WithTargets, a jego parametr $Action przesłoniłby nasz (rekurencja)
+    $rowButton = $Button
+    $rowAction = $Action
+    $rowModule = $Module
+    Invoke-WithTargets -Kind $Kind -Names $names -Action {
+        if ($rowButton) { $rowButton.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $rowButton))) }
+        elseif ($rowAction) { $null = & $rowAction $rowModule }
+    }
+}
+
+function Invoke-RowRefresh {
+    # Operacja, która wypełniła tabelę, ponownie - tylko dla obiektów z zaznaczonych wierszy (ich wiersze są podmieniane)
+    param([Parameter(Mandatory)][hashtable]$Module, [object[]]$Rows)
+    $op = $Module.LastGridOp
+    if (-not $op) { return }
+    $names = @(Get-RowTargetNames -Rows $Rows -Column $op.TargetColumn)
+    if ($names.Count -eq 0) { return }
+    $sp = @{ Module = $Module; Name = $op.Name; Targets = $names; ScriptBlock = $op.ScriptBlock; Local = [bool]$op.Local; Parameters = $op.Parameters; PerTarget = $op.PerTarget; TargetColumn = $op.TargetColumn; Pool = $op.Pool; ReplaceRows = $true }
+    if ($op.OnResult) { $sp.OnResult = $op.OnResult }
+    if ($op.OnComplete) { $sp.OnComplete = $op.OnComplete }
+    Start-HostOperation @sp
+}
+
+function Test-RowRefreshAvailable {
+    param([hashtable]$Module, [string]$Column)
+    return ($Module.LastGridOp -and $Module.LastGridOp.TargetColumn -eq $Column -and $Module.RowRefresh -ne $false -and -not $Module.Busy)
+}
+
+$script:ComputerTools = @(
+    @{ Text = 'Pulpit zdalny'; Icon = 'E8AF'; File = 'mstsc.exe'; Args = { param($n) @("/v:$n") } }
+    @{ Text = 'Zarządzanie komputerem'; Icon = 'E912'; File = 'compmgmt.msc'; Args = { param($n) @("/computer:\\$n") } }
+    @{ Text = 'Usługi'; Icon = 'E9F5'; File = 'services.msc'; Args = { param($n) @("/computer:\\$n") } }
+    @{ Text = 'Podgląd zdarzeń'; Icon = 'E81C'; File = 'eventvwr.exe'; Args = { param($n) @("\\$n") } }
+    @{ Text = 'Udział C$'; Icon = 'E838'; File = 'explorer.exe'; Args = { param($n) @("\\$n\C$") } }
+)
+
+function Add-TargetSubMenus {
+    <#
+        Wspólne akcje dla wierszy wskazujących komputery (kolumna Komputer) albo konta (Login): odświeżenie tylko tych obiektów,
+        zaznaczenie na liście po lewej i narzędzia komputera. Działają też na wierszach z błędem (np. ponowna próba).
+    #>
+    param([hashtable]$Module, $Menu, [object[]]$Rows)
+    $hosts = @(Get-RowTargetNames -Rows $Rows -Column 'Komputer')
+    if ($hosts.Count -gt 0) {
+        $sub = New-MenuItem -Text $(if ($hosts.Count -eq 1) { "Komputer $($hosts[0])" } else { "Komputery ($($hosts.Count))" }) -Icon 'E7F4'
+        [void]$sub.Items.Add((New-MenuItem -Text 'Odśwież tylko te komputery' -Icon 'E72C' -Module $Module -Enabled (Test-RowRefreshAvailable -Module $Module -Column 'Komputer') -Action {
+                    param($m) Invoke-RowRefresh -Module $m -Rows @(Get-SelectedResultRows -Module $m) }))
+        [void]$sub.Items.Add((New-MenuItem -Text 'Zaznacz na liście komputerów' -Icon 'E8B3' -Module $Module -Action {
+                    param($m) Add-ResultsToTargets -Module $m -Kind Computer -Column 'Komputer' -Rows @(Get-SelectedResultRows -Module $m) }))
+        [void]$sub.Items.Add((New-MenuSeparator))
+        foreach ($t in $script:ComputerTools) {
+            $item = New-MenuItem -Text $t.Text -Icon $t.Icon -Module $Module -Action {
+                param($m, $s)
+                $tool = $null
+                [void]$script:MenuTools.TryGetValue($s, [ref]$tool)
+                if (-not $tool) { return }
+                $names = @(Get-RowTargetNames -Rows @(Get-SelectedResultRows -Module $m) -Column 'Komputer')
+                if ($names.Count -gt 5) { Show-Warning ("Zaznaczono {0} komputerów – narzędzie otworzy się dla pierwszych pięciu." -f $names.Count) }
+                foreach ($n in @($names | Select-Object -First 5)) { Start-Tool -FilePath $tool.File -Arguments @(& $tool.Args $n) -Name $n }
+            }
+            $script:MenuTools[$item] = $t
+            [void]$sub.Items.Add($item)
+        }
+        if ($Menu.Items.Count -gt 0) { [void]$Menu.Items.Add((New-MenuSeparator)) }
+        [void]$Menu.Items.Add($sub)
+    }
+    $logins = @(Get-RowTargetNames -Rows $Rows -Column 'Login')
+    if ($logins.Count -gt 0 -and $Module.Workspace -eq 'AdUsers') {
+        $sub = New-MenuItem -Text $(if ($logins.Count -eq 1) { "Konto $($logins[0])" } else { "Konta ($($logins.Count))" }) -Icon 'E77B'
+        [void]$sub.Items.Add((New-MenuItem -Text 'Odśwież tylko te konta' -Icon 'E72C' -Module $Module -Enabled (Test-RowRefreshAvailable -Module $Module -Column 'Login') -Action {
+                    param($m) Invoke-RowRefresh -Module $m -Rows @(Get-SelectedResultRows -Module $m) }))
+        [void]$sub.Items.Add((New-MenuItem -Text 'Zaznacz na liście kont' -Icon 'E8B3' -Module $Module -Action {
+                    param($m) Add-ResultsToTargets -Module $m -Kind User -Column 'Login' -Rows @(Get-SelectedResultRows -Module $m) }))
+        if ($hosts.Count -eq 0 -and $Menu.Items.Count -gt 0) { [void]$Menu.Items.Add((New-MenuSeparator)) }
+        [void]$Menu.Items.Add($sub)
+    }
+}
+$script:MenuTools = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
 
 function Update-ParamsCollapse {
     param([hashtable]$Module)
@@ -3815,6 +3918,8 @@ function Complete-ModuleView {
 
 function Reset-ResultTable {
     param([Parameter(Mandatory)][hashtable]$Module)
+    # Odświeżenie wybranych obiektów z menu wiersza: tabela zostaje, wiersze podmienia Start-HostOperation
+    if ($script:TargetOverride.Refresh) { return }
     $table = New-Object System.Data.DataTable 'Wyniki'
     foreach ($c in '__search', '__flag', '__tone', '__cf') { [void]$table.Columns.Add($c, [string]) }
     # Nowe wyniki - nowe kolumny: filtry kolumn i ich lejki zaczynają od zera (pole «Filtruj wyniki» zostaje)
@@ -5237,6 +5342,8 @@ function Start-HostOperation {
         -PerTarget   : osobna hashtabla $P dla wybranych obiektów (np. różne usługi na różnych komputerach)
         -OnResult { param($m, $r) }   - po zakończeniu każdego obiektu ($r: Target, Ok, Data, Errors)
         -OnComplete { param($m, $op) } - po zakończeniu wszystkich (nie wywoływane po anulowaniu)
+        -ReplaceRows : zamiast czyścić tabelę - usuwa tylko wiersze tych obiektów (odświeżenie wybranych komputerów);
+                       tak samo działa w trakcie Invoke-WithTargets -Refresh
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Module,
@@ -5251,7 +5358,8 @@ function Start-HostOperation {
         [switch]$Append,
         [scriptblock]$OnResult,
         [scriptblock]$OnComplete,
-        [ValidateSet('Default', 'AD')][string]$Pool = 'Default'
+        [ValidateSet('Default', 'AD')][string]$Pool = 'Default',
+        [switch]$ReplaceRows
     )
     if ($Module.Busy) {
         Show-Warning "Poprzednia operacja w module «$($Module.Title)» jeszcze trwa. Poczekaj na jej zakończenie lub przerwij ją na pasku stanu."
@@ -5263,7 +5371,15 @@ function Start-HostOperation {
     Initialize-Engine -Ad:($Pool -eq 'AD')
     Initialize-EngineTimer
     $runspacePool = if ($Pool -eq 'AD') { $script:Engine.AdPool } else { $script:Engine.Pool }
-    if ($Output -eq 'Grid' -and -not $Append -and $Module.Grid) { Reset-ResultTable -Module $Module }
+    if ($Output -eq 'Grid' -and -not $Append -and $Module.Grid) {
+        $replace = ($ReplaceRows -or $script:TargetOverride.Refresh) -and $TargetColumn -and $Module.Table -and $Module.Table.Columns.Contains($TargetColumn)
+        if ($replace) { Remove-ResultRows -Module $Module -Rows @($Module.Table.Rows | Where-Object { $items -contains [string]$_[$TargetColumn] }) }
+        elseif (-not ($ReplaceRows -or $script:TargetOverride.Refresh)) { Reset-ResultTable -Module $Module }
+    }
+    # Operacja, która wypełnia tabelę - do odświeżenia wybranych obiektów z menu wiersza (Invoke-RowRefresh)
+    if ($Output -eq 'Grid' -and -not $Append -and $TargetColumn) {
+        $Module.LastGridOp = @{ Name = $Name; ScriptBlock = $ScriptBlock; Local = [bool]$Local; Parameters = $Parameters; PerTarget = $PerTarget; TargetColumn = $TargetColumn; OnResult = $OnResult; OnComplete = $OnComplete; Pool = $Pool }
+    }
 
     $ctx = @{
         Credential    = Get-EffectiveCredential
@@ -5288,6 +5404,8 @@ function Start-HostOperation {
         Cancelled    = $false
         CancelAt     = $null
         Started      = Get-Date
+        # Cele podstawione przez akcję wiersza - odświeżenie po zakończeniu (OnComplete) dotyczy tylko ich
+        Override     = Get-TargetOverride
     }
     $script:Engine.NextId++
 
@@ -5525,7 +5643,11 @@ function Complete-Operation {
     if ($Operation.OnComplete -and -not $Operation.Cancelled) {
         $previous = $script:LogContext
         $script:LogContext = $m.Title
-        try { $null = & $Operation.OnComplete $m $Operation }
+        try {
+            $ov = $Operation.Override
+            if ($ov -and $m.RowRefresh -ne $false) { Invoke-WithTargets -Kind $ov.Kind -Names $ov.Names -Refresh -Action { $null = & $Operation.OnComplete $m $Operation } }
+            else { $null = & $Operation.OnComplete $m $Operation }
+        }
         catch { Write-Log "Błąd po zakończeniu operacji: $($_.Exception.Message)" 'ERROR' }
         finally { $script:LogContext = $previous }
     }
@@ -5693,6 +5815,11 @@ function New-ModuleContext {
         PrimaryButton  = $null
         RowActions     = New-Object System.Collections.ArrayList
         Actions        = @{}
+        # Przyciski paska narzędzi wywoływane z menu wiersza (Invoke-ForRowTargets -Button)
+        Btn            = @{}
+        # Ostatnia operacja wypełniająca tabelę (odświeżenie wybranych obiektów); RowRefresh = $false wyłącza je w module
+        LastGridOp     = $null
+        RowRefresh     = $null
         RowDoubleClick = $null
         SecretColumns  = @()
         PillColumns    = @()
@@ -5806,9 +5933,36 @@ function Update-NavBusy {
 }
 $script:NavDots = @{}
 
+# Cele podstawione przez akcję wiersza (Invoke-WithTargets): akcje paska narzędzi działają wtedy na obiektach
+# z zaznaczonych wierszy wyników zamiast na liście po lewej. Refresh: tabela - podmiana tylko wierszy tych obiektów.
+$script:TargetOverride = @{ Computer = $null; User = $null; Group = $null; Refresh = $false }
+
+function Invoke-WithTargets {
+    param([Parameter(Mandatory)][ValidateSet('Computer', 'User', 'Group')][string]$Kind, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Names, [Parameter(Mandatory)][scriptblock]$Action, [switch]$Refresh)
+    # Nazwy lokalne z przedrostkiem: blok wykonuje się w tym zasięgu i nie powinien widzieć tu zwykłych nazw
+    $__twPrev = $script:TargetOverride[$Kind]
+    $__twPrevRefresh = $script:TargetOverride.Refresh
+    $script:TargetOverride[$Kind] = @($Names)
+    $script:TargetOverride.Refresh = [bool]$Refresh
+    try { & $Action }
+    finally {
+        $script:TargetOverride[$Kind] = $__twPrev
+        $script:TargetOverride.Refresh = $__twPrevRefresh
+    }
+}
+
+function Get-TargetOverride {
+    # Aktywne podstawienie celów (Kind, Names) albo $null
+    foreach ($k in 'Computer', 'User', 'Group') {
+        if ($null -ne $script:TargetOverride[$k]) { return @{ Kind = $k; Names = @($script:TargetOverride[$k]) } }
+    }
+    return $null
+}
+
 function Get-TargetComputers {
-    # Komputery zaznaczone na liście po lewej
+    # Komputery zaznaczone na liście po lewej (albo podstawione przez akcję wiersza)
     param([switch]$Quiet)
+    if ($null -ne $script:TargetOverride.Computer) { return @($script:TargetOverride.Computer) }
     $rows = @($script:UI.HostTable.Select('Sel = true', 'Name ASC'))
     $names = @($rows | ForEach-Object { [string]$_['Name'] } | Where-Object { $_ } | Select-Object -Unique)
     if ($names.Count -eq 0 -and -not $Quiet) { Show-Warning 'Zaznacz komputery na liście po lewej stronie.' }
@@ -5816,8 +5970,9 @@ function Get-TargetComputers {
 }
 
 function Get-TargetGroups {
-    # Grupy zaznaczone na liście grup (sAMAccountName)
+    # Grupy zaznaczone na liście grup (sAMAccountName) albo podstawione przez akcję wiersza
     param([switch]$Quiet)
+    if ($null -ne $script:TargetOverride.Group) { return @($script:TargetOverride.Group) }
     $rows = @($script:UI.GroupTable.Select('Sel = true', 'Sam ASC'))
     $names = @($rows | ForEach-Object { [string]$_['Sam'] } | Where-Object { $_ } | Select-Object -Unique)
     if ($names.Count -eq 0 -and -not $Quiet) { Show-Warning 'Zaznacz grupy na liście po lewej stronie.' }
@@ -5825,8 +5980,9 @@ function Get-TargetGroups {
 }
 
 function Get-TargetUsers {
-    # Konta zaznaczone na liście użytkowników (sAMAccountName)
+    # Konta zaznaczone na liście użytkowników (sAMAccountName) albo podstawione przez akcję wiersza
     param([switch]$Quiet)
+    if ($null -ne $script:TargetOverride.User) { return @($script:TargetOverride.User) }
     $rows = @($script:UI.UserTable.Select('Sel = true', 'Login ASC'))
     $names = @($rows | ForEach-Object { [string]$_['Login'] } | Where-Object { $_ } | Select-Object -Unique)
     if ($names.Count -eq 0 -and -not $Quiet) { Show-Warning 'Zaznacz konta na liście użytkowników po lewej stronie.' }
@@ -7329,7 +7485,6 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Connectivity' 
         if (-not $targets) { return }
         $ports = @(Split-ListText ($m.Ports.Text -replace '\s+', ',') | Where-Object { $_ -match '^\d+$' -and [int]$_ -ge 1 -and [int]$_ -le 65535 } | ForEach-Object { [int]$_ } | Select-Object -Unique)
         $params = @{ Ports = $ports; TimeoutMs = (Get-Num $m.TcpTimeout); TestSession = (Test-Checked $m.TestSession) }
-        $m.Data.Counts = @{ ok = 0; warn = 0; crit = 0 }
         Reset-StatTiles $m
         Start-HostOperation -Module $m -Name 'Test łączności' -Targets $targets -Local -Parameters $params -ScriptBlock {
             param($Target, $P, $Ctx)
@@ -7391,12 +7546,18 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Connectivity' 
             $psText = if ($d.Count -gt 0) { [string](Get-ObjectValue $d[0] 'PowerShell zdalnie') } else { '' }
             if ($psText -like 'Tak*') { $status += ' • ' + ($psText -replace '^Tak \((.*)\)$', '$1') }
             Set-ComputerState -Name $r.Target -State $tone -Status $status
-            $m.Data.Counts[$tone]++
         } -OnComplete {
             param($m)
-            Set-StatTile -Module $m -Key 'ok' -Value ([string]$m.Data.Counts.ok) -Tone 'ok'
-            Set-StatTile -Module $m -Key 'warn' -Value ([string]$m.Data.Counts.warn) -Tone $(if ($m.Data.Counts.warn) { 'warn' } else { '' })
-            Set-StatTile -Module $m -Key 'crit' -Value ([string]$m.Data.Counts.crit) -Tone $(if ($m.Data.Counts.crit) { 'crit' } else { '' })
+            # Liczniki z tabeli (po odświeżeniu wybranych komputerów tabela zawiera też starsze wyniki pozostałych)
+            $counts = @{ ok = 0; warn = 0; crit = 0 }
+            foreach ($row in $m.Table.Rows) {
+                $t = [string]$row['__tone']
+                if (-not $counts.ContainsKey($t)) { $t = 'crit' }
+                $counts[$t]++
+            }
+            Set-StatTile -Module $m -Key 'ok' -Value ([string]$counts.ok) -Tone 'ok'
+            Set-StatTile -Module $m -Key 'warn' -Value ([string]$counts.warn) -Tone $(if ($counts.warn) { 'warn' } else { '' })
+            Set-StatTile -Module $m -Key 'crit' -Value ([string]$counts.crit) -Tone $(if ($counts.crit) { 'crit' } else { '' })
         }
     } | Out-Null
     Add-Button -Parent $row2 -Text 'Zaznacz tylko dostępne' -Icon 'E73E' -Module $m -AlwaysEnabled -ToolTip 'Na liście komputerów zostaną zaznaczone tylko komputery dostępne w ostatnim teście' -OnClick {
@@ -7547,12 +7708,15 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Power' -Title 
             "$what zaplanowane za $($P.Delay) s."
         }
     }
-    $b = Add-Button -Parent $row3 -Text 'Restart' -Icon 'E777' -Module $m -Danger -OnClick $powerAction
-    $b.Tag = '/r'
-    $b = Add-Button -Parent $row3 -Text 'Wyłącz' -Icon 'E7E8' -Module $m -Danger -OnClick $powerAction
-    $b.Tag = '/s'
-    $b = Add-Button -Parent $row3 -Text 'Anuluj zaplanowane' -Icon 'E711' -Module $m -OnClick $powerAction
-    $b.Tag = '/a'
+    foreach ($a in @(@('Restart', '/r', 'E777', $true), @('Wyłącz', '/s', 'E7E8', $true), @('Anuluj zaplanowane', '/a', 'E711', $false))) {
+        $b = Add-Button -Parent $row3 -Text $a[0] -Icon $a[2] -Module $m -Danger:$a[3] -OnClick $powerAction
+        $b.Tag = $a[1]
+        $m.Btn[$a[1]] = $b
+    }
+    # Z menu wiersza: te same akcje (opóźnienie i komunikat z paska) dla komputerów z zaznaczonych wierszy
+    Add-RowAction -Module $m -Text 'Uruchom ponownie…' -Icon 'E777' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['/r'] }
+    Add-RowAction -Module $m -Text 'Wyłącz…' -Icon 'E7E8' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['/s'] }
+    Add-RowAction -Module $m -Text 'Anuluj zaplanowany restart' -Icon 'E711' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['/a'] }
 }
 #endregion
 
@@ -8290,6 +8454,10 @@ Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'Rdp
         $computer = [string](Get-ObjectValue $rows[0] 'Komputer')
         Start-Tool -FilePath 'mstsc.exe' -Arguments @("/v:$computer") -Name $computer
     }
+    Add-RowAction -Module $m -Text 'Włącz RDP' -Icon 'E73E' -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Set $m 'Enable' } }
+    Add-RowAction -Module $m -Text 'Wymagaj NLA' -Icon 'E72E' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Set $m 'NlaOn' } }
+    Add-RowAction -Module $m -Text 'Wyłącz NLA' -Icon 'E785' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Set $m 'NlaOff' } }
+    Add-RowAction -Module $m -Text 'Wyłącz RDP' -Icon 'E711' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Set $m 'Disable' } }
 }
 #endregion
 
@@ -8496,7 +8664,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
     $row3 = Add-ToolbarRow -Module $m -Title 'Limit czasu'
     $m.Timeout = Add-ComboBox -Parent $row3 -Items @($script:ExecTimeouts.Keys) -Width 120
     $m.Timeout.SelectedIndex = 2
-    Add-Button -Parent $row3 -Text 'Uruchom na zaznaczonych' -Icon 'E768' -Module $m -Primary -OnClick {
+    $m.Btn.Run = Add-Button -Parent $row3 -Text 'Uruchom na zaznaczonych' -Icon 'E768' -Module $m -Primary -OnClick {
         param($m)
         $command = $m.CommandBox.Text.Trim()
         if (-not $command) { Show-Warning 'Wpisz polecenie do wykonania.'; return }
@@ -8512,8 +8680,9 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
         Write-Log "Polecenie ($mode, limit $limitName): $command"
         $params = @{ Mode = $(if ($isPs) { 'PS' } else { 'CMD' }); Command = $command; TimeoutSec = $timeout }
         Start-HostOperation -Module $m -Name "Polecenie $mode" -Targets $targets -Parameters $params -ScriptBlock $script:RemoteExecScript
-    } | Out-Null
+    }
     Add-Label -Parent $row3 -Text 'Polecenie działa w osobnym procesie, bez okna i bez klawiatury: programy czekające na odpowiedź (cmd, pause, choice, set /p, Read-Host) kończą się od razu. Po upływie limitu albo po kliknięciu «Przerwij» proces wraz z potomnymi jest zamykany. Kilka linii w trybie cmd.exe działa jak plik .cmd (@echo off). Zasoby sieciowe mogą być niedostępne (podwójny przeskok).' -Hint -MaxWidth 760 | Out-Null
+    Add-RowAction -Module $m -Text 'Uruchom polecenie ponownie na tych komputerach' -Icon 'E768' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Run }
 }
 
 Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' -Title 'Instalacja oprogramowania' -Icon 'E896' `
@@ -8534,7 +8703,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
     Add-Label -Parent $row2 -Text '   Limit czasu' | Out-Null
     $m.Timeout = Add-ComboBox -Parent $row2 -Items @($script:ExecTimeouts.Keys) -Width 120
     $m.Timeout.SelectedIndex = 4
-    Add-Button -Parent $row2 -Text 'Zainstaluj na zaznaczonych' -Icon 'E896' -Module $m -Primary -OnClick {
+    $m.Btn.Run = Add-Button -Parent $row2 -Text 'Zainstaluj na zaznaczonych' -Icon 'E896' -Module $m -Primary -OnClick {
         param($m)
         $path = $m.Path.Text.Trim().Trim('"')
         if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { Show-Warning 'Wskaż istniejący plik instalatora.'; return }
@@ -8651,8 +8820,9 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
                 Remove-PSSession -Session $session -ErrorAction SilentlyContinue
             }
         }
-    } | Out-Null
+    }
     Add-Label -Parent (Add-ToolbarRow -Module $m -Title ' ') -Text 'MSI/MSP: automatycznie /qn /norestart i log w %SystemRoot%\Temp\DomainOps;  MSU: /quiet /norestart;  EXE: podaj przełączniki cichej instalacji.' -Hint | Out-Null
+    Add-RowAction -Module $m -Text 'Zainstaluj ponownie na tych komputerach' -Icon 'E896' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Run }
 }
 
 Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'GPUpdate' -Title 'Aktualizacja zasad grupy' -Icon 'E895' `
@@ -8663,7 +8833,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'GPUpdate'
     Add-Label -Parent $row -Text 'Zakres' | Out-Null
     $m.Scope = Add-ComboBox -Parent $row -Items @('Komputer', 'Komputer i użytkownik', 'Użytkownik') -Width 200
     $m.Force = Add-CheckBox -Parent $row -Text 'Wymuś ponowne zastosowanie (/force)' -Checked $true
-    Add-Button -Parent $row -Text 'Uruchom gpupdate' -Icon 'E895' -Module $m -Primary -OnClick {
+    $m.Btn.Run = Add-Button -Parent $row -Text 'Uruchom gpupdate' -Icon 'E895' -Module $m -Primary -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -8689,7 +8859,8 @@ param(`$P)
 }
 "@)
         Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters $params -ScriptBlock $sb
-    } | Out-Null
+    }
+    Add-RowAction -Module $m -Text 'Uruchom gpupdate na tych komputerach' -Icon 'E895' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Run }
 }
 #endregion
 
@@ -8737,15 +8908,17 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Services' -Title 'U
         }
     }
     $m.Actions.Change = {
-        param($m, [string]$Op, $Rows)
+        # -StartupFromMenu (Automatic / Manual / Disabled) z menu wiersza; bez niego typ z listy na pasku
+        param($m, [string]$Op, $Rows, [string]$StartupFromMenu = '')
         $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Nazwa') -Rows $Rows
         if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli usługi, których dotyczy operacja.'; return }
-        $startup = @('Automatic', 'Manual', 'Disabled')[$m.StartupType.SelectedIndex]
+        $startup = if ($StartupFromMenu) { $StartupFromMenu } else { @('Automatic', 'Manual', 'Disabled')[$m.StartupType.SelectedIndex] }
+        $startupText = @{ Automatic = 'Automatyczny'; Manual = 'Ręczny'; Disabled = 'Wyłączony' }[$startup]
         $question = @{
             Start       = 'Uruchomić wybrane usługi?'
             Stop        = 'Zatrzymać wybrane usługi? Zatrzymane zostaną też usługi od nich zależne.'
             Restart     = 'Uruchomić ponownie wybrane usługi?'
-            StartupType = "Ustawić typ uruchamiania «$($m.StartupType.SelectedItem)» dla wybranych usług?"
+            StartupType = "Ustawić typ uruchamiania «$startupText» dla wybranych usług?"
         }[$Op]
         $items = Get-HostItemList -ByHost $byHost -Format { param($i) $i['Nazwa'] }
         if (-not (Confirm-Action -Text $question -Items $items -ConfirmText 'Wykonaj' -Danger:($Op -eq 'Stop'))) { return }
@@ -8787,6 +8960,9 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Services' -Title 'U
     Add-RowAction -Module $m -Text 'Uruchom' -Icon 'E768' -Action { param($m, $rows) & $m.Actions.Change $m 'Start' $rows }
     Add-RowAction -Module $m -Text 'Zatrzymaj' -Icon 'E71A' -Action { param($m, $rows) & $m.Actions.Change $m 'Stop' $rows }
     Add-RowAction -Module $m -Text 'Uruchom ponownie' -Icon 'E72C' -Action { param($m, $rows) & $m.Actions.Change $m 'Restart' $rows }
+    Add-RowAction -Module $m -Text 'Typ uruchamiania: automatyczny' -Icon 'E768' -Separator -Action { param($m, $rows) & $m.Actions.Change $m 'StartupType' $rows 'Automatic' }
+    Add-RowAction -Module $m -Text 'Typ uruchamiania: ręczny' -Icon 'E7C3' -Action { param($m, $rows) & $m.Actions.Change $m 'StartupType' $rows 'Manual' }
+    Add-RowAction -Module $m -Text 'Typ uruchamiania: wyłączony' -Icon 'E711' -Action { param($m, $rows) & $m.Actions.Change $m 'StartupType' $rows 'Disabled' }
 }
 
 Register-Module -Workspace 'Remote' -Category 'System' -Key 'Processes' -Title 'Procesy' -Icon 'E7EF' `
@@ -8891,7 +9067,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
     $m.WuCache = Add-CheckBox -Parent $row2 -Text 'Pobrane aktualizacje (SoftwareDistribution\Download)' -ToolTip 'Usługa Windows Update zostanie na chwilę zatrzymana'
     Add-Label -Parent $row2 -Text 'Starsze niż (dni)' | Out-Null
     $m.Days = Add-Numeric -Parent $row2 -Value 2 -Minimum 0 -Maximum 365 -Width 60
-    Add-Button -Parent $row2 -Text 'Wyczyść na zaznaczonych' -Icon 'E74D' -Module $m -Danger -OnClick {
+    $m.Btn.Clean = Add-Button -Parent $row2 -Text 'Wyczyść na zaznaczonych' -Icon 'E74D' -Module $m -Danger -OnClick {
         param($m)
         if (-not ((Test-Checked $m.WinTemp) -or (Test-Checked $m.UserTemp) -or (Test-Checked $m.Recycle) -or (Test-Checked $m.WuCache))) { Show-Warning 'Wybierz, co ma zostać wyczyszczone.'; return }
         $targets = @(Get-TargetComputers)
@@ -8960,7 +9136,8 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
                 'Wolne na systemowym (GB)'     = [Math]::Round($after / 1GB, 1)
             }
         }
-    } | Out-Null
+    }
+    Add-RowAction -Module $m -Text 'Wyczyść pliki tymczasowe…' -Icon 'E74D' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Clean }
 }
 
 Register-Module -Workspace 'Remote' -Category 'System' -Key 'Events' -Title 'Dziennik zdarzeń' -Icon 'E81C' `
@@ -9401,7 +9578,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Drivers' -Title 'St
             }
         }
     } | Out-Null
-    Add-Button -Parent $row -Text 'Urządzenia z problemami' -Icon 'E7BA' -Module $m -OnClick {
+    $m.Btn.Problems = Add-Button -Parent $row -Text 'Urządzenia z problemami' -Icon 'E7BA' -Module $m -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -9421,7 +9598,8 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Drivers' -Title 'St
                 }
             }
         }
-    } | Out-Null
+    }
+    Add-RowAction -Module $m -Text 'Urządzenia z problemami na tych komputerach' -Icon 'E7BA' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Problems }
 }
 #endregion
 
@@ -9779,7 +9957,7 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
     $m.PillColumns = @('Status', 'Stan')
     $row = Add-ToolbarRow -Module $m -Title 'Sprawdzenie'
     $m.Drivers = Add-CheckBox -Parent $row -Text 'Uwzględnij sterowniki'
-    Add-Button -Parent $row -Text 'Wyszukaj dostępne' -Icon 'E721' -Module $m -Primary -OnClick {
+    $m.Btn.Search = Add-Button -Parent $row -Text 'Wyszukaj dostępne' -Icon 'E721' -Module $m -Primary -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -9804,8 +9982,8 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
                 }
             }
         }
-    } | Out-Null
-    Add-Button -Parent $row -Text 'Historia (ostatnie 50)' -Icon 'E81C' -Module $m -OnClick {
+    }
+    $m.Btn.History = Add-Button -Parent $row -Text 'Historia (ostatnie 50)' -Icon 'E81C' -Module $m -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -9828,7 +10006,7 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
                 }
             }
         }
-    } | Out-Null
+    }
     $row2 = Add-ToolbarRow -Module $m -Title 'Poprawki KB'
     $m.Kb = Add-TextBox -Parent $row2 -Width 300 -Placeholder 'np. KB5034441, KB5005565'
     Add-Button -Parent $row2 -Text 'Sprawdź obecność' -Icon 'E73E' -Module $m -OnClick {
@@ -9869,7 +10047,7 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
     } | Out-Null
     $row3 = Add-ToolbarRow -Module $m -Title 'Instalacja'
     $m.AutoReboot = Add-CheckBox -Parent $row3 -Text 'Automatyczny restart po instalacji (za 5 min), jeśli wymagany'
-    Add-Button -Parent $row3 -Text 'Zainstaluj aktualizacje' -Icon 'E896' -Module $m -Danger -OnClick {
+    $m.Btn.Install = Add-Button -Parent $row3 -Text 'Zainstaluj aktualizacje' -Icon 'E896' -Module $m -Danger -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -9895,8 +10073,8 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
             Start-ScheduledTask -TaskName $taskName
             'Zlecono instalację (zadanie SYSTEM). Postęp: przycisk «Stan instalacji».'
         }
-    } | Out-Null
-    Add-Button -Parent $row3 -Text 'Stan instalacji' -Icon 'E9D9' -Module $m -OnClick {
+    }
+    $m.Btn.State = Add-Button -Parent $row3 -Text 'Stan instalacji' -Icon 'E9D9' -Module $m -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -9922,8 +10100,12 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
                 '__tone'          = $(if ($state -eq 'Running') { 'info' } elseif ($rebootRequired) { 'warn' } else { 'ok' })
             }
         }
-    } | Out-Null
+    }
     $m.GoodWhenNo = @('Wymaga restartu')
+    Add-RowAction -Module $m -Text 'Wyszukaj dostępne aktualizacje' -Icon 'E721' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Search }
+    Add-RowAction -Module $m -Text 'Historia aktualizacji' -Icon 'E81C' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.History }
+    Add-RowAction -Module $m -Text 'Stan instalacji' -Icon 'E9D9' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.State }
+    Add-RowAction -Module $m -Text 'Zainstaluj aktualizacje…' -Icon 'E896' -Danger -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Install }
 }
 #endregion
 
@@ -10082,7 +10264,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Defender' 
     param($m)
     $m.ColorBools = $true
     $row = Add-ToolbarRow -Module $m -Title 'Stan'
-    Add-Button -Parent $row -Text 'Stan ochrony' -Icon 'E83D' -Module $m -Primary -OnClick {
+    $m.Btn.State = Add-Button -Parent $row -Text 'Stan ochrony' -Icon 'E83D' -Module $m -Primary -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -10104,8 +10286,8 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Defender' 
                 '__flag'                    = $(if (-not $s.RealTimeProtectionEnabled -or $s.AntivirusSignatureAge -gt 3) { 'warn' } else { '' })
             }
         }
-    } | Out-Null
-    Add-Button -Parent $row -Text 'Wykryte zagrożenia' -Icon 'E7BA' -Module $m -OnClick {
+    }
+    $m.Btn.Threats = Add-Button -Parent $row -Text 'Wykryte zagrożenia' -Icon 'E7BA' -Module $m -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -10128,7 +10310,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Defender' 
                 }
             }
         }
-    } | Out-Null
+    }
     $row2 = Add-ToolbarRow -Module $m -Title 'Akcje'
     $defAction = {
         param($m, $s)
@@ -10151,7 +10333,13 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Defender' 
     foreach ($a in @(@('Aktualizuj sygnatury', 'Update', 'E895'), @('Szybki skan', 'QuickScan', 'E721'), @('Pełny skan', 'FullScan', 'E9D9'))) {
         $b = Add-Button -Parent $row2 -Text $a[0] -Icon $a[2] -Module $m -OnClick $defAction
         $b.Tag = $a[1]
+        $m.Btn[$a[1]] = $b
     }
+    Add-RowAction -Module $m -Text 'Stan ochrony' -Icon 'E83D' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.State }
+    Add-RowAction -Module $m -Text 'Wykryte zagrożenia' -Icon 'E7BA' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Threats }
+    Add-RowAction -Module $m -Text 'Aktualizuj sygnatury' -Icon 'E895' -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['Update'] }
+    Add-RowAction -Module $m -Text 'Szybki skan' -Icon 'E721' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['QuickScan'] }
+    Add-RowAction -Module $m -Text 'Pełny skan' -Icon 'E9D9' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['FullScan'] }
 }
 
 Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'BitLocker' -Title 'BitLocker' -Icon 'E72E' `
@@ -10198,7 +10386,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'BitLocker'
             }
         }
     } | Out-Null
-    Add-Button -Parent $row -Text 'Kopia kluczy do AD' -Icon 'E74E' -Module $m -OnClick {
+    $m.Btn.Backup = Add-Button -Parent $row -Text 'Kopia kluczy do AD' -Icon 'E74E' -Module $m -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -10233,7 +10421,8 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'BitLocker'
                 }
             }
         }
-    } | Out-Null
+    }
+    Add-RowAction -Module $m -Text 'Kopia kluczy do AD' -Icon 'E74E' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Backup }
 }
 
 Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Firewall' -Title 'Zapora Windows' -Icon 'E785' `
@@ -10440,7 +10629,7 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Certificat
         $params = @{ Store = [string]$m.Store.SelectedItem; Filter = $m.Filter.Text.Trim(); ExpiringDays = $(if (Test-Checked $m.OnlyExpiring) { Get-Num $m.Days } else { 0 }) }
         Start-HostOperation -Module $m -Name 'Certyfikaty' -Targets $targets -Parameters $params -ScriptBlock $script:CertificatesScript
     } | Out-Null
-    Add-Button -Parent $row2 -Text 'Eksportuj zaznaczone (.cer)…' -Icon 'EDE1' -Module $m -OnClick {
+    $m.Btn.Export = Add-Button -Parent $row2 -Text 'Eksportuj zaznaczone (.cer)…' -Icon 'EDE1' -Module $m -OnClick {
         param($m)
         $byHost = Get-SelectedRowsByHost -Module $m -Columns @('Odcisk palca', 'Magazyn')
         if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli certyfikaty do eksportu.'; return }
@@ -10469,7 +10658,8 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Certificat
                 Write-Log ("[{0}] zapisano {1}" -f $r.Target, $file) 'OK'
             }
         }
-    } | Out-Null
+    }
+    Add-RowAction -Module $m -Text 'Eksportuj (.cer)…' -Icon 'EDE1' -Action { param($m, $rows) $m.Btn.Export.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $m.Btn.Export))) }
 }
 #endregion
 
@@ -13325,6 +13515,10 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserPassword' -Titl
         param($m, $rows)
         & $m.Actions.Simple $m 'Unlock' @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Login') })
     }
+    Add-RowAction -Module $m -Text 'Resetuj hasło…' -Icon 'E8D7' -Danger -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Kind User -Action { param($m) & $m.Actions.Reset $m } }
+    Add-RowAction -Module $m -Text 'Wymuś zmianę hasła przy logowaniu' -Icon 'E777' -Action { param($m, $rows) & $m.Actions.Simple $m 'MustChange' @(Get-RowTargetNames -Rows $rows -Column 'Login') }
+    Add-RowAction -Module $m -Text 'Hasło nigdy nie wygasa: włącz' -Icon 'E73E' -Action { param($m, $rows) & $m.Actions.Simple $m 'NeverOn' @(Get-RowTargetNames -Rows $rows -Column 'Login') }
+    Add-RowAction -Module $m -Text 'Hasło nigdy nie wygasa: wyłącz' -Icon 'E711' -Action { param($m, $rows) & $m.Actions.Simple $m 'NeverOff' @(Get-RowTargetNames -Rows $rows -Column 'Login') }
     $m.ResultHint = 'Nowe hasła są ukryte – «Pokaż poufne» albo «Kopiuj hasło» w menu wiersza'
 }
 
@@ -13429,6 +13623,12 @@ Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserState' -Title '
     $m.ExpireDate = Add-TextBox -Parent $row3 -Width 130 -Text ((Get-Date).AddDays(30).ToString('yyyy-MM-dd')) -Placeholder 'RRRR-MM-DD'
     Add-Button -Parent $row3 -Text 'Ustaw datę wygaśnięcia' -Icon 'E787' -Module $m -OnClick { param($m) & $m.Actions.Change $m 'Expire' } | Out-Null
     Add-Button -Parent $row3 -Text 'Usuń datę wygaśnięcia' -Icon 'E711' -Module $m -OnClick { param($m) & $m.Actions.Change $m 'ClearExpire' } | Out-Null
+    # Z menu wiersza: te same zmiany dla kont z zaznaczonych wierszy (OU, data wygaśnięcia z pól na pasku)
+    Add-RowAction -Module $m -Text 'Włącz konto' -Icon 'E73E' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Kind User -Action { param($m) & $m.Actions.Change $m 'Enable' } }
+    Add-RowAction -Module $m -Text 'Wyłącz konto' -Icon 'E8D8' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Kind User -Action { param($m) & $m.Actions.Change $m 'Disable' } }
+    Add-RowAction -Module $m -Text 'Przenieś do OU…' -Icon 'E8DE' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Kind User -Action { param($m) & $m.Actions.Change $m 'Move' } }
+    Add-RowAction -Module $m -Text 'Ustaw datę wygaśnięcia (z pola na pasku)' -Icon 'E787' -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Kind User -Action { param($m) & $m.Actions.Change $m 'Expire' } }
+    Add-RowAction -Module $m -Text 'Usuń datę wygaśnięcia' -Icon 'E711' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Kind User -Action { param($m) & $m.Actions.Change $m 'ClearExpire' } }
 }
 
 $script:UserAttributes = @(
@@ -13831,7 +14031,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
     }
     $row = Add-ToolbarRow -Module $m -Title 'Informacje'
     Add-Button -Parent $row -Text 'Informacje z AD' -Icon 'E946' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
-    Add-Button -Parent $row -Text 'Test kanału zaufania' -Icon 'E9D9' -Module $m -OnClick {
+    $m.Btn.TestChannel = Add-Button -Parent $row -Text 'Test kanału zaufania' -Icon 'E9D9' -Module $m -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -13854,8 +14054,8 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
                 '__tone'           = $(if ($ok) { 'ok' } else { 'crit' })
             }
         }
-    } | Out-Null
-    Add-Button -Parent $row -Text 'Napraw kanał zaufania' -Icon 'E90F' -Module $m -Danger -OnClick {
+    }
+    $m.Btn.RepairChannel = Add-Button -Parent $row -Text 'Napraw kanał zaufania' -Icon 'E90F' -Module $m -Danger -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -13871,7 +14071,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
             if ($P.Server) { $tp.Server = $P.Server }
             if (Test-ComputerSecureChannel @tp) { 'Kanał zaufania naprawiony.' } else { 'Błąd – naprawa nie powiodła się.' }
         }
-    } | Out-Null
+    }
     Add-ObjectReportRow -Module $m -Kind 'Computer'
     $row2 = Add-ToolbarRow -Module $m -Title 'Konto w AD'
     Add-Button -Parent $row2 -Text 'Włącz' -Icon 'E73E' -Module $m -OnClick { param($m) & $m.Actions.Change $m 'Enable' } | Out-Null
@@ -13882,6 +14082,15 @@ Register-Module -Workspace 'AdComputers' -Category 'Konta komputerów' -Key 'Com
     $row3 = Add-ToolbarRow -Module $m -Title 'Opis'
     $m.Description = Add-TextBox -Parent $row3 -Width 360 -Placeholder 'opis konta komputera (puste = usuń opis)'
     Add-Button -Parent $row3 -Text 'Ustaw opis' -Icon 'E70F' -Module $m -OnClick { param($m) & $m.Actions.Change $m 'Describe' } | Out-Null
+    # Z menu wiersza: te same akcje dla komputerów z zaznaczonych wierszy (OU, opis z pól na pasku)
+    Add-RowAction -Module $m -Text 'Test kanału zaufania' -Icon 'E9D9' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.TestChannel }
+    Add-RowAction -Module $m -Text 'Napraw kanał zaufania…' -Icon 'E90F' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.RepairChannel }
+    Add-RowAction -Module $m -Text 'Włącz konto' -Icon 'E73E' -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Change $m 'Enable' } }
+    Add-RowAction -Module $m -Text 'Wyłącz konto' -Icon 'E8D8' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Change $m 'Disable' } }
+    Add-RowAction -Module $m -Text 'Przenieś do OU…' -Icon 'E8DE' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Change $m 'Move' } }
+    Add-RowAction -Module $m -Text 'Ustaw opis (z pola na pasku)' -Icon 'E70F' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Change $m 'Describe' } }
+    Add-RowAction -Module $m -Text 'Resetuj konto…' -Icon 'E777' -Danger -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Change $m 'Reset' } }
+    Add-RowAction -Module $m -Text 'Usuń z AD…' -Icon 'E74D' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Action { param($m) & $m.Actions.Change $m 'Delete' } }
     $row4 = Add-ToolbarRow -Module $m -Title 'Nowe konto'
     Add-Button -Parent $row4 -Text 'Utwórz konto komputera…' -Icon 'E710' -Module $m -OnClick {
         param($m)
@@ -13972,7 +14181,7 @@ Register-Module -Workspace 'AdComputers' -Category 'Hasła i klucze' -Key 'Laps'
     Add-Button -Parent $row -Text 'Kopiuj hasło zaznaczonego' -Icon 'E8C8' -Module $m -AlwaysEnabled -OnClick { param($m) & $m.Actions.Copy $m $null } | Out-Null
     $row2 = Add-ToolbarRow -Module $m -Title 'Zmiana hasła'
     $m.ProcessNow = Add-CheckBox -Parent $row2 -Text 'Od razu przetwórz zasady na komputerze' -Checked $true
-    Add-Button -Parent $row2 -Text 'Wymuś zmianę hasła' -Icon 'E777' -Module $m -Danger -OnClick {
+    $m.Btn.LapsReset = Add-Button -Parent $row2 -Text 'Wymuś zmianę hasła' -Icon 'E777' -Module $m -Danger -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
@@ -14013,8 +14222,9 @@ Register-Module -Workspace 'AdComputers' -Category 'Hasła i klucze' -Key 'Laps'
             }
             $msg + '.'
         }
-    } | Out-Null
+    }
     Add-RowAction -Module $m -Text 'Kopiuj hasło (60 s)' -Icon 'E8C8' -Action { param($m, $rows) & $m.Actions.Copy $m $rows }
+    Add-RowAction -Module $m -Text 'Wymuś zmianę hasła LAPS' -Icon 'E777' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.LapsReset }
     $m.RowDoubleClick = { param($m, $row) & $m.Actions.Copy $m @($row) }
     $m.ResultHint = 'Dwuklik na wierszu – kopiuje hasło do schowka (60 s)'
 }
