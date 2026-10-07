@@ -26749,27 +26749,9 @@ function Import-RdsBrokerHosts {
 }
 
 function Import-RdsAdHosts {
-    # Serwery z AD po fragmencie nazwy (włączone, system serwerowy)
+    # Serwery sesji z AD po wzorcu nazwy (włączone, system serwerowy)
     param([hashtable]$Module)
-    $m = $Module
-    $filter = Show-InputDialog -Title 'Serwery z AD' -Prompt 'Wzorzec nazwy serwerów sesji (z * jako dowolnym ciągiem), np. RDS* albo *-TS-*. Pod uwagę brane są włączone komputery z systemem serwerowym.' -Default ([string](Get-ModuleSetting -Module $m -Name 'AdFilter' -Default 'RDS*')) -Icon 'E977' -Validate { param($t) if (-not $t.Trim()) { 'Wpisz wzorzec nazwy.' } else { '' } }
-    if (-not $filter) { return }
-    $filter = $filter.Trim()
-    Set-ModuleSetting -Module $m -Name 'AdFilter' -Value $filter
-    $m.Data.AdHosts = $null
-    Start-AdOperation -Module $m -Name 'Serwery z AD' -Targets @('Active Directory') -Output None -Parameters @{ Filter = $filter } -ScriptBlock {
-        $ldapName = ($P.Filter -replace '\\', '\5c' -replace '\(', '\28' -replace '\)', '\29')
-        $q = @{ LDAPFilter = "(&(objectCategory=computer)(name=$ldapName)(operatingSystem=*Server*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"; Properties = @('dNSHostName') }
-        foreach ($c in @(Get-ADComputer @q @ad)) { if ($c.DNSHostName) { [string]$c.DNSHostName } else { [string]$c.Name } }
-    } -OnResult { param($m, $r) $m.Data.AdHosts = $r } -OnComplete {
-        param($m)
-        $r = $m.Data.AdHosts
-        if (-not $r -or -not $r.Ok) { Show-Warning ("Nie udało się odczytać serwerów z AD: {0}" -f $(if ($r) { (@($r.Errors) -join ' | ') } else { 'brak wyniku' })); return }
-        $names = @($r.Data | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)
-        if ($names.Count -eq 0) { Show-Warning 'Nie znaleziono w AD włączonych serwerów pasujących do wzorca.'; return }
-        $m.Hosts.Text = ($names -join ', ')
-        Show-Toast ("Serwery z AD: {0}" -f $names.Count) 'ok'
-    }
+    Import-AdServerNames -Module $Module -DefaultFilter 'RDS*'
 }
 
 function Invoke-RdsLogoffDisconnected {
@@ -26813,6 +26795,621 @@ Register-Module -Workspace 'Domain' -Category 'Serwery' -Key 'RdsSessions' -Titl
     Add-StatTile -Module $m -Key 'idle' -Label 'Bezczynne ≥ 1 h' -Icon 'E916' | Out-Null
     Add-StatTile -Module $m -Key 'hosts' -Label 'Serwery z sesjami' -Icon 'E7F4' | Out-Null
     Add-RdsSessionRowActions -Module $m
+}
+#endregion
+
+#region Weryfikacja serwerów – kontrole ogólne i zależne od zainstalowanych ról
+$script:ServerCheckGrades = [ordered]@{ 'Błąd' = @{ Rank = 0; Tone = 'crit' }; 'Ostrzeżenie' = @{ Rank = 1; Tone = 'warn' }; 'Info' = @{ Rank = 2; Tone = 'info' }; 'OK' = @{ Rank = 3; Tone = 'ok' } }
+
+# Kontrole na serwerze (WinRM; Windows PowerShell 4.0 i nowszy). Role z Get-WindowsFeature (bez ServerManager - po usługach).
+# Każda kontrola osobno w try/catch: brak modułu lub uprawnień daje wiersz «Info», a nie błąd całego serwera.
+# $P: DiskWarn, DiskCrit (% wolnego), UpdWarnDays, UpdCritDays, UptimeDays, BackupWarnDays, BackupCritDays, EventWarn,
+#     CheckpointDays, UnsupportedOs (wzorzec), Domain (nazwa DNS domeny do testu rozwiązywania)
+$script:ServerCheckScript = {
+    param($P)
+    $rows = New-Object System.Collections.ArrayList
+    $rankOf = @{ 'Błąd' = 0; 'Ostrzeżenie' = 1; 'Info' = 2; 'OK' = 3 }
+    $toneOf = @{ 'Błąd' = 'crit'; 'Ostrzeżenie' = 'warn'; 'Info' = 'info'; 'OK' = 'ok' }
+    $now = Get-Date
+    function Add-Check([string]$Area, [string]$Name, [string]$Grade, [string]$Result, [string]$Details = '', [string]$Advice = '', [string]$Services = '') {
+        [void]$rows.Add([pscustomobject][ordered]@{ 'Ocena' = $Grade; 'Rola' = $Area; 'Kontrola' = $Name; 'Wynik' = $Result; 'Szczegóły' = $Details; 'Zalecenie' = $Advice; '__tone' = $toneOf[$Grade]; '__rank' = $rankOf[$Grade]; '__services' = $Services })
+    }
+    function Invoke-Check([string]$Area, [string]$Name, [scriptblock]$Body) {
+        try { & $Body }
+        catch { Add-Check $Area $Name 'Info' 'nie udało się sprawdzić' $_.Exception.Message }
+    }
+    function Test-ServiceRunning([string]$Area, [string[]]$Names) {
+        # Usługi roli: zatrzymana lub brak = błąd
+        $bad = @()
+        foreach ($n in $Names) {
+            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+            if (-not $s) { $bad += "$n (brak usługi)" }
+            elseif ([string]$s.Status -ne 'Running') { $bad += ('{0} ({1})' -f $n, $s.Status) }
+        }
+        if ($bad.Count) { Add-Check $Area 'Usługi roli' 'Błąd' ('nie działają: ' + ($bad -join ', ')) '' 'Uruchom usługę i sprawdź dziennik System, dlaczego się zatrzymała.' (@($Names) -join ',') }
+        else { Add-Check $Area 'Usługi roli' 'OK' ('działają: ' + (@($Names) -join ', ')) }
+    }
+    $days = { param($d) [int][Math]::Floor(($now - $d).TotalDays) }
+
+    # --- Role
+    $features = @{}
+    $featureSource = 'Get-WindowsFeature'
+    try {
+        if (-not (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue)) { Import-Module ServerManager -ErrorAction Stop }
+        foreach ($f in @(Get-WindowsFeature -ErrorAction Stop | Where-Object { $_.Installed })) { $features[[string]$f.Name] = $true }
+    }
+    catch {
+        $featureSource = 'usługi (brak modułu ServerManager)'
+        $map = @{ 'NTDS' = 'AD-Domain-Services'; 'DNS' = 'DNS'; 'DHCPServer' = 'DHCP'; 'W3SVC' = 'Web-Server'; 'vmms' = 'Hyper-V'; 'WsusService' = 'UpdateServices'; 'CertSvc' = 'ADCS-Cert-Authority'; 'ClusSvc' = 'Failover-Clustering'; 'TermServLicensing' = 'RDS-Licensing'; 'Tssdis' = 'RDS-Connection-Broker'; 'wbengine' = 'Windows-Server-Backup' }
+        foreach ($s in @(Get-Service -ErrorAction SilentlyContinue)) { if ($map.ContainsKey([string]$s.Name)) { $features[$map[[string]$s.Name]] = $true } }
+    }
+    $roleNames = [ordered]@{ 'AD-Domain-Services' = 'Kontroler domeny'; 'DNS' = 'DNS'; 'DHCP' = 'DHCP'; 'Web-Server' = 'IIS'; 'FS-FileServer' = 'Serwer plików'; 'Print-Server' = 'Serwer wydruku'; 'Hyper-V' = 'Hyper-V'; 'RDS-RD-Server' = 'Host sesji RD'; 'RDS-Licensing' = 'Licencjonowanie RD'; 'RDS-Connection-Broker' = 'Broker połączeń RD'; 'UpdateServices' = 'WSUS'; 'ADCS-Cert-Authority' = 'Urząd certyfikacji'; 'Failover-Clustering' = 'Klaster'; 'Windows-Server-Backup' = 'Kopia zapasowa Windows' }
+    $found = @($roleNames.Keys | Where-Object { $features.ContainsKey($_) } | ForEach-Object { $roleNames[$_] })
+    Add-Check 'Ogólne' 'Role serwera' 'Info' $(if ($found.Count) { $found -join ', ' } else { 'brak rozpoznanych ról' }) "źródło: $featureSource"
+
+    # --- Kontrole ogólne
+    Invoke-Check 'Ogólne' 'System' {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $cap = [string]$os.Caption
+        $end = $null
+        if ($cap -match '2016') { $end = Get-Date '2027-01-12' } elseif ($cap -match '2019') { $end = Get-Date '2029-01-09' } elseif ($cap -match '2022') { $end = Get-Date '2031-10-14' }
+        if ($P.UnsupportedOs -and $cap -match [string]$P.UnsupportedOs) { Add-Check 'Ogólne' 'System' 'Błąd' "$cap – bez wsparcia producenta" "kompilacja $($os.BuildNumber)" 'Zaplanuj migrację – system nie dostaje poprawek bezpieczeństwa.' }
+        elseif ($end -and ($end - $now).TotalDays -lt 180) { Add-Check 'Ogólne' 'System' 'Ostrzeżenie' ("{0} – wsparcie kończy się {1:yyyy-MM-dd}" -f $cap, $end) "kompilacja $($os.BuildNumber)" 'Zaplanuj migrację na nowszy system.' }
+        else { Add-Check 'Ogólne' 'System' 'OK' $cap ("kompilacja {0}{1}" -f $os.BuildNumber, $(if ($end) { ', wsparcie do {0:yyyy-MM-dd}' -f $end } else { '' })) }
+        $up = & $days $os.LastBootUpTime
+        if ($up -gt [int]$P.UptimeDays) { Add-Check 'Ogólne' 'Czas pracy' 'Ostrzeżenie' "bez restartu od $up dni" ('uruchomiony {0:yyyy-MM-dd HH:mm}' -f $os.LastBootUpTime) 'Aktualizacje zwykle wymagają restartu – zaplanuj okno serwisowe.' }
+        else { Add-Check 'Ogólne' 'Czas pracy' 'OK' "bez restartu od $up dni" ('uruchomiony {0:yyyy-MM-dd HH:mm}' -f $os.LastBootUpTime) }
+    }
+    Invoke-Check 'Ogólne' 'Oczekujący restart' {
+        $why = @()
+        if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $why += 'obsługa składników (CBS)' }
+        if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $why += 'Windows Update' }
+        $cn = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue
+        $acn = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue
+        if ($cn -and $acn -and [string]$cn.ComputerName -ne [string]$acn.ComputerName) { $why += 'zmiana nazwy komputera' }
+        if ($why.Count) { Add-Check 'Ogólne' 'Oczekujący restart' 'Ostrzeżenie' 'serwer czeka na restart' ($why -join ', ') 'Uruchom ponownie w oknie serwisowym – do restartu poprawki nie działają w pełni.' }
+        else { Add-Check 'Ogólne' 'Oczekujący restart' 'OK' 'nie' }
+    }
+    Invoke-Check 'Ogólne' 'Aktualizacje' {
+        $last = @(Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object -Property InstalledOn -Descending | Select-Object -First 1)
+        if (-not $last.Count) { Add-Check 'Ogólne' 'Aktualizacje' 'Ostrzeżenie' 'brak informacji o zainstalowanych poprawkach' '' 'Sprawdź Windows Update na serwerze.' }
+        else {
+            $d = & $days $last[0].InstalledOn
+            $text = 'ostatnia poprawka {0} dni temu ({1}, {2:yyyy-MM-dd})' -f $d, $last[0].HotFixID, $last[0].InstalledOn
+            if ($d -gt [int]$P.UpdCritDays) { Add-Check 'Ogólne' 'Aktualizacje' 'Błąd' $text '' 'Zainstaluj zaległe aktualizacje (moduł Windows Update w Zarządzaniu zdalnym).' }
+            elseif ($d -gt [int]$P.UpdWarnDays) { Add-Check 'Ogólne' 'Aktualizacje' 'Ostrzeżenie' $text '' 'Zainstaluj zaległe aktualizacje.' }
+            else { Add-Check 'Ogólne' 'Aktualizacje' 'OK' $text }
+        }
+    }
+    Invoke-Check 'Ogólne' 'Dyski' {
+        $bad = @(); $all = @(); $worst = 'OK'
+        foreach ($dk in @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop)) {
+            if (-not $dk.Size) { continue }
+            $pct = [Math]::Round(100 * $dk.FreeSpace / $dk.Size, 0)
+            $txt = '{0} {1}% wolnego ({2:N1} z {3:N0} GB)' -f $dk.DeviceID, $pct, ($dk.FreeSpace / 1GB), ($dk.Size / 1GB)
+            $all += ('{0} {1}%' -f $dk.DeviceID, $pct)
+            if ($pct -lt [double]$P.DiskCrit) { $bad += $txt; $worst = 'Błąd' }
+            elseif ($pct -lt [double]$P.DiskWarn) { $bad += $txt; if ($worst -ne 'Błąd') { $worst = 'Ostrzeżenie' } }
+        }
+        if ($bad.Count) { Add-Check 'Ogólne' 'Dyski' $worst ('mało miejsca: ' + ($bad -join '; ')) ($all -join ', ') 'Zwolnij miejsce (np. czyszczenie plików tymczasowych w module Dyski) albo powiększ wolumin.' }
+        else { Add-Check 'Ogólne' 'Dyski' 'OK' ('wolne miejsce w normie: ' + ($all -join ', ')) }
+    }
+    Invoke-Check 'Ogólne' 'Usługi automatyczne' {
+        # Pomijane: usługi uruchamiane wyzwalaczem (zatrzymują się same) i znane usługi, które kończą pracę po wykonaniu zadania
+        $ignore = @('gupdate', 'gupdatem', 'edgeupdate', 'edgeupdatem', 'MapsBroker', 'sppsvc', 'RemoteRegistry', 'TrustedInstaller', 'tiledatamodelsvc', 'CDPSvc', 'WbioSrvc', 'ShellHWDetection', 'BITS', 'wuauserv', 'UsoSvc', 'dmwappushservice', 'stisvc', 'WaaSMedicSvc', 'DoSvc', 'MicrosoftEdgeElevationService', 'clr_optimization_*', 'GoogleUpdater*', 'OneSyncSvc*', 'CDPUserSvc*', 'WpnUserService*')
+        $stopped = @()
+        $names = @()
+        foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" -ErrorAction Stop)) {
+            $n = [string]$s.Name
+            if (@($ignore | Where-Object { $n -like $_ }).Count) { continue }
+            if (Test-Path ("HKLM:\SYSTEM\CurrentControlSet\Services\{0}\TriggerInfo" -f $n)) { continue }
+            $stopped += ('{0} ({1}){2}' -f $s.DisplayName, $n, $(if ($s.ExitCode) { ', kod ' + $s.ExitCode } else { '' }))
+            $names += $n
+        }
+        if ($stopped.Count) { Add-Check 'Ogólne' 'Usługi automatyczne' 'Ostrzeżenie' ('zatrzymane: {0}' -f $stopped.Count) ($stopped -join '; ') 'Uruchom usługi (prawy przycisk: «Uruchom zatrzymane usługi») i sprawdź dziennik System.' ($names -join ',') }
+        else { Add-Check 'Ogólne' 'Usługi automatyczne' 'OK' 'wszystkie działają' }
+    }
+    Invoke-Check 'Ogólne' 'Źródło czasu' {
+        $src = (@(w32tm.exe /query /source 2>&1) | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() } | Select-Object -First 1)
+        $src = ([string]$src).Trim()
+        if ($src -match 'CMOS|Free-running') { Add-Check 'Ogólne' 'Źródło czasu' 'Ostrzeżenie' "zegar bez synchronizacji ($src)" '' 'Członek domeny powinien brać czas z hierarchii domeny (w32tm /config /syncfromflags:domhier /update), emulator PDC – z zewnętrznego NTP.' }
+        elseif ($src -match 'VM IC') { Add-Check 'Ogólne' 'Źródło czasu' 'Info' "synchronizacja z hostem wirtualizacji ($src)" '' 'W domenie zwykle lepiej wyłączyć synchronizację czasu z hostem i korzystać z hierarchii domeny.' }
+        else { Add-Check 'Ogólne' 'Źródło czasu' 'OK' $src }
+    }
+    Invoke-Check 'Ogólne' 'Błędy w dzienniku System' {
+        $ev = @()
+        try { $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = $now.AddHours(-24) } -MaxEvents 500 -ErrorAction Stop) }
+        catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*' -and $_.Exception.Message -notlike '*No events were found*') { throw } }
+        if ($ev.Count -eq 0) { Add-Check 'Ogólne' 'Błędy w dzienniku System' 'OK' 'brak błędów w ostatnich 24 godz.' }
+        else {
+            $top = (@($ev | Group-Object -Property ProviderName | Sort-Object -Property Count -Descending | Select-Object -First 3 | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Count }) -join ', ')
+            Add-Check 'Ogólne' 'Błędy w dzienniku System' $(if ($ev.Count -ge [int]$P.EventWarn) { 'Ostrzeżenie' } else { 'Info' }) ('błędy w ostatnich 24 godz.: {0}' -f $ev.Count) "najczęściej: $top" 'Szczegóły: moduł Dziennik zdarzeń (zestaw «Błędy i ostrzeżenia»).'
+        }
+    }
+    Invoke-Check 'Ogólne' 'Zapora' {
+        if (-not (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue)) { return }
+        $off = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { -not $_.Enabled -or [string]$_.Enabled -eq 'False' } | ForEach-Object { [string]$_.Name })
+        if ($off.Count) { Add-Check 'Ogólne' 'Zapora' 'Ostrzeżenie' ('wyłączona w profilach: ' + ($off -join ', ')) '' 'Włącz zaporę i dodaj potrzebne reguły zamiast wyłączać ją w całości.' }
+        else { Add-Check 'Ogólne' 'Zapora' 'OK' 'włączona we wszystkich profilach' }
+    }
+
+    # --- Kontroler domeny (szczegóły: moduł Stan domeny)
+    if ($features['AD-Domain-Services']) {
+        $a = 'Kontroler domeny'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('NTDS', 'Netlogon', 'Kdc', 'W32Time') }
+        Invoke-Check $a 'Udziały' {
+            $shares = @(Get-CimInstance -ClassName Win32_Share -ErrorAction Stop | ForEach-Object { [string]$_.Name })
+            $miss = @('SYSVOL', 'NETLOGON' | Where-Object { $shares -notcontains $_ })
+            if ($miss.Count) { Add-Check $a 'Udziały' 'Błąd' ('brak udziałów: ' + ($miss -join ', ')) '' 'Sprawdź replikację SYSVOL (DFSR) – szczegóły w module Stan domeny.' }
+            else { Add-Check $a 'Udziały' 'OK' 'SYSVOL i NETLOGON udostępnione' '' 'Pełny przegląd kontrolerów: moduł Stan domeny.' }
+        }
+    }
+    # --- DNS
+    if ($features['DNS']) {
+        $a = 'DNS'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('DNS') }
+        Invoke-Check $a 'Strefy' {
+            if (-not (Get-Command Get-DnsServerZone -ErrorAction SilentlyContinue)) { Import-Module DnsServer -ErrorAction Stop }
+            $zones = @(Get-DnsServerZone -ErrorAction Stop | Where-Object { -not $_.IsAutoCreated -and [string]$_.ZoneType -eq 'Primary' })
+            $insecure = @($zones | Where-Object { [string]$_.DynamicUpdate -eq 'NonsecureAndSecure' } | ForEach-Object { [string]$_.ZoneName })
+            if ($insecure.Count) { Add-Check $a 'Strefy' 'Ostrzeżenie' ('niezabezpieczone aktualizacje dynamiczne: ' + ($insecure -join ', ')) "strefy podstawowe: $($zones.Count)" 'Ustaw «Tylko zabezpieczone» dla stref zintegrowanych z AD.' }
+            else { Add-Check $a 'Strefy' 'OK' "strefy podstawowe: $($zones.Count)" }
+        }
+        Invoke-Check $a 'Czyszczenie rekordów' {
+            $sc = Get-DnsServerScavenging -ErrorAction Stop
+            if (-not $sc.ScavengingState) { Add-Check $a 'Czyszczenie rekordów' 'Info' 'czyszczenie starych rekordów wyłączone na tym serwerze' '' 'Wystarczy włączyć je na jednym serwerze DNS (z interwałem np. 7 dni), żeby nieaktualne rekordy nie zostawały w strefach.' }
+            else { Add-Check $a 'Czyszczenie rekordów' 'OK' ('włączone, co {0:N0} dni' -f ([TimeSpan]$sc.ScavengingInterval).TotalDays) }
+        }
+        if ($P.Domain) {
+            Invoke-Check $a 'Rozwiązywanie nazw' {
+                $r = @(Resolve-DnsName -Name ([string]$P.Domain) -Server 127.0.0.1 -DnsOnly -QuickTimeout -ErrorAction Stop)
+                Add-Check $a 'Rozwiązywanie nazw' 'OK' ('{0} → {1}' -f $P.Domain, ((@($r | Where-Object { $_.IPAddress } | ForEach-Object { [string]$_.IPAddress } | Select-Object -First 3)) -join ', '))
+            }
+        }
+    }
+    # --- DHCP
+    if ($features['DHCP']) {
+        $a = 'DHCP'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('DHCPServer') }
+        Invoke-Check $a 'Zakresy' {
+            if (-not (Get-Command Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)) { Import-Module DhcpServer -ErrorAction Stop }
+            $scopes = @(Get-DhcpServerv4Scope -ErrorAction Stop)
+            $stats = @{}
+            foreach ($st in @(Get-DhcpServerv4ScopeStatistics -ErrorAction Stop)) { $stats[[string]$st.ScopeId] = $st }
+            $crit = @(); $warn = @(); $info = @()
+            foreach ($sc in $scopes) {
+                $st = $stats[[string]$sc.ScopeId]
+                $pct = if ($st) { [Math]::Round([double]$st.PercentageInUse, 0) } else { 0 }
+                $txt = '{0} ({1}) {2}%{3}' -f $sc.ScopeId, $sc.Name, $pct, $(if ($st) { ', wolne: ' + $st.Free } else { '' })
+                if ([string]$sc.State -ne 'Active') { $info += "$($sc.ScopeId) ($($sc.Name)) – nieaktywny"; continue }
+                if ($pct -ge 95) { $crit += $txt } elseif ($pct -ge 85) { $warn += $txt }
+            }
+            if ($crit.Count) { Add-Check $a 'Zakresy' 'Błąd' ('zakresy prawie pełne: ' + ($crit -join '; ')) ($warn + $info -join '; ') 'Powiększ zakres, skróć czas dzierżawy albo usuń nieaktualne dzierżawy.' }
+            elseif ($warn.Count) { Add-Check $a 'Zakresy' 'Ostrzeżenie' ('zakresy zajęte w ponad 85%: ' + ($warn -join '; ')) ($info -join '; ') 'Zaplanuj powiększenie zakresu.' }
+            else { Add-Check $a 'Zakresy' 'OK' ('zakresy: {0}, zajętość w normie' -f $scopes.Count) ($info -join '; ') }
+        }
+        Invoke-Check $a 'Przełączanie awaryjne' {
+            if (-not (Get-Command Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)) { return }
+            $fo = @(Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)
+            if (-not $fo.Count) { Add-Check $a 'Przełączanie awaryjne' 'Info' 'brak skonfigurowanego przełączania awaryjnego' '' 'Drugi serwer DHCP w trybie przełączania awaryjnego chroni przed brakiem adresów przy awarii.' }
+            else {
+                $bad = @($fo | Where-Object { [string]$_.State -ne 'Normal' } | ForEach-Object { '{0}: {1}' -f $_.Name, $_.State })
+                if ($bad.Count) { Add-Check $a 'Przełączanie awaryjne' 'Ostrzeżenie' ('relacje w złym stanie: ' + ($bad -join ', ')) '' 'Sprawdź połączenie z serwerem partnerskim.' }
+                else { Add-Check $a 'Przełączanie awaryjne' 'OK' ('relacje: ' + ((@($fo | ForEach-Object { '{0} ↔ {1}' -f $_.Name, $_.PartnerServer })) -join ', ')) }
+            }
+        }
+    }
+    # --- IIS
+    if ($features['Web-Server']) {
+        $a = 'IIS'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('W3SVC', 'WAS') }
+        Invoke-Check $a 'Pule aplikacji' {
+            $pools = @()
+            if (Get-Command Get-IISAppPool -ErrorAction SilentlyContinue) { $pools = @(Get-IISAppPool -ErrorAction Stop | ForEach-Object { @{ Name = [string]$_.Name; State = [string]$_.State; Auto = [bool]$_.AutoStart } }) }
+            else {
+                Import-Module WebAdministration -ErrorAction Stop
+                $pools = @(Get-ChildItem 'IIS:\AppPools' -ErrorAction Stop | ForEach-Object { @{ Name = [string]$_.Name; State = [string]$_.State; Auto = [bool]$_.autoStart } })
+            }
+            $stopped = @($pools | Where-Object { $_.State -ne 'Started' -and $_.Auto } | ForEach-Object { $_.Name })
+            if ($stopped.Count) { Add-Check $a 'Pule aplikacji' 'Ostrzeżenie' ('zatrzymane pule z autostartem: ' + ($stopped -join ', ')) "pule: $($pools.Count)" 'Uruchom pulę i sprawdź dziennik Application (błędy WAS i ASP.NET).' }
+            else { Add-Check $a 'Pule aplikacji' 'OK' "pule: $($pools.Count), działają" }
+        }
+        Invoke-Check $a 'Witryny i certyfikaty' {
+            if (-not (Get-Command Get-IISSite -ErrorAction SilentlyContinue)) { return }
+            $sites = @(Get-IISSite -ErrorAction Stop)
+            $stopped = @($sites | Where-Object { [string]$_.State -ne 'Started' } | ForEach-Object { [string]$_.Name })
+            $certs = @(); $grade = 'OK'
+            foreach ($s in $sites) {
+                foreach ($b in @($s.Bindings | Where-Object { [string]$_.Protocol -eq 'https' -and $_.CertificateHash })) {
+                    $thumb = (@($b.CertificateHash | ForEach-Object { '{0:X2}' -f $_ }) -join '')
+                    $store = if ($b.CertificateStoreName) { [string]$b.CertificateStoreName } else { 'My' }
+                    $cert = Get-Item -Path ("Cert:\LocalMachine\{0}\{1}" -f $store, $thumb) -ErrorAction SilentlyContinue
+                    if (-not $cert) { $certs += ('{0}: brak certyfikatu {1}' -f $s.Name, $thumb); $grade = 'Błąd'; continue }
+                    $left = [int][Math]::Floor(($cert.NotAfter - $now).TotalDays)
+                    if ($left -lt 0) { $certs += ('{0}: certyfikat wygasł {1:yyyy-MM-dd}' -f $s.Name, $cert.NotAfter); $grade = 'Błąd' }
+                    elseif ($left -lt 30) { $certs += ('{0}: certyfikat wygasa za {1} dni' -f $s.Name, $left); if ($grade -ne 'Błąd') { $grade = 'Ostrzeżenie' } }
+                }
+            }
+            if ($certs.Count) { Add-Check $a 'Witryny i certyfikaty' $grade ($certs -join '; ') $(if ($stopped.Count) { 'zatrzymane witryny: ' + ($stopped -join ', ') } else { '' }) 'Odnów certyfikat i podmień go w powiązaniu https witryny.' }
+            elseif ($stopped.Count) { Add-Check $a 'Witryny i certyfikaty' 'Info' ('zatrzymane witryny: ' + ($stopped -join ', ')) "witryny: $($sites.Count)" }
+            else { Add-Check $a 'Witryny i certyfikaty' 'OK' "witryny: $($sites.Count), działają; certyfikaty https ważne" }
+        }
+    }
+    # --- Serwer plików
+    if ($features['FS-FileServer']) {
+        $a = 'Serwer plików'
+        Invoke-Check $a 'Udziały' {
+            if (-not (Get-Command Get-SmbShare -ErrorAction SilentlyContinue)) { return }
+            $shares = @(Get-SmbShare -ErrorAction Stop | Where-Object { -not $_.Special -and [string]$_.Name -notmatch '\$$' -and @('SYSVOL', 'NETLOGON') -notcontains [string]$_.Name })
+            $vols = @{}
+            foreach ($v in @(Get-CimInstance -ClassName Win32_Volume -ErrorAction SilentlyContinue)) { if ($v.DriveLetter) { $vols[[string]$v.DriveLetter] = [string]$v.DeviceID } }
+            $shadow = @{}
+            foreach ($sc in @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction SilentlyContinue)) { $shadow[[string]$sc.VolumeName] = 1 + [int]$shadow[[string]$sc.VolumeName] }
+            $noShadow = @()
+            foreach ($drive in @($shares | ForEach-Object { ([string]$_.Path).Substring(0, [Math]::Min(2, ([string]$_.Path).Length)) } | Select-Object -Unique)) {
+                $id = $vols[$drive]
+                if ($id -and -not $shadow[$id]) { $noShadow += $drive }
+            }
+            $list = (@($shares | Select-Object -First 15 | ForEach-Object { [string]$_.Name }) -join ', ')
+            if ($noShadow.Count) { Add-Check $a 'Udziały' 'Info' ('udziały: {0}; brak kopii w tle na: {1}' -f $shares.Count, ($noShadow -join ', ')) $list 'Kopie w tle (poprzednie wersje) pozwalają użytkownikom samodzielnie odzyskać pliki.' }
+            else { Add-Check $a 'Udziały' 'OK' ('udziały: {0}' -f $shares.Count) $list }
+        }
+        Invoke-Check $a 'SMB 1.0' {
+            if (-not (Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue)) { return }
+            $cfg = Get-SmbServerConfiguration -ErrorAction Stop
+            if ($cfg.EnableSMB1Protocol) { Add-Check $a 'SMB 1.0' 'Ostrzeżenie' 'protokół SMB 1.0 włączony' '' 'Wyłącz SMB1 (Set-SmbServerConfiguration -EnableSMB1Protocol $false) – sprawdź wcześniej stare urządzenia (skanery, NAS).' }
+            else { Add-Check $a 'SMB 1.0' 'OK' 'wyłączony' }
+        }
+    }
+    # --- Serwer wydruku
+    if ($features['Print-Server']) {
+        $a = 'Serwer wydruku'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('Spooler') }
+        Invoke-Check $a 'Drukarki' {
+            if (-not (Get-Command Get-Printer -ErrorAction SilentlyContinue)) { return }
+            $printers = @(Get-Printer -ErrorAction Stop)
+            $bad = @($printers | Where-Object { [string]$_.PrinterStatus -ne 'Normal' -and [string]$_.PrinterStatus -ne '0' } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.PrinterStatus })
+            $jobs = @(Get-CimInstance -ClassName Win32_PrintJob -ErrorAction SilentlyContinue)
+            $stuck = @($jobs | Where-Object { (([int]$_.StatusMask) -band 2) -or ($_.TimeSubmitted -and $_.TimeSubmitted -lt $now.AddHours(-24)) })
+            $details = 'drukarki: {0}, zadania w kolejkach: {1}' -f $printers.Count, $jobs.Count
+            if ($bad.Count -or $stuck.Count) { Add-Check $a 'Drukarki' 'Ostrzeżenie' ((@($(if ($bad.Count) { 'drukarki z problemem: ' + ($bad -join ', ') }), $(if ($stuck.Count) { "zadania z błędem lub starsze niż doba: $($stuck.Count)" }) | Where-Object { $_ })) -join '; ') $details 'Sprawdź drukarkę; zawieszone zadania usuń albo uruchom ponownie bufor wydruku.' }
+            else { Add-Check $a 'Drukarki' 'OK' $details }
+        }
+    }
+    # --- Hyper-V
+    if ($features['Hyper-V']) {
+        $a = 'Hyper-V'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('vmms') }
+        Invoke-Check $a 'Maszyny wirtualne' {
+            if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { Import-Module Hyper-V -ErrorAction Stop }
+            $vms = @(Get-VM -ErrorAction Stop)
+            $crit = @($vms | Where-Object { [string]$_.State -like '*Critical*' } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.State })
+            $other = @($vms | Where-Object { @('Running', 'Off') -notcontains [string]$_.State -and [string]$_.State -notlike '*Critical*' } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.State })
+            $running = @($vms | Where-Object { [string]$_.State -eq 'Running' }).Count
+            $txt = 'maszyny: {0}, uruchomione: {1}' -f $vms.Count, $running
+            if ($crit.Count) { Add-Check $a 'Maszyny wirtualne' 'Błąd' ('stan krytyczny: ' + ($crit -join ', ')) $txt 'Sprawdź miejsce na woluminie z plikami maszyn i dziennik Hyper-V-VMMS.' }
+            elseif ($other.Count) { Add-Check $a 'Maszyny wirtualne' 'Info' ('zapisane lub wstrzymane: ' + ($other -join ', ')) $txt }
+            else { Add-Check $a 'Maszyny wirtualne' 'OK' $txt }
+            $old = @()
+            foreach ($cp in @($vms | ForEach-Object { Get-VMSnapshot -VM $_ -ErrorAction SilentlyContinue })) {
+                $age = & $days $cp.CreationTime
+                if ($age -gt [int]$P.CheckpointDays) { $old += ('{0}: {1} ({2} dni)' -f $cp.VMName, $cp.Name, $age) }
+            }
+            if ($old.Count) { Add-Check $a 'Punkty kontrolne' 'Ostrzeżenie' ("punkty kontrolne starsze niż $($P.CheckpointDays) dni: $($old.Count)") ($old -join '; ') 'Stare punkty kontrolne spowalniają dyski maszyn i zajmują miejsce – usuń je (scalenie nastąpi automatycznie).' }
+            else { Add-Check $a 'Punkty kontrolne' 'OK' "brak punktów kontrolnych starszych niż $($P.CheckpointDays) dni" }
+            $repl = @(Get-VMReplication -ErrorAction SilentlyContinue | Where-Object { [string]$_.Health -ne 'Normal' })
+            if ($repl.Count) { Add-Check $a 'Replikacja' $(if (@($repl | Where-Object { [string]$_.Health -eq 'Critical' }).Count) { 'Błąd' } else { 'Ostrzeżenie' }) ('replikacja w złym stanie: ' + ((@($repl | ForEach-Object { '{0} ({1})' -f $_.VMName, $_.Health })) -join ', ')) '' 'Sprawdź połączenie z serwerem repliki i stan replikacji (Measure-VMReplication).' }
+        }
+    }
+    # --- Host sesji RD
+    if ($features['RDS-RD-Server']) {
+        $a = 'Host sesji RD'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('TermService') }
+        Invoke-Check $a 'Licencjonowanie' {
+            $ts = Get-CimInstance -Namespace 'root\cimv2\TerminalServices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
+            $modes = @{ 2 = 'na urządzenie'; 4 = 'na użytkownika'; 5 = 'nieskonfigurowany'; 6 = 'AAD na użytkownika' }
+            $mode = [int]$ts.LicensingType
+            $servers = @()
+            try { $servers = @((Invoke-CimMethod -InputObject $ts -MethodName GetSpecifiedLicenseServerList -ErrorAction Stop).SpecifiedLSList | Where-Object { $_ }) } catch { }
+            $grace = $null
+            try { $grace = [int](Invoke-CimMethod -InputObject $ts -MethodName GetGracePeriodDays -ErrorAction Stop).DaysLeft } catch { }
+            $txt = 'tryb: {0}; serwery licencji: {1}' -f $(if ($modes.ContainsKey($mode)) { $modes[$mode] } else { $mode }), $(if ($servers.Count) { $servers -join ', ' } else { 'brak' })
+            if ($mode -eq 5 -or -not $modes.ContainsKey($mode)) {
+                $g = if ($null -ne $grace -and $grace -le 14) { 'Błąd' } else { 'Ostrzeżenie' }
+                Add-Check $a 'Licencjonowanie' $g ('tryb licencjonowania nieskonfigurowany{0}' -f $(if ($null -ne $grace) { "; okres próbny: zostało $grace dni" } else { '' })) $txt 'Ustaw tryb licencjonowania i serwer licencji (zasady grupy lub wdrożenie RDS) – po okresie próbnym połączenia będą odrzucane.'
+            }
+            elseif (-not $servers.Count) { Add-Check $a 'Licencjonowanie' 'Ostrzeżenie' 'nie wskazano serwera licencji' $txt 'Wskaż serwer licencji RD (zasady grupy: Użyj określonych serwerów licencji usług pulpitu zdalnego).' }
+            else { Add-Check $a 'Licencjonowanie' 'OK' $txt }
+            if ([int]$ts.SessionBrokerDrainMode -gt 0) { Add-Check $a 'Nowe połączenia' 'Info' 'serwer nie przyjmuje nowych połączeń (tryb opróżniania)' '' 'Po zakończeniu prac przywróć przyjmowanie połączeń.' }
+        }
+    }
+    # --- Licencjonowanie RD
+    if ($features['RDS-Licensing']) {
+        $a = 'Licencjonowanie RD'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('TermServLicensing') }
+        Invoke-Check $a 'Pakiety licencji' {
+            $packs = @(Get-CimInstance -ClassName Win32_TSLicenseKeyPack -ErrorAction Stop | Where-Object { [int]$_.TotalLicenses -gt 0 -and [int]$_.TotalLicenses -lt 4000000 })
+            $low = @(); $exp = @()
+            foreach ($k in $packs) {
+                $name = '{0} {1}' -f $k.ProductVersion, $k.TypeAndModel
+                if ([int]$k.AvailableLicenses -le 0) { $low += "$name (wszystkie wydane: $($k.TotalLicenses))" }
+                if ($k.ExpirationDate -and $k.ExpirationDate -is [datetime] -and $k.ExpirationDate.Year -lt 2099 -and $k.ExpirationDate -lt $now.AddDays(30)) { $exp += ('{0} (ważny do {1:yyyy-MM-dd})' -f $name, $k.ExpirationDate) }
+            }
+            $txt = (@($packs | ForEach-Object { '{0} {1}: {2}/{3} wolnych' -f $_.ProductVersion, $_.TypeAndModel, $_.AvailableLicenses, $_.TotalLicenses }) -join '; ')
+            if (-not $packs.Count) { Add-Check $a 'Pakiety licencji' 'Ostrzeżenie' 'brak zainstalowanych licencji dostępu (CAL)' '' 'Zainstaluj i aktywuj licencje CAL usług pulpitu zdalnego.' }
+            elseif ($low.Count -or $exp.Count) { Add-Check $a 'Pakiety licencji' 'Ostrzeżenie' ((@($low) + @($exp)) -join '; ') $txt 'Dokup licencje albo odzyskaj nieużywane (licencje na urządzenie wracają po 52–89 dniach).' }
+            else { Add-Check $a 'Pakiety licencji' 'OK' $txt }
+        }
+    }
+    # --- Broker połączeń RD
+    if ($features['RDS-Connection-Broker']) {
+        $a = 'Broker połączeń RD'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('Tssdis') }
+    }
+    # --- WSUS
+    if ($features['UpdateServices']) {
+        $a = 'WSUS'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('WsusService', 'W3SVC') }
+        Invoke-Check $a 'Synchronizacja' {
+            if (-not (Get-Command Get-WsusServer -ErrorAction SilentlyContinue)) { Import-Module UpdateServices -ErrorAction Stop }
+            $ws = Get-WsusServer -ErrorAction Stop
+            $sync = $ws.GetSubscription().GetLastSynchronizationInfo()
+            $age = if ($sync -and $sync.StartTime) { & $days $sync.StartTime.ToLocalTime() } else { $null }
+            $txt = if ($sync) { 'ostatnia synchronizacja {0:yyyy-MM-dd HH:mm}: {1}' -f $sync.StartTime.ToLocalTime(), $sync.Result } else { 'brak synchronizacji' }
+            if (-not $sync -or [string]$sync.Result -ne 'Succeeded') { Add-Check $a 'Synchronizacja' 'Błąd' $txt '' 'Sprawdź połączenie z Microsoft Update (lub serwerem nadrzędnym) i dziennik SoftwareDistribution.log.' }
+            elseif ($age -gt 3) { Add-Check $a 'Synchronizacja' 'Ostrzeżenie' $txt '' 'Synchronizacja powinna działać codziennie – sprawdź harmonogram.' }
+            else { Add-Check $a 'Synchronizacja' 'OK' $txt }
+            $st = $ws.GetStatus()
+            $err = [int]$st.ComputerTargetsWithUpdateErrorsCount
+            Add-Check $a 'Komputery' $(if ($err -gt 0) { 'Info' } else { 'OK' }) ('komputery z błędami aktualizacji: {0}, wymagające aktualizacji: {1}' -f $err, $st.ComputerTargetsNeedingUpdatesCount) ('aktualizacje niezatwierdzone: {0}' -f $st.NotApprovedUpdateCount)
+        }
+    }
+    # --- Urząd certyfikacji
+    if ($features['ADCS-Cert-Authority']) {
+        $a = 'Urząd certyfikacji'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('CertSvc') }
+        Invoke-Check $a 'Certyfikat urzędu' {
+            $ca = @(Get-ChildItem -Path 'Cert:\LocalMachine\My' -ErrorAction Stop | Where-Object { $_.HasPrivateKey -and @($_.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] -and $_.CertificateAuthority }).Count })
+            if (-not $ca.Count) { Add-Check $a 'Certyfikat urzędu' 'Info' 'nie znaleziono certyfikatu urzędu w magazynie komputera' }
+            else {
+                $c = @($ca | Sort-Object -Property NotAfter -Descending)[0]
+                $left = [int][Math]::Floor(($c.NotAfter - $now).TotalDays)
+                $txt = '{0}, ważny do {1:yyyy-MM-dd} ({2} dni)' -f $c.Subject, $c.NotAfter, $left
+                if ($left -lt 0) { Add-Check $a 'Certyfikat urzędu' 'Błąd' $txt '' 'Certyfikat urzędu wygasł – wystawiane certyfikaty są nieważne.' }
+                elseif ($left -lt 180) { Add-Check $a 'Certyfikat urzędu' 'Ostrzeżenie' $txt '' 'Odnów certyfikat urzędu z wyprzedzeniem (certyfikaty nie mogą być ważne dłużej niż certyfikat urzędu).' }
+                else { Add-Check $a 'Certyfikat urzędu' 'OK' $txt }
+            }
+            $crl = @(Get-ChildItem -Path (Join-Path $env:SystemRoot 'System32\CertSrv\CertEnroll') -Filter '*.crl' -ErrorAction SilentlyContinue | Sort-Object -Property LastWriteTime -Descending)
+            if ($crl.Count) {
+                $age = & $days $crl[0].LastWriteTime
+                if ($age -gt 8) { Add-Check $a 'Lista CRL' 'Ostrzeżenie' "ostatnia publikacja CRL $age dni temu" $crl[0].Name 'Sprawdź, czy urząd publikuje listy odwołań (certutil -crl) – przeterminowana lista blokuje weryfikację certyfikatów.' }
+                else { Add-Check $a 'Lista CRL' 'OK' "ostatnia publikacja CRL $age dni temu" $crl[0].Name }
+            }
+        }
+    }
+    # --- Klaster
+    if ($features['Failover-Clustering']) {
+        $a = 'Klaster'
+        Invoke-Check $a 'Usługi roli' { Test-ServiceRunning $a @('ClusSvc') }
+        Invoke-Check $a 'Węzły i role' {
+            if (-not (Get-Command Get-ClusterNode -ErrorAction SilentlyContinue)) { Import-Module FailoverClusters -ErrorAction Stop }
+            $down = @(Get-ClusterNode -ErrorAction Stop | Where-Object { [string]$_.State -ne 'Up' } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.State })
+            $groups = @(Get-ClusterGroup -ErrorAction Stop | Where-Object { [string]$_.State -ne 'Online' -and [string]$_.Name -ne 'Available Storage' } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.State })
+            $failed = @(Get-ClusterResource -ErrorAction Stop | Where-Object { [string]$_.State -eq 'Failed' } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.OwnerGroup })
+            if ($down.Count -or $failed.Count) { Add-Check $a 'Węzły i role' 'Błąd' ((@($(if ($down.Count) { 'węzły niedostępne: ' + ($down -join ', ') }), $(if ($failed.Count) { 'zasoby w stanie błędu: ' + ($failed -join ', ') }) | Where-Object { $_ })) -join '; ') ($groups -join ', ') 'Sprawdź Menedżera klastra trybu failover i dziennik FailoverClustering.' }
+            elseif ($groups.Count) { Add-Check $a 'Węzły i role' 'Ostrzeżenie' ('role poza stanem online: ' + ($groups -join ', ')) }
+            else { Add-Check $a 'Węzły i role' 'OK' 'wszystkie węzły i role działają' }
+        }
+    }
+    # --- Kopia zapasowa Windows Server
+    if ($features['Windows-Server-Backup']) {
+        $a = 'Kopia zapasowa Windows'
+        Invoke-Check $a 'Ostatnia kopia' {
+            if (-not (Get-Command Get-WBSummary -ErrorAction SilentlyContinue)) { Import-Module WindowsServerBackup -ErrorAction Stop }
+            $sum = Get-WBSummary -ErrorAction Stop
+            $policy = $null
+            try { $policy = Get-WBPolicy -ErrorAction Stop } catch { }
+            $last = $sum.LastSuccessfulBackupTime
+            if (-not $last -or ($last -is [datetime] -and $last.Year -lt 2000)) {
+                Add-Check $a 'Ostatnia kopia' $(if ($policy) { 'Błąd' } else { 'Ostrzeżenie' }) $(if ($policy) { 'zaplanowana kopia nigdy się nie udała' } else { 'kopia zapasowa nie jest skonfigurowana' }) '' 'Skonfiguruj harmonogram kopii (wbadmin / Kopia zapasowa systemu Windows Server) albo usuń funkcję, jeśli kopie robi inny system.'
+            }
+            else {
+                $age = & $days $last
+                $hr = [int]$sum.LastBackupResultHR
+                $txt = 'ostatnia udana kopia {0:yyyy-MM-dd HH:mm} ({1} dni temu)' -f $last, $age
+                if ($hr -ne 0) { $txt += '; ostatnia próba zakończona błędem 0x{0:X8}' -f $hr }
+                $det = 'następna: {0}' -f $(if ($sum.NextBackupTime -and $sum.NextBackupTime.Year -gt 2000) { '{0:yyyy-MM-dd HH:mm}' -f $sum.NextBackupTime } else { 'nie zaplanowano' })
+                if ($age -gt [int]$P.BackupCritDays) { Add-Check $a 'Ostatnia kopia' 'Błąd' $txt $det 'Sprawdź dziennik Microsoft-Windows-Backup i miejsce docelowe kopii.' }
+                elseif ($age -gt [int]$P.BackupWarnDays -or $hr -ne 0) { Add-Check $a 'Ostatnia kopia' 'Ostrzeżenie' $txt $det 'Sprawdź dziennik Microsoft-Windows-Backup.' }
+                else { Add-Check $a 'Ostatnia kopia' 'OK' $txt $det }
+            }
+        }
+    }
+    $rows
+}
+
+function New-ServerCheckParameters {
+    param([hashtable]$Thresholds = @{})
+    $p = @{ DiskWarn = 15; DiskCrit = 5; UpdWarnDays = 45; UpdCritDays = 90; UptimeDays = 60; BackupWarnDays = 2; BackupCritDays = 7; EventWarn = 20; CheckpointDays = 7; UnsupportedOs = $script:UnsupportedOsPattern; Domain = [string]$env:USERDNSDOMAIN }
+    foreach ($k in $Thresholds.Keys) { $p[$k] = $Thresholds[$k] }
+    return $p
+}
+
+function Set-ServerCheckSort {
+    # Kolejność: błędy, ostrzeżenia, informacje, OK; w obrębie oceny - serwer
+    param([hashtable]$Module)
+    $g = $Module.Grid
+    if (-not $g -or -not $Module.Table -or -not $Module.Table.Columns.Contains('__rank')) { return }
+    foreach ($c in $g.Columns) { $c.SortDirection = $null }
+    $g.Items.SortDescriptions.Clear()
+    $g.Items.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription('__rank', [System.ComponentModel.ListSortDirection]::Ascending)))
+    $g.Items.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription('Komputer', [System.ComponentModel.ListSortDirection]::Ascending)))
+}
+
+function Update-ServerCheckTiles {
+    param([hashtable]$Module)
+    $crit = 0; $warn = 0; $roles = @{}; $ok = @{}; $off = 0
+    foreach ($r in @(Get-ResultRowsAll -Module $Module)) {
+        if ([string](Get-ObjectValue $r 'Status') -eq 'Błąd') { $off++; continue }
+        switch ([string](Get-ObjectValue $r 'Ocena')) { 'Błąd' { $crit++ } 'Ostrzeżenie' { $warn++ } }
+        $ok[[string](Get-ObjectValue $r 'Komputer')] = $true
+        if ([string](Get-ObjectValue $r 'Kontrola') -eq 'Role serwera') { foreach ($x in ([string](Get-ObjectValue $r 'Wynik') -split ',\s*')) { if ($x -and $x -ne 'brak rozpoznanych ról') { $roles[$x] = $true } } }
+    }
+    Set-StatTile -Module $Module -Key 'servers' -Value ([string]$ok.Count) -Tone $(if ($ok.Count) { 'info' } else { '' })
+    Set-StatTile -Module $Module -Key 'crit' -Value ([string]$crit) -Tone $(if ($crit) { 'crit' } else { 'ok' })
+    Set-StatTile -Module $Module -Key 'warn' -Value ([string]$warn) -Tone $(if ($warn) { 'warn' } else { 'ok' })
+    Set-StatTile -Module $Module -Key 'roles' -Value ([string]$roles.Count)
+    Set-StatTile -Module $Module -Key 'off' -Value ([string]$off) -Tone $(if ($off) { 'crit' } else { 'ok' })
+}
+
+function Update-ServerCheckFilter {
+    param([hashtable]$Module)
+    $Module.ExtraFilter = $(if (Test-Checked $Module.OnlyProblems) { "ISNULL([Ocena], '') <> 'OK'" } else { '' })
+    Update-ResultFilter -Module $Module
+}
+
+function Invoke-ServerCheck {
+    param([hashtable]$Module)
+    $m = $Module
+    $hosts = @(Get-RdsFarmHosts -Module $m)
+    if ($hosts.Count -eq 0) { Show-Warning 'Wpisz serwery albo wczytaj je z AD.'; return }
+    if (-not (Get-TargetOverride)) { Set-ModuleSetting -Module $m -Name 'Hosts' -Value ($hosts -join ', ') }
+    $params = New-ServerCheckParameters -Thresholds @{ DiskWarn = (Get-Num $m.DiskWarn); DiskCrit = (Get-Num $m.DiskCrit); UpdWarnDays = (Get-Num $m.UpdWarn); UpdCritDays = (Get-Num $m.UpdCrit); BackupWarnDays = (Get-Num $m.BackupWarn); BackupCritDays = (Get-Num $m.BackupCrit) }
+    Start-HostOperation -Module $m -Name 'Weryfikacja serwerów' -Targets $hosts -Parameters $params -ScriptBlock $script:ServerCheckScript -OnComplete {
+        param($m)
+        Set-ServerCheckSort -Module $m
+        Update-ServerCheckFilter -Module $m
+        Update-ServerCheckTiles -Module $m
+        $crit = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Ocena') -eq 'Błąd' -or [string](Get-ObjectValue $_ 'Status') -eq 'Błąd' }).Count
+        Show-Toast $(if ($crit) { "Weryfikacja serwerów: błędy do sprawdzenia – $crit." } else { 'Weryfikacja serwerów: bez błędów.' }) $(if ($crit) { 'warn' } else { 'ok' })
+    }
+}
+
+function Start-ServerStoppedServices {
+    # «Uruchom zatrzymane usługi» z wierszy kontroli usług (nazwy w ukrytej kolumnie), potem ponowna kontrola tych serwerów
+    param([hashtable]$Module, $Rows)
+    $per = @{}
+    $items = @()
+    foreach ($r in @($Rows)) {
+        $names = @(([string](Get-ObjectValue $r '__services')) -split ',' | Where-Object { $_ })
+        $h = [string](Get-ObjectValue $r 'Komputer')
+        if (-not $names.Count -or -not $h) { continue }
+        if (-not $per.ContainsKey($h)) { $per[$h] = @{ Names = @() } }
+        $per[$h].Names = @(@($per[$h].Names) + $names | Select-Object -Unique)
+    }
+    if ($per.Count -eq 0) { Show-Warning 'Zaznacz wiersze kontroli usług (usługi automatyczne albo usługi roli), w których są zatrzymane usługi.'; return }
+    foreach ($h in $per.Keys) { foreach ($n in $per[$h].Names) { $items += "$h – $n" } }
+    if (-not (Confirm-Action -Text 'Uruchomić te usługi? (usługi, które już działają, zostaną pominięte)' -Items $items -ConfirmText 'Uruchom')) { return }
+    $Module.Data.ActionHosts = @($per.Keys)
+    Start-HostOperation -Module $Module -Name 'Uruchamianie usług' -Targets @($per.Keys) -PerTarget $per -Output Log -ScriptBlock {
+        param($P)
+        foreach ($n in @($P.Names)) {
+            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+            if (-not $s) { [pscustomobject]@{ 'Usługa' = $n; 'Wynik' = 'Błąd – brak usługi' }; continue }
+            if ([string]$s.Status -eq 'Running') { [pscustomobject]@{ 'Usługa' = $n; 'Wynik' = 'już działa' }; continue }
+            try { Start-Service -Name $n -ErrorAction Stop; [pscustomobject]@{ 'Usługa' = $n; 'Wynik' = 'OK – uruchomiona' } }
+            catch { [pscustomobject]@{ 'Usługa' = $n; 'Wynik' = 'Błąd – ' + $_.Exception.Message } }
+        }
+    } -OnComplete { param($m) Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { Invoke-ServerCheck -Module $m } }
+}
+
+function Import-AdServerNames {
+    # Włączone serwery z AD według wzorca nazwy -> pole «Serwery» modułu ($Module.Hosts)
+    param([hashtable]$Module, [string]$DefaultFilter = '*')
+    $m = $Module
+    $filter = Show-InputDialog -Title 'Serwery z AD' -Prompt 'Wzorzec nazwy serwerów (z * jako dowolnym ciągiem), np. RDS* albo * dla wszystkich. Pod uwagę brane są włączone komputery z systemem serwerowym.' -Default ([string](Get-ModuleSetting -Module $m -Name 'AdFilter' -Default $DefaultFilter)) -Icon 'E977' -Validate { param($t) if (-not $t.Trim()) { 'Wpisz wzorzec nazwy.' } else { '' } }
+    if (-not $filter) { return }
+    $filter = $filter.Trim()
+    Set-ModuleSetting -Module $m -Name 'AdFilter' -Value $filter
+    $m.Data.AdHosts = $null
+    Start-AdOperation -Module $m -Name 'Serwery z AD' -Targets @('Active Directory') -Output None -Parameters @{ Filter = $filter } -ScriptBlock {
+        $ldapName = ($P.Filter -replace '\\', '\5c' -replace '\(', '\28' -replace '\)', '\29')
+        $q = @{ LDAPFilter = "(&(objectCategory=computer)(name=$ldapName)(operatingSystem=*Server*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"; Properties = @('dNSHostName') }
+        foreach ($c in @(Get-ADComputer @q @ad)) { if ($c.DNSHostName) { [string]$c.DNSHostName } else { [string]$c.Name } }
+    } -OnResult { param($m, $r) $m.Data.AdHosts = $r } -OnComplete {
+        param($m)
+        $r = $m.Data.AdHosts
+        if (-not $r -or -not $r.Ok) { Show-Warning ("Nie udało się odczytać serwerów z AD: {0}" -f $(if ($r) { (@($r.Errors) -join ' | ') } else { 'brak wyniku' })); return }
+        $names = @($r.Data | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)
+        if ($names.Count -eq 0) { Show-Warning 'Nie znaleziono w AD włączonych serwerów pasujących do wzorca.'; return }
+        $m.Hosts.Text = ($names -join ', ')
+        Show-Toast ("Serwery z AD: {0}" -f $names.Count) 'ok'
+    }
+}
+
+Register-Module -Workspace 'Domain' -Category 'Serwery' -Key 'ServerCheck' -Title 'Weryfikacja serwerów' -Icon 'E9F9' -Badge 'nowe' `
+    -Description 'Przegląd serwerów zależny od zainstalowanych ról: kontrole ogólne (system i wsparcie, aktualizacje, oczekujący restart, dyski, zatrzymane usługi automatyczne, źródło czasu, błędy w dzienniku, zapora) oraz kontrole ról – DNS, DHCP, IIS, serwer plików, wydruku, Hyper-V, pulpit zdalny i licencje, WSUS, urząd certyfikacji, klaster, kopia zapasowa. Każdy wynik z oceną i zaleceniem.' -Build {
+    param($m)
+    $m.PillColumns = @('Ocena')
+    $m.EmptyHint = 'Wpisz serwery albo wczytaj je z AD, potem «Sprawdź serwery». Role są rozpoznawane automatycznie; każda kontrola ma ocenę i zalecenie.'
+    $m.Data.ActionHosts = @()
+    $m.Actions.List = { param($m) Invoke-ServerCheck -Module $m }
+    $row = Add-ToolbarRow -Module $m -Title 'Serwery'
+    $m.Hosts = Add-TextBox -Parent $row -Width 430 -Placeholder 'np. DC01, FS01, RDS01 – albo «Z AD…»'
+    $m.Hosts.Text = [string](Get-ModuleSetting -Module $m -Name 'Hosts' -Default '')
+    Add-Button -Parent $row -Text 'Z AD…' -Icon 'E977' -Module $m -ToolTip 'Włączone serwery z AD według wzorca nazwy' -OnClick { param($m) Import-AdServerNames -Module $m -DefaultFilter '*' } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Progi'
+    Add-Label -Parent $row2 -Text 'Dysk – ostrzeżenie / błąd (% wolnego)' | Out-Null
+    $m.DiskWarn = Add-Numeric -Parent $row2 -Value 15 -Minimum 1 -Maximum 90 -Width 50
+    $m.DiskCrit = Add-Numeric -Parent $row2 -Value 5 -Minimum 1 -Maximum 90 -Width 50
+    Add-Label -Parent $row2 -Text '   Aktualizacje (dni)' | Out-Null
+    $m.UpdWarn = Add-Numeric -Parent $row2 -Value 45 -Minimum 1 -Maximum 3650 -Width 50
+    $m.UpdCrit = Add-Numeric -Parent $row2 -Value 90 -Minimum 1 -Maximum 3650 -Width 50
+    Add-Label -Parent $row2 -Text '   Kopia zapasowa (dni)' | Out-Null
+    $m.BackupWarn = Add-Numeric -Parent $row2 -Value 2 -Minimum 1 -Maximum 365 -Width 50
+    $m.BackupCrit = Add-Numeric -Parent $row2 -Value 7 -Minimum 1 -Maximum 365 -Width 50
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Sprawdź serwery' -Icon 'E9F9' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
+    $m.OnlyProblems = Add-CheckBox -Parent $row3 -Text 'Ukryj wyniki OK'
+    Register-ControlHandler -Control $m.OnlyProblems -EventName 'Checked' -Module $m -Action { param($m) Update-ServerCheckFilter -Module $m }
+    Register-ControlHandler -Control $m.OnlyProblems -EventName 'Unchecked' -Module $m -Action { param($m) Update-ServerCheckFilter -Module $m }
+    Add-StatTile -Module $m -Key 'servers' -Label 'Sprawdzone serwery' -Icon 'E977' | Out-Null
+    Add-StatTile -Module $m -Key 'crit' -Label 'Błędy' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'warn' -Label 'Ostrzeżenia' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'roles' -Label 'Rozpoznane role' -Icon 'E8FD' | Out-Null
+    Add-StatTile -Module $m -Key 'off' -Label 'Bez połączenia' -Icon 'E711' | Out-Null
+    Add-RowAction -Module $m -Text 'Uruchom zatrzymane usługi…' -Icon 'E768' -Action { param($m, $rows) Start-ServerStoppedServices -Module $m -Rows $rows }
+    Add-RowAction -Module $m -Text 'Sesje użytkowników na tych serwerach' -Icon 'E7EE' -Action {
+        param($m, $rows)
+        $hosts = @(Get-RowTargetNames -Rows $rows -Column 'Komputer')
+        if (-not $hosts.Count) { return }
+        Show-Module -Key 'RdsSessions'
+        $rm = $script:UI.Modules['RdsSessions']
+        if (-not $rm) { return }
+        $rm.Hosts.Text = ($hosts -join ', ')
+        Invoke-RdsFarmList -Module $rm
+    }
+}
+
+Register-ReportType -Key 'ServerCheck' -Title 'Weryfikacja serwerów' -Icon 'E9F9' -Requires 'Remote' `
+    -Description 'Kontrole ogólne i zależne od ról na serwerach (WinRM), jak w module Weryfikacja serwerów. Bez listy komputerów – wszystkie włączone serwery z AD.' `
+    -KeyColumns @('Komputer', 'Rola', 'Kontrola', 'Ocena') -Options @(
+    @{ Key = 'Computers'; Label = 'Komputery (po jednym w wierszu)'; Type = 'Multi'; Value = ''; Hint = 'Puste – włączone serwery z AD, które logowały się w ostatnich 45 dniach.' }
+    @{ Key = 'SearchBase'; Label = 'Jednostka organizacyjna serwerów (gdy lista jest pusta)'; Type = 'Ou'; Value = ''; Placeholder = 'Cała domena' }
+    @{ Key = 'MinGrade'; Label = 'Pokaż w raporcie od oceny'; Type = 'Combo'; Items = @('Błąd', 'Ostrzeżenie', 'Info', 'OK'); Value = 'Ostrzeżenie' }
+) -Run {
+    param($O)
+    $targets = @(Get-ReportComputerTargets -Computers ([string](Get-ReportOption $O 'Computers' '')) -SearchBase ([string](Get-ReportOption $O 'SearchBase' '')))
+    $res = @(Invoke-SyncOperation -Targets $targets -ScriptBlock $script:ServerCheckScript -Parameters (New-ServerCheckParameters))
+    $x = Get-ReportRemoteRows -Results $res -Failed @{ 'Ocena' = 'Błąd'; 'Rola' = 'Połączenie'; 'Kontrola' = 'WinRM'; 'Wynik' = 'brak połączenia' }
+    $all = @($x.Rows | ForEach-Object {
+            $g = $script:ServerCheckGrades[[string]$_.'Ocena']
+            [pscustomobject][ordered]@{ 'Komputer' = $_.'Komputer'; 'Ocena' = $_.'Ocena'; 'Rola' = $_.'Rola'; 'Kontrola' = $_.'Kontrola'; 'Wynik' = $_.'Wynik'; 'Szczegóły' = $_.'Szczegóły'; 'Zalecenie' = (Get-ObjectValue $_ 'Zalecenie'); '__tone' = $(if ($g) { $g.Tone } else { '' }); '__rank' = $(if ($g) { $g.Rank } else { 9 }) }
+        } | Sort-Object -Property '__rank', 'Komputer')
+    $min = [string](Get-ReportOption $O 'MinGrade' 'Ostrzeżenie')
+    $limit = if ($script:ServerCheckGrades.Contains($min)) { $script:ServerCheckGrades[$min].Rank } else { 1 }
+    $shown = @($all | Where-Object { $_.'__rank' -le $limit })
+    $findings = @($all | Where-Object { $_.'__rank' -le 1 })
+    $crit = @($all | Where-Object { $_.'Ocena' -eq 'Błąd' }).Count
+    $warn = @($all | Where-Object { $_.'Ocena' -eq 'Ostrzeżenie' }).Count
+    $off = @($res | Where-Object { -not $_.Ok }).Count
+    return @{
+        Title = 'Weryfikacja serwerów'; Subtitle = ('serwery: {0}' -f $targets.Count)
+        Summary = $(if ($findings.Count) { 'błędy: {0}, ostrzeżenia: {1}, bez połączenia: {2}' -f $crit, $warn, $off } else { 'bez uwag' })
+        Rows = $shown; Findings = $findings; PillColumns = @('Ocena')
+        Tiles = @(@{ Label = 'Serwery'; Value = $targets.Count; Tone = '' }, @{ Label = 'Błędy'; Value = $crit; Tone = $(if ($crit) { 'crit' } else { 'ok' }) }, @{ Label = 'Ostrzeżenia'; Value = $warn; Tone = $(if ($warn) { 'warn' } else { 'ok' }) }, @{ Label = 'Bez połączenia'; Value = $off; Tone = $(if ($off) { 'crit' } else { '' }) })
+        Errors = $x.Errors
+    }
 }
 #endregion
 
