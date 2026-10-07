@@ -4473,11 +4473,13 @@ function Copy-ResultView {
 }
 
 function Show-GridDialog {
-    # Dowolne obiekty w tabeli z filtrem, eksportem i kopiowaniem (okno z widokiem modułu)
-    param([string]$Title, [object[]]$Rows, [string[]]$SecretColumns = @(), [string]$Subtitle = '', [string[]]$PillColumns = @())
+    # Dowolne obiekty w tabeli z filtrem, eksportem i kopiowaniem (okno z widokiem modułu).
+    # -RowActions: pozycje menu wiersza jak w Add-RowAction (@{ Text; Icon; Danger; Action = { param($dialogModule, $rows) } })
+    param([string]$Title, [object[]]$Rows, [string[]]$SecretColumns = @(), [string]$Subtitle = '', [string[]]$PillColumns = @(), [hashtable[]]$RowActions = @())
     $m = New-ModuleContext -Definition @{ Key = 'Dialog_' + [guid]::NewGuid().ToString('N'); Title = $Title; Description = $Subtitle; Category = 'Podgląd'; Icon = 'E8FD'; Workspace = '' }
     $m.SecretColumns = @($SecretColumns)
     $m.PillColumns = @($PillColumns)
+    foreach ($a in @($RowActions)) { if ($a) { Add-RowAction -Module $m -Text $a.Text -Icon ([string]$a['Icon']) -Danger:([bool]$a['Danger']) -Action $a.Action } }
     New-ModuleView -Module $m
     Complete-ModuleView -Module $m
     foreach ($r in $Rows) { Add-ResultRows -Module $m -Objects @($r) }
@@ -5406,9 +5408,16 @@ function Start-HostOperation {
         if ($replace) { Remove-ResultRows -Module $Module -Rows @($Module.Table.Rows | Where-Object { $items -contains [string]$_[$TargetColumn] }) }
         elseif (-not ($ReplaceRows -or $script:TargetOverride.Refresh)) { Reset-ResultTable -Module $Module }
     }
-    # Operacja, która wypełnia tabelę - do odświeżenia wybranych obiektów z menu wiersza (Invoke-RowRefresh)
+    # Operacja, która wypełnia tabelę - do odświeżenia wybranych obiektów z menu wiersza (Invoke-RowRefresh).
+    # Odświeżenie części obiektów nie zawęża zapamiętanej operacji - dopisuje tylko ich parametry (-PerTarget).
     if ($Output -eq 'Grid' -and -not $Append -and $TargetColumn) {
-        $Module.LastGridOp = @{ Name = $Name; ScriptBlock = $ScriptBlock; Local = [bool]$Local; Parameters = $Parameters; PerTarget = $PerTarget; TargetColumn = $TargetColumn; OnResult = $OnResult; OnComplete = $OnComplete; Pool = $Pool }
+        $last = $Module.LastGridOp
+        if (($ReplaceRows -or $script:TargetOverride.Refresh) -and $last -and $last.Name -eq $Name) {
+            foreach ($k in @($PerTarget.Keys)) { $last.PerTarget[$k] = $PerTarget[$k] }
+        }
+        else {
+            $Module.LastGridOp = @{ Name = $Name; ScriptBlock = $ScriptBlock; Local = [bool]$Local; Parameters = $Parameters; PerTarget = @{} + $PerTarget; TargetColumn = $TargetColumn; OnResult = $OnResult; OnComplete = $OnComplete; Pool = $Pool }
+        }
     }
 
     $ctx = @{
@@ -8118,92 +8127,22 @@ Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'Pro
 }
 
 Register-Module -Workspace 'Remote' -Category 'Użytkownicy i dostęp' -Key 'Sessions' -Title 'Sesje użytkowników' -Icon 'E7EE' -Badge 'Nowość w wersji 4.0' `
-    -Description 'Zalogowani użytkownicy (konsola i pulpit zdalny): stan sesji, bezczynność, czas logowania. Wylogowanie, rozłączenie, wiadomość dla użytkownika i podgląd sesji (shadow).' -Build {
+    -Description 'Zalogowani użytkownicy (konsola i pulpit zdalny): stan sesji, skąd (nazwa i adres komputera klienta), bezczynność, czas logowania. Wylogowanie, rozłączenie, reset zawieszonej sesji (rwinsta), wiadomość, procesy w sesji i podgląd (shadow).' -Build {
     param($m)
     $m.PillColumns = @('Stan')
     $m.Actions.List = {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Sesje' -Targets $targets -ScriptBlock {
-            param($P)
-            $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = Join-Path $env:SystemRoot 'System32\quser.exe'
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.CreateNoWindow = $true
-            $psi.StandardOutputEncoding = $oem
-            $psi.StandardErrorEncoding = $oem
-            $proc = [System.Diagnostics.Process]::Start($psi)
-            $errTask = $proc.StandardError.ReadToEndAsync()
-            $out = $proc.StandardOutput.ReadToEnd()
-            $proc.WaitForExit()
-            $lines = @($out -split "`r?`n" | Where-Object { $_.Trim() })
-            if ($lines.Count -le 1) { return [pscustomobject]@{ 'Użytkownik' = '(brak zalogowanych użytkowników)'; '__flag' = 'muted' } }
-            foreach ($line in ($lines | Select-Object -Skip 1)) {
-                $mt = [regex]::Match($line, '^(?<cur>>)?\s*(?<user>\S+)\s+(?:(?<session>\S+)\s+)?(?<id>\d+)\s+(?<state>\S+)\s+(?<idle>\S+)\s+(?<logon>.+?)\s*$')
-                if (-not $mt.Success) { continue }
-                $state = $mt.Groups['state'].Value
-                $active = ($state -match '^(Active|Aktywn)')
-                [pscustomobject]@{
-                    'Użytkownik'   = $mt.Groups['user'].Value
-                    'Stan'         = $(if ($active) { 'Aktywna' } else { 'Rozłączona' })
-                    'Sesja'        = $mt.Groups['session'].Value
-                    'ID'           = [int]$mt.Groups['id'].Value
-                    'Bezczynność'  = $mt.Groups['idle'].Value
-                    'Zalogowano'   = $mt.Groups['logon'].Value
-                    '__tone'       = $(if ($active) { 'ok' } else { 'warn' })
-                }
-            }
-        }
-    }
-    $m.Actions.Session = {
-        param($m, [string]$Op, $Rows)
-        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('ID', 'Użytkownik') -Rows $Rows
-        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli sesje użytkowników.'; return }
-        $items = Get-HostItemList -ByHost $byHost -Format { param($i) '{0} (sesja {1})' -f $i['Użytkownik'], $i['ID'] }
-        $message = ''
-        switch ($Op) {
-            'Logoff' { if (-not (Confirm-Action -Text 'Wylogować wybrane sesje? Niezapisane dane użytkowników zostaną utracone.' -Items $items -ConfirmText 'Wyloguj' -Danger)) { return } }
-            'Disconnect' { if (-not (Confirm-Action -Text 'Rozłączyć wybrane sesje? Programy użytkowników pozostaną uruchomione.' -Items $items -ConfirmText 'Rozłącz')) { return } }
-            'Message' {
-                $message = Show-InputDialog -Title 'Wiadomość dla użytkowników' -Prompt 'Treść komunikatu wyświetlanego w wybranych sesjach (maks. 255 znaków).' -Default 'Za 10 minut nastąpi restart komputera. Zapisz swoją pracę.' -Icon 'E715' -Validate { param($t) if (-not $t.Trim()) { 'Wpisz treść wiadomości.' } elseif ($t.Length -gt 255) { 'Maksymalnie 255 znaków.' } else { '' } }
-                if (-not $message) { return }
-            }
-        }
-        $per = @{}
-        foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $Op; Message = $message; Ids = @($byHost[$h] | ForEach-Object { [int]$_['ID'] }) } }
-        $onComplete = if ($Op -eq 'Message') { $null } else { { param($m) & $m.Actions.List $m } }
-        Start-HostOperation -Module $m -Name "Sesje – $Op" -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete $onComplete -ScriptBlock {
-            param($P)
-            foreach ($id in $P.Ids) {
-                $exe = switch ($P.Op) { 'Logoff' { 'logoff.exe' } 'Disconnect' { 'tsdiscon.exe' } 'Message' { 'msg.exe' } }
-                $cmdArgs = @([string]$id)
-                if ($P.Op -eq 'Message') { $cmdArgs += '/TIME:300'; $cmdArgs += $P.Message }
-                $out = & (Join-Path $env:SystemRoot "System32\$exe") @cmdArgs 2>&1
-                if ($LASTEXITCODE -eq 0) { [pscustomobject]@{ 'Sesja' = $id; 'Operacja' = $P.Op; 'Wynik' = 'OK' } }
-                else { [pscustomobject]@{ 'Sesja' = $id; 'Operacja' = $P.Op; 'Wynik' = ('Błąd – kod {0} {1}' -f $LASTEXITCODE, ($out | Out-String).Trim()) } }
-            }
-        }
+        Start-HostOperation -Module $m -Name 'Sesje' -Targets $targets -Parameters (New-RdsSessionParameters) -ScriptBlock $script:RdsSessionScript -OnResult { param($m, $r) Write-RdsSourceNotes -Module $m -Result $r } -OnComplete { param($m) Complete-RdsList -Module $m }
     }
     $row = Add-ToolbarRow -Module $m -Title 'Akcje'
     Add-Button -Parent $row -Text 'Pokaż sesje' -Icon 'E72C' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
-    Add-Button -Parent $row -Text 'Wiadomość…' -Icon 'E715' -Module $m -OnClick { param($m) & $m.Actions.Session $m 'Message' $null } | Out-Null
-    Add-Button -Parent $row -Text 'Rozłącz' -Icon 'E8CD' -Module $m -OnClick { param($m) & $m.Actions.Session $m 'Disconnect' $null } | Out-Null
-    Add-Button -Parent $row -Text 'Wyloguj' -Icon 'E7E8' -Module $m -Danger -OnClick { param($m) & $m.Actions.Session $m 'Logoff' $null } | Out-Null
-    Add-RowAction -Module $m -Text 'Wyślij wiadomość…' -Icon 'E715' -Action { param($m, $rows) & $m.Actions.Session $m 'Message' $rows }
-    Add-RowAction -Module $m -Text 'Podgląd sesji (shadow)' -Icon 'E7B3' -Action {
-        param($m, $rows)
-        $r = $rows[0]
-        $computer = [string](Get-ObjectValue $r 'Komputer')
-        $id = [string](Get-ObjectValue $r 'ID')
-        if ($id -notmatch '^\d+$') { return }
-        Start-Tool -FilePath 'mstsc.exe' -Arguments @("/v:$computer", "/shadow:$id", '/control') -Name $computer
-    }
-    Add-RowAction -Module $m -Text 'Rozłącz' -Icon 'E8CD' -Action { param($m, $rows) & $m.Actions.Session $m 'Disconnect' $rows }
-    Add-RowAction -Module $m -Text 'Wyloguj' -Icon 'E7E8' -Danger -Separator -Action { param($m, $rows) & $m.Actions.Session $m 'Logoff' $rows }
+    Add-Button -Parent $row -Text 'Wiadomość…' -Icon 'E715' -Module $m -OnClick { param($m) Invoke-RdsSessionAction -Module $m -Op Message -Rows $null } | Out-Null
+    Add-Button -Parent $row -Text 'Rozłącz' -Icon 'E8CD' -Module $m -OnClick { param($m) Invoke-RdsSessionAction -Module $m -Op Disconnect -Rows $null } | Out-Null
+    Add-Button -Parent $row -Text 'Wyloguj' -Icon 'E7E8' -Module $m -Danger -OnClick { param($m) Invoke-RdsSessionAction -Module $m -Op Logoff -Rows $null } | Out-Null
+    Add-Button -Parent $row -Text 'Resetuj…' -Icon 'E72C' -Module $m -Danger -ToolTip 'Reset zawieszonej sesji (rwinsta) – gdy wylogowanie nie pomaga' -OnClick { param($m) Invoke-RdsSessionAction -Module $m -Op Reset -Rows $null } | Out-Null
+    Add-RdsSessionRowActions -Module $m
 }
 
 $script:LocalGroupDefs = @(
@@ -26362,6 +26301,518 @@ Register-ReportType -Key 'LocalGroupCompliance' -Title 'Zgodność grup lokalnyc
         Rows = $rows.ToArray(); Findings = $findings; PillColumns = @('Zgodność'); Errors = $errs.ToArray()
         Tiles = @(@{ Label = 'Komputery'; Value = $targets.Count; Tone = '' }, @{ Label = 'Zgodne z szablonem'; Value = $okCount; Tone = $(if ($okCount -eq $results.Count) { 'ok' } else { 'warn' }) }, @{ Label = 'Niedozwoleni członkowie'; Value = $denied; Tone = $(if ($denied) { 'crit' } else { '' }) }, @{ Label = 'Bez połączenia'; Value = $errs.Count; Tone = $(if ($errs.Count) { 'crit' } else { '' }) })
     }
+}
+#endregion
+
+#region Sesje pulpitu zdalnego (RDS) – lista sesji (WTS), akcje, procesy, farma
+# Lista sesji na serwerze przez WTS API (stan niezależny od języka systemu, nazwa i adres klienta, bezczynność, czas logowania).
+# Kod C# kompilowany na serwerze (Add-Type); gdy to niemożliwe (np. tryb ograniczonego języka) - quser bez danych klienta.
+$script:RdsWtsSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public class DomainOpsWtsSession {
+    public int Id; public int State; public int Protocol;
+    public string WinStation = ""; public string User = ""; public string Domain = ""; public string Client = ""; public string Address = "";
+    public long LogonTime; public long DisconnectTime; public long LastInputTime; public long CurrentTime;
+}
+public static class DomainOpsWts {
+    [StructLayout(LayoutKind.Sequential)]
+    struct SessionInfo { public int SessionId; public IntPtr WinStationName; public int State; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WtsInfo {
+        public int State; public int SessionId;
+        public int IncomingBytes; public int OutgoingBytes; public int IncomingFrames; public int OutgoingFrames; public int IncomingCompressedBytes; public int OutgoingCompressedBytes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string WinStationName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 17)] public string Domain;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 21)] public string UserName;
+        public long ConnectTime; public long DisconnectTime; public long LastInputTime; public long LogonTime; public long CurrentTime;
+    }
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSEnumerateSessionsW(IntPtr server, int reserved, int version, out IntPtr info, out int count);
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSQuerySessionInformationW(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out int bytes);
+    [DllImport("wtsapi32.dll")]
+    static extern void WTSFreeMemory(IntPtr memory);
+
+    static IntPtr Query(int id, int cls) {
+        IntPtr buf; int bytes;
+        if (!WTSQuerySessionInformationW(IntPtr.Zero, id, cls, out buf, out bytes)) return IntPtr.Zero;
+        return buf;
+    }
+    static string QueryString(int id, int cls) {
+        IntPtr buf = Query(id, cls);
+        if (buf == IntPtr.Zero) return "";
+        try { return Marshal.PtrToStringUni(buf) ?? ""; } finally { WTSFreeMemory(buf); }
+    }
+    public static List<DomainOpsWtsSession> Sessions() {
+        IntPtr info; int count;
+        if (!WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out info, out count)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        var list = new List<DomainOpsWtsSession>();
+        try {
+            int size = Marshal.SizeOf(typeof(SessionInfo));
+            for (int i = 0; i < count; i++) {
+                var si = (SessionInfo)Marshal.PtrToStructure(new IntPtr(info.ToInt64() + (long)i * size), typeof(SessionInfo));
+                var s = new DomainOpsWtsSession();
+                s.Id = si.SessionId; s.State = si.State;
+                s.WinStation = si.WinStationName == IntPtr.Zero ? "" : (Marshal.PtrToStringUni(si.WinStationName) ?? "");
+                s.User = QueryString(s.Id, 5);      // WTSUserName
+                s.Domain = QueryString(s.Id, 7);    // WTSDomainName
+                s.Client = QueryString(s.Id, 10);   // WTSClientName
+                IntPtr buf = Query(s.Id, 14);       // WTSClientAddress: rodzina adresu, potem adres od bajtu 2
+                if (buf != IntPtr.Zero) {
+                    try {
+                        int family = Marshal.ReadInt32(buf);
+                        if (family == 2) s.Address = string.Format("{0}.{1}.{2}.{3}", Marshal.ReadByte(buf, 6), Marshal.ReadByte(buf, 7), Marshal.ReadByte(buf, 8), Marshal.ReadByte(buf, 9));
+                        else if (family == 23) { var b = new byte[16]; for (int k = 0; k < 16; k++) b[k] = Marshal.ReadByte(buf, 6 + k); s.Address = new System.Net.IPAddress(b).ToString(); }
+                    } finally { WTSFreeMemory(buf); }
+                }
+                buf = Query(s.Id, 16);              // WTSClientProtocolType: 0 konsola, 2 RDP
+                if (buf != IntPtr.Zero) { try { s.Protocol = Marshal.ReadInt16(buf); } finally { WTSFreeMemory(buf); } }
+                buf = Query(s.Id, 24);              // WTSSessionInfo: czasy logowania, rozłączenia, ostatniej aktywności
+                if (buf != IntPtr.Zero) {
+                    try {
+                        var wi = (WtsInfo)Marshal.PtrToStructure(buf, typeof(WtsInfo));
+                        s.LogonTime = wi.LogonTime; s.DisconnectTime = wi.DisconnectTime; s.LastInputTime = wi.LastInputTime; s.CurrentTime = wi.CurrentTime;
+                    } finally { WTSFreeMemory(buf); }
+                }
+                list.Add(s);
+            }
+        } finally { WTSFreeMemory(info); }
+        return list;
+    }
+}
+'@
+
+function ConvertFrom-QuserText {
+    # Wiersze wyniku quser -> sesje (zapasowo, gdy WTS jest niedostępne); bezczynność «.», «5», «1:05», «2+03:04» -> minuty
+    param([string[]]$Lines)
+    foreach ($line in @($Lines | Select-Object -Skip 1)) {
+        $mt = [regex]::Match($line, '^(?<cur>>)?\s*(?<user>\S+)\s+(?:(?<session>\S+)\s+)?(?<id>\d+)\s+(?<state>\S+)\s+(?<idle>\S+)\s+(?<logon>.+?)\s*$')
+        if (-not $mt.Success) { continue }
+        $idleText = $mt.Groups['idle'].Value
+        $idle = 0
+        if ($idleText -match '^(\d+)\+(\d+):(\d+)$') { $idle = [int]$Matches[1] * 1440 + [int]$Matches[2] * 60 + [int]$Matches[3] }
+        elseif ($idleText -match '^(\d+):(\d+)$') { $idle = [int]$Matches[1] * 60 + [int]$Matches[2] }
+        elseif ($idleText -match '^\d+$') { $idle = [int]$idleText }
+        $active = ($mt.Groups['state'].Value -match '^(Active|Aktywn|Activ)')
+        @{ User = $mt.Groups['user'].Value; Session = $mt.Groups['session'].Value; Id = [int]$mt.Groups['id'].Value; Active = $active; Idle = $idle; Logon = $mt.Groups['logon'].Value }
+    }
+}
+
+# Sesje użytkowników na serwerze. $P: WtsSource, QuserParser (tekst funkcji), User (fragment loginu), OnlyDisconnected, Collection (farma)
+$script:RdsSessionScript = {
+    param($P)
+    $states = @{ 0 = 'Aktywna'; 1 = 'Połączona'; 2 = 'Łączenie'; 3 = 'Podgląd'; 4 = 'Rozłączona'; 5 = 'Bezczynna'; 6 = 'Nasłuchuje'; 7 = 'Resetowanie'; 8 = 'Wyłączona'; 9 = 'Inicjowanie' }
+    $rows = New-Object System.Collections.ArrayList
+    # Kompilacja pomocnika WTS; gdy niemożliwa - quser. Błąd samego odczytu WTS jest błędem komputera.
+    $fallback = ''
+    if (-not ('DomainOpsWts' -as [type])) {
+        try { Add-Type -TypeDefinition ([string]$P.WtsSource) -ErrorAction Stop } catch { $fallback = $_.Exception.Message }
+    }
+    if (-not $fallback) {
+        $now = Get-Date
+        foreach ($s in @([DomainOpsWts]::Sessions())) {
+            if (-not $s.User) { continue }
+            $cur = if ($s.CurrentTime -gt 0) { [datetime]::FromFileTime($s.CurrentTime) } else { $now }
+            $idle = $null
+            $disc = $null
+            if ($s.State -eq 4 -and $s.DisconnectTime -gt 0) {
+                $disc = [datetime]::FromFileTime($s.DisconnectTime)
+                $idle = [int][Math]::Max(0, ($cur - $disc).TotalMinutes)
+            }
+            elseif ($s.LastInputTime -gt 0) { $idle = [int][Math]::Max(0, ($cur - [datetime]::FromFileTime($s.LastInputTime)).TotalMinutes) }
+            [void]$rows.Add([ordered]@{
+                    'Użytkownik'        = $(if ($s.Domain) { '{0}\{1}' -f $s.Domain, $s.User } else { $s.User })
+                    'Stan'              = $(if ($states.ContainsKey($s.State)) { $states[$s.State] } else { [string]$s.State })
+                    'ID'                = $s.Id
+                    'Sesja'             = $s.WinStation
+                    'Klient'            = $s.Client
+                    'Adres klienta'     = $s.Address
+                    'Bezczynność (min)' = $idle
+                    'Zalogowano'        = $(if ($s.LogonTime -gt 0) { [datetime]::FromFileTime($s.LogonTime) } else { $null })
+                    'Rozłączono'        = $disc
+                    '__tone'            = $(if ($s.State -eq 0) { 'ok' } elseif ($s.State -eq 4) { 'warn' } else { 'info' })
+                })
+        }
+    }
+    if ($fallback) {
+        # quser: bez nazwy i adresu klienta; stan tylko aktywna / rozłączona
+        $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = Join-Path $env:SystemRoot 'System32\quser.exe'
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        $psi.StandardOutputEncoding = $oem
+        $psi.StandardErrorEncoding = $oem
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $null = $proc.StandardError.ReadToEndAsync()
+        $out = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit()
+        $parse = [scriptblock]::Create([string]$P.QuserParser)
+        foreach ($q in @(& $parse @($out -split "`r?`n" | Where-Object { $_.Trim() }))) {
+            [void]$rows.Add([ordered]@{
+                    'Użytkownik' = $q.User; 'Stan' = $(if ($q.Active) { 'Aktywna' } else { 'Rozłączona' }); 'ID' = $q.Id; 'Sesja' = $q.Session; 'Klient' = ''; 'Adres klienta' = ''
+                    'Bezczynność (min)' = $q.Idle; 'Zalogowano' = $q.Logon; 'Rozłączono' = $null; '__tone' = $(if ($q.Active) { 'ok' } else { 'warn' }); '__src' = "quser ($fallback)"
+                })
+        }
+    }
+    foreach ($o in $rows) {
+        if ($P.OnlyDisconnected -and $o['Stan'] -ne 'Rozłączona') { continue }
+        if ($P.User -and ([string]$o['Użytkownik']).IndexOf([string]$P.User, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        if ($P.Collection) { $o.Insert(2, 'Kolekcja', [string]$P.Collection) }
+        [pscustomobject]$o
+    }
+}
+
+# Akcja na sesjach serwera narzędziami systemu (jak z wiersza poleceń na serwerze). $P: Op, Ids, Users, Message
+$script:RdsActionScript = {
+    param($P)
+    $names = @{ 'Logoff' = 'wylogowanie'; 'Disconnect' = 'rozłączenie'; 'Reset' = 'reset (rwinsta)'; 'Message' = 'wiadomość' }
+    $exe = @{ 'Logoff' = 'logoff.exe'; 'Disconnect' = 'tsdiscon.exe'; 'Reset' = 'rwinsta.exe'; 'Message' = 'msg.exe' }[[string]$P.Op]
+    $users = @($P.Users)
+    $i = 0
+    foreach ($id in @($P.Ids)) {
+        $cmdArgs = @([string]$id)
+        if ($P.Op -eq 'Message') { $cmdArgs += '/TIME:300'; $cmdArgs += [string]$P.Message }
+        $out = @(& $exe @cmdArgs 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+        $code = $LASTEXITCODE
+        [pscustomobject]@{
+            'Sesja'      = [int]$id
+            'Użytkownik' = $(if ($i -lt $users.Count) { [string]$users[$i] } else { '' })
+            'Operacja'   = $names[[string]$P.Op]
+            'Wynik'      = $(if ($code -eq 0) { 'OK' } else { ('Błąd – kod {0}: {1}' -f $code, ($out -join ' ')).Trim() })
+        }
+        $i++
+    }
+}
+
+# Procesy w sesjach (Ids) - do okna z listą i kończeniem procesów
+$script:RdsProcessScript = {
+    param($P)
+    $ids = @($P.Ids | ForEach-Object { [int]$_ })
+    foreach ($pr in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $ids -contains [int]$_.SessionId } | Sort-Object -Property WorkingSet64 -Descending)) {
+        $cpu = $null
+        try { $cpu = [Math]::Round($pr.TotalProcessorTime.TotalSeconds, 1) } catch { }
+        $path = ''
+        try { $path = [string]$pr.Path } catch { }
+        $start = $null
+        try { $start = $pr.StartTime } catch { }
+        [pscustomobject]@{
+            'Sesja'       = [int]$pr.SessionId
+            'Proces'      = $pr.ProcessName
+            'PID'         = $pr.Id
+            'Pamięć (MB)' = [Math]::Round($pr.WorkingSet64 / 1MB, 1)
+            'CPU (s)'     = $cpu
+            'Okno'        = [string]$pr.MainWindowTitle
+            'Uruchomiono' = $start
+            'Ścieżka'     = $path
+        }
+    }
+}
+
+$script:RdsStopProcessScript = {
+    param($P)
+    foreach ($id in @($P.Pids)) {
+        try {
+            Stop-Process -Id ([int]$id) -Force -ErrorAction Stop
+            [pscustomobject]@{ PID = [int]$id; Ok = $true; Error = '' }
+        }
+        catch { [pscustomobject]@{ PID = [int]$id; Ok = $false; Error = $_.Exception.Message } }
+    }
+}
+
+# Serwery sesji z brokera połączeń RD (moduł RemoteDesktop na brokerze)
+$script:RdsBrokerScript = {
+    param($P)
+    if (-not (Get-Command Get-RDSessionHost -ErrorAction SilentlyContinue)) { Import-Module RemoteDesktop -ErrorAction Stop }
+    $broker = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
+    $allowed = @{ 'Yes' = 'Tak'; 'No' = 'Nie'; 'NotUntilReboot' = 'Nie do restartu' }
+    foreach ($c in @(Get-RDSessionCollection -ConnectionBroker $broker -ErrorAction Stop)) {
+        foreach ($h in @(Get-RDSessionHost -CollectionName $c.CollectionName -ConnectionBroker $broker -ErrorAction Stop)) {
+            $na = [string]$h.NewConnectionAllowed
+            [pscustomobject]@{ 'Serwer' = [string]$h.SessionHost; 'Kolekcja' = [string]$c.CollectionName; 'Nowe połączenia' = $(if ($allowed.ContainsKey($na)) { $allowed[$na] } else { $na }) }
+        }
+    }
+}
+
+function New-RdsSessionParameters {
+    param([string]$User = '', [bool]$OnlyDisconnected = $false, [string]$Collection = '')
+    return @{ WtsSource = $script:RdsWtsSource; QuserParser = ${function:ConvertFrom-QuserText}.ToString(); User = $User; OnlyDisconnected = $OnlyDisconnected; Collection = $Collection }
+}
+
+function Write-RdsSourceNotes {
+    # Raz na komputer: lista z quser zamiast WTS (bez nazwy i adresu klienta) - z przyczyną
+    param([hashtable]$Module, $Result)
+    $first = @($Result.Data | Where-Object { $_ -and $_.PSObject.Properties['__src'] } | Select-Object -First 1)
+    if ($first) { Write-Log ("[{0}] lista sesji z quser – bez nazwy i adresu klienta: {1}" -f $Result.Target, $first[0].'__src') 'WARN' -Module $Module.Title }
+}
+
+function Complete-RdsList {
+    # Po odczycie sesji: ukrycie pustych kolumn, kafelki (gdy moduł je ma)
+    param([hashtable]$Module)
+    Set-EmptyColumnsHidden -Module $Module -Columns @('Kolekcja', 'Klient', 'Adres klienta', 'Bezczynność (min)', 'Rozłączono')
+    if (-not $Module.Stats.ContainsKey('sessions')) { return }
+    $total = 0; $active = 0; $disc = 0; $idle = 0
+    $hosts = @{}
+    foreach ($r in @(Get-ResultRowsAll -Module $Module)) {
+        if (-not $r.Table.Columns.Contains('ID') -or $r['ID'] -is [System.DBNull]) { continue }
+        $total++
+        $hosts[[string]$r['Komputer']] = $true
+        switch ([string]$r['Stan']) { 'Aktywna' { $active++ } 'Rozłączona' { $disc++ } }
+        $v = Get-ObjectValue $r 'Bezczynność (min)'
+        if ($null -ne $v -and $v -isnot [System.DBNull] -and [int]$v -ge 60) { $idle++ }
+    }
+    Set-StatTile -Module $Module -Key 'sessions' -Value ([string]$total) -Tone $(if ($total) { 'info' } else { '' })
+    Set-StatTile -Module $Module -Key 'active' -Value ([string]$active) -Tone $(if ($active) { 'ok' } else { '' })
+    Set-StatTile -Module $Module -Key 'disc' -Value ([string]$disc) -Tone $(if ($disc) { 'warn' } else { 'ok' })
+    Set-StatTile -Module $Module -Key 'idle' -Value ([string]$idle) -Tone $(if ($idle) { 'warn' } else { 'ok' })
+    Set-StatTile -Module $Module -Key 'hosts' -Value ('{0} z {1}' -f $hosts.Count, @($Module.Data.LastHosts).Count)
+}
+
+function Get-RdsSessionRows {
+    # Wiersze sesji (z kolumną ID; bez wierszy błędów komputerów)
+    param($Rows)
+    return @($Rows | Where-Object { [string](Get-ObjectValue $_ 'ID') -match '^\d+$' -and [string](Get-ObjectValue $_ 'Komputer') })
+}
+
+function Invoke-RdsSessionAction {
+    # Wylogowanie, rozłączenie, reset (rwinsta) albo wiadomość dla sesji z wierszy; po zmianie odświeżenie tylko tych serwerów
+    param([hashtable]$Module, [ValidateSet('Logoff', 'Disconnect', 'Reset', 'Message')][string]$Op, $Rows)
+    $m = $Module
+    if ($null -eq $Rows) { $Rows = @(Get-SelectedResultRows -Module $m) }
+    $sel = @(Get-RdsSessionRows $Rows)
+    if ($sel.Count -eq 0) { Show-Warning 'Zaznacz w tabeli sesje użytkowników.'; return }
+    $byHost = [ordered]@{}
+    foreach ($r in $sel) {
+        $h = [string](Get-ObjectValue $r 'Komputer')
+        if (-not $byHost.Contains($h)) { $byHost[$h] = New-Object System.Collections.ArrayList }
+        [void]$byHost[$h].Add(@{ Id = [int](Get-ObjectValue $r 'ID'); User = [string](Get-ObjectValue $r 'Użytkownik') })
+    }
+    $items = @(foreach ($h in $byHost.Keys) { foreach ($i in $byHost[$h]) { '{0} – {1} (sesja {2})' -f $h, $i.User, $i.Id } })
+    $message = ''
+    switch ($Op) {
+        'Logoff' { if (-not (Confirm-Action -Text 'Wylogować wybrane sesje? Programy użytkowników zostaną zamknięte, niezapisane dane przepadną.' -Items $items -ConfirmText 'Wyloguj' -Danger)) { return } }
+        'Reset' { if (-not (Confirm-Action -Text 'Zresetować wybrane sesje (rwinsta)? Sesja kończy się natychmiast, bez zamykania programów i zapisywania danych. Używaj, gdy sesja jest zawieszona i wylogowanie nie pomaga.' -Items $items -ConfirmText 'Resetuj' -Danger)) { return } }
+        'Disconnect' { if (-not (Confirm-Action -Text 'Rozłączyć wybrane sesje? Programy użytkowników pozostaną uruchomione, a użytkownik może wrócić do sesji.' -Items $items -ConfirmText 'Rozłącz')) { return } }
+        'Message' {
+            $message = Show-InputDialog -Title 'Wiadomość dla użytkowników' -Prompt ("Treść komunikatu wyświetlanego w wybranych sesjach ({0}); maks. 255 znaków." -f $items.Count) -Default 'Za 10 minut nastąpi restart serwera. Zapisz swoją pracę i wyloguj się.' -Icon 'E715' -Validate { param($t) if (-not $t.Trim()) { 'Wpisz treść wiadomości.' } elseif ($t.Length -gt 255) { 'Maksymalnie 255 znaków.' } else { '' } }
+            if (-not $message) { return }
+        }
+    }
+    $per = @{}
+    foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $Op; Message = $message; Ids = @($byHost[$h] | ForEach-Object { $_.Id }); Users = @($byHost[$h] | ForEach-Object { $_.User }) } }
+    $m.Data.ActionHosts = @($byHost.Keys)
+    $onComplete = $null
+    if ($Op -ne 'Message') {
+        # Odświeżenie tylko serwerów, których dotyczyła akcja (wiersze pozostałych zostają)
+        $onComplete = { param($m) Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } }
+    }
+    $title = @{ 'Logoff' = 'Wylogowanie sesji'; 'Disconnect' = 'Rozłączenie sesji'; 'Reset' = 'Reset sesji'; 'Message' = 'Wiadomość' }[$Op]
+    Start-HostOperation -Module $m -Name $title -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete $onComplete -ScriptBlock $script:RdsActionScript
+}
+
+function Show-RdsSessionProcesses {
+    # Procesy w sesjach z wierszy (w tle), potem okno z listą; z okna można zakończyć proces
+    param([hashtable]$Module, $Rows)
+    $sel = @(Get-RdsSessionRows $Rows)
+    if ($sel.Count -eq 0) { return }
+    $per = @{}
+    foreach ($r in $sel) {
+        $h = [string](Get-ObjectValue $r 'Komputer')
+        if (-not $per.ContainsKey($h)) { $per[$h] = @{ Ids = @() } }
+        $per[$h].Ids += [int](Get-ObjectValue $r 'ID')
+    }
+    $Module.Data.ProcRows = New-Object System.Collections.ArrayList
+    $Module.Data.ProcTitle = (@($sel | Select-Object -First 3 | ForEach-Object { '{0} (sesja {1}, {2})' -f (Get-ObjectValue $_ 'Użytkownik'), (Get-ObjectValue $_ 'ID'), (Get-ObjectValue $_ 'Komputer') }) -join ', ')
+    Start-HostOperation -Module $Module -Name 'Procesy w sesji' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:RdsProcessScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { return }
+        foreach ($d in @($r.Data)) {
+            if (-not $d) { continue }
+            $o = [ordered]@{ 'Komputer' = [string]$r.Target }
+            foreach ($p in $d.PSObject.Properties) { if ($script:HiddenProperties -notcontains $p.Name) { $o[$p.Name] = $p.Value } }
+            [void]$m.Data.ProcRows.Add([pscustomobject]$o)
+        }
+    } -OnComplete {
+        param($m)
+        $rows = @($m.Data.ProcRows)
+        if ($rows.Count -eq 0) { Show-Message -Text 'Nie znaleziono procesów w tych sesjach (sesja mogła się już zakończyć).' -Title 'Procesy w sesji'; return }
+        $kill = @{ Text = 'Zakończ proces…'; Icon = 'E711'; Danger = $true; Action = { param($dm, $rows) Stop-RdsSessionProcess -DialogModule $dm -Rows $rows } }
+        Show-GridDialog -Title 'Procesy w sesji' -Subtitle ("{0}. Od największego zużycia pamięci. Prawy przycisk: zakończenie procesu." -f $m.Data.ProcTitle) -Rows $rows -RowActions @($kill)
+    }
+}
+
+function Stop-RdsSessionProcess {
+    # Kończy procesy z wierszy okna «Procesy w sesji» (synchronicznie, z kursorem oczekiwania) i usuwa je z listy
+    param([hashtable]$DialogModule, $Rows)
+    $byHost = [ordered]@{}
+    foreach ($r in @($Rows)) {
+        $h = [string](Get-ObjectValue $r 'Komputer')
+        if (-not $h) { continue }
+        if (-not $byHost.Contains($h)) { $byHost[$h] = New-Object System.Collections.ArrayList }
+        [void]$byHost[$h].Add($r)
+    }
+    if ($byHost.Count -eq 0) { return }
+    $items = @(foreach ($h in $byHost.Keys) { foreach ($r in $byHost[$h]) { '{0} – {1} (PID {2})' -f $h, (Get-ObjectValue $r 'Proces'), (Get-ObjectValue $r 'PID') } })
+    if (-not (Confirm-Action -Text 'Zakończyć wybrane procesy? Niezapisane dane w tych programach przepadną.' -Items $items -ConfirmText 'Zakończ' -Danger)) { return }
+    $per = @{}
+    foreach ($h in $byHost.Keys) { $per[$h] = @{ Pids = @($byHost[$h] | ForEach-Object { [int](Get-ObjectValue $_ 'PID') }) } }
+    $results = @(Invoke-WithWaitCursor { Invoke-SyncOperation -Targets @($byHost.Keys) -PerTarget $per -ScriptBlock $script:RdsStopProcessScript -TimeoutSec 60 })
+    $done = 0
+    $errors = New-Object System.Collections.ArrayList
+    foreach ($res in $results) {
+        if (-not $res.Ok) { [void]$errors.Add(('{0}: {1}' -f $res.Target, (@($res.Errors) -join ' '))); continue }
+        foreach ($d in @($res.Data)) {
+            if ($d.Ok) {
+                $done++
+                Remove-ResultRows -Module $DialogModule -Rows @($byHost[$res.Target] | Where-Object { [int](Get-ObjectValue $_ 'PID') -eq [int]$d.PID })
+            }
+            else { [void]$errors.Add(('{0}: PID {1} – {2}' -f $res.Target, $d.PID, $d.Error)) }
+        }
+    }
+    Write-Log ("Zakończono procesów: {0}{1}" -f $done, $(if ($errors.Count) { '; błędy: ' + ($errors -join ' | ') } else { '' })) $(if ($errors.Count) { 'WARN' } else { 'OK' })
+    if ($errors.Count) { Show-Warning ("Nie udało się zakończyć części procesów:`n" + ($errors -join "`n")) }
+    else { Show-Toast "Zakończono procesów: $done" 'ok' }
+}
+
+function Add-RdsSessionRowActions {
+    # Wspólne akcje wiersza sesji (moduł «Sesje użytkowników» i «Sesje RDS»)
+    param([hashtable]$Module)
+    Add-RowAction -Module $Module -Text 'Wyślij wiadomość…' -Icon 'E715' -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Message -Rows $rows }
+    Add-RowAction -Module $Module -Text 'Podgląd sesji (shadow)' -Icon 'E7B3' -Action {
+        param($m, $rows)
+        $r = @(Get-RdsSessionRows $rows)[0]
+        if (-not $r) { return }
+        Start-Tool -FilePath 'mstsc.exe' -Arguments @(('/v:{0}' -f (Get-ObjectValue $r 'Komputer')), ('/shadow:{0}' -f (Get-ObjectValue $r 'ID')), '/control') -Name ([string](Get-ObjectValue $r 'Komputer'))
+    }
+    Add-RowAction -Module $Module -Text 'Procesy w sesji' -Icon 'E9D9' -Action { param($m, $rows) Show-RdsSessionProcesses -Module $m -Rows $rows }
+    Add-RowAction -Module $Module -Text 'Rozłącz' -Icon 'E8CD' -Separator -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Disconnect -Rows $rows }
+    Add-RowAction -Module $Module -Text 'Wyloguj' -Icon 'E7E8' -Danger -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Logoff -Rows $rows }
+    Add-RowAction -Module $Module -Text 'Resetuj sesję (rwinsta)…' -Icon 'E72C' -Danger -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Reset -Rows $rows }
+}
+
+function Get-RdsFarmHosts {
+    # Serwery farmy: podstawione przez akcję wiersza albo z pola «Serwery»
+    param([hashtable]$Module)
+    $ov = Get-TargetOverride
+    if ($ov -and $ov.Kind -eq 'Computer') { return @($ov.Names) }
+    return @(Split-ListText ($Module.Hosts.Text -replace '\s+', ',') | Select-Object -Unique)
+}
+
+function Invoke-RdsFarmList {
+    param([hashtable]$Module)
+    $m = $Module
+    $hosts = @(Get-RdsFarmHosts -Module $m)
+    if ($hosts.Count -eq 0) { Show-Warning 'Wpisz serwery sesji (RD Session Host) albo wczytaj je z brokera połączeń lub z AD.'; return }
+    if (-not (Get-TargetOverride)) {
+        Set-ModuleSetting -Module $m -Name 'Hosts' -Value ($hosts -join ', ')
+        $m.Data.LastHosts = $hosts
+    }
+    $collections = Get-ModuleSetting -Module $m -Name 'Collections' -Default @{}
+    $per = @{}
+    foreach ($h in $hosts) {
+        $col = ''
+        if ($collections -is [System.Collections.IDictionary] -and $collections.Contains($h)) { $col = [string]$collections[$h] }
+        elseif ($collections -and $collections.PSObject.Properties[$h]) { $col = [string]$collections.$h }
+        $per[$h] = New-RdsSessionParameters -User $m.UserFilter.Text.Trim() -OnlyDisconnected (Test-Checked $m.OnlyDisc) -Collection $col
+    }
+    Start-HostOperation -Module $m -Name 'Sesje RDS' -Targets $hosts -PerTarget $per -ScriptBlock $script:RdsSessionScript -OnResult { param($m, $r) Write-RdsSourceNotes -Module $m -Result $r } -OnComplete { param($m) Complete-RdsList -Module $m }
+}
+
+function Import-RdsBrokerHosts {
+    # Serwery sesji i kolekcje z brokera połączeń RD (WinRM na brokerze, moduł RemoteDesktop)
+    param([hashtable]$Module)
+    $m = $Module
+    $broker = Show-InputDialog -Title 'Broker połączeń RD' -Prompt 'Nazwa serwera brokera połączeń pulpitu zdalnego (RD Connection Broker). Serwery sesji i kolekcje zostaną odczytane modułem RemoteDesktop na brokerze.' -Default ([string](Get-ModuleSetting -Module $m -Name 'Broker' -Default '')) -Icon 'E968' -Validate { param($t) if (-not $t.Trim()) { 'Wpisz nazwę brokera.' } else { '' } }
+    if (-not $broker) { return }
+    $broker = $broker.Trim()
+    Set-ModuleSetting -Module $m -Name 'Broker' -Value $broker
+    $m.Data.BrokerRows = @()
+    Start-HostOperation -Module $m -Name 'Broker RD' -Targets @($broker) -Output None -ScriptBlock $script:RdsBrokerScript -OnResult { param($m, $r) $m.Data.BrokerResult = $r } -OnComplete {
+        param($m)
+        $r = $m.Data.BrokerResult
+        if (-not $r -or -not $r.Ok) { Show-Warning ("Nie udało się odczytać serwerów z brokera: {0}" -f $(if ($r) { (@($r.Errors) -join ' | ') } else { 'brak wyniku' })); return }
+        $rows = @($r.Data | Where-Object { $_ -and $_.'Serwer' })
+        if ($rows.Count -eq 0) { Show-Warning 'Broker nie zwrócił żadnych serwerów sesji (brak kolekcji sesji?).'; return }
+        $map = @{}
+        foreach ($x in $rows) { $map[[string]$x.'Serwer'] = [string]$x.'Kolekcja' }
+        Set-ModuleSetting -Module $m -Name 'Collections' -Value $map
+        $m.Hosts.Text = (@($rows | ForEach-Object { [string]$_.'Serwer' } | Select-Object -Unique) -join ', ')
+        $drain = @($rows | Where-Object { $_.'Nowe połączenia' -ne 'Tak' })
+        $cols = @($rows | ForEach-Object { [string]$_.'Kolekcja' } | Select-Object -Unique)
+        Write-Log ("Broker RD: {0} serwerów w kolekcjach: {1}{2}" -f @($map.Keys).Count, ($cols -join ', '), $(if ($drain.Count) { '; nie przyjmują nowych połączeń: ' + ((@($drain | ForEach-Object { '{0} ({1})' -f $_.'Serwer', $_.'Nowe połączenia' })) -join ', ') } else { '' })) 'OK' -Module $m.Title
+        Show-Toast ("Serwery z brokera: {0}" -f @($map.Keys).Count) 'ok'
+    }
+}
+
+function Import-RdsAdHosts {
+    # Serwery z AD po fragmencie nazwy (włączone, system serwerowy)
+    param([hashtable]$Module)
+    $m = $Module
+    $filter = Show-InputDialog -Title 'Serwery z AD' -Prompt 'Wzorzec nazwy serwerów sesji (z * jako dowolnym ciągiem), np. RDS* albo *-TS-*. Pod uwagę brane są włączone komputery z systemem serwerowym.' -Default ([string](Get-ModuleSetting -Module $m -Name 'AdFilter' -Default 'RDS*')) -Icon 'E977' -Validate { param($t) if (-not $t.Trim()) { 'Wpisz wzorzec nazwy.' } else { '' } }
+    if (-not $filter) { return }
+    $filter = $filter.Trim()
+    Set-ModuleSetting -Module $m -Name 'AdFilter' -Value $filter
+    $m.Data.AdHosts = $null
+    Start-AdOperation -Module $m -Name 'Serwery z AD' -Targets @('Active Directory') -Output None -Parameters @{ Filter = $filter } -ScriptBlock {
+        $ldapName = ($P.Filter -replace '\\', '\5c' -replace '\(', '\28' -replace '\)', '\29')
+        $q = @{ LDAPFilter = "(&(objectCategory=computer)(name=$ldapName)(operatingSystem=*Server*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"; Properties = @('dNSHostName') }
+        foreach ($c in @(Get-ADComputer @q @ad)) { if ($c.DNSHostName) { [string]$c.DNSHostName } else { [string]$c.Name } }
+    } -OnResult { param($m, $r) $m.Data.AdHosts = $r } -OnComplete {
+        param($m)
+        $r = $m.Data.AdHosts
+        if (-not $r -or -not $r.Ok) { Show-Warning ("Nie udało się odczytać serwerów z AD: {0}" -f $(if ($r) { (@($r.Errors) -join ' | ') } else { 'brak wyniku' })); return }
+        $names = @($r.Data | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)
+        if ($names.Count -eq 0) { Show-Warning 'Nie znaleziono w AD włączonych serwerów pasujących do wzorca.'; return }
+        $m.Hosts.Text = ($names -join ', ')
+        Show-Toast ("Serwery z AD: {0}" -f $names.Count) 'ok'
+    }
+}
+
+function Invoke-RdsLogoffDisconnected {
+    # Wylogowanie sesji rozłączonych dłużej niż N minut (z widocznych wierszy tabeli)
+    param([hashtable]$Module)
+    $m = $Module
+    if ($null -eq $m.View) { return }
+    $v = Show-InputDialog -Title 'Wyloguj rozłączone' -Prompt 'Wylogować sesje rozłączone dłużej niż ile minut? (dotyczy widocznych wierszy tabeli)' -Default '120' -Icon 'E7E8' -Validate { param($t) if ($t.Trim() -notmatch '^\d+$') { 'Wpisz liczbę minut.' } else { '' } }
+    if (-not $v) { return }
+    $limit = [int]$v.Trim()
+    $rows = @(@($m.View | ForEach-Object { $_ }) | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Rozłączona' -and [string](Get-ObjectValue $_ 'Bezczynność (min)') -match '^\d+$' -and [int](Get-ObjectValue $_ 'Bezczynność (min)') -ge $limit })
+    if ($rows.Count -eq 0) { Show-Message -Text "Brak sesji rozłączonych dłużej niż $limit min." -Title 'Wyloguj rozłączone'; return }
+    Invoke-RdsSessionAction -Module $m -Op Logoff -Rows $rows
+}
+
+Register-Module -Workspace 'Domain' -Category 'Serwery' -Key 'RdsSessions' -Title 'Sesje RDS' -Icon 'E7F4' -Badge 'nowe' `
+    -Description 'Sesje użytkowników na serwerach farmy pulpitu zdalnego: kto jest zalogowany, skąd (nazwa i adres klienta), stan, bezczynność. Szukanie użytkownika na wszystkich serwerach, wylogowanie, rozłączenie, reset zawieszonej sesji (rwinsta), wiadomość, procesy w sesji.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.EmptyHint = 'Wpisz serwery sesji albo wczytaj je z brokera połączeń RD lub z AD, potem «Pokaż sesje». Prawy przycisk na sesji: wylogowanie, reset, wiadomość, procesy.'
+    $m.Data.LastHosts = @()
+    $m.Data.ActionHosts = @()
+    $m.Actions.List = { param($m) Invoke-RdsFarmList -Module $m }
+    $row = Add-ToolbarRow -Module $m -Title 'Serwery'
+    $m.Hosts = Add-TextBox -Parent $row -Width 430 -Placeholder 'np. RDS01, RDS02, RDS03'
+    $m.Hosts.Text = [string](Get-ModuleSetting -Module $m -Name 'Hosts' -Default '')
+    Add-Button -Parent $row -Text 'Z brokera…' -Icon 'E968' -Module $m -ToolTip 'Serwery sesji i kolekcje z brokera połączeń RD (moduł RemoteDesktop na brokerze)' -OnClick { param($m) Import-RdsBrokerHosts -Module $m } | Out-Null
+    Add-Button -Parent $row -Text 'Z AD…' -Icon 'E977' -Module $m -ToolTip 'Włączone serwery z AD według wzorca nazwy' -OnClick { param($m) Import-RdsAdHosts -Module $m } | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Filtr'
+    Add-Label -Parent $row2 -Text 'Użytkownik' | Out-Null
+    $m.UserFilter = Add-TextBox -Parent $row2 -Width 170 -Placeholder 'login lub fragment'
+    $m.UserFilter.ToolTip = 'Pokaż tylko sesje użytkowników, których login zawiera ten tekst – na wszystkich serwerach naraz.'
+    $m.OnlyDisc = Add-CheckBox -Parent $row2 -Text 'Tylko rozłączone'
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Pokaż sesje' -Icon 'E72C' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
+    Add-Button -Parent $row3 -Text 'Wiadomość…' -Icon 'E715' -Module $m -ToolTip 'Do zaznaczonych sesji' -OnClick { param($m) Invoke-RdsSessionAction -Module $m -Op Message -Rows $null } | Out-Null
+    Add-Button -Parent $row3 -Text 'Wyloguj rozłączone…' -Icon 'E7E8' -Module $m -Danger -ToolTip 'Sesje rozłączone dłużej niż podana liczba minut (z widocznych wierszy)' -OnClick { param($m) Invoke-RdsLogoffDisconnected -Module $m } | Out-Null
+    Add-StatTile -Module $m -Key 'sessions' -Label 'Sesje' -Icon 'E7EE' | Out-Null
+    Add-StatTile -Module $m -Key 'active' -Label 'Aktywne' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'disc' -Label 'Rozłączone' -Icon 'E8CD' | Out-Null
+    Add-StatTile -Module $m -Key 'idle' -Label 'Bezczynne ≥ 1 h' -Icon 'E916' | Out-Null
+    Add-StatTile -Module $m -Key 'hosts' -Label 'Serwery z sesjami' -Icon 'E7F4' | Out-Null
+    Add-RdsSessionRowActions -Module $m
 }
 #endregion
 
