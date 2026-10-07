@@ -2244,6 +2244,8 @@ function Confirm-Action {
         -Select: lista z polami wyboru (wszystkie zaznaczone) - można zawęzić operację do części obiektów
                  bez zmiany zaznaczenia na liście po lewej. Zwraca wybrane pozycje z -Items (albo ich numery
                  z -ReturnIndex); po anulowaniu nic nie zwraca. Wywołanie: $targets = @(Confirm-Action ... -Select)
+        -Checked: z -Select - na początku zaznaczone są tylko te pozycje (wybór z listy, np. dzienników zdarzeń);
+                  -SelectHint zastępuje wskazówkę nad listą
     #>
     param(
         [Parameter(Mandatory)][string]$Text,
@@ -2252,7 +2254,9 @@ function Confirm-Action {
         [string]$ConfirmText = 'Wykonaj',
         [switch]$Danger,
         [switch]$Select,
-        [switch]$ReturnIndex
+        [switch]$ReturnIndex,
+        [string[]]$Checked,
+        [string]$SelectHint = ''
     )
     $body = @'
 <StackPanel>
@@ -2272,7 +2276,7 @@ function Confirm-Action {
     </ScrollViewer>
   </Border>
   <StackPanel x:Name="cfSelHost" Margin="0,14,0,0" Visibility="Collapsed">
-    <TextBlock Text="Odznacz pozycje, których operacja ma nie dotyczyć (zaznaczenie na liście po lewej się nie zmieni)." Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="2,0,0,8"/>
+    <TextBlock x:Name="cfSelHint" Text="Odznacz pozycje, których operacja ma nie dotyczyć (zaznaczenie na liście po lewej się nie zmieni)." Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="2,0,0,8"/>
     <Grid Margin="0,0,0,8">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*"/>
@@ -2325,7 +2329,8 @@ function Confirm-Action {
         [void]$table.Columns.Add('Sel', [bool])
         [void]$table.Columns.Add('Text', [string])
         [void]$table.Columns.Add('Index', [int])
-        for ($i = 0; $i -lt $list.Count; $i++) { [void]$table.Rows.Add($true, $list[$i], $i) }
+        $preset = $PSBoundParameters.ContainsKey('Checked')
+        for ($i = 0; $i -lt $list.Count; $i++) { [void]$table.Rows.Add($(if ($preset) { @($Checked) -contains $list[$i] } else { $true }), $list[$i], $i) }
         $table.AcceptChanges()
         $w.Tag.SelTable = $table
         $w.Tag.SelView = $table.DefaultView
@@ -2341,6 +2346,7 @@ function Confirm-Action {
         $table.ExtendedProperties['Window'] = $w
         $table.add_ColumnChanged($script:ConfirmSelectEvents.ColumnChanged)
         $w.FindName('cfSelHost').Visibility = 'Visible'
+        if ($SelectHint) { $w.FindName('cfSelHint').Text = $SelectHint }
         $w.FindName('cfSel').ItemsSource = $w.Tag.SelView
         $w.FindName('cfFilter').add_TextChanged($script:ConfirmSelectEvents.Filter)
         foreach ($n in 'cfAll', 'cfNone', 'cfInvert') { $w.FindName($n).add_Click($script:ConfirmSelectEvents.Bulk) }
@@ -4153,6 +4159,23 @@ function Set-RowState {
     if ($null -ne $Note) { Set-ResultValue -Module $Module -Row $Row -Column 'Uwagi' -Value ([string]$Note) }
 }
 
+function Set-EmptyColumnsHidden {
+    # Kolumny bez żadnej wartości w tabeli są ukryte; gdy wartości się pojawią (np. kolejne wyniki), wracają
+    param([hashtable]$Module, [string[]]$Columns)
+    if (-not $Module.Grid -or -not $Module.Table) { return }
+    foreach ($c in @($Module.Grid.Columns)) {
+        $name = [string]$c.SortMemberPath
+        if ($Columns -notcontains $name -or -not $Module.Table.Columns.Contains($name)) { continue }
+        $has = $false
+        foreach ($r in $Module.Table.Rows) {
+            if ($r.RowState -eq [System.Data.DataRowState]::Deleted) { continue }
+            $v = $r[$name]
+            if ($v -isnot [System.DBNull] -and [string]$v -ne '') { $has = $true; break }
+        }
+        $c.Visibility = $(if ($has) { 'Visible' } else { 'Collapsed' })
+    }
+}
+
 function Get-ResultRowsAll {
     # Wszystkie wiersze tabeli (DataRow) w kolejności dodania
     param([hashtable]$Module)
@@ -4274,6 +4297,10 @@ function Update-DetailPane {
 
 function Format-RowDetails {
     param([hashtable]$Module, $Row)
+    if ($Module.DetailsFormatter) {
+        $custom = & $Module.DetailsFormatter $Module $Row
+        if ($custom) { return [string]$custom }
+    }
     $sb = New-Object System.Text.StringBuilder
     foreach ($col in $Module.Table.Columns) {
         $name = $col.ColumnName
@@ -5344,6 +5371,8 @@ function Start-HostOperation {
         -OnComplete { param($m, $op) } - po zakończeniu wszystkich (nie wywoływane po anulowaniu)
         -ReplaceRows : zamiast czyścić tabelę - usuwa tylko wiersze tych obiektów (odświeżenie wybranych komputerów);
                        tak samo działa w trakcie Invoke-WithTargets -Refresh
+        -Quiet       : bez wpisów w dzienniku i powiadomień o starcie, wynikach i zakończeniu (operacje cykliczne,
+                       np. śledzenie nowych zdarzeń - błędy obsługuje -OnResult)
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Module,
@@ -5359,7 +5388,8 @@ function Start-HostOperation {
         [scriptblock]$OnResult,
         [scriptblock]$OnComplete,
         [ValidateSet('Default', 'AD')][string]$Pool = 'Default',
-        [switch]$ReplaceRows
+        [switch]$ReplaceRows,
+        [switch]$Quiet
     )
     if ($Module.Busy) {
         Show-Warning "Poprzednia operacja w module «$($Module.Title)» jeszcze trwa. Poczekaj na jej zakończenie lub przerwij ją na pasku stanu."
@@ -5404,6 +5434,7 @@ function Start-HostOperation {
         Cancelled    = $false
         CancelAt     = $null
         Started      = Get-Date
+        Quiet        = [bool]$Quiet
         # Cele podstawione przez akcję wiersza - odświeżenie po zakończeniu (OnComplete) dotyczy tylko ich
         Override     = Get-TargetOverride
     }
@@ -5424,7 +5455,7 @@ function Start-HostOperation {
     Set-ModuleBusy -Module $Module -Busy $true -Text ("{0}: 0/{1}" -f $Name, $items.Count)
     $list = (@($items | Select-Object -First 8) -join ', ')
     if ($items.Count -gt 8) { $list += ", … (+$($items.Count - 8))" }
-    Write-Log ("{0} – start ({1}): {2}" -f $Name, $items.Count, $list) -Module $Module.Title
+    if (-not $Quiet) { Write-Log ("{0} – start ({1}): {2}" -f $Name, $items.Count, $list) -Module $Module.Title }
     $script:Engine.Timer.Start()
     Update-StatusBar
 }
@@ -5583,7 +5614,7 @@ function Complete-OperationItem {
         $errorText = (@($Result.Errors | Where-Object { $_ } | Select-Object -Unique)) -join ' | '
         if (-not $Result.Ok) {
             $Operation.Failed++
-            Write-Log ("[{0}] {1}" -f $Result.Target, $errorText) 'ERROR'
+            if (-not $Operation.Quiet) { Write-Log ("[{0}] {1}" -f $Result.Target, $errorText) 'ERROR' }
             if ($Operation.Output -eq 'Grid') {
                 # Bez kolumny obiektu docelowego wiersz błędu sam mówi, czego dotyczy
                 $errRow = [ordered]@{ 'Status' = 'Błąd' }
@@ -5593,12 +5624,12 @@ function Complete-OperationItem {
             }
         }
         else {
-            if ($errorText) { Write-Log ("[{0}] ostrzeżenia: {1}" -f $Result.Target, $errorText) 'WARN' }
+            if ($errorText -and -not $Operation.Quiet) { Write-Log ("[{0}] ostrzeżenia: {1}" -f $Result.Target, $errorText) 'WARN' }
             $data = @($Result.Data | Where-Object { $null -ne $_ })
             switch ($Operation.Output) {
                 'Grid' {
                     if ($data.Count -gt 0) { Add-ResultRows -Module $m -Computer $Result.Target -TargetColumn $Operation.TargetColumn -Objects $data }
-                    else { Write-Log ("[{0}] brak wyników" -f $Result.Target) }
+                    elseif (-not $Operation.Quiet) { Write-Log ("[{0}] brak wyników" -f $Result.Target) }
                 }
                 'Log' {
                     foreach ($d in $data) {
@@ -5630,7 +5661,7 @@ function Complete-Operation {
         Write-Log ("{0} – przerwano (zakończone: {1}, czas {2} s)" -f $Operation.Name, $okCount, $seconds) 'WARN' -Module $m.Title
         Show-Toast ("{0}: przerwano" -f $Operation.Name) 'warn'
     }
-    else {
+    elseif (-not $Operation.Quiet) {
         $level = if ($Operation.Failed -gt 0) { 'WARN' } else { 'OK' }
         Write-Log ("{0} – zakończono: {1} OK, {2} z błędem, czas {3} s" -f $Operation.Name, $okCount, $Operation.Failed, $seconds) $level -Module $m.Title
         if ($Operation.Total -gt 1 -or $Operation.Failed -gt 0 -or $seconds -ge 3) {
@@ -5821,6 +5852,8 @@ function New-ModuleContext {
         LastGridOp     = $null
         RowRefresh     = $null
         RowDoubleClick = $null
+        # { param($m, $row) } -> tekst panelu i okna szczegółów wiersza (puste = zwykła lista kolumn)
+        DetailsFormatter = $null
         SecretColumns  = @()
         PillColumns    = @()
         GoodWhenNo     = @()
@@ -9141,97 +9174,9 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
 }
 
 Register-Module -Workspace 'Remote' -Category 'System' -Key 'Events' -Title 'Dziennik zdarzeń' -Icon 'E81C' `
-    -Description 'Zdarzenia z wybranych dzienników z ostatnich godzin. Gotowe zestawy pomagają szybko znaleźć typowe problemy (nieoczekiwane wyłączenia, błędy dysku, nieudane logowania).' -Build {
+    -Description 'Zdarzenia z wielu komputerów naraz: dowolne dzienniki (także Security i dzienniki aplikacji i usług), poziomy z inspekcją sukcesu i niepowodzenia, filtry ID, źródła, konta i tekstu. Konto, adres i przyczyna z danych zdarzenia, podsumowanie i śledzenie na bieżąco.' -Build {
     param($m)
-    $m.PillColumns = @('Poziom')
-    $m.Presets = @(
-        @{ Name = '(własne ustawienia)' }
-        @{ Name = 'Nieoczekiwane wyłączenia i restarty'; Logs = @('System'); Ids = '41, 6008, 1074, 1076'; Levels = @(1, 2, 3, 4) }
-        @{ Name = 'Błędy dysków i systemu plików'; Logs = @('System'); Ids = '7, 11, 15, 51, 55, 98, 129, 153'; Levels = @(1, 2, 3) }
-        @{ Name = 'Awarie aplikacji'; Logs = @('Application'); Ids = '1000, 1001, 1002, 1026'; Levels = @(1, 2, 4) }
-        @{ Name = 'Nieudane logowania (Security 4625)'; Logs = @('Security'); Ids = '4625'; Levels = @() }
-        @{ Name = 'Blokady kont (Security 4740)'; Logs = @('Security'); Ids = '4740'; Levels = @() }
-        @{ Name = 'Zasady grupy – błędy'; Logs = @('System'); Ids = '1085, 1096, 1125, 1129'; Levels = @(1, 2, 3) }
-        @{ Name = 'Windows Update – instalacje'; Logs = @('System'); Ids = '19, 20, 43'; Levels = @(1, 2, 3, 4) }
-    )
-    $row = Add-ToolbarRow -Module $m -Title 'Zestaw'
-    $m.Preset = Add-ComboBox -Parent $row -Items @($m.Presets | ForEach-Object { $_.Name }) -Width 320
-    Register-ControlHandler -Control $m.Preset -EventName 'SelectionChanged' -Module $m -Action {
-        param($m, $s)
-        $p = $m.Presets[$s.SelectedIndex]
-        if (-not $p.ContainsKey('Logs')) { return }
-        $m.LogSystem.IsChecked = ($p.Logs -contains 'System')
-        $m.LogApp.IsChecked = ($p.Logs -contains 'Application')
-        $m.LogSec.IsChecked = ($p.Logs -contains 'Security')
-        $m.LvlCrit.IsChecked = ($p.Levels -contains 1)
-        $m.LvlErr.IsChecked = ($p.Levels -contains 2)
-        $m.LvlWarn.IsChecked = ($p.Levels -contains 3)
-        $m.LvlInfo.IsChecked = ($p.Levels -contains 4)
-        $m.Ids.Text = $p.Ids
-    }
-    $row1 = Add-ToolbarRow -Module $m -Title 'Dzienniki'
-    $m.LogSystem = Add-CheckBox -Parent $row1 -Text 'System' -Checked $true
-    $m.LogApp = Add-CheckBox -Parent $row1 -Text 'Application' -Checked $true
-    $m.LogSec = Add-CheckBox -Parent $row1 -Text 'Security'
-    Add-Label -Parent $row1 -Text '   Poziom' -Hint | Out-Null
-    $m.LvlCrit = Add-CheckBox -Parent $row1 -Text 'Krytyczny' -Checked $true
-    $m.LvlErr = Add-CheckBox -Parent $row1 -Text 'Błąd' -Checked $true
-    $m.LvlWarn = Add-CheckBox -Parent $row1 -Text 'Ostrzeżenie' -Checked $true
-    $m.LvlInfo = Add-CheckBox -Parent $row1 -Text 'Informacja'
-    $row2 = Add-ToolbarRow -Module $m -Title 'Zakres'
-    Add-Label -Parent $row2 -Text 'Ostatnie godziny' | Out-Null
-    $m.Hours = Add-Numeric -Parent $row2 -Value 24 -Minimum 1 -Maximum 2160 -Width 70
-    Add-Label -Parent $row2 -Text 'ID zdarzeń' | Out-Null
-    $m.Ids = Add-TextBox -Parent $row2 -Width 200 -Placeholder 'opcjonalnie, np. 41, 6008'
-    Add-Label -Parent $row2 -Text 'Maks. na komputer' | Out-Null
-    $m.Max = Add-Numeric -Parent $row2 -Value 300 -Minimum 10 -Maximum 10000 -Width 70
-    Add-Button -Parent $row2 -Text 'Pobierz zdarzenia' -Icon 'E896' -Module $m -Primary -OnClick {
-        param($m)
-        $logs = @()
-        if (Test-Checked $m.LogSystem) { $logs += 'System' }
-        if (Test-Checked $m.LogApp) { $logs += 'Application' }
-        if (Test-Checked $m.LogSec) { $logs += 'Security' }
-        if ($logs.Count -eq 0) { Show-Warning 'Wybierz co najmniej jeden dziennik.'; return }
-        $levels = @()
-        if (Test-Checked $m.LvlCrit) { $levels += 1 }
-        if (Test-Checked $m.LvlErr) { $levels += 2 }
-        if (Test-Checked $m.LvlWarn) { $levels += 3 }
-        if (Test-Checked $m.LvlInfo) { $levels += 4; $levels += 0 }
-        if ($levels.Count -eq 0 -and -not ($logs.Count -eq 1 -and $logs[0] -eq 'Security')) { Show-Warning 'Wybierz co najmniej jeden poziom zdarzeń.'; return }
-        $ids = @(Split-ListText ($m.Ids.Text -replace '\s+', ',') | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
-        $targets = @(Get-TargetComputers)
-        if (-not $targets) { return }
-        $params = @{ Logs = $logs; Levels = $levels; Ids = $ids; Hours = (Get-Num $m.Hours); Max = (Get-Num $m.Max) }
-        Start-HostOperation -Module $m -Name 'Dziennik zdarzeń' -Targets $targets -Parameters $params -ScriptBlock {
-            param($P)
-            $filter = @{ LogName = [string[]]@($P.Logs); StartTime = (Get-Date).AddHours( - [int]$P.Hours) }
-            $ids = @($P.Ids | Where-Object { $null -ne $_ })
-            if ($ids.Count -gt 0) { $filter.Id = [int[]]$ids }
-            # Security nie używa poziomów (audyt) - bez filtra poziomu, gdy wybrano tylko Security
-            $levels = [int[]]@($P.Levels)
-            if ($levels.Count -gt 0 -and (@($P.Logs) -notcontains 'Security' -or @($P.Logs).Count -gt 1)) { $filter.Level = $levels }
-            try {
-                $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents ([int]$P.Max) -ErrorAction Stop)
-            }
-            catch {
-                if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $events = @() } else { throw }
-            }
-            $events | Sort-Object TimeCreated -Descending | ForEach-Object {
-                $msg = $_.Message
-                if (-not $msg) { $msg = '(brak opisu – brak biblioteki komunikatów dostawcy)' }
-                $tone = switch ([int]$_.Level) { 1 { 'crit' } 2 { 'crit' } 3 { 'warn' } default { 'info' } }
-                [pscustomobject]@{
-                    'Czas'      = $_.TimeCreated
-                    'Poziom'    = $(if ($_.LevelDisplayName) { $_.LevelDisplayName } else { 'Inspekcja' })
-                    'ID'        = $_.Id
-                    'Źródło'    = $_.ProviderName
-                    'Dziennik'  = $_.LogName
-                    'Komunikat' = ($msg -replace '\s+', ' ').Trim()
-                    '__tone'    = $tone
-                }
-            }
-        }
-    } | Out-Null
+    Initialize-EventLogModule -Module $m
 }
 
 Register-Module -Workspace 'Remote' -Category 'System' -Key 'Tasks' -Title 'Harmonogram zadań' -Icon 'E787' `
@@ -9600,6 +9545,979 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Drivers' -Title 'St
         }
     }
     Add-RowAction -Module $m -Text 'Urządzenia z problemami na tych komputerach' -Icon 'E7BA' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Problems }
+}
+#endregion
+
+#region Dziennik zdarzeń – zapytania, odczyt na komputerach, śledzenie, podsumowanie
+# Poziomy filtra: liczby jak w Podglądzie zdarzeń; AS/AF - słowa kluczowe inspekcji (dziennik Security ma poziom 0,
+# a sukces i niepowodzenie rozróżniają tylko słowa kluczowe)
+$script:EventLevelChoices = @(
+    @{ Key = '1'; Text = 'Krytyczny' }
+    @{ Key = '2'; Text = 'Błąd' }
+    @{ Key = '3'; Text = 'Ostrzeżenie' }
+    @{ Key = '4'; Text = 'Informacja' }
+    @{ Key = '5'; Text = 'Szczegółowe' }
+    @{ Key = 'AS'; Text = 'Inspekcja – sukces' }
+    @{ Key = 'AF'; Text = 'Inspekcja – niepowodzenie' }
+)
+$script:EventAuditSuccess = [long]9007199254740992    # 0x0020000000000000
+$script:EventAuditFailure = [long]4503599627370496    # 0x0010000000000000
+# Więcej warunków EventID usługa dziennika odrzuca («The specified query is invalid») - wtedy ID są filtrowane po pobraniu
+$script:EventXPathTermLimit = 20
+$script:EventStandardLogs = @('System', 'Application', 'Security', 'Setup')
+# Kolumny z danymi zdarzenia (konto, adres...) - ukrywane, gdy w wynikach nie ma żadnej wartości
+$script:EventDataColumns = @('Konto', 'Skąd', 'Logowanie', 'Szczegóły')
+
+function Get-EventPresets {
+    $lsm = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    $rcm = 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'
+    return @(
+        @{ Name = '(własne ustawienia)' }
+        @{ Name = 'Błędy i ostrzeżenia (System, Application)'; Logs = @('System', 'Application'); Levels = @('1', '2', '3'); Ids = '' }
+        @{ Name = 'Nieoczekiwane wyłączenia i restarty (41, 6008, 1074…)'; Logs = @('System'); Levels = @(); Ids = '41, 1074, 1076, 6005, 6006, 6008' }
+        @{ Name = 'Błędy dysków i systemu plików'; Logs = @('System'); Levels = @('1', '2', '3'); Ids = '7, 11, 15, 51, 55, 98, 129, 153' }
+        @{ Name = 'Awarie i zawieszenia aplikacji (1000, 1002, 1026)'; Logs = @('Application'); Levels = @(); Ids = '1000, 1001, 1002, 1026' }
+        @{ Name = 'Usługi: instalacje i awarie (7045, 7031, 7034…)'; Logs = @('System'); Levels = @(); Ids = '7000, 7009, 7022, 7023, 7024, 7031, 7034, 7045' }
+        @{ Name = 'Logowania udane i nieudane (Security 4624, 4625)'; Logs = @('Security'); Levels = @(); Ids = '4624, 4625' }
+        @{ Name = 'Nieudane logowania i uwierzytelnienia (4625, 4771, 4776)'; Logs = @('Security'); Levels = @('AF'); Ids = '4625, 4771, 4776' }
+        @{ Name = 'Blokady i odblokowania kont (4740, 4767)'; Logs = @('Security'); Levels = @(); Ids = '4740, 4767' }
+        @{ Name = 'Zmiany kont i grup (4720–4767, 4780–4799)'; Logs = @('Security'); Levels = @(); Ids = '4720-4767, 4780-4799' }
+        @{ Name = 'Uprawnienia administracyjne i jawne poświadczenia (4672, 4648)'; Logs = @('Security'); Levels = @(); Ids = '4648, 4672' }
+        @{ Name = 'Sesje pulpitu zdalnego: logowanie, rozłączenie, powrót'; Logs = @('Security', $lsm, $rcm); Levels = @(); Ids = '21, 23, 24, 25, 1149, 4778, 4779' }
+        @{ Name = 'Zadania zaplanowane i nowe usługi (4697–4702, 7045)'; Logs = @('Security', 'System'); Levels = @(); Ids = '4697-4702, 7045' }
+        @{ Name = 'Zmiany zasad audytu i domeny (4719, 4739…)'; Logs = @('Security'); Levels = @(); Ids = '4706, 4707, 4713, 4716, 4719, 4739' }
+        @{ Name = 'Wyczyszczenie dziennika (1102, 104)'; Logs = @('Security', 'System'); Levels = @(); Ids = '104, 1102' }
+        @{ Name = 'Zasady grupy – błędy w System (1085, 1096, 1125, 1129)'; Logs = @('System'); Levels = @('1', '2', '3'); Ids = '1085, 1096, 1125, 1129' }
+        @{ Name = 'Zasady grupy – dziennik operacyjny (błędy i ostrzeżenia)'; Logs = @('Microsoft-Windows-GroupPolicy/Operational'); Levels = @('1', '2', '3'); Ids = '' }
+        @{ Name = 'Windows Update – instalacje (19, 20, 43)'; Logs = @('System'); Levels = @(); Ids = '19, 20, 43' }
+        @{ Name = 'Kontroler domeny: Directory Service, DFS Replication, DNS Server'; Logs = @('Directory Service', 'DFS Replication', 'DNS Server'); Levels = @('1', '2', '3'); Ids = '' }
+        @{ Name = 'PowerShell – podejrzane bloki skryptów (4104)'; Logs = @('Microsoft-Windows-PowerShell/Operational'); Levels = @('3'); Ids = '4104' }
+    )
+}
+
+function ConvertFrom-EventIdText {
+    <#
+        «4624, 4720-4767, -4634» -> Include / Exclude: zakresy jako tekst «od-do»; Invalid: niezrozumiałe fragmenty.
+        Myślnik ze spacją za nim («4720 - 4767», «4720- 4767») łączy zakres; «-4634» i «!4634» wykluczają (także zakres «!4720-4767»).
+    #>
+    param([string]$Text)
+    $r = @{ Include = @(); Exclude = @(); Invalid = @() }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $r }
+    $norm = ($Text -replace '[–—]', '-') -replace '(\d)\s*-\s+(?=\d)', '$1-'
+    foreach ($tok in ($norm -split '[\s,;]+')) {
+        if (-not $tok) { continue }
+        if ($tok -notmatch '^([!-])?(\d{1,5})(?:-(\d{1,5}))?$') { $r.Invalid += $tok; continue }
+        $a = [int]$Matches[2]
+        $b = if ($Matches[3]) { [int]$Matches[3] } else { $a }
+        if ($a -gt 65535 -or $b -gt 65535) { $r.Invalid += $tok; continue }
+        if ($b -lt $a) { $t = $a; $a = $b; $b = $t }
+        if ($Matches[1]) { $r.Exclude += "$a-$b" } else { $r.Include += "$a-$b" }
+    }
+    return $r
+}
+
+function Get-EventIdXPath {
+    # Zakresy «od-do» -> warunek XPath w postaci, jaką tworzy Podgląd zdarzeń
+    param([string[]]$Ranges)
+    $terms = foreach ($rg in @($Ranges | Where-Object { $_ })) {
+        $x = $rg.Split('-')
+        if ($x[0] -eq $x[1]) { "EventID=$($x[0])" } else { "(EventID>=$($x[0]) and EventID<=$($x[1]))" }
+    }
+    return (@($terms) -join ' or ')
+}
+
+function New-EventQueryXml {
+    <#
+        Zapytanie strukturalne (QueryList) dla jednego dziennika: <Select> z poziomami, ID i czasem, <Suppress> z wykluczonymi ID.
+        Tylko konstrukcje, które tworzy też Podgląd zdarzeń: Level=, band(Keywords,…), EventID, timediff(@SystemTime), @SystemTime>=.
+        -SinceUtc (śledzenie) zastępuje -Hours.
+    #>
+    param([Parameter(Mandatory)][string]$Log, [string[]]$Levels = @(), [string[]]$Include = @(), [string[]]$Exclude = @(), [int]$Hours = 0, [string]$SinceUtc = '')
+    $Levels = @($Levels | Where-Object { $_ })
+    $Include = @($Include | Where-Object { $_ })
+    $Exclude = @($Exclude | Where-Object { $_ })
+    $cond = New-Object System.Collections.Generic.List[string]
+    $lv = New-Object System.Collections.Generic.List[string]
+    foreach ($l in @($Levels)) {
+        switch ([string]$l) {
+            'AS' { $lv.Add("band(Keywords,$($script:EventAuditSuccess))") }
+            'AF' { $lv.Add("band(Keywords,$($script:EventAuditFailure))") }
+            '4' { $lv.Add('Level=4'); $lv.Add('Level=0') }
+            default { $lv.Add("Level=$([int]$l)") }
+        }
+    }
+    if ($lv.Count -gt 0) { $cond.Add('(' + ($lv -join ' or ') + ')') }
+    if (@($Include).Count -gt 0) { $cond.Add('(' + (Get-EventIdXPath $Include) + ')') }
+    if ($SinceUtc) { $cond.Add("TimeCreated[@SystemTime>='$SinceUtc']") }
+    elseif ($Hours -gt 0) { $cond.Add("TimeCreated[timediff(@SystemTime) <= $([long]$Hours * 3600000)]") }
+    $select = if ($cond.Count -gt 0) { '*[System[' + ($cond -join ' and ') + ']]' } else { '*' }
+    $path = [System.Security.SecurityElement]::Escape($Log)
+    $xml = '<QueryList><Query Id="0" Path="' + $path + '"><Select Path="' + $path + '">' + [System.Security.SecurityElement]::Escape($select) + '</Select>'
+    if (@($Exclude).Count -gt 0) { $xml += '<Suppress Path="' + $path + '">' + [System.Security.SecurityElement]::Escape('*[System[(' + (Get-EventIdXPath $Exclude) + ')]]') + '</Suppress>' }
+    return $xml + '</Query></QueryList>'
+}
+
+function ConvertTo-EventPatternList {
+    # «Disk, Kernel-Power; !Netlogon» -> wzorce -like: Include (fragment bez * i ? jest szukany w środku nazwy) i Exclude (z «!»)
+    param([string]$Text)
+    $r = @{ Include = @(); Exclude = @() }
+    foreach ($tok in ($Text -split '[,;]')) {
+        $t = $tok.Trim()
+        $neg = $t.StartsWith('!')
+        if ($neg) { $t = $t.Substring(1).Trim() }
+        if (-not $t) { continue }
+        if ($t -notmatch '[\*\?]') { $t = "*$t*" }
+        if ($neg) { $r.Exclude += $t } else { $r.Include += $t }
+    }
+    return $r
+}
+
+function ConvertTo-EventPhraseList {
+    # «timeout; refused; !test» -> Include (wystarczy jedna) i Exclude (żadna nie może wystąpić); bez rozróżniania wielkości liter
+    param([string]$Text)
+    $r = @{ Include = @(); Exclude = @() }
+    foreach ($tok in ($Text -split ';')) {
+        $t = $tok.Trim()
+        $neg = $t.StartsWith('!')
+        if ($neg) { $t = $t.Substring(1).Trim() }
+        if (-not $t) { continue }
+        if ($neg) { $r.Exclude += $t } else { $r.Include += $t }
+    }
+    return $r
+}
+
+function New-EventReadParameters {
+    <#
+        Parametry bloku $script:EventReadScript dla jednego komputera. $Spec - ustawienia z paska (Get-EventQuerySpec).
+        -SinceUtc / -Seen: śledzenie - tylko zdarzenia od ostatniego znanego (Seen: «dziennik|rekord» już pokazane na granicy).
+    #>
+    param([Parameter(Mandatory)][hashtable]$Spec, [string]$SinceUtc = '', [string[]]$Seen = @())
+    $incPost = @($Spec.Ids.Include).Count -gt $script:EventXPathTermLimit
+    $excPost = @($Spec.Ids.Exclude).Count -gt $script:EventXPathTermLimit
+    $inc = @($Spec.Ids.Include | Where-Object { $_ })
+    $exc = @($Spec.Ids.Exclude | Where-Object { $_ })
+    # Za dużo warunków dla XPath - filtr po pobraniu (IdInc / IdExc), zapytanie bez nich
+    $xInc = $inc; $postInc = @()
+    $xExc = $exc; $postExc = @()
+    if ($incPost) { $xInc = @(); $postInc = $inc }
+    if ($excPost) { $xExc = @(); $postExc = $exc }
+    $queries = @(foreach ($log in @($Spec.Logs)) {
+            @{ Log = $log; Xml = (New-EventQueryXml -Log $log -Levels $Spec.Levels -Include $xInc -Exclude $xExc -Hours $Spec.Hours -SinceUtc $SinceUtc) }
+        })
+    return @{
+        Queries = $queries
+        Max     = [int]$Spec.Max
+        IdInc   = $postInc
+        IdExc   = $postExc
+        Src     = @($Spec.Source.Include)
+        SrcNot  = @($Spec.Source.Exclude)
+        Acct    = [string]$Spec.Account
+        Text    = @($Spec.Text.Include)
+        TextNot = @($Spec.Text.Exclude)
+        Seen    = @($Seen)
+        Follow  = [bool]$SinceUtc
+    }
+}
+
+# Odczyt na komputerze (zdalnie przez WinRM; zgodny z Windows PowerShell 4.0 i 5.1).
+# Dla każdego dziennika: sprawdzenie, czy istnieje i jest włączony, zapytanie strukturalne, filtry po pobraniu
+# (źródło, konto, tekst, ID ponad limit XPath), dane zdarzenia z XML (konto, adres, typ logowania, przyczyna).
+$script:EventReadScript = {
+    param($P)
+    $auditOk = [long]9007199254740992
+    $auditFail = [long]4503599627370496
+    $max = [Math]::Max(1, [int]$P.Max)
+    $logonTypes = @{ '0' = 'system'; '2' = 'interaktywne'; '3' = 'sieciowe'; '4' = 'wsadowe'; '5' = 'usługa'; '7' = 'odblokowanie'; '8' = 'sieciowe (hasło jawnym tekstem)'; '9' = 'nowe poświadczenia (runas /netonly)'; '10' = 'zdalne (RDP)'; '11' = 'z pamięci podręcznej'; '12' = 'zdalne z pamięci podręcznej'; '13' = 'odblokowanie z pamięci podręcznej' }
+    $ntStatus = @{
+        '0xc0000064' = 'konto nie istnieje'; '0xc000006a' = 'błędne hasło'; '0xc000006d' = 'błędna nazwa użytkownika lub hasło'
+        '0xc000006e' = 'ograniczenie konta'; '0xc000006f' = 'logowanie poza dozwolonymi godzinami'; '0xc0000070' = 'niedozwolona stacja robocza'
+        '0xc0000071' = 'hasło wygasło'; '0xc0000072' = 'konto wyłączone'; '0xc0000133' = 'różnica czasu z kontrolerem domeny'
+        '0xc000015b' = 'brak prawa do tego typu logowania'; '0xc000018c' = 'brak relacji zaufania z domeną'; '0xc0000192' = 'usługa Netlogon nie działa'
+        '0xc0000193' = 'konto wygasło'; '0xc0000224' = 'wymagana zmiana hasła'; '0xc0000234' = 'konto zablokowane'
+        '0xc000005e' = 'brak serwera logowania'; '0xc0000413' = 'zapora uwierzytelniania'; '0xc0000371' = 'brak dostępu do lokalnej bazy kont'
+    }
+    $kerbStatus = @{ '0x6' = 'konto nie istnieje'; '0x7' = 'nieznana usługa (SPN)'; '0xc' = 'ograniczenie zasad (godziny lub stacje logowania)'; '0xe' = 'nieobsługiwany typ szyfrowania'; '0x12' = 'konto wyłączone, wygasłe lub zablokowane'; '0x17' = 'hasło wygasło'; '0x18' = 'błędne hasło'; '0x25' = 'różnica czasu z kontrolerem domeny' }
+    $mgmtIds = @(4704, 4705, 4706, 4707, 4713, 4716, 4717, 4718, 4719, 4739, 4864, 4865, 4866, 4867)
+
+    $toRange = { param($list) foreach ($x in @($list | Where-Object { $_ })) { $p2 = ([string]$x).Split('-'); , @([int]$p2[0], [int]$p2[$p2.Length - 1]) } }
+    $idInc = @(& $toRange $P.IdInc)
+    $idExc = @(& $toRange $P.IdExc)
+    $src = @($P.Src | Where-Object { $_ })
+    $srcNot = @($P.SrcNot | Where-Object { $_ })
+    $textInc = @($P.Text | Where-Object { $_ })
+    $textNot = @($P.TextNot | Where-Object { $_ })
+    $acctText = [string]$P.Acct
+    $seen = @{}
+    foreach ($k in @($P.Seen)) { if ($k) { $seen[[string]$k] = $true } }
+    $postFilter = ($idInc.Count + $idExc.Count + $src.Count + $srcNot.Count + $textInc.Count + $textNot.Count) -gt 0 -or $acctText
+    $cap = if ($postFilter) { [Math]::Min(50000, [Math]::Max(5000, $max * 50)) } else { $max + $seen.Count }
+
+    $val = { param($d, [string]$k) $x = [string]$d[$k]; if ($x) { $x = $x.Trim() }; if (-not $x -or $x -eq '-' -or $x -like '%%*') { '' } else { $x } }
+    $acct = { param([string]$dom, [string]$user) if (-not $user) { '' } elseif ($dom -and $dom -ne $user) { "$dom\$user" } else { $user } }
+    $contains = { param([string]$text, [string]$part) $text -and $text.IndexOf($part, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+    $getData = {
+        param($e)
+        $d = [ordered]@{}
+        try {
+            $x = [xml]$e.ToXml()
+            foreach ($sec in @($x.DocumentElement.ChildNodes)) {
+                if ($sec.LocalName -eq 'EventData') {
+                    $i = 0
+                    foreach ($n in @($sec.ChildNodes)) {
+                        if ($n.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                        $i++
+                        $name = $n.GetAttribute('Name')
+                        if (-not $name) { $name = "Dane$i" }
+                        $d[$name] = $n.InnerText
+                    }
+                }
+                elseif ($sec.LocalName -eq 'UserData') {
+                    foreach ($c in @($sec.ChildNodes)) { foreach ($n in @($c.ChildNodes)) { if ($n.NodeType -eq [System.Xml.XmlNodeType]::Element) { $d[$n.LocalName] = $n.InnerText } } }
+                }
+            }
+        }
+        catch { }
+        return $d
+    }
+    $describe = {
+        # Konto, skąd, typ logowania i szczegóły - zależnie od rodzaju zdarzenia
+        param([int]$id, [string]$prov, $d)
+        $r = @{ Konto = ''; Skad = ''; Logowanie = ''; Info = New-Object System.Collections.Generic.List[string] }
+        $tu = & $val $d 'TargetUserName'; $td = & $val $d 'TargetDomainName'
+        $su = & $val $d 'SubjectUserName'; $sd = & $val $d 'SubjectDomainName'
+        $target = & $acct $td $tu
+        $subject = & $acct $sd $su
+        $ip = (& $val $d 'IpAddress') -replace '^::ffff:', ''
+        if ($ip -eq '::1' -or $ip -eq '127.0.0.1') { $ip = 'lokalnie' }
+        $wsName = & $val $d 'WorkstationName'
+        $from = if ($ip -and $wsName) { "$ip ($wsName)" } elseif ($ip) { $ip } else { $wsName }
+        if ($prov -like '*TerminalServices-LocalSessionManager*') {
+            $r.Konto = & $val $d 'User'
+            $a = & $val $d 'Address'
+            if ($a -and $a -ne 'LOCAL') { $r.Skad = $a }
+            $sid = & $val $d 'SessionID'
+            if ($sid) { $r.Info.Add("sesja $sid") }
+            return $r
+        }
+        if ($prov -like '*TerminalServices-RemoteConnectionManager*') {
+            $r.Konto = & $acct (& $val $d 'Param2') (& $val $d 'Param1')
+            $r.Skad = & $val $d 'Param3'
+            return $r
+        }
+        if (@(4624, 4625, 4634, 4647) -contains $id) {
+            $r.Konto = $(if ($target) { $target } else { $subject })
+            $r.Skad = $from
+            $lt = & $val $d 'LogonType'
+            if ($lt) { $r.Logowanie = $(if ($logonTypes.ContainsKey($lt)) { "$lt – $($logonTypes[$lt])" } else { $lt }) }
+            if ($id -eq 4625) {
+                $st = (& $val $d 'Status').ToLowerInvariant(); $sub = (& $val $d 'SubStatus').ToLowerInvariant()
+                $code = if ($sub -and $sub -ne '0x0' -and $ntStatus.ContainsKey($sub)) { $sub } else { $st }
+                if ($code) { $r.Info.Add('przyczyna: ' + $(if ($ntStatus.ContainsKey($code)) { $ntStatus[$code] } else { "kod $code" })) }
+                $proc = & $val $d 'ProcessName'
+                if ($proc) { $r.Info.Add("proces: $proc") }
+            }
+            if ($id -eq 4624) {
+                $pkg = & $val $d 'AuthenticationPackageName'; $lm = & $val $d 'LmPackageName'
+                if ($pkg) { $r.Info.Add('uwierzytelnianie: ' + $pkg + $(if ($lm) { " ($lm)" } else { '' })) }
+                if ($subject -and $subject -ne $r.Konto -and $su -notlike '*$') { $r.Info.Add("zalogował: $subject") }
+            }
+        }
+        elseif ($id -eq 4740) {
+            $r.Konto = $tu
+            $r.Skad = $td
+            $r.Info.Add($(if ($td) { "blokada z komputera $td" } else { 'blokada konta' }))
+        }
+        elseif ($id -eq 4648) {
+            $r.Konto = $subject
+            $r.Skad = $ip
+            if ($target) { $r.Info.Add("użyte poświadczenia: $target") }
+            $srv = & $val $d 'TargetServerName'
+            if ($srv -and $srv -ne 'localhost') { $r.Info.Add("serwer: $srv") }
+            $proc = & $val $d 'ProcessName'
+            if ($proc) { $r.Info.Add("proces: $proc") }
+        }
+        elseif ($id -eq 4672) { $r.Konto = $subject }
+        elseif ($id -ge 4768 -and $id -le 4773) {
+            $r.Konto = $target
+            $r.Skad = $ip
+            $st = (& $val $d 'Status').ToLowerInvariant()
+            if ($st -and $st -ne '0x0') { $r.Info.Add('przyczyna: ' + $(if ($kerbStatus.ContainsKey($st)) { $kerbStatus[$st] } else { "kod Kerberos $st" })) }
+            $svc = & $val $d 'ServiceName'
+            if ($svc -and $id -eq 4769) { $r.Info.Add("usługa: $svc") }
+        }
+        elseif ($id -eq 4776) {
+            $r.Konto = $tu
+            $r.Skad = & $val $d 'Workstation'
+            $st = (& $val $d 'Status').ToLowerInvariant()
+            if ($st -and $st -ne '0x0') { $r.Info.Add('przyczyna: ' + $(if ($ntStatus.ContainsKey($st)) { $ntStatus[$st] } else { "kod $st" })) }
+        }
+        elseif ($id -eq 4778 -or $id -eq 4779) {
+            $r.Konto = & $acct (& $val $d 'AccountDomain') (& $val $d 'AccountName')
+            $cn = & $val $d 'ClientName'; $ca = & $val $d 'ClientAddress'
+            $r.Skad = if ($ca -and $cn -and $cn -ne 'Unknown') { "$ca ($cn)" } elseif ($ca) { $ca } else { $cn }
+            $sn = & $val $d 'SessionName'
+            if ($sn) { $r.Info.Add("sesja $sn") }
+        }
+        elseif ($id -eq 1102 -or ($id -eq 104 -and $prov -like '*Eventlog*')) {
+            $r.Konto = $subject
+            $ch = & $val $d 'Channel'
+            if ($ch) { $r.Info.Add("dziennik: $ch") }
+        }
+        elseif ($id -eq 1074 -and $prov -like '*User32*') {
+            $r.Konto = & $val $d 'param7'
+            foreach ($pair in @(@('param5', 'typ'), @('param1', 'proces'), @('param3', 'przyczyna'), @('param6', 'komentarz'))) {
+                $v = & $val $d $pair[0]
+                if ($v) { $r.Info.Add("$($pair[1]): $v") }
+            }
+        }
+        elseif ($id -eq 7045) {
+            foreach ($pair in @(@('ServiceName', 'usługa'), @('ImagePath', 'plik'), @('AccountName', 'konto usługi'))) {
+                $v = & $val $d $pair[0]
+                if ($v) { $r.Info.Add("$($pair[1]): $v") }
+            }
+        }
+        elseif ($id -eq 4697) {
+            $r.Konto = $subject
+            foreach ($pair in @(@('ServiceName', 'usługa'), @('ServiceFileName', 'plik'), @('ServiceAccount', 'konto usługi'))) {
+                $v = & $val $d $pair[0]
+                if ($v) { $r.Info.Add("$($pair[1]): $v") }
+            }
+        }
+        elseif ($id -ge 4698 -and $id -le 4702) {
+            $r.Konto = $subject
+            $tn = & $val $d 'TaskName'
+            if ($tn) { $r.Info.Add("zadanie: $tn") }
+        }
+        elseif ($id -ge 5136 -and $id -le 5141) {
+            $r.Konto = $subject
+            $dn = & $val $d 'ObjectDN'
+            if ($dn) { $r.Info.Add("obiekt: $dn") }
+            $attr = & $val $d 'AttributeLDAPDisplayName'
+            if ($attr) { $r.Info.Add("atrybut: $attr = " + (& $val $d 'AttributeValue')) }
+        }
+        elseif (($id -ge 4720 -and $id -le 4767) -or ($id -ge 4780 -and $id -le 4799) -or $mgmtIds -contains $id) {
+            $r.Konto = $(if ($target) { $target } else { $subject })
+            if ($subject -and $subject -ne $r.Konto) { $r.Info.Add("wykonał: $subject") }
+            $mem = & $val $d 'MemberName'
+            if ($mem -match '^CN=((?:\\,|[^,])+)') { $mem = $Matches[1] -replace '\\,', ',' }
+            if (-not $mem) { $mem = & $val $d 'MemberSid' }
+            if ($mem) { $r.Info.Add("członek: $mem") }
+        }
+        else {
+            $r.Konto = $(if ($target) { $target } elseif ($subject) { $subject } else { & $acct (& $val $d 'AccountDomain') (& $val $d 'AccountName') })
+            if (-not $r.Konto) { foreach ($k in 'User', 'UserName', 'Username') { $v = & $val $d $k; if ($v) { $r.Konto = $v; break } } }
+            $r.Skad = $from
+        }
+        return $r
+    }
+    $process = {
+        # Zdarzenie -> wiersz tabeli albo $null, gdy nie przechodzi przez filtry po pobraniu
+        param($e)
+        $id = [int]$e.Id
+        if ($seen.Count -gt 0 -and $seen.ContainsKey("$($e.LogName)|$($e.RecordId)")) { return }
+        if ($idInc.Count -gt 0) {
+            $hit = $false
+            foreach ($rg in $idInc) { if ($id -ge $rg[0] -and $id -le $rg[1]) { $hit = $true; break } }
+            if (-not $hit) { return }
+        }
+        foreach ($rg in $idExc) { if ($id -ge $rg[0] -and $id -le $rg[1]) { return } }
+        $prov = [string]$e.ProviderName
+        if ($src.Count -gt 0) {
+            $hit = $false
+            foreach ($s in $src) { if ($prov -like $s) { $hit = $true; break } }
+            if (-not $hit) { return }
+        }
+        foreach ($s in $srcNot) { if ($prov -like $s) { return } }
+        # Dane z XML i treść komunikatu są kosztowne - liczone tylko wtedy, gdy filtr ich potrzebuje (i raz)
+        $d = $null
+        $msg = $null
+        if ($acctText) {
+            $d = & $getData $e
+            $hit = $false
+            foreach ($v in $d.Values) { if (& $contains ([string]$v) $acctText) { $hit = $true; break } }
+            if (-not $hit) {
+                try { $msg = $e.Message } catch { }
+                if (-not (& $contains $msg $acctText)) { return }
+            }
+        }
+        if ($textInc.Count -gt 0 -or $textNot.Count -gt 0) {
+            if ($null -eq $msg) { try { $msg = $e.Message } catch { } }
+            $txt = $msg
+            if (-not $txt) {
+                if ($null -eq $d) { $d = & $getData $e }
+                $txt = (@($d.Values) -join ' ')
+            }
+            if ($textInc.Count -gt 0) {
+                $hit = $false
+                foreach ($t in $textInc) { if (& $contains $txt $t) { $hit = $true; break } }
+                if (-not $hit) { return }
+            }
+            foreach ($t in $textNot) { if (& $contains $txt $t) { return } }
+        }
+        if ($null -eq $d) { $d = & $getData $e }
+        if ($null -eq $msg) { try { $msg = $e.Message } catch { } }
+        if (-not $msg) {
+            $vals = @($d.Values | Where-Object { $_ } | Select-Object -First 12)
+            $msg = '(brak opisu – brak biblioteki komunikatów dostawcy)' + $(if ($vals.Count) { ' Dane: ' + ($vals -join '; ') } else { '' })
+        }
+
+        $lvl = [int]$e.Level
+        $kw = [long]0
+        if ($null -ne $e.Keywords) { $kw = [long]$e.Keywords }
+        $name = 'Informacja'; $tone = 'info'
+        if ($lvl -eq 1) { $name = 'Krytyczny'; $tone = 'crit' }
+        elseif ($lvl -eq 2) { $name = 'Błąd'; $tone = 'crit' }
+        elseif ($lvl -eq 3) { $name = 'Ostrzeżenie'; $tone = 'warn' }
+        elseif (($kw -band $auditFail) -ne 0) { $name = 'Inspekcja – niepowodzenie'; $tone = 'warn' }
+        elseif (($kw -band $auditOk) -ne 0) { $name = 'Inspekcja – sukces'; $tone = 'ok' }
+        elseif ($lvl -eq 5) { $name = 'Szczegółowe'; $tone = '' }
+        $info = & $describe $id $prov $d
+        $dataText = (@($d.Keys | ForEach-Object { '{0} = {1}' -f $_, $d[$_] }) -join "`n")
+        $time = $e.TimeCreated
+        [pscustomobject]@{
+            'Czas'      = $time
+            'Poziom'    = $name
+            'ID'        = $id
+            'Konto'     = $info.Konto
+            'Skąd'      = $info.Skad
+            'Logowanie' = $info.Logowanie
+            'Szczegóły' = ($info.Info -join '; ')
+            'Źródło'    = $prov
+            'Dziennik'  = [string]$e.LogName
+            'Komunikat' = ($msg -replace '\s+', ' ').Trim()
+            '__tone'    = $tone
+            '__rid'     = [long]$e.RecordId
+            '__utc'     = $(if ($time) { $time.ToUniversalTime().ToString('o') } else { '' })
+            '__msg'     = $msg
+            '__data'    = $dataText
+        }
+    }
+    $note = {
+        param([string]$log, [string]$text, [string]$tone)
+        [pscustomobject]@{
+            'Czas' = $null; 'Poziom' = 'Uwaga'; 'ID' = $null; 'Konto' = ''; 'Skąd' = ''; 'Logowanie' = ''; 'Szczegóły' = ''; 'Źródło' = ''; 'Dziennik' = $log
+            'Komunikat' = $text; '__tone' = $tone; '__rid' = $null; '__utc' = ''; '__msg' = $text; '__data' = ''; '__note' = '1'
+        }
+    }
+
+    $rows = New-Object System.Collections.ArrayList
+    $notes = New-Object System.Collections.ArrayList
+    $failed = New-Object System.Collections.ArrayList
+    $queries = @($P.Queries)
+    foreach ($q in $queries) {
+        $log = [string]$q.Log
+        # Czy dziennik istnieje i jest włączony (komunikat zamiast błędu całego komputera)
+        try {
+            $li = Get-WinEvent -ListLog $log -ErrorAction Stop
+            if ($li -and -not $li.IsEnabled -and -not $li.RecordCount) {
+                if (-not $P.Follow) { [void]$notes.Add((& $note $log 'Dziennik jest wyłączony na tym komputerze (włączysz go w Podglądzie zdarzeń).' 'warn')) }
+                continue
+            }
+            if ($li -and $null -ne $li.RecordCount -and [long]$li.RecordCount -eq 0) { continue }
+        }
+        catch {
+            $text = if ($_.FullyQualifiedErrorId -like 'NoMatchingLogsFound*') { 'Na tym komputerze nie ma tego dziennika.' } else { 'Nie można odczytać dziennika: ' + $_.Exception.Message }
+            [void]$failed.Add("${log}: $text")
+            if (-not $P.Follow) { [void]$notes.Add((& $note $log $text 'warn')) }
+            continue
+        }
+        $st = @{ N = 0 }
+        $found = @()
+        try {
+            $found = @(Get-WinEvent -FilterXml ([xml]$q.Xml) -MaxEvents $cap -ErrorAction Stop | ForEach-Object { $st.N++; & $process $_ } | Select-Object -First $max)
+        }
+        catch {
+            if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+                $msg = $_.Exception.Message
+                $text = if ($_.Exception -is [System.UnauthorizedAccessException] -or $msg -like '*unauthorized*' -or $msg -like '*Access is denied*') { 'Brak dostępu do dziennika (potrzebne uprawnienia administratora albo grupa Event Log Readers).' } else { "Błąd odczytu: $msg" }
+                [void]$failed.Add("${log}: $text")
+                if (-not $P.Follow) { [void]$notes.Add((& $note $log $text 'warn')) }
+            }
+        }
+        foreach ($f in $found) { [void]$rows.Add($f) }
+        if ($P.Follow) { continue }
+        if ($postFilter -and $st.N -ge $cap -and $found.Count -lt $max) {
+            [void]$notes.Add((& $note $log ("Przejrzano {0} najnowszych zdarzeń pasujących do zapytania – starsze nie zostały sprawdzone filtrami źródła, konta i tekstu. Zawęź zakres (godziny, ID, poziom)." -f $cap) 'info'))
+        }
+        elseif ($found.Count -ge $max) {
+            [void]$notes.Add((& $note $log ("Pokazano {0} najnowszych zdarzeń – limit na komputer. Starsze są pominięte." -f $max) 'info'))
+        }
+    }
+    # Wszystkie dzienniki zawiodły - błąd komputera, a nie pusta lista
+    if ($queries.Count -gt 0 -and $failed.Count -eq $queries.Count) { throw ($failed -join ' | ') }
+    $sorted = @($rows | Sort-Object -Property '__utc' -Descending | Select-Object -First $max)
+    $sorted
+    $notes
+}
+
+# Lista dzienników z zapisanymi zdarzeniami (wybór «Wybierz…»)
+$script:EventLogListScript = {
+    param($P)
+    foreach ($l in @(Get-WinEvent -ListLog * -ErrorAction SilentlyContinue)) {
+        if ($l.RecordCount -gt 0) { [pscustomobject]@{ Name = [string]$l.LogName; Count = [long]$l.RecordCount; Enabled = [bool]$l.IsEnabled } }
+    }
+}
+$script:EventFollowSeconds = 30
+
+function Initialize-EventLogModule {
+    # Budowa modułu «Dziennik zdarzeń» (przestrzeń Zarządzanie zdalne)
+    param([Parameter(Mandatory)][hashtable]$Module)
+    $m = $Module
+    $m.PillColumns = @('Poziom')
+    $m.DetailsFormatter = { param($m, $row) Format-EventDetails -Module $m -Row $row }
+    $m.EmptyHint = 'Wybierz zestaw albo dzienniki i poziomy, a potem «Pobierz zdarzenia». Prawy przycisk na wierszu: te same zdarzenia na wszystkich komputerach, zdarzenia konta, pomijanie ID.'
+    $m.Data.Spec = $null
+    $m.Data.OkHosts = New-Object System.Collections.ArrayList
+    $m.Data.FollowHosts = @()
+    $m.Data.FollowTimer = $null
+    $m.Data.FollowErrors = @{}
+    $m.Data.FollowNew = @{}
+    $m.Data.FetchStartUtc = $null
+    $m.Data.LogList = $null
+    $m.Presets = @(Get-EventPresets)
+
+    $row = Add-ToolbarRow -Module $m -Title 'Zestaw'
+    $m.Preset = Add-ComboBox -Parent $row -Items @($m.Presets | ForEach-Object { $_.Name }) -Width 430
+    Register-ControlHandler -Control $m.Preset -EventName 'SelectionChanged' -Module $m -Action { param($m, $s) Set-EventPreset -Module $m -Preset $m.Presets[$s.SelectedIndex] }
+
+    $row1 = Add-ToolbarRow -Module $m -Title 'Dzienniki'
+    $m.LogChecks = [ordered]@{}
+    foreach ($n in $script:EventStandardLogs) { $m.LogChecks[$n] = Add-CheckBox -Parent $row1 -Text $n -Checked (@('System', 'Application') -contains $n) }
+    $m.OtherLogs = Add-TextBox -Parent $row1 -Width 290 -Placeholder 'inne, np. Directory Service; …/Operational'
+    $m.OtherLogs.ToolTip = 'Dowolne dzienniki (także «Dzienniki aplikacji i usług») – pełne nazwy rozdzielone średnikiem. «Wybierz…» pokazuje listę z komputera.'
+    Add-Button -Parent $row1 -Text 'Wybierz…' -Icon 'E71D' -Module $m -ToolTip 'Dzienniki z zapisanymi zdarzeniami na pierwszym zaznaczonym komputerze' -OnClick { param($m) Select-EventLogs -Module $m } | Out-Null
+
+    $row2 = Add-ToolbarRow -Module $m -Title 'Poziom'
+    $m.LevelChecks = [ordered]@{}
+    $tips = @{ '4' = 'Także poziom 0 (zawsze rejestrowane) – jak w Podglądzie zdarzeń'; 'AS' = 'Dziennik Security: udane operacje objęte inspekcją (np. logowania 4624)'; 'AF' = 'Dziennik Security: nieudane operacje objęte inspekcją (np. 4625, 4771)' }
+    foreach ($c in $script:EventLevelChoices) { $m.LevelChecks[$c.Key] = Add-CheckBox -Parent $row2 -Text $c.Text -Checked (@('1', '2', '3') -contains $c.Key) -ToolTip ([string]$tips[$c.Key]) }
+    Add-Label -Parent $row2 -Text '   nic nie zaznaczone = wszystkie poziomy' -Hint | Out-Null
+
+    $row3 = Add-ToolbarRow -Module $m -Title 'Filtr'
+    Add-Label -Parent $row3 -Text 'Ostatnie godziny' | Out-Null
+    $m.Hours = Add-Numeric -Parent $row3 -Value 24 -Minimum 1 -Maximum 2160 -Width 64
+    Add-Label -Parent $row3 -Text 'ID' | Out-Null
+    $m.Ids = Add-TextBox -Parent $row3 -Width 165 -Placeholder 'np. 4624, 4720-4767, -4634'
+    $m.Ids.ToolTip = 'Pojedyncze ID i zakresy (4720-4767); minus albo ! przed ID wyklucza (-4634).'
+    Add-Label -Parent $row3 -Text 'Źródło' | Out-Null
+    $m.SourceFilter = Add-TextBox -Parent $row3 -Width 150 -Placeholder 'np. Disk; !Netlogon'
+    $m.SourceFilter.ToolTip = 'Fragment nazwy dostawcy (źródła) albo wzorzec z * i ?; kilka rozdzielonych przecinkiem; ! wyklucza.'
+    Add-Label -Parent $row3 -Text 'Konto' | Out-Null
+    $m.AccountFilter = Add-TextBox -Parent $row3 -Width 115 -Placeholder 'login'
+    $m.AccountFilter.ToolTip = 'Konto w danych zdarzenia (np. konto logowania w Security) albo w treści komunikatu.'
+    Add-Label -Parent $row3 -Text 'Tekst' | Out-Null
+    $m.TextFilter = Add-TextBox -Parent $row3 -Width 150 -Placeholder 'fragment; !wyklucza'
+    $m.TextFilter.ToolTip = 'Fragmenty treści rozdzielone średnikiem – wystarczy jeden; z ! na początku – zdarzenie nie może go zawierać.'
+
+    $row4 = Add-ToolbarRow -Module $m -Title 'Pobieranie'
+    Add-Label -Parent $row4 -Text 'Maks. na komputer' | Out-Null
+    $m.Max = Add-Numeric -Parent $row4 -Value 300 -Minimum 10 -Maximum 10000 -Width 70
+    $m.Btn.Fetch = Add-Button -Parent $row4 -Text 'Pobierz zdarzenia' -Icon 'E896' -Module $m -Primary -OnClick { param($m) Invoke-EventFetch -Module $m }
+    Add-Button -Parent $row4 -Text 'Podsumowanie' -Icon 'E9D2' -Module $m -AlwaysEnabled -ToolTip 'Zdarzenia pogrupowane wg dziennika, ID i źródła: ile, na ilu komputerach, kiedy pierwsze i ostatnie (z widocznych wierszy)' -OnClick { param($m) Show-EventSummary -Module $m } | Out-Null
+    $m.Follow = Add-CheckBox -Parent $row4 -Text ("Śledź nowe zdarzenia (co {0} s)" -f $script:EventFollowSeconds) -ToolTip 'Po pobraniu co pewien czas dopisuje nowe zdarzenia z tych samych komputerów i z tymi samymi filtrami.'
+    Register-ControlHandler -Control $m.Follow -EventName 'Checked' -Module $m -Action {
+        param($m)
+        if ($m.Data.Spec -and @($m.Data.FollowHosts).Count -gt 0) {
+            Start-EventFollow -Module $m
+            Write-Log ("Śledzenie zdarzeń: co {0} s na {1} komputerach." -f $script:EventFollowSeconds, @($m.Data.FollowHosts).Count) -Module $m.Title
+        }
+    }
+    Register-ControlHandler -Control $m.Follow -EventName 'Unchecked' -Module $m -Action {
+        param($m)
+        if ($m.Data.FollowTimer -and $m.Data.FollowTimer.IsEnabled) { Write-Log 'Śledzenie zdarzeń zatrzymane.' -Module $m.Title }
+        Stop-EventFollow -Module $m
+    }
+
+    Add-StatTile -Module $m -Key 'events' -Label 'Zdarzenia' -Icon 'E81C' | Out-Null
+    Add-StatTile -Module $m -Key 'crit' -Label 'Krytyczne i błędy' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'warn' -Label 'Ostrzeżenia' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'fail' -Label 'Niepowodzenia' -Icon 'E72E' | Out-Null
+    Add-StatTile -Module $m -Key 'hosts' -Label 'Komputery' -Icon 'E7F4' | Out-Null
+
+    Add-RowAction -Module $m -Text 'Te zdarzenia na zaznaczonych komputerach' -Icon 'E721' -Action { param($m, $rows) Invoke-EventSameQuery -Module $m -Rows $rows }
+    Add-RowAction -Module $m -Text 'Zdarzenia tego konta' -Icon 'E77B' -Action { param($m, $rows) Invoke-EventAccountQuery -Module $m -Rows $rows }
+    Add-RowAction -Module $m -Text 'Pomijaj ten identyfikator przy pobieraniu' -Icon 'E8F6' -Action { param($m, $rows) Hide-EventIds -Module $m -Rows $rows }
+}
+
+function Get-EventLogSelection {
+    # Dzienniki z pól wyboru i pola «Inne» (bez powtórzeń, kolejność jak na pasku)
+    param([hashtable]$Module)
+    $logs = New-Object System.Collections.Generic.List[string]
+    foreach ($k in @($Module.LogChecks.Keys)) { if (Test-Checked $Module.LogChecks[$k]) { $logs.Add($k) } }
+    foreach ($l in ([string]$Module.OtherLogs.Text -split '[;,\r\n]')) {
+        $t = $l.Trim()
+        if ($t -and -not (@($logs) -contains $t)) { $logs.Add($t) }
+    }
+    return @($logs)
+}
+
+function Set-EventLogSelection {
+    param([hashtable]$Module, [string[]]$Logs)
+    $std = @($Module.LogChecks.Keys)
+    foreach ($k in $std) { $Module.LogChecks[$k].IsChecked = (@($Logs) -contains $k) }
+    $Module.OtherLogs.Text = (@($Logs | Where-Object { $_ -and $std -notcontains $_ }) -join '; ')
+}
+
+function Set-EventLevelSelection {
+    param([hashtable]$Module, [string[]]$Levels)
+    foreach ($k in @($Module.LevelChecks.Keys)) { $Module.LevelChecks[$k].IsChecked = (@($Levels) -contains $k) }
+}
+
+function Set-EventPreset {
+    param([hashtable]$Module, $Preset)
+    if (-not $Preset -or -not $Preset.ContainsKey('Logs')) { return }
+    Set-EventLogSelection -Module $Module -Logs @($Preset.Logs)
+    Set-EventLevelSelection -Module $Module -Levels @($Preset.Levels)
+    $Module.Ids.Text = [string]$Preset.Ids
+    $Module.SourceFilter.Text = [string]$Preset['Source']
+    $Module.AccountFilter.Text = ''
+    $Module.TextFilter.Text = ''
+}
+
+function Get-EventQuerySpec {
+    # Ustawienia z paska -> hashtabla dla New-EventReadParameters; $null (po komunikacie), gdy czegoś brakuje
+    param([hashtable]$Module)
+    $m = $Module
+    $logs = @(Get-EventLogSelection -Module $m)
+    if ($logs.Count -eq 0) { Show-Warning 'Wybierz co najmniej jeden dziennik.'; return $null }
+    $ids = ConvertFrom-EventIdText $m.Ids.Text
+    if (@($ids.Invalid).Count -gt 0) { Show-Warning ("Nie rozumiem w polu ID: {0}.`nPrzykład: 4624, 4720-4767, -4634 (minus albo ! przed ID wyklucza)." -f ($ids.Invalid -join ', ')); return $null }
+    $levels = @(foreach ($k in @($m.LevelChecks.Keys)) { if (Test-Checked $m.LevelChecks[$k]) { $k } })
+    return @{
+        Logs    = $logs
+        Levels  = $levels
+        Ids     = $ids
+        Hours   = (Get-Num $m.Hours)
+        Max     = (Get-Num $m.Max)
+        Source  = (ConvertTo-EventPatternList $m.SourceFilter.Text)
+        Account = $m.AccountFilter.Text.Trim()
+        Text    = (ConvertTo-EventPhraseList $m.TextFilter.Text)
+    }
+}
+
+function Invoke-EventFetch {
+    param([hashtable]$Module)
+    $m = $Module
+    $spec = Get-EventQuerySpec -Module $m
+    if (-not $spec) { return }
+    $targets = @(Get-TargetComputers)
+    if (-not $targets) { return }
+    if ($m.Busy) { Show-Warning "Poprzednia operacja w module «$($m.Title)» jeszcze trwa. Poczekaj na jej zakończenie lub przerwij ją na pasku stanu."; return }
+    Stop-EventFollow -Module $m
+    $m.Data.Spec = $spec
+    $m.Data.FetchStartUtc = [datetime]::UtcNow
+    $m.Data.OkHosts = New-Object System.Collections.ArrayList
+    $m.Data.FollowErrors = @{}
+    Start-HostOperation -Module $m -Name 'Dziennik zdarzeń' -Targets $targets -Parameters (New-EventReadParameters -Spec $spec) -ScriptBlock $script:EventReadScript -OnResult {
+        param($m, $r)
+        if ($r.Ok -and -not $m.Data.OkHosts.Contains($r.Target)) { [void]$m.Data.OkHosts.Add($r.Target) }
+        foreach ($n in @($r.Data | Where-Object { $_ -and $_.PSObject.Properties['__note'] -and $_.'__tone' -eq 'warn' })) { Write-Log ("[{0}] {1}: {2}" -f $r.Target, $n.'Dziennik', $n.'Komunikat') 'WARN' -Module $m.Title }
+    } -OnComplete { param($m) Complete-EventFetch -Module $m }
+}
+
+function Complete-EventFetch {
+    param([hashtable]$Module)
+    $m = $Module
+    if ($m.Table -and $m.Table.Columns.Contains('Czas')) { Set-ResultSort -Module $m -Column 'Czas' -Descending }
+    Set-EmptyColumnsHidden -Module $m -Columns $script:EventDataColumns
+    Update-EventTiles -Module $m
+    $m.Data.FollowHosts = @($m.Data.OkHosts)
+    if (Test-Checked $m.Follow) { Start-EventFollow -Module $m }
+}
+
+function Update-EventTiles {
+    param([hashtable]$Module)
+    $n = 0; $crit = 0; $warn = 0; $fail = 0
+    $hosts = @{}
+    if ($Module.Table -and $Module.Table.Columns.Contains('__rid')) {
+        foreach ($r in @(Get-ResultRowsAll -Module $Module)) {
+            if ($r['__rid'] -is [System.DBNull]) { continue }
+            $n++
+            switch ([string]$r['Poziom']) {
+                'Krytyczny' { $crit++ }
+                'Błąd' { $crit++ }
+                'Ostrzeżenie' { $warn++ }
+                'Inspekcja – niepowodzenie' { $fail++ }
+            }
+            $hosts[[string]$r['Komputer']] = $true
+        }
+    }
+    Set-StatTile -Module $Module -Key 'events' -Value ([string]$n) -Tone $(if ($n) { 'info' } else { '' })
+    Set-StatTile -Module $Module -Key 'crit' -Value ([string]$crit) -Tone $(if ($crit) { 'crit' } else { 'ok' })
+    Set-StatTile -Module $Module -Key 'warn' -Value ([string]$warn) -Tone $(if ($warn) { 'warn' } else { 'ok' })
+    Set-StatTile -Module $Module -Key 'fail' -Value ([string]$fail) -Tone $(if ($fail) { 'warn' } else { 'ok' })
+    Set-StatTile -Module $Module -Key 'hosts' -Value ([string]$hosts.Count)
+}
+
+function Start-EventFollow {
+    param([hashtable]$Module)
+    $m = $Module
+    if (-not $m.Data.Spec -or @($m.Data.FollowHosts).Count -eq 0) { return }
+    if (-not $m.Data.FollowTimer) {
+        $t = New-Object System.Windows.Threading.DispatcherTimer
+        $t.Interval = [TimeSpan]::FromSeconds($script:EventFollowSeconds)
+        $t.Tag = $m
+        $t.add_Tick({
+                param($s, $e)
+                $s.Stop()
+                Invoke-UiAction -Module $s.Tag -Action { param($m) Invoke-EventFollowTick -Module $m }
+            })
+        $m.Data.FollowTimer = $t
+    }
+    if (-not $m.Data.FollowTimer.IsEnabled) { $m.Data.FollowTimer.Start() }
+}
+
+function Stop-EventFollow {
+    param([hashtable]$Module)
+    if ($Module.Data.FollowTimer) { $Module.Data.FollowTimer.Stop() }
+}
+
+function Get-EventFollowState {
+    # Dla każdego komputera: od kiedy pytać (najnowsze zdarzenie w tabeli) i które rekordy z tej chwili już są (bez powtórzeń).
+    # Komputer bez zdarzeń w tabeli: od chwili pobrania minus 10 min (różnica zegarów) - takich zdarzeń w tabeli nie ma.
+    param([hashtable]$Module, [string[]]$Hosts)
+    $newest = @{}
+    $byHost = @{}
+    if ($Module.Table -and $Module.Table.Columns.Contains('__utc')) {
+        foreach ($r in @(Get-ResultRowsAll -Module $Module)) {
+            $u = [string]$r['__utc']
+            if (-not $u) { continue }
+            $h = [string]$r['Komputer']
+            if (-not $byHost.ContainsKey($h)) { $byHost[$h] = New-Object System.Collections.ArrayList }
+            [void]$byHost[$h].Add($r)
+            if (-not $newest.ContainsKey($h) -or [string]::CompareOrdinal($u, $newest[$h]) -gt 0) { $newest[$h] = $u }
+        }
+    }
+    $start = $Module.Data.FetchStartUtc
+    if (-not $start) { $start = [datetime]::UtcNow }
+    $fallback = $start.AddMinutes(-10).ToString("yyyy-MM-ddTHH:mm:ss.fff'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+    $state = @{}
+    foreach ($h in $Hosts) {
+        if (-not $newest.ContainsKey($h)) { $state[$h] = @{ Since = $fallback; Seen = @() }; continue }
+        $t = [datetime]::Parse($newest[$h], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        $edge = $t.AddSeconds(-1).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+        $seen = @($byHost[$h] | Where-Object { [string]::CompareOrdinal([string]$_['__utc'], $edge) -ge 0 } | ForEach-Object { '{0}|{1}' -f $_['Dziennik'], $_['__rid'] })
+        $state[$h] = @{ Since = $t.ToString("yyyy-MM-ddTHH:mm:ss.fff'Z'", [System.Globalization.CultureInfo]::InvariantCulture); Seen = $seen }
+    }
+    return $state
+}
+
+function Invoke-EventFollowTick {
+    # Jeden takt śledzenia: nowe zdarzenia z tych samych komputerów i filtrów, dopisane do tabeli
+    param([hashtable]$Module)
+    $m = $Module
+    if (-not (Test-Checked $m.Follow) -or -not $m.Data.Spec) { return }
+    $hosts = @($m.Data.FollowHosts)
+    if ($hosts.Count -eq 0) { return }
+    # Zegar odlicza dalej także wtedy, gdy ten takt się nie wykona albo zostanie przerwany
+    Start-EventFollow -Module $m
+    if ($m.Busy) { return }
+    $state = Get-EventFollowState -Module $m -Hosts $hosts
+    $per = @{}
+    foreach ($h in $hosts) { $per[$h] = New-EventReadParameters -Spec $m.Data.Spec -SinceUtc $state[$h].Since -Seen $state[$h].Seen }
+    $m.Data.FollowNew = @{}
+    Start-HostOperation -Module $m -Name 'Dziennik zdarzeń – nowe' -Targets $hosts -Output None -Quiet -PerTarget $per -ScriptBlock $script:EventReadScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) {
+            $err = (@($r.Errors | Select-Object -Unique) -join ' | ')
+            if ([string]$m.Data.FollowErrors[$r.Target] -ne $err) { Write-Log ("Śledzenie zdarzeń – {0}: {1}" -f $r.Target, $err) 'WARN' -Module $m.Title }
+            $m.Data.FollowErrors[$r.Target] = $err
+            return
+        }
+        if ($m.Data.FollowErrors.ContainsKey($r.Target)) {
+            $m.Data.FollowErrors.Remove($r.Target)
+            Write-Log ("Śledzenie zdarzeń – {0}: znowu odpowiada." -f $r.Target) 'OK' -Module $m.Title
+        }
+        $new = @($r.Data | Where-Object { $_ -and -not $_.PSObject.Properties['__note'] })
+        if ($new.Count -gt 0) {
+            Add-ResultRows -Module $m -Computer $r.Target -Objects $new
+            $m.Data.FollowNew[$r.Target] = $new.Count
+        }
+    } -OnComplete {
+        param($m)
+        $n = 0
+        foreach ($v in $m.Data.FollowNew.Values) { $n += $v }
+        if ($n -eq 0) { return }
+        Set-EmptyColumnsHidden -Module $m -Columns $script:EventDataColumns
+        Update-EventTiles -Module $m
+        $where = (@($m.Data.FollowNew.Keys | Sort-Object | ForEach-Object { '{0}: {1}' -f $_, $m.Data.FollowNew[$_] }) -join ', ')
+        Write-Log ("Nowe zdarzenia: {0} ({1})" -f $n, $where) 'OK' -Module $m.Title
+    }
+}
+
+function Format-EventDetails {
+    # Szczegóły zdarzenia: pełny komunikat z podziałem na wiersze i wszystkie dane zdarzenia (panel, dwuklik, «Szczegóły wiersza»)
+    param([hashtable]$Module, $Row)
+    $msg = [string](Get-ObjectValue $Row '__msg')
+    if (-not $msg -or [string](Get-ObjectValue $Row '__note') -eq '1') { return $null }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($c in 'Komputer', 'Czas', 'Dziennik', 'Źródło', 'ID', 'Poziom', 'Konto', 'Skąd', 'Logowanie', 'Szczegóły') {
+        $v = [string](Get-ObjectValue $Row $c)
+        if ($v) { [void]$sb.AppendLine(('{0}:  {1}' -f $c, $v)) }
+    }
+    $rid = [string](Get-ObjectValue $Row '__rid')
+    if ($rid) { [void]$sb.AppendLine("Numer rekordu:  $rid") }
+    [void]$sb.AppendLine().AppendLine('Komunikat:').AppendLine($msg.Trim())
+    $data = [string](Get-ObjectValue $Row '__data')
+    if ($data) { [void]$sb.AppendLine().AppendLine('Dane zdarzenia:').AppendLine($data) }
+    return $sb.ToString()
+}
+
+function Get-EventSummaryRows {
+    # Widoczne zdarzenia pogrupowane wg dziennika, ID, źródła i poziomu (najliczniejsze na początku)
+    param([hashtable]$Module)
+    $groups = @{}
+    if ($null -eq $Module.View -or -not $Module.Table -or -not $Module.Table.Columns.Contains('__rid')) { return @() }
+    $total = 0
+    foreach ($rv in $Module.View) {
+        if ($rv['__rid'] -is [System.DBNull]) { continue }
+        $total++
+        $key = '{0}|{1}|{2}|{3}' -f $rv['Dziennik'], $rv['ID'], $rv['Źródło'], $rv['Poziom']
+        $g = $groups[$key]
+        if (-not $g) {
+            $g = @{ Log = [string]$rv['Dziennik']; Id = $rv['ID']; Source = [string]$rv['Źródło']; Level = [string]$rv['Poziom']; Tone = [string]$rv['__tone']; Count = 0; Hosts = @{}; Accounts = @{}; First = ''; Last = ''; Sample = '' }
+            $groups[$key] = $g
+        }
+        $g.Count++
+        $h = [string]$rv['Komputer']
+        $g.Hosts[$h] = 1 + [int]$g.Hosts[$h]
+        $a = [string](Get-ObjectValue $rv 'Konto')
+        if ($a) { $g.Accounts[$a] = 1 + [int]$g.Accounts[$a] }
+        $t = [string]$rv['Czas']
+        if (-not $g.First -or [string]::CompareOrdinal($t, $g.First) -lt 0) { $g.First = $t }
+        if ([string]::CompareOrdinal($t, $g.Last) -gt 0 -or -not $g.Sample) { $g.Last = $t; $g.Sample = [string]$rv['Komunikat'] }
+    }
+    $top = {
+        param([hashtable]$Counts, [int]$N)
+        $sorted = @($Counts.GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value }; Descending = $true }, @{ Expression = { $_.Key } })
+        $text = (@($sorted | Select-Object -First $N | ForEach-Object { '{0} ({1})' -f $_.Key, $_.Value }) -join ', ')
+        if ($sorted.Count -gt $N) { $text += " … +$($sorted.Count - $N)" }
+        $text
+    }
+    $out = foreach ($g in $groups.Values) {
+        $sample = $g.Sample
+        if ($sample.Length -gt 300) { $sample = $sample.Substring(0, 300) + '…' }
+        [pscustomobject]@{
+            'Poziom'    = $g.Level
+            'ID'        = $g.Id
+            'Źródło'    = $g.Source
+            'Dziennik'  = $g.Log
+            'Liczba'    = $g.Count
+            'Komputery' = $g.Hosts.Count
+            'Gdzie'     = (& $top $g.Hosts 5)
+            'Konta'     = (& $top $g.Accounts 3)
+            'Pierwsze'  = $g.First
+            'Ostatnie'  = $g.Last
+            'Przykład'  = $sample
+            '__tone'    = $g.Tone
+        }
+    }
+    return @($out | Sort-Object -Property @{ Expression = { $_.'Liczba' }; Descending = $true }, @{ Expression = { $_.'ID' } })
+}
+
+function Show-EventSummary {
+    param([hashtable]$Module)
+    $rows = @(Get-EventSummaryRows -Module $Module)
+    if ($rows.Count -eq 0) { Show-Message -Text 'Brak zdarzeń do podsumowania – najpierw pobierz zdarzenia (podsumowanie obejmuje wiersze widoczne po filtrach).' -Title 'Podsumowanie zdarzeń'; return }
+    $events = 0
+    $hosts = @{}
+    foreach ($rv in $Module.View) { if ($rv['__rid'] -isnot [System.DBNull]) { $events++; $hosts[[string]$rv['Komputer']] = $true } }
+    $rows = @($rows)
+    Show-GridDialog -Title 'Podsumowanie zdarzeń' -Subtitle ("{0} zdarzeń z {1} komputerów, {2} rodzajów (dziennik, ID, źródło, poziom). Kolumna «Gdzie» pokazuje, czy problem dotyczy wielu komputerów, czy jednego." -f $events, $hosts.Count, $rows.Count) -Rows $rows -PillColumns @('Poziom')
+}
+
+function Select-EventLogs {
+    # «Wybierz…»: lista dzienników z pierwszego zaznaczonego komputera (w tle), potem okno wyboru
+    param([hashtable]$Module)
+    $first = @(Get-TargetComputers) | Select-Object -First 1
+    if (-not $first) { return }
+    $Module.Data.LogList = $null
+    Start-HostOperation -Module $Module -Name 'Lista dzienników' -Targets @($first) -Output None -ScriptBlock $script:EventLogListScript -OnResult { param($m, $r) $m.Data.LogList = $r } -OnComplete { param($m) Show-EventLogPicker -Module $m }
+}
+
+function Show-EventLogPicker {
+    param([hashtable]$Module)
+    $r = $Module.Data.LogList
+    if (-not $r) { return }
+    if (-not $r.Ok) { Show-Warning ("Nie można odczytać listy dzienników z komputera {0}: {1}" -f $r.Target, (@($r.Errors) -join ' | ')); return }
+    $current = @(Get-EventLogSelection -Module $Module)
+    $list = @($r.Data | Where-Object { $_ -and $_.Name })
+    # Wybrane wcześniej dzienniki, których nie ma na tym komputerze (albo są puste), zostają na liście
+    foreach ($c in $current) { if (-not @($list | Where-Object { $_.Name -eq $c })) { $list += [pscustomobject]@{ Name = $c; Count = 0; Enabled = $true } } }
+    $list = @($list | Sort-Object -Property @{ Expression = { if ($script:EventStandardLogs -contains $_.Name) { 0 } elseif ($_.Name -notmatch '/') { 1 } else { 2 } } }, @{ Expression = { $_.Name } })
+    $labels = @($list | ForEach-Object { if ($_.Count -gt 0) { '{0}   ({1:N0})' -f $_.Name, $_.Count } else { "$($_.Name)   (brak zdarzeń)" } })
+    $checked = @(for ($i = 0; $i -lt $list.Count; $i++) { if ($current -contains $list[$i].Name) { $labels[$i] } })
+    $text = "Dzienniki z zapisanymi zdarzeniami na komputerze $($r.Target): $($list.Count). Zaznacz te, które chcesz przeszukiwać – zapytanie trafi do wszystkich zaznaczonych komputerów."
+    $idx = @(Confirm-Action -Title 'Dzienniki zdarzeń' -Text $text -Items $labels -Select -ReturnIndex -Checked $checked -ConfirmText 'Wybierz' -SelectHint 'W nawiasie liczba zdarzeń zapisanych w dzienniku. Filtr pomaga znaleźć dziennik po fragmencie nazwy (np. TerminalServices, GroupPolicy).')
+    if ($idx.Count -eq 0) { return }
+    Set-EventLogSelection -Module $Module -Logs @($idx | ForEach-Object { $list[[int]$_].Name })
+    $Module.Preset.SelectedIndex = 0
+}
+
+function Get-EventRowsOnly {
+    # Wiersze zdarzeń (bez uwag i błędów komputerów)
+    param($Rows)
+    return @($Rows | Where-Object { [string](Get-ObjectValue $_ '__rid') -and [string](Get-ObjectValue $_ '__note') -ne '1' })
+}
+
+function Invoke-EventSameQuery {
+    # Te same zdarzenia (dziennik, ID, źródło; wszystkie poziomy) na komputerach zaznaczonych po lewej
+    param([hashtable]$Module, $Rows)
+    $ev = @(Get-EventRowsOnly $Rows)
+    if ($ev.Count -eq 0) { return }
+    $logs = @($ev | ForEach-Object { [string](Get-ObjectValue $_ 'Dziennik') } | Select-Object -Unique)
+    $ids = @($ev | ForEach-Object { [string](Get-ObjectValue $_ 'ID') } | Select-Object -Unique)
+    $sources = @($ev | ForEach-Object { [string](Get-ObjectValue $_ 'Źródło') } | Select-Object -Unique)
+    $Module.Preset.SelectedIndex = 0
+    Set-EventLogSelection -Module $Module -Logs $logs
+    Set-EventLevelSelection -Module $Module -Levels @()
+    $Module.Ids.Text = ($ids -join ', ')
+    $Module.SourceFilter.Text = $(if ($sources.Count -eq 1) { $sources[0] } else { '' })
+    $Module.AccountFilter.Text = ''
+    $Module.TextFilter.Text = ''
+    Invoke-EventFetch -Module $Module
+}
+
+function Invoke-EventAccountQuery {
+    # Wszystkie zdarzenia konta z wiersza (bez filtra ID i poziomu) w wybranych dziennikach i dziennikach wierszy
+    param([hashtable]$Module, $Rows)
+    $ev = @(Get-EventRowsOnly $Rows)
+    $accounts = @($ev | ForEach-Object { [string](Get-ObjectValue $_ 'Konto') } | Where-Object { $_ } | Select-Object -Unique)
+    if ($accounts.Count -eq 0) { Show-Warning 'Zaznaczone zdarzenia nie mają konta w danych.'; return }
+    $name = $accounts[0]
+    if ($name.Contains('\')) { $name = $name.Substring($name.LastIndexOf('\') + 1) }
+    if ($accounts.Count -gt 1) { Write-Log ("Zdarzenia konta: wiersze mają {0} różne konta – szukam pierwszego: {1}." -f $accounts.Count, $name) 'WARN' -Module $Module.Title }
+    $logs = @(@(Get-EventLogSelection -Module $Module) + @($ev | ForEach-Object { [string](Get-ObjectValue $_ 'Dziennik') }) | Select-Object -Unique)
+    $Module.Preset.SelectedIndex = 0
+    Set-EventLogSelection -Module $Module -Logs $logs
+    Set-EventLevelSelection -Module $Module -Levels @()
+    $Module.Ids.Text = ''
+    $Module.SourceFilter.Text = ''
+    $Module.TextFilter.Text = ''
+    $Module.AccountFilter.Text = $name
+    Invoke-EventFetch -Module $Module
+}
+
+function Hide-EventIds {
+    # Usuwa z tabeli zdarzenia o tych ID (z tych dzienników) i dopisuje ID do wykluczeń w polu «ID»
+    param([hashtable]$Module, $Rows)
+    $ev = @(Get-EventRowsOnly $Rows)
+    if ($ev.Count -eq 0) { return }
+    $pairs = @{}
+    foreach ($r in $ev) { $pairs['{0}|{1}' -f (Get-ObjectValue $r 'Dziennik'), (Get-ObjectValue $r 'ID')] = $true }
+    $ids = @($ev | ForEach-Object { [int](Get-ObjectValue $_ 'ID') } | Sort-Object -Unique)
+    $drop = @(Get-ResultRowsAll -Module $Module | Where-Object { $_.Table.Columns.Contains('__rid') -and $_['__rid'] -isnot [System.DBNull] -and $pairs.ContainsKey(('{0}|{1}' -f $_['Dziennik'], $_['ID'])) })
+    Remove-ResultRows -Module $Module -Rows $drop
+    $current = ConvertFrom-EventIdText $Module.Ids.Text
+    $add = @($ids | Where-Object { @($current.Exclude) -notcontains "$_-$_" } | ForEach-Object { "-$_" })
+    # Śledzenie korzysta z ustawień z chwili pobrania - wykluczenie działa w nim od razu
+    if ($Module.Data.Spec) { $Module.Data.Spec.Ids.Exclude = @(@($Module.Data.Spec.Ids.Exclude) + @($ids | ForEach-Object { "$_-$_" }) | Where-Object { $_ } | Select-Object -Unique) }
+    if ($add.Count -gt 0) {
+        $text = $Module.Ids.Text.Trim().TrimEnd(',')
+        $Module.Ids.Text = $(if ($text) { $text + ', ' + ($add -join ', ') } else { $add -join ', ' })
+    }
+    Update-EventTiles -Module $Module
+    Show-Toast ("Ukryto wierszy: {0}. ID {1} będą pomijane przy kolejnych pobraniach i śledzeniu (pole «ID»)." -f $drop.Count, ($ids -join ', ')) 'info'
 }
 #endregion
 
