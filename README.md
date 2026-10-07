@@ -21,6 +21,16 @@ Zbiór mikroprojektów PowerShell wspomagających codzienną administrację Acti
 3. Uruchom interesujący plik, np.: `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1`.
 4. Narzędzia GUI uruchamiaj w sesji desktopowej z odpowiednimi uprawnieniami.
 
+`NET-SharePermissionAudit.ps1` to skrypt konsolowy z parametrami (bez GUI) — wynik to interaktywny raport HTML oraz pliki CSV:
+
+```powershell
+.\NET-SharePermissionAudit.ps1                                            # udziały komputera lokalnego
+.\NET-SharePermissionAudit.ps1 -ComputerName FS01, FS02 -Depth 4 -ExpandGroups
+.\NET-SharePermissionAudit.ps1 -FromAD -SearchBase 'OU=Serwery,DC=firma,DC=local' -ShareOnly
+.\NET-SharePermissionAudit.ps1 -Path '\\FS01\Dzialy\Kadry' -Depth -1 -UserAccess jkowalski
+Get-Help .\NET-SharePermissionAudit.ps1 -Full                               # opis wszystkich parametrów
+```
+
 ## Kodowanie plików
 
 Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows PowerShell 5.1 bez BOM czyta pliki w kodowaniu systemowym (np. cp1250), przez co polskie znaki psują napisy, a część skryptów w ogóle się nie parsuje. Przy edycji zachowuj kodowanie „UTF-8 with BOM” (w VS Code: *Save with Encoding → UTF-8 with BOM*).
@@ -30,6 +40,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | Plik / lokalizacja | Skrypt | Zawartość |
 | --- | --- | --- |
 | `Pulpit\NTFS_Audit_*.csv/.xlsx` | `AD-NTFS-AuditGUI.ps1` | Eksport wyników audytu NTFS. |
+| `Pulpit\ShareAudit_<data>\` (lub folder z `-OutputPath`) | `NET-SharePermissionAudit.ps1` | `Raport.html`, pliki CSV (ustalenia, udziały, uprawnienia udziałów i NTFS, członkowie grup, dostęp użytkowników, serwery, błędy), opcjonalnie `Raport.json`/`Raport.xlsx` oraz `Audyt.log`. |
 | `%TEMP%\PC-CheckHashFoldersIntegrity.log` | `PC-CheckHashFoldersIntegrity.ps1` | Log diagnostyczny porównania. |
 | `%APPDATA%\CyberGenPro\CyberGenConfig.json`, `%TEMP%\CyberGenHistory.json` | `PasswordGenerator.ps1` | Ustawienia generatora oraz historia haseł z ostatnich 24 h (zapisana jawnym tekstem). |
 | `%APPDATA%\AD-ManagerDiamond\settings.json` | `AD-ManagerDiamond.ps1` | Ustawienia: OU i filtry list komputerów, użytkowników i grup, kontroler domeny, liczba równoległych operacji i zapytań AD, limit połączenia, próg nieaktywności, profile tworzenia kont, OU dla wyłączonych kont, wyjątki i grupy chronione, konta systemowe ukrywane w raporcie NTFS, szablony zgodności grup lokalnych, folder raportów cyklicznych, ostatnio użyte wartości pól modułów, ostatnia przestrzeń i moduły, rozmiar okna (bez poświadczeń i haseł). |
@@ -56,6 +67,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | `AD-RDP-LoginEvents.ps1` | GUI do pobierania zdarzeń z dziennika Security (domyślnie 4624/4634) z ostatnich N dni z wybranych komputerów lub wszystkich kontrolerów domeny. Działa w tle, zapisuje raport CSV do wskazanego folderu; konfigurację można zapisać/wczytać z JSON. |
 | `AD-SwapLogin.ps1` | GUI do naprawiania kont z zamienionym imieniem i nazwiskiem: sprawdza listę loginów, podpowiada konta do zamiany, hurtowo zamienia GivenName/Surname (opcjonalnie DisplayName); ma tryb testowy i eksport CSV. |
 | `AD-User-Manager.ps1` | Lekki manager użytkowników: wyszukuje po SamAccountName, wyświetla najważniejsze atrybuty (hasło, logowania, blokady), pozwala wyłączyć/włączyć konto, odblokować po lockoucie i zresetować hasło. |
+| `NET-SharePermissionAudit.ps1` | Audyt uprawnień udziałów sieciowych na wielu serwerach (lista, OU w AD lub konkretne ścieżki): uprawnienia udziału (NetShareEnum — wystarczy port 445, bez WMI/WinRM), właściwości udziału (ABE, szyfrowanie, offline), NTFS do zadanej głębokości (równolegle, opcjonalnie po stronie serwera przez WinRM). Rozwiązuje SID-y w kontekście serwera, wykrywa ryzyka z wagą (m.in. zapis dla Everyone/Domain Users, dostęp anonimowy, pełna kontrola dla zwykłych kont, uprawnienia bezpośrednio dla użytkowników, osierocone SID-y, wyłączone konta, Deny, przerwane dziedziczenie), opcjonalnie rozwija grupy i liczy efektywny dostęp wskazanych użytkowników. Raport HTML z filtrami + CSV/JSON/XLSX. Tylko odczyt. |
 | `PasswordGenerator.ps1` | Generator haseł (WPF, kryptograficzne losowanie) z konfigurowalnymi regułami, generowaniem paczek do schowka, historią z ostatnich 24 h, motywem jasnym/ciemnym i wysyłką przez `mailto:`. |
 | `PC-CheckHashFoldersIntegrity.ps1` | WinForms do porównywania dwóch folderów (np. lokalnego z udziałem sieciowym): indeksuje pliki (także ukryte), porównuje rozmiar/datę i opcjonalnie SHA-256, pokazuje różnice i eksportuje je do CSV. |
 | `PC-Folder-TreeView.ps1` | Podgląd drzewa folderu (leniwe wczytywanie, opcjonalnie pliki ukryte) z eksportem do TXT w formie ASCII. Nie wchodzi w junctiony/symlinki. |
@@ -295,6 +307,7 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'TimeSync' -Tit
 - Moduły z folderu `AD-ManagerDiamond.Modules` są wykonywane z uprawnieniami użytkownika programu — trzymaj tam tylko zaufane pliki.
 - **Raporty cykliczne** wykonują kopię programu (z modułami własnymi) na koncie zadania — często z najwyższymi uprawnieniami albo jako SYSTEM. Folder zadań powinien być zapisywalny tylko dla administratorów (program sam zabezpiecza podfolder `Program`); kto może zmieniać definicje, może też zmienić adresatów raportów. Hasło konta zadania przechowuje Harmonogram zadań (program go nie zapisuje), a hasło SMTP jest zapisane w definicji zaszyfrowane DPAPI — odczyta je tylko konto, które je wpisało, na tym samym komputerze. Raporty i wiadomości zawierają nazwy kont, grup i ścieżek — wysyłaj je tylko do zaufanych odbiorców i na zaufany serwer SMTP (włącz TLS, jeśli serwer go obsługuje).
 - `PasswordGenerator` przechowuje wygenerowane hasła jawnym tekstem (historia w `%TEMP%`) — czyść historię i schowek po pracy. Hasła nowych kont w *Tworzeniu kont* są maskowane w tabeli i eksporcie (do czasu zaznaczenia „Pokaż poufne”) i nie są zapisywane w ustawieniach ani dzienniku.
+- Raport `NET-SharePermissionAudit` to pełna mapa „kto ma dostęp do czego” (w tym słabo zabezpieczone lokalizacje) — przechowuj go w miejscu z ograniczonym dostępem i usuń, gdy nie jest już potrzebny.
 
 ## Kontakt
 
