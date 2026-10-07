@@ -13818,12 +13818,13 @@ if ($null -eq [System.AppDomain]::CurrentDomain.GetData('DomainOps.AdLock')) { [
 $script:AdReadCommands = @('Get-ADUser', 'Get-ADComputer', 'Get-ADGroup', 'Get-ADObject', 'Get-ADOrganizationalUnit', 'Get-ADGroupMember', 'Get-ADPrincipalGroupMembership',
     'Get-ADDomain', 'Get-ADForest', 'Get-ADRootDSE', 'Get-ADDomainController', 'Search-ADAccount', 'Get-ADDefaultDomainPasswordPolicy', 'Get-ADFineGrainedPasswordPolicy',
     'Get-ADUserResultantPasswordPolicy', 'Get-ADAccountAuthorizationGroup', 'Get-ADReplicationAttributeMetadata', 'Get-ADOptionalFeature', 'Get-ADReplicationPartnerMetadata',
-    'Get-ADReplicationFailure', 'Get-ADServiceAccount', 'Get-ADTrust')
+    'Get-ADReplicationFailure', 'Get-ADServiceAccount', 'Get-ADTrust', 'Get-ADFineGrainedPasswordPolicySubject')
 $script:AdWriteCommands = @('Set-ADUser', 'Set-ADComputer', 'Set-ADGroup', 'Set-ADObject', 'Set-ADOrganizationalUnit', 'Set-ADAccountPassword', 'Set-ADAccountExpiration',
     'Set-ADAccountControl', 'Clear-ADAccountExpiration', 'New-ADUser', 'New-ADComputer', 'New-ADGroup', 'New-ADOrganizationalUnit', 'Add-ADGroupMember', 'Remove-ADGroupMember',
     'Add-ADPrincipalGroupMembership', 'Remove-ADPrincipalGroupMembership', 'Move-ADObject', 'Rename-ADObject', 'Remove-ADObject', 'Remove-ADUser', 'Remove-ADComputer',
     'Remove-ADGroup', 'Remove-ADOrganizationalUnit', 'Restore-ADObject', 'Enable-ADAccount', 'Disable-ADAccount', 'Unlock-ADAccount', 'Enable-ADOptionalFeature',
-    'Move-ADDirectoryServerOperationMasterRole', 'Install-ADServiceAccount')
+    'Move-ADDirectoryServerOperationMasterRole', 'Install-ADServiceAccount', 'Add-ADFineGrainedPasswordPolicySubject',
+    'Remove-ADFineGrainedPasswordPolicySubject')
 
 function Invoke-AdCall {
     # Polecenie modułu ActiveDirectory pod blokadą procesu. -WaitMs: jak długo czekać na blokadę (-1 bez limitu; wątek okna
@@ -19515,6 +19516,1143 @@ function ConvertTo-ObjectReportHtml {
     }
     [void]$sb.Append((Get-ReportTail))
     return $sb.ToString()
+}
+#endregion
+
+#region Offboarding – odejście pracownika
+# Kroki w kolejności wykonania; Move na końcu (zmienia DN). Default - stan pól przy pierwszym uruchomieniu.
+$script:OffboardingSteps = @(
+    @{ Key = 'Disable'; Text = 'Wyłącz konto'; Default = $true; Tip = 'Konto nie zaloguje się nigdzie w domenie.' }
+    @{ Key = 'Password'; Text = 'Ustaw losowe hasło'; Default = $true; Tip = 'Unieważnia hasło znane użytkownikowi (np. zapisane w telefonie). Nowe hasło nie jest nigdzie pokazywane ani zapisywane.' }
+    @{ Key = 'Groups'; Text = 'Usuń z grup (z kopią)'; Default = $true; Tip = 'Z wyjątkiem grupy podstawowej i grup chronionych (ustawienia modułu «Wyłączone konta»). Kopia członkostw w pliku – do przywrócenia.' }
+    @{ Key = 'Stamp'; Text = 'Dopisz do opisu datę, autora i powód'; Default = $true; Tip = 'Np. «Offboarding 2026-10-07 (admin.jan): zgłoszenie 1234 | poprzedni opis».' }
+    @{ Key = 'Expire'; Text = 'Wygaśnięcie konta: dziś'; Default = $false; Tip = 'Konto wygasa z końcem dzisiejszego dnia – druga blokada niezależna od wyłączenia.' }
+    @{ Key = 'Manager'; Text = 'Wyczyść przełożonego'; Default = $false; Tip = 'Atrybut manager. Podwładnych tego konta trzeba przypisać ręcznie – podgląd ich pokazuje.' }
+    @{ Key = 'HideGal'; Text = 'Ukryj w książce adresowej'; Default = $false; Tip = 'msExchHideFromAddressLists – tylko gdy schemat AD ma atrybuty Exchange (także przy Exchange Online z synchronizacją).' }
+    @{ Key = 'Move'; Text = 'Przenieś do OU'; Default = $true; Tip = 'Jednostka z pola poniżej (np. OU dla byłych pracowników).' }
+    @{ Key = 'Rds'; Text = 'Wyloguj sesje na serwerach RDS'; Default = $false; Tip = 'Serwery z modułu Domena → Sesje RDS (pole «Serwery»); sesje użytkownika są wylogowywane po zmianach w AD.' }
+)
+
+# Podgląd: stan konta i ostrzeżenia. $P: Protected (grupy chronione), Me (loginy operatora), Exceptions (konta-wyjątki)
+$script:OffboardingPreviewScript = {
+    $u = Get-ADUser -Identity $Target -Properties displayName, memberOf, manager, directReports, adminCount, LastLogonDate, description @ad
+    $prot = @{}
+    foreach ($g in @($P.Protected)) { $prot[([string]$g).ToLowerInvariant()] = $true }
+    $groups = @($u.memberOf | Where-Object { $_ })
+    $kept = @($groups | Where-Object { $prot.ContainsKey((Get-DnName $_).ToLowerInvariant()) })
+    $sam = [string]$u.SamAccountName
+    $notes = @()
+    $blocked = $false
+    $warn = $false
+    if (([string]$u.SID) -match '-(500|502)$') { $blocked = $true; $notes += 'konto wbudowane (Administrator / krbtgt) – pominięte' }
+    if (@($P.Me) -contains $sam.ToLowerInvariant()) { $blocked = $true; $notes += 'konto, na którym działa program – pominięte' }
+    foreach ($e in @($P.Exceptions)) { if ($e -and ($sam -ieq $e -or [string]$u.Name -ieq $e)) { $blocked = $true; $notes += 'konto-wyjątek (ustawienia modułu «Wyłączone konta») – pominięte' } }
+    if ([int]$u.adminCount -eq 1) { $warn = $true; $notes += 'konto uprzywilejowane (adminCount=1) – sprawdź, czy nie działają na nim usługi lub zadania' }
+    $reports = @($u.directReports | Where-Object { $_ })
+    if ($reports.Count) { $warn = $true; $notes += ('ma podwładnych ({0}): {1}{2} – przypisz im nowego przełożonego' -f $reports.Count, ((@($reports | Select-Object -First 5 | ForEach-Object { Get-DnName $_ })) -join ', '), $(if ($reports.Count -gt 5) { ', …' } else { '' })) }
+    if (-not $u.Enabled) { $notes += 'konto już wyłączone' }
+    [pscustomobject][ordered]@{
+        'Stan'               = $(if ($blocked) { 'Pominięte' } elseif ($warn) { 'Uwaga' } else { 'Do wykonania' })
+        'Nazwa'              = $u.displayName
+        'Włączone'           = [bool]$u.Enabled
+        'Grupy do usunięcia' = $groups.Count - $kept.Count
+        'Grupy chronione'    = $kept.Count
+        'Przełożony'         = $(if ($u.manager) { Get-DnName ([string]$u.manager) } else { '' })
+        'Podwładni'          = $reports.Count
+        'Ostatnie logowanie' = $u.LastLogonDate
+        'Jednostka OU'       = Get-DnParent ([string]$u.DistinguishedName)
+        'Uwagi'              = ($notes -join '; ')
+        '__tone'             = $(if ($blocked) { 'crit' } elseif ($warn) { 'warn' } else { 'info' })
+        '__blocked'          = $(if ($blocked) { '1' } else { '' })
+        '__kind'             = 'preview'
+    }
+}
+
+# Stan konta przed zmianami (do pliku kopii i przywracania). $P: Protected
+$script:OffboardingStateScript = {
+    $u = Get-ADUser -Identity $Target -Properties displayName, memberOf, manager, description, AccountExpirationDate @ad
+    $prot = @{}
+    foreach ($g in @($P.Protected)) { $prot[([string]$g).ToLowerInvariant()] = $true }
+    $groups = @($u.memberOf | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    # Przełożony także po GUID - przy przywracaniu może już być w innej OU
+    $mgrGuid = ''
+    if ($u.manager) { try { $mgrGuid = [string](Get-ADObject -Identity ([string]$u.manager) @ad).ObjectGUID } catch { $mgrGuid = '' } }
+    [pscustomobject]@{
+        Login          = [string]$u.SamAccountName
+        Name           = [string]$u.displayName
+        DN             = [string]$u.DistinguishedName
+        Guid           = [string]$u.ObjectGUID
+        Enabled        = [bool]$u.Enabled
+        Description    = [string]$u.description
+        Manager        = [string]$u.manager
+        ManagerGuid    = $mgrGuid
+        AccountExpires = $(if ($u.AccountExpirationDate) { ([datetime]$u.AccountExpirationDate).ToString('o') } else { '' })
+        Groups         = @($groups | Where-Object { -not $prot.ContainsKey((Get-DnName $_).ToLowerInvariant()) })
+        KeptGroups     = @($groups | Where-Object { $prot.ContainsKey((Get-DnName $_).ToLowerInvariant()) })
+    }
+}
+
+# Kroki dla jednego konta. $P: Guid, Steps (klucze), Groups (DN do usunięcia), Stamp, Password, ExpireAt, TargetOu.
+# Błąd kroku nie przerywa pozostałych - każdy krok ma własny wiersz wyniku.
+$script:OffboardingScript = {
+    $results = New-Object System.Collections.ArrayList
+    $tones = @{ 'OK' = 'ok'; 'Błąd' = 'crit'; 'Pominięto' = ''; 'Uwaga' = 'warn' }
+    $put = { param([string]$Step, [string]$Result, [string]$Details) [void]$results.Add([pscustomobject][ordered]@{ 'Krok' = $Step; 'Wynik' = $Result; 'Szczegóły' = $Details; '__tone' = $tones[$Result]; '__kind' = 'result' }) }
+    $steps = @($P.Steps)
+    $id = [string]$P.Guid
+    $u = Get-ADUser -Identity $id -Properties description, manager @ad
+    if ($steps -contains 'Disable') {
+        try { Disable-ADAccount -Identity $id @ad; & $put 'Wyłączenie konta' 'OK' '' } catch { & $put 'Wyłączenie konta' 'Błąd' $_.Exception.Message }
+    }
+    if ($steps -contains 'Password') {
+        try { Set-ADAccountPassword -Identity $id -Reset -NewPassword (ConvertTo-SecureString -String ([string]$P.Password) -AsPlainText -Force) @ad; & $put 'Losowe hasło' 'OK' 'hasło nie zostało nigdzie zapisane ani pokazane' }
+        catch { & $put 'Losowe hasło' 'Błąd' $_.Exception.Message }
+    }
+    if ($steps -contains 'Groups') {
+        $ok = @(); $err = @()
+        foreach ($g in @($P.Groups | Where-Object { $_ })) {
+            try { Remove-ADGroupMember -Identity $g -Members $u.DistinguishedName -Confirm:$false @ad; $ok += (Get-DnName $g) }
+            catch { $err += ('{0}: {1}' -f (Get-DnName $g), $_.Exception.Message) }
+        }
+        $kept = @($P.Kept | Where-Object { $_ } | ForEach-Object { Get-DnName $_ })
+        $tail = if ($kept.Count) { '; zostają grupy chronione: ' + ($kept -join ', ') } else { '' }
+        if ($err.Count) { & $put 'Usunięcie z grup' 'Błąd' (('usunięto z {0} z {1} grup; błędy: {2}' -f $ok.Count, ($ok.Count + $err.Count), ($err -join '; ')) + $tail) }
+        elseif ($ok.Count) { & $put 'Usunięcie z grup' 'OK' (('usunięto z {0} grup: {1}' -f $ok.Count, ($ok -join ', ')) + $tail) }
+        else { & $put 'Usunięcie z grup' 'Pominięto' ('konto nie należy do grup do usunięcia' + $tail) }
+    }
+    if ($steps -contains 'Stamp' -and $P.Stamp) {
+        try {
+            $desc = if ($u.description) { '{0} | {1}' -f $P.Stamp, $u.description } else { [string]$P.Stamp }
+            if ($desc.Length -gt 1024) { $desc = $desc.Substring(0, 1024) }
+            Set-ADUser -Identity $id -Description $desc @ad
+            & $put 'Opis' 'OK' $desc
+        }
+        catch { & $put 'Opis' 'Błąd' $_.Exception.Message }
+    }
+    if ($steps -contains 'Expire') {
+        try { Set-ADAccountExpiration -Identity $id -DateTime ([datetime]$P.ExpireAt) @ad; & $put 'Wygaśnięcie konta' 'OK' ('konto wygasa {0:yyyy-MM-dd HH:mm}' -f [datetime]$P.ExpireAt) }
+        catch { & $put 'Wygaśnięcie konta' 'Błąd' $_.Exception.Message }
+    }
+    if ($steps -contains 'Manager') {
+        if (-not $u.manager) { & $put 'Przełożony' 'Pominięto' 'brak przełożonego' }
+        else {
+            try { Set-ADUser -Identity $id -Clear manager @ad; & $put 'Przełożony' 'OK' ('usunięto: {0}' -f (Get-DnName ([string]$u.manager))) }
+            catch { & $put 'Przełożony' 'Błąd' $_.Exception.Message }
+        }
+    }
+    if ($steps -contains 'HideGal') {
+        try { Set-ADUser -Identity $id -Replace @{ msExchHideFromAddressLists = $true } @ad; & $put 'Książka adresowa' 'OK' 'ukryte (msExchHideFromAddressLists)' }
+        catch {
+            $msg = $_.Exception.Message
+            if ($msg -match 'attribute|atrybut|schema|schemat') { & $put 'Książka adresowa' 'Pominięto' 'schemat AD nie ma atrybutów Exchange' }
+            else { & $put 'Książka adresowa' 'Błąd' $msg }
+        }
+    }
+    if ($steps -contains 'Move' -and $P.TargetOu) {
+        try {
+            $cur = Get-ADUser -Identity $id @ad
+            if ((Get-DnParent ([string]$cur.DistinguishedName)) -ieq [string]$P.TargetOu) { & $put 'Przeniesienie' 'Pominięto' 'konto już jest w docelowej OU' }
+            else { Move-ADObject -Identity $cur.DistinguishedName -TargetPath $P.TargetOu @ad; & $put 'Przeniesienie' 'OK' ('do {0}' -f $P.TargetOu) }
+        }
+        catch { & $put 'Przeniesienie' 'Błąd' $_.Exception.Message }
+    }
+    $results
+}
+
+# Przywrócenie stanu z pliku offboardingu. $P: Record (stan sprzed zmian), Opt (co przywrócić)
+$script:OffboardingRestoreScript = {
+    $results = New-Object System.Collections.ArrayList
+    $tones = @{ 'OK' = 'ok'; 'Błąd' = 'crit'; 'Pominięto' = ''; 'Uwaga' = 'warn' }
+    $put = { param([string]$Step, [string]$Result, [string]$Details) [void]$results.Add([pscustomobject][ordered]@{ 'Krok' = $Step; 'Wynik' = $Result; 'Szczegóły' = $Details; '__tone' = $tones[$Result]; '__kind' = 'result' }) }
+    $rec = $P.Record
+    $o = $P.Opt
+    $u = $null
+    try { $u = Get-ADUser -Identity ([string]$rec.Guid) @ad } catch { $u = Get-ADUser -Identity $Target @ad }
+    $id = [string]$u.ObjectGUID
+    if ($o.Groups) {
+        $ok = 0; $err = @()
+        foreach ($g in @($rec.Groups | Where-Object { $_ })) {
+            try { Add-ADGroupMember -Identity $g -Members $u.DistinguishedName @ad; $ok++ }
+            catch { if ($_.Exception.Message -match 'already a member|już członkiem') { $ok++ } else { $err += ('{0}: {1}' -f (Get-DnName $g), $_.Exception.Message) } }
+        }
+        & $put 'Grupy' $(if ($err.Count) { 'Błąd' } elseif ($ok) { 'OK' } else { 'Pominięto' }) ('przywrócono {0} z {1}{2}' -f $ok, @($rec.Groups).Count, $(if ($err.Count) { '; błędy: ' + ($err -join '; ') } else { '' }))
+    }
+    if ($o.Description) {
+        try {
+            if ([string]$rec.Description) { Set-ADUser -Identity $id -Description ([string]$rec.Description) @ad } else { Set-ADUser -Identity $id -Clear description @ad }
+            & $put 'Opis' 'OK' ([string]$rec.Description)
+        }
+        catch { & $put 'Opis' 'Błąd' $_.Exception.Message }
+    }
+    if ($o.Manager -and [string]$rec.Manager) {
+        try {
+            $mgr = if ([string]$rec.ManagerGuid) { [string]$rec.ManagerGuid } else { [string]$rec.Manager }
+            Set-ADUser -Identity $id -Manager $mgr @ad
+            & $put 'Przełożony' 'OK' (Get-DnName ([string]$rec.Manager))
+        }
+        catch { & $put 'Przełożony' 'Błąd' $_.Exception.Message }
+    }
+    if ($o.Expire) {
+        try {
+            if ([string]$rec.AccountExpires) { Set-ADAccountExpiration -Identity $id -DateTime ([datetime]::Parse([string]$rec.AccountExpires, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)) @ad; & $put 'Wygaśnięcie konta' 'OK' ([string]$rec.AccountExpires) }
+            else { Clear-ADAccountExpiration -Identity $id @ad; & $put 'Wygaśnięcie konta' 'OK' 'konto nie wygasa' }
+        }
+        catch { & $put 'Wygaśnięcie konta' 'Błąd' $_.Exception.Message }
+    }
+    if ($o.Gal) {
+        try { Set-ADUser -Identity $id -Clear msExchHideFromAddressLists @ad; & $put 'Książka adresowa' 'OK' 'widoczne' }
+        catch { & $put 'Książka adresowa' 'Pominięto' $_.Exception.Message }
+    }
+    if ($o.Ou) {
+        try {
+            $parent = Get-DnParent ([string]$rec.DN)
+            $cur = Get-ADUser -Identity $id @ad
+            if ((Get-DnParent ([string]$cur.DistinguishedName)) -ieq $parent) { & $put 'Jednostka OU' 'Pominięto' 'konto jest w pierwotnej OU' }
+            else { Move-ADObject -Identity $cur.DistinguishedName -TargetPath $parent @ad; & $put 'Jednostka OU' 'OK' $parent }
+        }
+        catch { & $put 'Jednostka OU' 'Błąd' $_.Exception.Message }
+    }
+    if ($o.Enable) {
+        if ($rec.Enabled) { try { Enable-ADAccount -Identity $id @ad; & $put 'Włączenie konta' 'OK' 'ustaw nowe hasło w module «Hasło i blokada» – konto ma losowe hasło z offboardingu' } catch { & $put 'Włączenie konta' 'Błąd' $_.Exception.Message } }
+        else { & $put 'Włączenie konta' 'Pominięto' 'konto było wyłączone już przed offboardingiem' }
+    }
+    $results
+}
+
+function Get-OffboardingSelection {
+    # Zaznaczone kroki (klucze) z pól modułu
+    param([hashtable]$Module)
+    return @($script:OffboardingSteps | Where-Object { Test-Checked $Module.StepChecks[$_.Key] } | ForEach-Object { $_.Key })
+}
+
+function Get-OffboardingOperatorNames {
+    # Loginy konta, na którym działa program (bieżące albo alternatywne) - tych kont nie wolno wyłączyć
+    $names = @(([string]$env:USERNAME).ToLowerInvariant())
+    $cred = Get-EffectiveCredential
+    if ($cred -and $cred.UserName) { $names += ((([string]$cred.UserName) -split '\\')[-1] -split '@')[0].ToLowerInvariant() }
+    return @($names | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Invoke-OffboardingPreview {
+    param([hashtable]$Module)
+    $m = $Module
+    $targets = @(Get-TargetUsers)
+    if (-not $targets) { return }
+    $params = @{ Protected = @($script:Settings.ProtectedGroups); Me = @(Get-OffboardingOperatorNames); Exceptions = @($script:Settings.ExceptionUsers) }
+    Start-AdOperation -Module $m -Name 'Offboarding – podgląd' -Targets $targets -TargetColumn 'Login' -Parameters $params -ScriptBlock $script:OffboardingPreviewScript -OnComplete {
+        param($m)
+        Update-OffboardingTiles -Module $m
+        $blocked = @(Get-OffboardingPreviewRows -Module $m | Where-Object { [string](Get-ObjectValue $_ '__blocked') -eq '1' }).Count
+        if ($blocked) { Write-Log ("Offboarding: kont pominiętych w podglądzie: {0} (wbudowane, wyjątki albo konto programu)." -f $blocked) 'WARN' -Module $m.Title }
+    }
+}
+
+function Get-OffboardingPreviewRows {
+    param([hashtable]$Module, [switch]$Runnable)
+    $rows = @(Get-ResultRowsAll -Module $Module | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'preview' })
+    if ($Runnable) { $rows = @($rows | Where-Object { [string](Get-ObjectValue $_ '__blocked') -ne '1' }) }
+    return $rows
+}
+
+function Update-OffboardingTiles {
+    param([hashtable]$Module)
+    $all = @(Get-ResultRowsAll -Module $Module)
+    $prev = @($all | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'preview' })
+    $res = @($all | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'result' })
+    $groups = 0
+    foreach ($r in $prev) { $v = Get-ObjectValue $r 'Grupy do usunięcia'; if ($null -ne $v -and $v -isnot [System.DBNull] -and [string](Get-ObjectValue $r '__blocked') -ne '1') { $groups += [int]$v } }
+    $errors = @($res | Where-Object { [string](Get-ObjectValue $_ 'Wynik') -eq 'Błąd' }).Count + @($all | Where-Object { [string](Get-ObjectValue $_ 'Status') -eq 'Błąd' }).Count
+    Set-StatTile -Module $Module -Key 'accounts' -Value ([string]$(if ($prev.Count) { @($prev | Where-Object { [string](Get-ObjectValue $_ '__blocked') -ne '1' }).Count } else { @($res | ForEach-Object { [string](Get-ObjectValue $_ 'Login') } | Select-Object -Unique).Count }))
+    Set-StatTile -Module $Module -Key 'groups' -Value ([string]$groups)
+    Set-StatTile -Module $Module -Key 'warn' -Value ([string]@($prev | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Uwaga' }).Count) -Tone $(if (@($prev | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Uwaga' }).Count) { 'warn' } else { '' })
+    Set-StatTile -Module $Module -Key 'errors' -Value ([string]$errors) -Tone $(if ($errors) { 'crit' } else { 'ok' })
+}
+
+function Invoke-Offboarding {
+    # Wykonanie: najpierw kopia stanu kont (plik), dopiero potem zmiany w AD; na końcu opcjonalnie wylogowanie sesji RDS
+    param([hashtable]$Module)
+    $m = $Module
+    $rows = @(Get-OffboardingPreviewRows -Module $m -Runnable)
+    if ($rows.Count -eq 0) {
+        if (@(Get-OffboardingPreviewRows -Module $m).Count) { Show-Warning 'Wszystkie konta z podglądu są pominięte (konta wbudowane, wyjątki albo konto programu).' }
+        else { Show-Warning 'Najpierw zaznacz konta na liście po lewej i kliknij «Podgląd» – offboarding wykonuje się dla kont z podglądu.' }
+        return
+    }
+    $steps = @(Get-OffboardingSelection -Module $m)
+    if ($steps.Count -eq 0) { Show-Warning 'Zaznacz co najmniej jeden krok offboardingu.'; return }
+    $ou = $m.TargetOu.Text.Trim()
+    if ($steps -contains 'Move' -and -not $ou) { Show-Warning 'Wskaż jednostkę OU dla kont po offboardingu albo odznacz krok «Przenieś do OU».'; return }
+    $reason = $m.Reason.Text.Trim()
+    $stampDate = Get-Date
+    $stamp = 'Offboarding {0:yyyy-MM-dd} ({1}){2}' -f $stampDate, $env:USERNAME, $(if ($reason) { ": $reason" } else { '' })
+    $labels = @($script:OffboardingSteps | Where-Object { $steps -contains $_.Key } | ForEach-Object { if ($_.Key -eq 'Move') { "Przenieś do $ou" } else { $_.Text } })
+    $text = "Wykonać offboarding wybranych kont? Kroki:`r`n• " + ($labels -join "`r`n• ")
+    $text += "`r`n`r`nPrzed zmianami stan kont (grupy, OU, opis, przełożony) zostanie zapisany w pliku – można go przywrócić."
+    $items = @($rows | ForEach-Object { '{0} ({1})' -f (Get-ObjectValue $_ 'Nazwa'), (Get-ObjectValue $_ 'Login') })
+    $chosen = @(Confirm-Action -Title 'Offboarding' -Text $text -Items $items -ConfirmText 'Wykonaj offboarding' -Danger -Select -ReturnIndex)
+    if ($chosen.Count -eq 0) { return }
+    $logins = @($chosen | ForEach-Object { [string](Get-ObjectValue $rows[$_] 'Login') })
+    $m.Data.Off = @{
+        Logins = $logins; Steps = $steps; Reason = $reason; TargetOu = $ou; Stamp = $stamp; Date = $stampDate
+        ExpireAt = $stampDate.Date.AddDays(1); States = @{}; Files = @{}; Failed = @{}
+    }
+    Start-AdOperation -Module $m -Name 'Offboarding – kopia stanu' -Targets $logins -Output None -Parameters @{ Protected = @($script:Settings.ProtectedGroups) } -ScriptBlock $script:OffboardingStateScript -OnResult {
+        param($m, $r)
+        if ($r.Ok -and @($r.Data).Count) { $m.Data.Off.States[$r.Target] = @($r.Data)[0] }
+        else { $m.Data.Off.Failed[$r.Target] = ((@($r.Errors)) -join ' ') }
+    } -OnComplete {
+        param($m)
+        $off = $m.Data.Off
+        if ($off.States.Count -eq 0) { Show-Warning ("Nie odczytano stanu żadnego konta – nic nie zmieniono.`r`n" + (@($off.Failed.Keys | ForEach-Object { '{0}: {1}' -f $_, $off.Failed[$_] }) -join "`r`n")); return }
+        try { Save-OffboardingBackup -Off $off }
+        catch { Show-Error 'Nie udało się zapisać kopii stanu kont – offboarding nie został wykonany.' $_; return }
+        Invoke-Deferred -Module $m -Action { param($m) Start-OffboardingChanges -Module $m }
+    }
+}
+
+function Save-OffboardingBackup {
+    # Kopia przed zmianami: CSV członkostw (format modułu «Wyłączone konta» – ten sam przycisk przywraca) i plik JSON na konto
+    param([hashtable]$Off)
+    $stamp = '{0:yyyyMMdd_HHmmss}' -f $Off.Date
+    $members = foreach ($l in $Off.States.Keys) {
+        $s = $Off.States[$l]
+        foreach ($g in @($s.Groups)) { [pscustomobject][ordered]@{ TimeStamp = $Off.Date.ToString('s'); Login = $s.Login; UserName = $s.Name; UserDN = $s.DN; GroupName = (Get-RdnValue ([string]$g)); GroupDN = [string]$g } }
+    }
+    $members = @($members)
+    if ($Off.Steps -contains 'Groups' -and $members.Count) {
+        $csv = Join-Path (Get-DataFolder 'Backup') ("Czlonkostwa_offboarding_$stamp.csv")
+        $encoding = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
+        $members | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding $encoding -Delimiter ';'
+        $Off.Csv = $csv
+    }
+    $dir = Get-DataFolder 'Offboarding'
+    foreach ($l in $Off.States.Keys) {
+        $s = $Off.States[$l]
+        $safe = ([string]$l) -replace '[^\w\.\-]', '_'
+        $file = Join-Path $dir ("{0}_{1}.json" -f $stamp, $safe)
+        $rec = [ordered]@{
+            Version = 1; Kind = 'DomainOps.Offboarding'; Date = $Off.Date.ToString('o'); Operator = $env:USERNAME; Reason = $Off.Reason; Steps = @($Off.Steps); TargetOu = $Off.TargetOu
+            Login = $s.Login; Name = $s.Name; DN = $s.DN; Guid = $s.Guid; Enabled = [bool]$s.Enabled; Description = $s.Description; Manager = $s.Manager; ManagerGuid = $s.ManagerGuid; AccountExpires = $s.AccountExpires
+            Groups = @($s.Groups); KeptGroups = @($s.KeptGroups); Results = @()
+        }
+        [System.IO.File]::WriteAllText($file, ($rec | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($true)))
+        $Off.Files[$l] = $file
+    }
+    Write-Log ("Offboarding: zapisano stan {0} kont ({1}){2}." -f $Off.States.Count, $dir, $(if ($Off.Csv) { "; członkostwa: $($Off.Csv)" } else { '' })) 'OK'
+}
+
+function Start-OffboardingChanges {
+    param([hashtable]$Module)
+    $m = $Module
+    $off = $m.Data.Off
+    $per = @{}
+    foreach ($l in $off.States.Keys) {
+        $s = $off.States[$l]
+        $per[$l] = @{ Guid = $s.Guid; Steps = @($off.Steps); Groups = @($s.Groups); Kept = @($s.KeptGroups); Stamp = $off.Stamp; Password = (New-RandomPassword -Length 24); ExpireAt = $off.ExpireAt; TargetOu = $off.TargetOu }
+    }
+    Start-AdOperation -Module $m -Name 'Offboarding' -Targets @($per.Keys) -PerTarget $per -TargetColumn 'Login' -ScriptBlock $script:OffboardingScript -OnResult {
+        param($m, $r)
+        $off = $m.Data.Off
+        $data = @($r.Data | Where-Object { $_ })
+        if ($r.Ok -and @($data | Where-Object { $_.'Krok' -eq 'Wyłączenie konta' -and $_.'Wynik' -eq 'OK' }).Count) { Update-UserRow -Login $r.Target -Values @{ Enabled = $false } }
+        Add-OffboardingResults -Off $off -Login $r.Target -Results $(if ($r.Ok) { $data } else { @([pscustomobject]@{ 'Krok' = 'Offboarding'; 'Wynik' = 'Błąd'; 'Szczegóły' = ((@($r.Errors)) -join ' ') }) })
+    } -OnComplete {
+        param($m)
+        $off = $m.Data.Off
+        if ($off.Steps -contains 'Rds') { Invoke-Deferred -Module $m -Action { param($m) Start-OffboardingRdsLogoff -Module $m } }
+        else { Complete-Offboarding -Module $m }
+    }
+}
+
+function Add-OffboardingResults {
+    # Wyniki kroków dopisane do pliku JSON konta (protokół offboardingu)
+    param([hashtable]$Off, [string]$Login, [object[]]$Results)
+    $file = $Off.Files[$Login]
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) { return }
+    try {
+        $rec = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+        $list = @(@($rec.Results) | Where-Object { $_ }) + @($Results | ForEach-Object { [ordered]@{ Step = [string]$_.'Krok'; Result = [string]$_.'Wynik'; Details = [string]$_.'Szczegóły' } })
+        $rec.Results = $list
+        [System.IO.File]::WriteAllText($file, ($rec | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($true)))
+    }
+    catch { Write-Log ("Offboarding: nie udało się dopisać wyników do {0}: {1}" -f $file, $_.Exception.Message) 'WARN' }
+}
+
+function Start-OffboardingRdsLogoff {
+    # Sesje użytkowników po offboardingu na serwerach farmy (lista z modułu Sesje RDS) - wylogowanie
+    param([hashtable]$Module)
+    $m = $Module
+    $off = $m.Data.Off
+    $hosts = @(Split-ListText ([string](Get-ModuleSetting -Module @{ Key = 'RdsSessions' } -Name 'Hosts' -Default '') -replace '\s+', ','))
+    if ($hosts.Count -eq 0) {
+        foreach ($l in $off.States.Keys) { Add-OffboardingRow -Module $m -Login $l -Step 'Sesje RDS' -Result 'Pominięto' -Details 'brak serwerów – wpisz je w module Domena → Sesje RDS (pole «Serwery»)' }
+        Complete-Offboarding -Module $m
+        return
+    }
+    $off.RdsFound = @{}
+    $off.RdsErrors = @()
+    Start-HostOperation -Module $m -Name 'Offboarding – sesje RDS' -Targets $hosts -Output None -Parameters (New-RdsSessionParameters) -ScriptBlock $script:RdsSessionScript -OnResult {
+        param($m, $r)
+        $off = $m.Data.Off
+        if (-not $r.Ok) { $off.RdsErrors += ('{0}: {1}' -f $r.Target, ((@($r.Errors)) -join ' ')); return }
+        foreach ($d in @($r.Data | Where-Object { $_ -and $_.'ID' -ne $null })) {
+            $user = ((([string]$d.'Użytkownik') -split '\\')[-1]).ToLowerInvariant()
+            $login = @($off.States.Keys | Where-Object { ([string]$_).ToLowerInvariant() -eq $user })
+            if (-not $login.Count) { continue }
+            if (-not $off.RdsFound.ContainsKey($r.Target)) { $off.RdsFound[$r.Target] = New-Object System.Collections.ArrayList }
+            [void]$off.RdsFound[$r.Target].Add(@{ Login = $login[0]; Id = [int]$d.'ID' })
+        }
+    } -OnComplete {
+        param($m)
+        $off = $m.Data.Off
+        $note = if ($off.RdsErrors.Count) { '; nie sprawdzono: ' + ($off.RdsErrors -join ' | ') } else { '' }
+        $withSessions = @{}
+        foreach ($h in $off.RdsFound.Keys) { foreach ($s in $off.RdsFound[$h]) { $withSessions[$s.Login] = $true } }
+        foreach ($l in $off.States.Keys) { if (-not $withSessions.ContainsKey($l)) { Add-OffboardingRow -Module $m -Login $l -Step 'Sesje RDS' -Result $(if ($off.RdsErrors.Count) { 'Uwaga' } else { 'Pominięto' }) -Details ('brak sesji na serwerach farmy' + $note) } }
+        if ($off.RdsFound.Count -eq 0) { Complete-Offboarding -Module $m; return }
+        $per = @{}
+        foreach ($h in $off.RdsFound.Keys) { $per[$h] = @{ Op = 'Logoff'; Message = ''; Ids = @($off.RdsFound[$h] | ForEach-Object { $_.Id }); Users = @($off.RdsFound[$h] | ForEach-Object { $_.Login }) } }
+        $off.RdsPer = $per
+        Invoke-Deferred -Module $m -Action {
+            param($m)
+            Start-HostOperation -Module $m -Name 'Offboarding – wylogowanie sesji' -Targets @($m.Data.Off.RdsPer.Keys) -PerTarget $m.Data.Off.RdsPer -Output None -ScriptBlock $script:RdsActionScript -OnResult {
+                param($m, $r)
+                foreach ($s in @($m.Data.Off.RdsFound[$r.Target])) {
+                    $res = @($r.Data | Where-Object { $_ -and [int]$_.'Sesja' -eq $s.Id })
+                    if (-not $r.Ok) { Add-OffboardingRow -Module $m -Login $s.Login -Step 'Sesje RDS' -Result 'Błąd' -Details ('{0}: {1}' -f $r.Target, ((@($r.Errors)) -join ' ')) }
+                    elseif ($res.Count -and [string]$res[0].'Wynik' -eq 'OK') { Add-OffboardingRow -Module $m -Login $s.Login -Step 'Sesje RDS' -Result 'OK' -Details ('wylogowano z {0} (sesja {1})' -f $r.Target, $s.Id) }
+                    else { Add-OffboardingRow -Module $m -Login $s.Login -Step 'Sesje RDS' -Result 'Błąd' -Details ('{0} (sesja {1}): {2}' -f $r.Target, $s.Id, $(if ($res.Count) { $res[0].'Wynik' } else { 'brak wyniku' })) }
+                }
+            } -OnComplete { param($m) Complete-Offboarding -Module $m }
+        }
+    }
+}
+
+function Add-OffboardingRow {
+    param([hashtable]$Module, [string]$Login, [string]$Step, [string]$Result, [string]$Details)
+    $tone = @{ 'OK' = 'ok'; 'Błąd' = 'crit'; 'Pominięto' = ''; 'Uwaga' = 'warn' }[$Result]
+    $row = [pscustomobject][ordered]@{ 'Krok' = $Step; 'Wynik' = $Result; 'Szczegóły' = $Details; '__tone' = $tone; '__kind' = 'result' }
+    Add-ResultRows -Module $Module -Computer $Login -TargetColumn 'Login' -Objects @($row)
+    if ($Module.Data.Off) { Add-OffboardingResults -Off $Module.Data.Off -Login $Login -Results @($row) }
+}
+
+function Complete-OffboardingSummary {
+    param([hashtable]$Module)
+    $res = @(Get-ResultRowsAll -Module $Module | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'result' })
+    return @{ Errors = @($res | Where-Object { [string](Get-ObjectValue $_ 'Wynik') -eq 'Błąd' }).Count; Accounts = @($res | ForEach-Object { [string](Get-ObjectValue $_ 'Login') } | Select-Object -Unique).Count }
+}
+
+function Complete-Offboarding {
+    param([hashtable]$Module)
+    $m = $Module
+    $off = $m.Data.Off
+    foreach ($l in $off.Failed.Keys) { Add-OffboardingRow -Module $m -Login $l -Step 'Kopia stanu' -Result 'Błąd' -Details ('nie odczytano konta – pominięte: ' + $off.Failed[$l]) }
+    Update-OffboardingTiles -Module $m
+    $sum = Complete-OffboardingSummary -Module $m
+    $m.ResultHint = 'Offboarding {0:yyyy-MM-dd HH:mm} • kont: {1} • błędy kroków: {2} • kopia: {3}' -f $off.Date, $sum.Accounts, $sum.Errors, (Get-DataFolder 'Offboarding')
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+    Write-Log ("Offboarding zakończony: kont {0}, błędy kroków: {1}. Protokół i stan sprzed zmian: {2}" -f $sum.Accounts, $sum.Errors, (Get-DataFolder 'Offboarding')) $(if ($sum.Errors) { 'WARN' } else { 'OK' }) -Module $m.Title
+    Show-Toast $(if ($sum.Errors) { "Offboarding: błędy w krokach – $($sum.Errors). Sprawdź tabelę." } else { "Offboarding zakończony ($($sum.Accounts))." }) $(if ($sum.Errors) { 'warn' } else { 'ok' })
+}
+
+function Restore-Offboarding {
+    # Przywrócenie stanu kont z plików offboardingu (JSON) - wybrane elementy
+    param([hashtable]$Module, [string[]]$Files = @())
+    $m = $Module
+    if (-not $Files.Count) {
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Filter = 'Offboarding (*.json)|*.json'
+        $dlg.Multiselect = $true
+        $dlg.InitialDirectory = Get-DataFolder 'Offboarding'
+        if ($dlg.ShowDialog($script:UI.Window) -ne $true) { return }
+        $Files = @($dlg.FileNames)
+    }
+    $records = @{}
+    foreach ($f in $Files) {
+        try {
+            $rec = Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ([string]$rec.Kind -ne 'DomainOps.Offboarding' -or -not [string]$rec.Login) { throw 'to nie jest plik offboardingu' }
+            $records[[string]$rec.Login] = $rec
+        }
+        catch { Show-Warning ("Pominięto plik {0}: {1}" -f [System.IO.Path]::GetFileName($f), $_.Exception.Message) }
+    }
+    if ($records.Count -eq 0) { return }
+    $opt = Show-FormDialog -Title 'Przywracanie po offboardingu' -Subtitle ("Konta: {0}. Wybierz, co przywrócić ze stanu zapisanego przed offboardingiem." -f (@($records.Keys) -join ', ')) -Icon 'E7A7' -OkText 'Dalej' -Fields @(
+        @{ Key = 'Groups'; Label = 'Członkostwa w grupach'; Type = 'Check'; Value = $true }
+        @{ Key = 'Ou'; Label = 'Pierwotna jednostka OU'; Type = 'Check'; Value = $true }
+        @{ Key = 'Description'; Label = 'Opis konta'; Type = 'Check'; Value = $true }
+        @{ Key = 'Manager'; Label = 'Przełożony'; Type = 'Check'; Value = $true }
+        @{ Key = 'Expire'; Label = 'Data wygaśnięcia konta'; Type = 'Check'; Value = $true }
+        @{ Key = 'Gal'; Label = 'Widoczność w książce adresowej'; Type = 'Check'; Value = $false }
+        @{ Key = 'Enable'; Label = 'Włącz konto (jeśli było włączone) – hasło trzeba potem ustawić na nowo'; Type = 'Check'; Value = $false }
+    )
+    if (-not $opt) { return }
+    $items = @($records.Keys | Sort-Object | ForEach-Object { $r = $records[$_]; '{0} ({1}) – grupy: {2}, OU: {3}, offboarding {4}' -f $r.Name, $_, @($r.Groups).Count, (Get-ParentDN ([string]$r.DN)), ([string]$r.Date).Substring(0, 10) })
+    $chosen = @(Confirm-Action -Title 'Przywracanie po offboardingu' -Text 'Przywrócić wybrane elementy dla tych kont?' -Items $items -ConfirmText 'Przywróć' -Select -ReturnIndex)
+    if ($chosen.Count -eq 0) { return }
+    $keys = @($records.Keys | Sort-Object)
+    $per = @{}
+    foreach ($i in $chosen) {
+        $k = $keys[$i]
+        $r = $records[$k]
+        $per[$k] = @{ Record = @{ Login = [string]$r.Login; Guid = [string]$r.Guid; DN = [string]$r.DN; Enabled = [bool]$r.Enabled; Description = [string]$r.Description; Manager = [string]$r.Manager; ManagerGuid = $(if ($r.PSObject.Properties['ManagerGuid']) { [string]$r.ManagerGuid } else { '' }); AccountExpires = [string]$r.AccountExpires; Groups = @($r.Groups | ForEach-Object { [string]$_ }) }; Opt = $opt }
+    }
+    $m.Data.Off = $null
+    Start-AdOperation -Module $m -Name 'Przywracanie po offboardingu' -Targets @($per.Keys) -PerTarget $per -TargetColumn 'Login' -ScriptBlock $script:OffboardingRestoreScript -OnResult {
+        param($m, $r)
+        if ($r.Ok -and @($r.Data | Where-Object { $_ -and $_.'Krok' -eq 'Włączenie konta' -and $_.'Wynik' -eq 'OK' }).Count) { Update-UserRow -Login $r.Target -Values @{ Enabled = $true } }
+    } -OnComplete { param($m) Update-OffboardingTiles -Module $m }
+}
+
+Register-Module -Workspace 'AdUsers' -Category 'Konta' -Key 'UserOffboarding' -Title 'Offboarding' -Icon 'E7E8' -Badge 'nowe' `
+    -Description 'Odejście pracownika w jednym kroku dla kont zaznaczonych po lewej: wyłączenie, losowe hasło, usunięcie z grup, opis z datą i powodem, wygaśnięcie, przełożony, książka adresowa, przeniesienie do OU i wylogowanie sesji RDS. Podgląd z ostrzeżeniami, zapis stanu sprzed zmian i przywracanie.' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $m.PillColumns = @('Stan', 'Wynik')
+    $m.Data.Off = $null
+    $m.EmptyHint = 'Zaznacz konta na liście po lewej, wybierz kroki i kliknij «Podgląd». «Wykonaj offboarding» zapisuje najpierw stan kont (do przywrócenia), potem wprowadza zmiany.'
+    $saved = Get-ModuleSetting -Module $m -Name 'Steps' -Default $null
+    $row = Add-ToolbarRow -Module $m -Title 'Kroki'
+    $m.StepChecks = @{}
+    foreach ($s in $script:OffboardingSteps) {
+        $on = if ($saved) { @($saved) -contains $s.Key } else { [bool]$s.Default }
+        $m.StepChecks[$s.Key] = Add-CheckBox -Parent $row -Text $s.Text -Checked $on -ToolTip $s.Tip
+        Register-ControlHandler -Control $m.StepChecks[$s.Key] -EventName 'Checked' -Module $m -Action { param($m) Set-ModuleSetting -Module $m -Name 'Steps' -Value @(Get-OffboardingSelection -Module $m) }
+        Register-ControlHandler -Control $m.StepChecks[$s.Key] -EventName 'Unchecked' -Module $m -Action { param($m) Set-ModuleSetting -Module $m -Name 'Steps' -Value @(Get-OffboardingSelection -Module $m) }
+    }
+    $row2 = Add-ToolbarRow -Module $m -Title 'Szczegóły'
+    Add-Label -Parent $row2 -Text 'Powód' | Out-Null
+    $m.Reason = Add-TextBox -Parent $row2 -Width 220 -Placeholder 'np. numer zgłoszenia, data odejścia'
+    Add-Label -Parent $row2 -Text '   OU docelowa' | Out-Null
+    $m.TargetOu = Add-OuField -Parent $row2 -Module $m -Width 330 -Placeholder 'np. OU=Byli pracownicy,…' -DialogTitle 'Jednostka dla kont po offboardingu' -Remember 'TargetOu'
+    if (-not $m.TargetOu.Text) { $m.TargetOu.Text = [string]$script:Settings.DisabledBaseOU }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Podgląd' -Icon 'E9D5' -Module $m -Primary -OnClick { param($m) Invoke-OffboardingPreview -Module $m } | Out-Null
+    $m.Btn.Run = Add-Button -Parent $row3 -Text 'Wykonaj offboarding…' -Icon 'E7E8' -Module $m -Danger -OnClick { param($m) Invoke-Offboarding -Module $m }
+    Add-Button -Parent $row3 -Text 'Przywróć z kopii…' -Icon 'E7A7' -Module $m -ToolTip 'Stan kont zapisany przed offboardingiem: grupy, OU, opis, przełożony, wygaśnięcie, włączenie' -OnClick { param($m) Restore-Offboarding -Module $m } | Out-Null
+    Add-Button -Parent $row3 -Text '' -Icon 'E838' -Module $m -AlwaysEnabled -ToolTip 'Folder z protokołami offboardingu (stan sprzed zmian i wyniki kroków)' -OnClick { param($m) Open-Folder (Get-DataFolder 'Offboarding') } | Out-Null
+    Add-StatTile -Module $m -Key 'accounts' -Label 'Konta' -Icon 'E716' | Out-Null
+    Add-StatTile -Module $m -Key 'groups' -Label 'Członkostwa do usunięcia' -Icon 'E902' | Out-Null
+    Add-StatTile -Module $m -Key 'warn' -Label 'Ostrzeżenia' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'errors' -Label 'Błędy' -Icon 'EA39' | Out-Null
+    Add-RowAction -Module $m -Text 'Usuń z podglądu' -Icon 'E74D' -Action {
+        param($m, $rows)
+        Remove-ResultRows -Module $m -Rows @($rows | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'preview' })
+        Update-OffboardingTiles -Module $m
+    }
+    Add-RowAction -Module $m -Text 'Pokaż grupy konta' -Icon 'E902' -Action {
+        param($m, $rows)
+        $login = @(Get-RowTargetNames -Rows $rows -Column 'Login') | Select-Object -First 1
+        if (-not $login) { return }
+        Start-AdOperation -Module $m -Name 'Grupy konta' -Targets @($login) -Output None -Parameters @{ Protected = @($script:Settings.ProtectedGroups) } -ScriptBlock {
+            $u = Get-ADUser -Identity $Target -Properties memberOf @ad
+            $prot = @{}
+            foreach ($g in $P.Protected) { $prot[([string]$g).ToLowerInvariant()] = $true }
+            foreach ($g in @($u.memberOf)) { [pscustomobject]@{ 'Grupa' = Get-DnName $g; 'Zostaje (chroniona)' = $prot.ContainsKey((Get-DnName $g).ToLowerInvariant()); 'DN' = [string]$g } }
+        } -OnResult {
+            param($m, $r)
+            $m.Data.Popup = @{ Title = "Grupy konta $($r.Target)"; Rows = @($r.Data) }
+            Invoke-Deferred -Module $m -Action { param($m) Show-GridDialog -Title $m.Data.Popup.Title -Rows $m.Data.Popup.Rows }
+        }
+    }
+}
+#endregion
+
+#region Konta MAB (802.1X) – uwierzytelnianie urządzeń adresem MAC
+# Login i hasło konta = adres MAC w formacie, który wysyła przełącznik (NPS szuka konta po nazwie użytkownika z RADIUS).
+# Dwukropek jest niedozwolony w sAMAccountName, dlatego formatu 00:11:22:… nie ma na liście.
+$script:MabFormats = [ordered]@{
+    'lower'      = @{ Text = '001122aabbcc – małe litery, bez separatorów'; Sep = ''; Size = 12; Upper = $false }
+    'upper'      = @{ Text = '001122AABBCC – wielkie litery, bez separatorów'; Sep = ''; Size = 12; Upper = $true }
+    'dash-lower' = @{ Text = '00-11-22-aa-bb-cc'; Sep = '-'; Size = 2; Upper = $false }
+    'dash-upper' = @{ Text = '00-11-22-AA-BB-CC'; Sep = '-'; Size = 2; Upper = $true }
+    'dot-lower'  = @{ Text = '0011.22aa.bbcc (format Cisco)'; Sep = '.'; Size = 4; Upper = $false }
+}
+$script:MabPasteHeaders = [ordered]@{
+    Mac         = @('mac', 'adres mac', 'mac address', 'macaddress', 'adres')
+    Name        = @('nazwa', 'urządzenie', 'urzadzenie', 'device', 'name', 'host', 'hostname')
+    Description = @('opis', 'description', 'lokalizacja', 'location', 'uwagi')
+}
+$script:MabNoPso = '(nie przypisuj – zasady haseł z grup albo domeny)'
+
+function ConvertTo-MacHex {
+    # Adres MAC w dowolnym zapisie (00:11:22:AA:BB:CC, 00-11-22-aa-bb-cc, 0011.22aa.bbcc, 001122aabbcc) -> 12 znaków hex albo $null
+    param([string]$Text)
+    $h = ([string]$Text -replace '[\s:\-\.]', '').ToLowerInvariant()
+    if ($h -match '^[0-9a-f]{12}$') { return $h }
+    return $null
+}
+
+function Format-MacAddress {
+    param([string]$Hex, [string]$Format)
+    $f = $script:MabFormats[$Format]
+    if (-not $f) { $f = $script:MabFormats['lower'] }
+    $h = if ($f.Upper) { $Hex.ToUpperInvariant() } else { $Hex.ToLowerInvariant() }
+    if (-not $f.Sep) { return $h }
+    $parts = for ($i = 0; $i -lt 12; $i += $f.Size) { $h.Substring($i, $f.Size) }
+    return (@($parts) -join $f.Sep)
+}
+
+function Get-MabFormatKey {
+    param([hashtable]$Module)
+    $keys = @($script:MabFormats.Keys)
+    $i = $Module.Format.SelectedIndex
+    if ($i -lt 0 -or $i -ge $keys.Count) { return 'lower' }
+    return $keys[$i]
+}
+
+function Get-MabSelectedPso {
+    # Wybrane PSO (obiekt z listy zasad) albo $null, gdy «nie przypisuj»
+    param([hashtable]$Module)
+    $i = $Module.Pso.SelectedIndex
+    $list = @($Module.Data.PsoList)
+    if ($i -le 0 -or $i -gt $list.Count) { return $null }
+    return $list[$i - 1]
+}
+
+function Get-MabPolicyCheck {
+    <#
+        Zasady haseł, które obejmą nowe konto - jak liczy je AD: PSO przypisane bezpośrednio do konta wygrywa; bez niego
+        PSO grup konta z najniższym pierwszeństwem; bez nich zasady domeny. Hasło konta MAB jest równe loginowi, więc
+        złożoność (zakaz nazwy konta w haśle) zawsze je odrzuci. Grupy zagnieżdżone nie są tu uwzględniane.
+    #>
+    param([hashtable]$Module, [int]$PasswordLength)
+    if (-not @($Module.Data.Policies | Where-Object { $_.Kind -eq 'domain' }).Count) { return @{ Known = $false; Ok = $true; Text = 'nie odczytano zasad haseł z AD – zgodność hasła nie została sprawdzona' } }
+    $eff = Get-MabSelectedPso -Module $Module
+    $src = 'PSO przypisane do konta'
+    if (-not $eff) {
+        $dns = @($Module.Data.Groups | ForEach-Object { [string]$_.DN })
+        $cands = @($Module.Data.PsoList | Where-Object { $ap = @($_.AppliesTo); @($dns | Where-Object { $ap -contains $_ }).Count -gt 0 })
+        if ($cands.Count) {
+            $eff = @($cands | Sort-Object -Property Precedence)[0]
+            $src = 'PSO z grupy konta'
+        }
+        else {
+            $eff = $Module.Data.Policies | Where-Object { $_.Kind -eq 'domain' } | Select-Object -First 1
+            $src = 'zasady domeny'
+        }
+    }
+    $problems = @()
+    if ($eff.Complex) { $problems += 'wymagają złożoności (hasło równe nazwie konta zawsze ją narusza)' }
+    if ([int]$eff.MinLen -gt $PasswordLength) { $problems += ('wymagają co najmniej {0} znaków (hasło ma {1})' -f $eff.MinLen, $PasswordLength) }
+    $name = if ($eff.Kind -eq 'domain') { 'zasady domeny' } else { 'PSO «{0}»' -f $eff.Name }
+    if ($problems.Count) { return @{ Known = $true; Ok = $false; Name = $eff.Name; Text = ('{0} ({1}) {2} – hasło zostanie odrzucone. Wybierz PSO bez złożoności z odpowiednią minimalną długością.' -f $name, $src, ($problems -join ' i ')) } }
+    return @{ Known = $true; Ok = $true; Name = $eff.Name; Text = ('{0} ({1}): min. {2} znaków, bez złożoności – hasło ({3} znaków) jest zgodne' -f $name, $src, $eff.MinLen, $PasswordLength) }
+}
+
+function Update-MabPolicyInfo {
+    param([hashtable]$Module)
+    $m = $Module
+    $len = (Format-MacAddress -Hex '001122aabbcc' -Format (Get-MabFormatKey -Module $m)).Length
+    $chk = Get-MabPolicyCheck -Module $m -PasswordLength $len
+    $pso = Get-MabSelectedPso -Module $m
+    $about = if ($pso) { 'PSO «{0}»: pierwszeństwo {1}, min. {2} znaków, złożoność {3}, przypisane do {4} obiektów. ' -f $pso.Name, $pso.Precedence, $pso.MinLen, $(if ($pso.Complex) { 'włączona' } else { 'wyłączona' }), @($pso.AppliesTo).Count } else { '' }
+    $m.PolicyInfo.Text = $about + 'Skutek: ' + $chk.Text
+    $m.PolicyInfo.Foreground = Get-Brush $(if (-not $chk.Known) { '#F5C46B' } elseif ($chk.Ok) { '#7B8496' } else { '#FF7A86' })
+}
+
+function Update-MabGroupsInfo {
+    param([hashtable]$Module)
+    $names = @($Module.Data.Groups | ForEach-Object { [string]$_.Name })
+    $Module.GroupsInfo.Text = if ($names.Count) { 'Grupy (' + $names.Count + '): ' + ($names -join ', ') } else { 'Grupy: brak' }
+}
+
+# Zasady haseł domeny i lista PSO (z obiektami, do których są przypisane)
+$script:MabPolicyScript = {
+    $d = Get-ADDefaultDomainPasswordPolicy @ad
+    [pscustomobject]@{ Kind = 'domain'; Name = 'zasady domeny'; MinLen = [int]$d.MinPasswordLength; Complex = [bool]$d.ComplexityEnabled; Precedence = [int]::MaxValue; Dn = ''; AppliesTo = @(); Reversible = [bool]$d.ReversibleEncryptionEnabled }
+    foreach ($p in @(Get-ADFineGrainedPasswordPolicy -Filter * @ad)) {
+        [pscustomobject]@{ Kind = 'pso'; Name = [string]$p.Name; MinLen = [int]$p.MinPasswordLength; Complex = [bool]$p.ComplexityEnabled; Precedence = [int]$p.Precedence; Dn = [string]$p.DistinguishedName; AppliesTo = @($p.AppliesTo | ForEach-Object { [string]$_ }); Reversible = [bool]$p.ReversibleEncryptionEnabled }
+    }
+}
+
+function Update-MabPolicies {
+    # Odczyt zasad haseł (w tle); -Then: akcja modułu po odczycie (np. sprawdzenie planu)
+    param([hashtable]$Module, [scriptblock]$Then)
+    $m = $Module
+    $m.Data.AfterPolicies = $Then
+    $m.Data.PoliciesTried = $true
+    Start-AdOperation -Module $m -Name 'Zasady haseł (PSO)' -Targets @('AD') -Output None -ScriptBlock $script:MabPolicyScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { Write-Log ("Nie odczytano zasad haseł (PSO): {0}" -f ((@($r.Errors)) -join ' ')) 'WARN' -Module $m.Title; return }
+        $m.Data.Policies = @($r.Data | Where-Object { $_ })
+        $m.Data.PsoList = @($m.Data.Policies | Where-Object { $_.Kind -eq 'pso' } | Sort-Object -Property Precedence, Name)
+    } -OnComplete {
+        param($m)
+        $want = [string](Get-ModuleSetting -Module $m -Name 'Pso' -Default '')
+        $m.Data.Loading = $true
+        try {
+            $m.Pso.Items.Clear()
+            [void]$m.Pso.Items.Add($script:MabNoPso)
+            foreach ($p in @($m.Data.PsoList)) { [void]$m.Pso.Items.Add(('{0} – pierwszeństwo {1}, min. {2} zn., złożoność {3}' -f $p.Name, $p.Precedence, $p.MinLen, $(if ($p.Complex) { 'wł.' } else { 'wył.' }))) }
+            $idx = 0
+            for ($i = 0; $i -lt @($m.Data.PsoList).Count; $i++) { if ([string]$m.Data.PsoList[$i].Name -eq $want) { $idx = $i + 1 } }
+            $m.Pso.SelectedIndex = $idx
+        }
+        finally { $m.Data.Loading = $false }
+        Update-MabPolicyInfo -Module $m
+        if ($m.Data.AfterPolicies) { $next = $m.Data.AfterPolicies; $m.Data.AfterPolicies = $null; $m.Data.Next = $next; Invoke-Deferred -Module $m -Action { param($m) & $m.Data.Next $m } }
+    }
+}
+
+# Sprawdzenie planu w AD: istniejące konta, jednostka, wolna nazwa CN. $P.Rows: Id, Login, Cn, Ou
+$script:MabCheckScript = {
+    $ouCache = @{}
+    foreach ($r in $P.Rows) {
+        $notes = @(); $issues = @(); $state = 'Gotowe'; $dn = ''
+        if (-not $ouCache.ContainsKey($r.Ou)) { $ok = $true; try { [void](Get-ADObject -Identity $r.Ou @ad) } catch { $ok = $false }; $ouCache[$r.Ou] = $ok }
+        if (-not $ouCache[$r.Ou]) { $issues += "nie ma jednostki $($r.Ou)" }
+        $existing = @(Get-ADObject -LDAPFilter "(sAMAccountName=$(ConvertTo-LdapValue $r.Login))" @ad)
+        if ($existing.Count) { $state = 'Istnieje'; $dn = [string]$existing[0].DistinguishedName; $notes += "konto już istnieje: $dn" }
+        $cn = [string]$r.Cn
+        if ($state -eq 'Gotowe' -and $ouCache[$r.Ou] -and @(Get-ADObject -LDAPFilter "(name=$(ConvertTo-LdapValue $cn))" -SearchBase $r.Ou -SearchScope OneLevel @ad).Count) {
+            $suffix = ' ({0})' -f $r.Login
+            $cn = ([string]$r.Cn).Substring(0, [Math]::Min(([string]$r.Cn).Length, 64 - $suffix.Length)).TrimEnd() + $suffix
+            $notes += "nazwa «$($r.Cn)» zajęta w OU – CN: $cn"
+        }
+        if ($issues.Count) { $state = 'Konflikt' }
+        [pscustomobject]@{ Id = $r.Id; State = $state; Cn = $cn; Dn = $dn; Note = ((@($issues) + @($notes)) -join '; '); Tone = $(switch ($state) { 'Gotowe' { $(if ($notes.Count) { 'warn' } else { 'info' }) } 'Istnieje' { 'warn' } default { 'crit' } }) }
+    }
+}
+
+# Utworzenie konta MAB ($Target = login). Kolejność ma znaczenie: konto wyłączone bez hasła, grupy i PSO, flagi (szyfrowanie
+# odwracalne przed hasłem), dopiero potem hasło - zasady domeny odrzuciłyby hasło równe adresowi MAC. Na końcu włączenie.
+$script:MabCreateScript = {
+    $new = @{ Name = $P.Cn; SamAccountName = $Target; DisplayName = $P.Display; Path = $P.Ou; Enabled = $false }
+    if ($P.Description) { $new.Description = [string]$P.Description }
+    New-ADUser @new @ad
+    $user = Get-ADUser -Identity $Target @ad
+    $dn = [string]$user.DistinguishedName
+    $notes = @()
+    $warn = $false
+    try {
+        foreach ($g in @($P.Groups | Where-Object { $_ })) { Add-ADGroupMember -Identity $g -Members $dn @ad; $notes += ('grupa {0}' -f (Get-DnName $g)) }
+        if ($P.Pso) { Add-ADFineGrainedPasswordPolicySubject -Identity $P.Pso -Subjects $dn @ad }
+        Set-ADUser -Identity $dn -PasswordNeverExpires ([bool]$P.NeverExpires) -CannotChangePassword ([bool]$P.CannotChange) -AllowReversiblePasswordEncryption ([bool]$P.Reversible) @ad
+        Set-ADAccountPassword -Identity $dn -Reset -NewPassword (ConvertTo-SecureString -String ([string]$P.Password) -AsPlainText -Force) @ad
+        if ($P.Primary) {
+            $pg = Get-ADGroup -Identity $P.Primary @ad
+            $rid = [int](([string]$pg.SID) -replace '^.*-', '')
+            Set-ADUser -Identity $dn -Replace @{ primaryGroupID = $rid } @ad
+            $du = '{0}-513' -f [string](Get-ADDomain @ad).DomainSID
+            try { Remove-ADGroupMember -Identity $du -Members $dn -Confirm:$false @ad }
+            catch { if ($_.Exception.Message -notmatch 'not a member|nie jest członkiem') { $notes += ('Domain Users: {0}' -f $_.Exception.Message); $warn = $true } }
+            $notes += ('grupa podstawowa: {0} (bez Domain Users)' -f $pg.Name)
+        }
+        Enable-ADAccount -Identity $dn @ad
+    }
+    catch {
+        return [pscustomobject]@{ Dn = $dn; State = 'Utworzono z błędem'; Note = ('konto utworzone, ale wyłączone: {0}' -f $_.Exception.Message); Warn = $true; Policy = '' }
+    }
+    $pol = ''
+    try { $rp = Get-ADUserResultantPasswordPolicy -Identity $dn @ad; $pol = if ($rp) { [string]$rp.Name } else { 'zasady domeny' } } catch { $pol = 'nie odczytano' }
+    [pscustomobject]@{ Dn = $dn; State = 'Utworzono'; Note = ((@("zasady haseł: $pol") + $notes) -join '; '); Warn = $warn; Policy = $pol }
+}
+
+# Istniejące konto MAB: PSO, flagi i hasło równe loginowi (np. po zmianie hasła albo przypisania PSO)
+$script:MabResetScript = {
+    $u = Get-ADUser -Identity $Target @ad
+    $dn = [string]$u.DistinguishedName
+    $notes = @()
+    if ($P.Pso) {
+        try { Add-ADFineGrainedPasswordPolicySubject -Identity $P.Pso -Subjects $dn @ad; $notes += 'przypisano PSO' }
+        catch { if ($_.Exception.Message -notmatch 'already|już') { throw } }
+    }
+    Set-ADUser -Identity $dn -PasswordNeverExpires ([bool]$P.NeverExpires) -CannotChangePassword ([bool]$P.CannotChange) -AllowReversiblePasswordEncryption ([bool]$P.Reversible) @ad
+    Set-ADAccountPassword -Identity $dn -Reset -NewPassword (ConvertTo-SecureString -String ([string]$u.SamAccountName) -AsPlainText -Force) @ad
+    $pol = ''
+    try { $rp = Get-ADUserResultantPasswordPolicy -Identity $dn @ad; $pol = if ($rp) { [string]$rp.Name } else { 'zasady domeny' } } catch { $pol = 'nie odczytano' }
+    [pscustomobject]@{ Note = ((@('hasło = login', "zasady haseł: $pol") + $notes) -join '; ') }
+}
+
+# Konta w jednostce MAB (zarządzanie istniejącymi). $P: Ou, Limit
+$script:MabListScript = {
+    $q = @{ LDAPFilter = '(&(objectCategory=person)(objectClass=user))'; Properties = @('description', 'displayName', 'whenCreated', 'LastLogonDate'); SearchBase = $P.Ou }
+    $users = @(Get-ADUser @q @ad | Sort-Object -Property SamAccountName)
+    $i = 0
+    foreach ($u in $users) {
+        $i++
+        $sam = [string]$u.SamAccountName
+        $hex = ($sam -replace '[:\-\.]', '').ToLowerInvariant()
+        $isMac = $hex -match '^[0-9a-f]{12}$'
+        $pol = ''
+        if ($i -le [int]$P.Limit) { try { $rp = Get-ADUserResultantPasswordPolicy -Identity $u.DistinguishedName @ad; $pol = if ($rp) { [string]$rp.Name } else { 'zasady domeny' } } catch { $pol = 'nie odczytano' } }
+        [pscustomobject][ordered]@{
+            'Stan'               = $(if ($u.Enabled) { 'Istnieje' } else { 'Wyłączone' })
+            'MAC'                = $(if ($isMac) { (@(0, 2, 4, 6, 8, 10) | ForEach-Object { $hex.Substring($_, 2) }) -join ':' } else { '' })
+            'Login'              = $sam
+            'Nazwa'              = $(if ($u.displayName) { [string]$u.displayName } else { [string]$u.Name })
+            'Opis'               = [string]$u.description
+            'OU'                 = Get-DnParent ([string]$u.DistinguishedName)
+            'Włączone'           = [bool]$u.Enabled
+            'Ostatnie logowanie' = $u.LastLogonDate
+            'Utworzono'          = $u.whenCreated
+            'Zasady haseł'       = $pol
+            'Uwagi'              = $(if (-not $isMac) { 'login nie jest adresem MAC' } else { '' })
+            'DN'                 = [string]$u.DistinguishedName
+            '__tone'             = $(if (-not $u.Enabled) { 'warn' } elseif (-not $isMac) { 'warn' } else { 'info' })
+            '__kind'             = 'existing'
+        }
+    }
+}
+
+function Get-MabOptions {
+    param([hashtable]$Module)
+    $m = $Module
+    $pso = Get-MabSelectedPso -Module $m
+    return @{
+        NeverExpires = (Test-Checked $m.NeverExpires); CannotChange = (Test-Checked $m.CannotChange); Reversible = (Test-Checked $m.Reversible)
+        Pso = $(if ($pso) { [string]$pso.Dn } else { '' }); PsoName = $(if ($pso) { [string]$pso.Name } else { '' })
+        Groups = @($m.Data.Groups | ForEach-Object { [string]$_.DN }); Primary = $(if ((Test-Checked $m.PrimaryFirst) -and @($m.Data.Groups).Count) { [string]@($m.Data.Groups)[0].DN } else { '' })
+    }
+}
+
+function Invoke-MabPreview {
+    param([hashtable]$Module)
+    $m = $Module
+    $text = [string]$m.Input.Text
+    if (-not $text.Trim()) { Show-Warning 'Wklej lub wpisz adresy MAC w polu «Adresy MAC» (jeden w wierszu; opcjonalnie nazwa urządzenia i opis po tabulatorze).'; return }
+    $ou = $m.Ou.Text.Trim()
+    if (-not $ou) { Show-Warning 'Wskaż jednostkę OU dla kont MAB.'; return }
+    $fmt = Get-MabFormatKey -Module $m
+    $t = ConvertFrom-PastedTable -Text $text -Headers $script:MabPasteHeaders -Order @('Mac', 'Name', 'Description')
+    $defaultDesc = $m.DescDefault.Text.Trim()
+    $seen = @{}
+    $lp = 0
+    $objects = foreach ($r in $t.Rows) {
+        $raw = ([string](Get-PastedValue $r $t.Map 'Mac')).Trim()
+        $name = ([string](Get-PastedValue $r $t.Map 'Name')).Trim()
+        $desc = ([string](Get-PastedValue $r $t.Map 'Description')).Trim()
+        if (-not $raw -and -not $name) { continue }
+        $hex = ConvertTo-MacHex $raw
+        # «00:11:22:33:44:55 Drukarka» bez tabulatora - adres i nazwa rozdzielone spacją
+        if (-not $hex -and $raw -match '^(\S+)\s+(.+)$') { $h2 = ConvertTo-MacHex $Matches[1]; if ($h2) { $hex = $h2; if (-not $name) { $name = $Matches[2].Trim() } } }
+        $lp++
+        $state = ''; $note = ''; $tone = ''
+        if (-not $hex) { $state = 'Błąd danych'; $note = "niepoprawny adres MAC: «$raw»"; $tone = 'crit' }
+        elseif ($hex -eq '000000000000' -or $hex -eq 'ffffffffffff') { $state = 'Błąd danych'; $note = 'adres zerowy albo rozgłoszeniowy'; $tone = 'crit' }
+        elseif ($seen.ContainsKey($hex)) { $state = 'Błąd danych'; $note = ('adres powtarza się w danych (wiersz {0})' -f $seen[$hex]); $tone = 'crit' }
+        if ($hex -and -not $seen.ContainsKey($hex)) { $seen[$hex] = $lp }
+        if ($hex -and -not $state -and ([Convert]::ToInt32($hex.Substring(0, 2), 16) -band 1)) { $note = 'adres grupowy (multicast) – karty sieciowe go nie używają' }
+        $login = if ($hex) { Format-MacAddress -Hex $hex -Format $fmt } else { '' }
+        $display = if ($name) { $name } else { $login }
+        if ($display.Length -gt 64) { $display = $display.Substring(0, 64) }
+        $description = if ($desc) { $desc } elseif ($defaultDesc) { $(if ($name) { "${defaultDesc}: $name" } else { $defaultDesc }) } else { $name }
+        [pscustomobject][ordered]@{
+            'Lp' = $lp; 'Stan' = $state; 'MAC' = $(if ($hex) { (@(0, 2, 4, 6, 8, 10) | ForEach-Object { $hex.Substring($_, 2) }) -join ':' } else { $raw }); 'Login' = $login
+            'Nazwa' = $display; 'Opis' = $description; 'OU' = $ou; 'Uwagi' = $note; '__tone' = $tone; '__id' = [guid]::NewGuid().ToString('N'); '__hex' = $hex; '__kind' = 'plan'; '__cn' = ''
+            '__err' = $(if ($state) { '1' } else { '' }); '__note' = $note
+        }
+    }
+    $objects = @($objects)
+    if ($objects.Count -eq 0) { Show-Warning 'Nie rozpoznano żadnego adresu MAC.'; return }
+    Reset-ResultTable -Module $m
+    Add-ResultRows -Module $m -Objects $objects
+    Request-ResultSpace -Module $m
+    Write-Log ("Podgląd kont MAB: {0} adresów, format {1}{2}." -f $objects.Count, (Format-MacAddress -Hex '001122aabbcc' -Format $fmt), $(if ($t.HasHeader) { ' (rozpoznano nagłówek)' } else { '' })) -Module $m.Title
+    Start-MabCheck -Module $m
+}
+
+function Get-MabPlanRows {
+    # Wiersze planu, które można (ponownie) sprawdzić i utworzyć: bez błędów danych i jeszcze nieutworzone
+    param([hashtable]$Module)
+    return @(Get-ResultRowsAll -Module $Module | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'plan' -and -not [string](Get-ObjectValue $_ '__err') -and @('Utworzono', 'Utworzono z błędem') -notcontains [string](Get-ObjectValue $_ 'Stan') })
+}
+
+function Find-MabRows {
+    # Wiersze konta o danym loginie - bez wierszy z błędem danych (np. powtórzony adres ma ten sam login); -State: tylko w tym stanie
+    param([hashtable]$Module, [string]$Login, [string]$State = '')
+    return @(Find-ResultRow -Module $Module -Column 'Login' -Value $Login | Where-Object { -not [string](Get-ObjectValue $_ '__err') -and (-not $State -or [string](Get-ObjectValue $_ 'Stan') -eq $State) })
+}
+
+function Start-MabCheck {
+    # Zgodność hasła z zasadami (w programie), grupa podstawowa, potem sprawdzenie w AD
+    param([hashtable]$Module, [switch]$ThenCreate)
+    $m = $Module
+    if (-not $m.Data.Policies -and -not $m.Data.PoliciesTried) {
+        $m.Data.ThenCreate = [bool]$ThenCreate
+        Update-MabPolicies -Module $m -Then { param($m) Start-MabCheck -Module $m -ThenCreate:$m.Data.ThenCreate }
+        return
+    }
+    $rows = @(Get-MabPlanRows -Module $m)
+    $len = (Format-MacAddress -Hex '001122aabbcc' -Format (Get-MabFormatKey -Module $m)).Length
+    $chk = Get-MabPolicyCheck -Module $m -PasswordLength $len
+    $primaryProblem = ''
+    if ((Test-Checked $m.PrimaryFirst)) {
+        $g = $m.Data.Groups | Select-Object -First 1
+        if (-not $g) { $primaryProblem = 'zaznaczono grupę podstawową, ale nie wybrano grup' }
+        elseif ([string]$g.Scope -and ([string]$g.Scope -ne 'Global' -or [string]$g.Category -ne 'Security')) { $primaryProblem = ('grupa podstawowa «{0}» musi być globalną grupą zabezpieczeń' -f $g.Name) }
+    }
+    $check = @()
+    foreach ($r in $rows) {
+        if (-not $chk.Ok -or $primaryProblem) {
+            Set-RowState -Module $m -Row $r -State 'Konflikt' -Tone 'crit' -Note ((@($(if (-not $chk.Ok) { $chk.Text }), $primaryProblem) | Where-Object { $_ }) -join '; ')
+            continue
+        }
+        Set-RowState -Module $m -Row $r -State 'Sprawdzanie…' -Tone '' -Note ([string](Get-ObjectValue $r '__note'))
+        $check += @{ Id = [string]$r['__id']; Login = [string]$r['Login']; Cn = ([string]$r['Nazwa']).Trim(); Ou = ([string]$r['OU']).Trim() }
+    }
+    $m.Data.Stale = $false
+    Update-MabTiles -Module $m
+    if ($check.Count -eq 0) { if ($ThenCreate -and $rows.Count) { Show-Warning ('Żadne konto nie jest gotowe do utworzenia. ' + $(if (-not $chk.Ok) { $chk.Text } else { $primaryProblem })) }; return }
+    $m.Data.ThenCreate = [bool]$ThenCreate
+    Start-AdOperation -Module $m -Name 'Sprawdzanie kont MAB' -Targets @('AD') -Output None -Parameters @{ Rows = $check } -ScriptBlock $script:MabCheckScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) {
+            foreach ($row in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Sprawdzanie…' })) { Set-RowState -Module $m -Row $row -State 'Nie sprawdzono' -Tone 'warn' -Note ((@($r.Errors)) -join ' ') }
+            return
+        }
+        foreach ($res in @($r.Data)) {
+            foreach ($row in @(Find-ResultRow -Module $m -Column '__id' -Value ([string]$res.Id))) {
+                $prev = [string](Get-ObjectValue $row 'Uwagi')
+                Set-ResultValue -Module $m -Row $row -Column '__cn' -Value $res.Cn
+                if ($res.Dn) { Set-ResultValue -Module $m -Row $row -Column 'DN' -Value $res.Dn }
+                Set-RowState -Module $m -Row $row -State $res.State -Tone $res.Tone -Note ((@($prev, $res.Note) | Where-Object { $_ }) -join '; ')
+            }
+        }
+    } -OnComplete {
+        param($m)
+        Update-MabTiles -Module $m
+        if ($m.Data.ThenCreate) { $m.Data.ThenCreate = $false; Invoke-Deferred -Module $m -Action { param($m) Invoke-MabCreate -Module $m } }
+    }
+}
+
+function Update-MabTiles {
+    param([hashtable]$Module)
+    $rows = @(Get-ResultRowsAll -Module $Module)
+    $count = { param([string[]]$s) @($rows | Where-Object { $s -contains [string](Get-ObjectValue $_ 'Stan') }).Count }
+    Set-StatTile -Module $Module -Key 'ready' -Value ([string](& $count @('Gotowe'))) -Tone 'info'
+    Set-StatTile -Module $Module -Key 'done' -Value ([string](& $count @('Utworzono', 'Utworzono z błędem', 'Hasło ustawione'))) -Tone 'ok'
+    Set-StatTile -Module $Module -Key 'exists' -Value ([string](& $count @('Istnieje', 'Wyłączone')))
+    $bad = & $count @('Błąd danych', 'Konflikt', 'Błąd', 'Nie sprawdzono')
+    Set-StatTile -Module $Module -Key 'bad' -Value ([string]$bad) -Tone $(if ($bad) { 'crit' } else { '' })
+}
+
+function Invoke-MabCreate {
+    param([hashtable]$Module)
+    $m = $Module
+    if (-not $m.Table -or @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'plan' }).Count -eq 0) { Invoke-MabPreview -Module $m; return }
+    if ($m.Data.Stale) { Start-MabCheck -Module $m -ThenCreate; return }
+    $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'plan' -and [string](Get-ObjectValue $_ 'Stan') -eq 'Gotowe' })
+    if ($rows.Count -eq 0) { Show-Message -Text 'Brak kont gotowych do utworzenia. Popraw wiersze z błędami (albo zasady haseł) i sprawdź ponownie.' -Title 'Brak zmian'; return }
+    $o = Get-MabOptions -Module $m
+    $fmtText = Format-MacAddress -Hex '001122aabbcc' -Format (Get-MabFormatKey -Module $m)
+    $text = "Utworzyć konta MAB? Login i hasło = adres MAC (format $fmtText)."
+    $text += "`r`nZasady haseł: " + $(if ($o.PsoName) { "PSO «$($o.PsoName)» przypisane do kont" } else { 'z grup albo domeny (bez przypisania PSO)' })
+    if ($o.Groups.Count) { $text += "`r`nGrupy: " + ((@($m.Data.Groups | ForEach-Object { $_.Name })) -join ', ') }
+    if ($o.Primary) { $text += "`r`nGrupa podstawowa: $(@($m.Data.Groups)[0].Name) – konta zostaną usunięte z Domain Users." }
+    $items = @($rows | ForEach-Object { '{0}  ({1})' -f $_['Login'], $_['Nazwa'] })
+    $chosen = @(Confirm-Action -Title 'Konta MAB' -Text $text -Items $items -ConfirmText 'Utwórz konta' -Select -ReturnIndex)
+    if ($chosen.Count -eq 0) { return }
+    $per = @{}
+    foreach ($i in $chosen) {
+        $r = $rows[$i]
+        $login = [string]$r['Login']
+        $per[$login] = @{
+            Cn = $(if ([string]$r['__cn']) { [string]$r['__cn'] } else { ([string]$r['Nazwa']).Trim() }); Display = ([string]$r['Nazwa']).Trim(); Description = [string]$r['Opis']; Ou = ([string]$r['OU']).Trim(); Password = $login
+            Groups = $o.Groups; Pso = $o.Pso; Primary = $o.Primary; NeverExpires = $o.NeverExpires; CannotChange = $o.CannotChange; Reversible = $o.Reversible
+        }
+        Set-RowState -Module $m -Row $r -State 'Tworzenie…' -Tone ''
+    }
+    Start-AdOperation -Module $m -Name 'Tworzenie kont MAB' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:MabCreateScript -OnResult {
+        param($m, $r)
+        foreach ($row in @(Find-MabRows -Module $m -Login $r.Target -State 'Tworzenie…')) {
+            if ($r.Ok) {
+                $d = @($r.Data)[-1]
+                Set-RowState -Module $m -Row $row -State $d.State -Tone $(if ($d.Warn) { 'warn' } else { 'ok' }) -Note $d.Note
+                Set-ResultValue -Module $m -Row $row -Column 'DN' -Value $d.Dn
+            }
+            else { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')) }
+        }
+    } -OnComplete {
+        param($m)
+        Update-MabTiles -Module $m
+        $done = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Stan') -eq 'Utworzono' }).Count
+        if ($done) { Write-Log "Utworzono kont MAB: $done." 'OK' -Module $m.Title }
+    }
+}
+
+function Invoke-MabList {
+    param([hashtable]$Module)
+    $m = $Module
+    $ou = $m.Ou.Text.Trim()
+    if (-not $ou) { Show-Warning 'Wskaż jednostkę OU z kontami MAB.'; return }
+    Start-AdOperation -Module $m -Name 'Konta MAB w OU' -Targets @('AD') -Parameters @{ Ou = $ou; Limit = 500 } -ScriptBlock $script:MabListScript -OnComplete {
+        param($m)
+        Update-MabTiles -Module $m
+        Set-EmptyColumnsHidden -Module $m -Columns @('Uwagi')
+    }
+}
+
+function Get-MabAccountRows {
+    # Wiersze z istniejącymi kontami (lista z OU albo «Istnieje» / utworzone z planu)
+    param($Rows)
+    return @($Rows | Where-Object { [string](Get-ObjectValue $_ 'Login') -and @('Istnieje', 'Wyłączone', 'Utworzono', 'Utworzono z błędem', 'Hasło ustawione', 'Włączone') -contains [string](Get-ObjectValue $_ 'Stan') })
+}
+
+function Invoke-MabAccountAction {
+    # Akcje na istniejących kontach z wierszy: ponowne hasło i PSO, włączenie, wyłączenie, usunięcie
+    param([hashtable]$Module, [ValidateSet('Reset', 'Enable', 'Disable', 'Delete')][string]$Op, $Rows)
+    $m = $Module
+    $sel = @(Get-MabAccountRows $Rows)
+    if ($sel.Count -eq 0) { Show-Warning 'Zaznacz wiersze z istniejącymi kontami MAB.'; return }
+    $logins = @($sel | ForEach-Object { [string](Get-ObjectValue $_ 'Login') } | Select-Object -Unique)
+    $o = Get-MabOptions -Module $m
+    switch ($Op) {
+        'Reset' {
+            $len = @($logins | ForEach-Object { $_.Length } | Sort-Object)[0]
+            $chk = Get-MabPolicyCheck -Module $m -PasswordLength $len
+            $text = 'Ustawić ponownie hasło równe loginowi' + $(if ($o.PsoName) { " i przypisać PSO «$($o.PsoName)»" } else { '' }) + '? Konto zachowa grupy i stan (włączone / wyłączone).'
+            if ($chk.Known -and -not $chk.Ok -and -not $o.PsoName) { $text += "`r`nUwaga: $($chk.Text)" }
+            if (-not (Confirm-Action -Title 'Konta MAB' -Text $text -Items $logins -ConfirmText 'Ustaw')) { return }
+        }
+        'Disable' { if (-not (Confirm-Action -Title 'Konta MAB' -Text 'Wyłączyć konta? Urządzenia przestaną przechodzić uwierzytelnianie MAB.' -Items $logins -ConfirmText 'Wyłącz')) { return } }
+        'Enable' { if (-not (Confirm-Action -Title 'Konta MAB' -Text 'Włączyć konta?' -Items $logins -ConfirmText 'Włącz')) { return } }
+        'Delete' { if (-not (Confirm-Action -Title 'Konta MAB' -Text 'Usunąć konta z AD? Operacji nie da się cofnąć (poza Koszem AD, jeśli jest włączony).' -Items $logins -ConfirmText 'Usuń' -Danger)) { return } }
+    }
+    $body = switch ($Op) {
+        'Reset' { $script:MabResetScript }
+        'Enable' { { Enable-ADAccount -Identity $Target @ad; [pscustomobject]@{ Note = 'włączone' } } }
+        'Disable' { { Disable-ADAccount -Identity $Target @ad; [pscustomobject]@{ Note = 'wyłączone' } } }
+        'Delete' { { Remove-ADUser -Identity $Target -Confirm:$false @ad; [pscustomobject]@{ Note = 'usunięte' } } }
+    }
+    $m.Data.MabOp = $Op
+    Start-AdOperation -Module $m -Name ('Konta MAB – {0}' -f @{ Reset = 'hasło i PSO'; Enable = 'włączenie'; Disable = 'wyłączenie'; Delete = 'usunięcie' }[$Op]) -Targets $logins -Output None -Parameters @{ Pso = $o.Pso; NeverExpires = $o.NeverExpires; CannotChange = $o.CannotChange; Reversible = $o.Reversible } -ScriptBlock $body -OnResult {
+        param($m, $r)
+        foreach ($row in @(Find-MabRows -Module $m -Login $r.Target)) {
+            if (-not $r.Ok) { Set-RowState -Module $m -Row $row -State 'Błąd' -Tone 'crit' -Note (Get-FriendlyAdError ((@($r.Errors)) -join ' ')); continue }
+            $note = [string](@($r.Data)[-1].Note)
+            switch ($m.Data.MabOp) {
+                'Reset' { Set-RowState -Module $m -Row $row -State 'Hasło ustawione' -Tone 'ok' -Note $note }
+                'Enable' { Set-RowState -Module $m -Row $row -State 'Istnieje' -Tone 'info' -Note $note; if ($row.Table.Columns.Contains('Włączone')) { Set-ResultValue -Module $m -Row $row -Column 'Włączone' -Value 'Tak' } }
+                'Disable' { Set-RowState -Module $m -Row $row -State 'Wyłączone' -Tone 'warn' -Note $note; if ($row.Table.Columns.Contains('Włączone')) { Set-ResultValue -Module $m -Row $row -Column 'Włączone' -Value 'Nie' } }
+                'Delete' { Remove-ResultRows -Module $m -Rows @($row) }
+            }
+        }
+    } -OnComplete { param($m) Update-MabTiles -Module $m }
+}
+
+Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'MabAccounts' -Title 'Konta MAB (802.1X)' -Icon 'E968' -Badge 'nowe' `
+    -Description 'Konta do uwierzytelniania urządzeń adresem MAC (MAC Authentication Bypass, np. przez NPS): login i hasło = adres MAC w formacie przełącznika, wybór PSO z AD (przypisane przed ustawieniem hasła), grupy i grupa podstawowa zamiast Domain Users, sprawdzenie zgodności hasła z zasadami. Zarządzanie istniejącymi kontami w OU.' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $m.PillColumns = @('Stan')
+    $m.EditableColumns = @('Nazwa', 'Opis', 'OU')
+    $m.Data.Policies = $null
+    $m.Data.PoliciesTried = $false
+    $m.Data.PsoList = @()
+    $m.Data.Stale = $true
+    $m.Data.ThenCreate = $false
+    $m.Data.Loading = $false
+    $m.Data.Groups = @(Get-ModuleSetting -Module $m -Name 'Groups' -Default @() | Where-Object { $_ -and $_.DN })
+    $m.EmptyHint = 'Wklej adresy MAC (jeden w wierszu, opcjonalnie nazwa urządzenia i opis po tabulatorze) i kliknij «Sprawdź». «Pokaż konta w OU» wyświetla istniejące konta MAB.'
+    $m.OnCellEdit = {
+        param($m, $row, $column)
+        if (@('Utworzono', 'Utworzono z błędem') -notcontains [string]$row['Stan'] -and [string](Get-ObjectValue $row '__kind') -eq 'plan' -and -not [string](Get-ObjectValue $row '__err')) { Set-RowState -Module $m -Row $row -State 'Zmieniono – sprawdź' -Tone 'warn' }
+        $m.Data.Stale = $true
+    }
+
+    $row = Add-ToolbarRow -Module $m -Title 'Format'
+    $m.Format = Add-ComboBox -Parent $row -Items @($script:MabFormats.Values | ForEach-Object { $_.Text }) -Width 330
+    $keys = @($script:MabFormats.Keys)
+    $m.Format.SelectedIndex = [Math]::Max(0, [Array]::IndexOf($keys, [string](Get-ModuleSetting -Module $m -Name 'Format' -Default 'lower')))
+    $m.Format.ToolTip = 'Login i hasło konta = adres MAC w formacie, który przełącznik wysyła w polu User-Name (np. Cisco: 001122aabbcc). Dwukropek nie jest dozwolony w loginie AD.'
+    Register-ControlHandler -Control $m.Format -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        Set-ModuleSetting -Module $m -Name 'Format' -Value (Get-MabFormatKey -Module $m)
+        Update-MabPolicyInfo -Module $m
+        $fmt = Get-MabFormatKey -Module $m
+        foreach ($r in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'plan' -and [string](Get-ObjectValue $_ '__hex') -and @('Utworzono', 'Utworzono z błędem') -notcontains [string](Get-ObjectValue $_ 'Stan') })) {
+            $old = [string]$r['Login']
+            $new = Format-MacAddress -Hex ([string]$r['__hex']) -Format $fmt
+            Set-ResultValue -Module $m -Row $r -Column 'Login' -Value $new
+            if ([string]$r['Nazwa'] -eq $old) { Set-ResultValue -Module $m -Row $r -Column 'Nazwa' -Value $new }
+            if (-not [string](Get-ObjectValue $r '__err')) { Set-RowState -Module $m -Row $r -State 'Zmieniono – sprawdź' -Tone 'warn' -Note ([string](Get-ObjectValue $r '__note')) }
+        }
+        $m.Data.Stale = $true
+    }
+    $row2 = Add-ToolbarRow -Module $m -Title 'Konto'
+    Add-Label -Parent $row2 -Text 'OU' | Out-Null
+    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 330 -Placeholder 'np. OU=MAB,OU=Urządzenia,…' -DialogTitle 'Jednostka dla kont MAB' -Remember 'Ou'
+    Add-Label -Parent $row2 -Text '   Opis domyślny' | Out-Null
+    $m.DescDefault = Add-TextBox -Parent $row2 -Width 200 -Text ([string](Get-ModuleSetting -Module $m -Name 'DescDefault' -Default 'Konto MAB (802.1X)'))
+    Register-ControlHandler -Control $m.DescDefault -EventName 'TextChanged' -Module $m -Action { param($m) Set-ModuleSetting -Module $m -Name 'DescDefault' -Value $m.DescDefault.Text }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.NeverExpires = Add-CheckBox -Parent $row3 -Text 'Hasło nigdy nie wygasa' -Checked ([bool](Get-ModuleSetting -Module $m -Name 'NeverExpires' -Default $true))
+    $m.CannotChange = Add-CheckBox -Parent $row3 -Text 'Użytkownik nie może zmienić hasła' -Checked ([bool](Get-ModuleSetting -Module $m -Name 'CannotChange' -Default $true))
+    $m.Reversible = Add-CheckBox -Parent $row3 -Text 'Szyfrowanie odwracalne' -Checked ([bool](Get-ModuleSetting -Module $m -Name 'Reversible' -Default $false)) -ToolTip 'Potrzebne, gdy przełącznik wysyła hasło przez CHAP / EAP-MD5 (przy PAP nie). Ustawiane przed hasłem, żeby było zapisane odwracalnie.'
+    $m.PrimaryFirst = Add-CheckBox -Parent $row3 -Text 'Pierwsza grupa jako podstawowa (bez Domain Users)' -Checked ([bool](Get-ModuleSetting -Module $m -Name 'PrimaryFirst' -Default $false)) -ToolTip 'Konto MAB zna każdy, kto zna adres MAC – bez Domain Users nie dostaje uprawnień nadanych tej grupie. Pierwsza wybrana grupa musi być globalną grupą zabezpieczeń.'
+    foreach ($pair in @(@('NeverExpires', $m.NeverExpires), @('CannotChange', $m.CannotChange), @('Reversible', $m.Reversible), @('PrimaryFirst', $m.PrimaryFirst))) {
+        $m.Data["Box_$($pair[0])"] = $pair[1]
+        foreach ($ev in 'Checked', 'Unchecked') {
+            Register-ControlHandler -Control $pair[1] -EventName $ev -Module $m -Action {
+                param($m, $s)
+                foreach ($k in 'NeverExpires', 'CannotChange', 'Reversible', 'PrimaryFirst') { if ([object]::ReferenceEquals($m.Data["Box_$k"], $s)) { Set-ModuleSetting -Module $m -Name $k -Value (Test-Checked $s) } }
+                $m.Data.Stale = $true
+            }
+        }
+    }
+    $row4 = Add-ToolbarRow -Module $m -Title 'Zasady haseł'
+    $m.Pso = Add-ComboBox -Parent $row4 -Items @($script:MabNoPso) -Width 430
+    $m.Pso.ToolTip = 'PSO przypisane bezpośrednio do konta ma pierwszeństwo przed PSO grup i zasadami domeny. Przypisywane przed ustawieniem hasła.'
+    Register-ControlHandler -Control $m.Pso -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        if ($m.Data.Loading) { return }
+        $p = Get-MabSelectedPso -Module $m
+        Set-ModuleSetting -Module $m -Name 'Pso' -Value $(if ($p) { [string]$p.Name } else { '' })
+        $m.Data.Stale = $true
+        Update-MabPolicyInfo -Module $m
+    }
+    Add-Button -Parent $row4 -Text 'Odśwież' -Icon 'E72C' -Module $m -ToolTip 'Odczytaj zasady haseł domeny i listę PSO z AD' -OnClick { param($m) Update-MabPolicies -Module $m } | Out-Null
+    $rowInfo = Add-ToolbarRow -Module $m -Title ' '
+    $m.PolicyInfo = Add-Label -Parent $rowInfo -Text 'Zasady haseł zostaną odczytane z AD przy sprawdzaniu (albo «Odśwież»).' -Hint -MaxWidth 1100
+    $row5 = Add-ToolbarRow -Module $m -Title 'Grupy'
+    Add-Button -Parent $row5 -Text 'Wybierz grupy…' -Icon 'E902' -Module $m -AlwaysEnabled -ToolTip 'Np. grupa sieci VLAN / zasady NPS dla urządzeń' -OnClick {
+        param($m)
+        $groups = Select-AdGroups -Title 'Grupy dla kont MAB' -Subtitle 'Pierwsza wybrana grupa może zostać grupą podstawową kont (opcja «Pierwsza grupa jako podstawowa»).'
+        if (-not $groups) { return }
+        $m.Data.Groups = @($groups | ForEach-Object { [pscustomobject]@{ Name = $_.Name; DN = $_.DN; Scope = $_.Scope; Category = $_.Category } })
+        Set-ModuleSetting -Module $m -Name 'Groups' -Value @($m.Data.Groups)
+        Update-MabGroupsInfo -Module $m
+        $m.Data.Stale = $true
+        Update-MabPolicyInfo -Module $m
+    } | Out-Null
+    Add-Button -Parent $row5 -Text 'Wyczyść' -Icon 'E894' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $m.Data.Groups = @()
+        Set-ModuleSetting -Module $m -Name 'Groups' -Value @()
+        Update-MabGroupsInfo -Module $m
+        $m.Data.Stale = $true
+        Update-MabPolicyInfo -Module $m
+    } | Out-Null
+    $m.GroupsInfo = Add-Label -Parent $row5 -Text '' -Hint -MaxWidth 800
+    Update-MabGroupsInfo -Module $m
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Adresy MAC' -Multiline -Height 100 -Placeholder "Jeden adres w wierszu, dowolny zapis; opcjonalnie [TAB] nazwa urządzenia [TAB] opis – wklej z Excela.`r`n00:11:22:AA:BB:CC [TAB] Drukarka 1 piętro [TAB] Pokój 101`r`n0011.22aa.bbcd"
+    $row6 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row6 -Text 'Wklej ze schowka' -Icon 'E77F' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $clip = Get-ClipboardText
+        if (-not $clip.Trim()) { Show-Warning 'Schowek nie zawiera tekstu.'; return }
+        $m.Input.Text = $clip
+        Invoke-MabPreview -Module $m
+    } | Out-Null
+    Add-Button -Parent $row6 -Text 'Sprawdź' -Icon 'E9D5' -Module $m -Primary -OnClick { param($m) Invoke-MabPreview -Module $m } | Out-Null
+    Add-Button -Parent $row6 -Text 'Sprawdź ponownie' -Icon 'E72C' -Module $m -ToolTip 'Sprawdza wiersze tabeli po edycji albo zmianie PSO / grup (bez ponownego wczytywania adresów)' -OnClick {
+        param($m)
+        if (@(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'plan' }).Count -eq 0) { Invoke-MabPreview -Module $m; return }
+        Start-MabCheck -Module $m
+    } | Out-Null
+    Add-Button -Parent $row6 -Text 'Utwórz konta' -Icon 'E8FA' -Module $m -OnClick { param($m) Invoke-MabCreate -Module $m } | Out-Null
+    Add-Button -Parent $row6 -Text 'Pokaż konta w OU' -Icon 'E8FD' -Module $m -ToolTip 'Istniejące konta w jednostce MAB: stan, ostatnie logowanie, zasady haseł' -OnClick { param($m) Invoke-MabList -Module $m } | Out-Null
+    Add-StatTile -Module $m -Key 'ready' -Label 'Gotowe do utworzenia' -Icon 'E9D5' | Out-Null
+    Add-StatTile -Module $m -Key 'done' -Label 'Utworzone' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'exists' -Label 'Istniejące' -Icon 'E8FD' | Out-Null
+    Add-StatTile -Module $m -Key 'bad' -Label 'Błędy i konflikty' -Icon 'EA39' | Out-Null
+    Add-RowAction -Module $m -Text 'Ustaw ponownie hasło i PSO…' -Icon 'E8D7' -Action { param($m, $rows) Invoke-MabAccountAction -Module $m -Op Reset -Rows $rows }
+    Add-RowAction -Module $m -Text 'Włącz konto' -Icon 'E73E' -Action { param($m, $rows) Invoke-MabAccountAction -Module $m -Op Enable -Rows $rows }
+    Add-RowAction -Module $m -Text 'Wyłącz konto' -Icon 'E8D8' -Action { param($m, $rows) Invoke-MabAccountAction -Module $m -Op Disable -Rows $rows }
+    Add-RowAction -Module $m -Text 'Usuń konto z AD…' -Icon 'E74D' -Danger -Action { param($m, $rows) Invoke-MabAccountAction -Module $m -Op Delete -Rows $rows }
+    Add-RowAction -Module $m -Text 'Usuń wiersze z tabeli' -Icon 'E711' -Separator -Action { param($m, $rows) Remove-ResultRows -Module $m -Rows $rows; Update-MabTiles -Module $m }
 }
 #endregion
 
