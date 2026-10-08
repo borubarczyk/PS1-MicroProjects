@@ -12021,7 +12021,7 @@ if ($st.Error) { throw ('Instalacja aktualizacji: ' + (Format-WuError $st)) }
 $what = if ($ids.Count) { "wybrane aktualizacje ($($ids.Count))" } else { 'wszystkie dostępne aktualizacje' }
 if ($st.Done) {
     $ok = @($st.Updates | Where-Object { $_ -and [string]$_.Result -like 'Zainstalowano*' }).Count
-    "Instalacja zakończona: zainstalowano $ok z $(@($st.Updates | Where-Object { $_ }).Count). Szczegóły: «Stan instalacji»."
+    "Instalacja zakończona: zainstalowano $ok z $(@($st.Updates | Where-Object { $_ }).Count)$(if ($st.RebootRequired) { ' – wymagany restart komputera' }). Szczegóły: «Stan instalacji»."
 }
 else { "Zlecono instalację: $what (zadanie SYSTEM DomainOps-WindowsUpdate, etap: $($st.Phase)). Postęp i wyniki: «Stan instalacji»." }
 '@
@@ -12044,8 +12044,19 @@ if (Test-Path -LiteralPath $log) {
     for ($i = $all.Count - 1; $i -ge 0; $i--) { if ($all[$i] -like '*==== START ====*') { $start = $i; break } }
     if ($all.Count) { $lines = @($all[$start..($all.Count - 1)]) }
 }
-$reboot = $false
-try { $reboot = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired } catch { }
+# Wymagany restart: API Windows Update bywa w sesji WinRM niedostępne (wtedy zawsze «nie») - także klucze rejestru
+# (Windows Update, obsługa składników) i wynik instalacji z pliku stanu, jeśli od jej końca nie było restartu
+$rebootWhy = @()
+try { if ((New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired) { $rebootWhy += 'Windows Update' } } catch { }
+if (-not $rebootWhy.Count -and (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) { $rebootWhy += 'Windows Update' }
+if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $rebootWhy += 'obsługa składników (CBS)' }
+if ($st -and $st.Done -and $st.RebootRequired -and $st.Finished) {
+    $fin = [datetime]::Parse([string]$st.Finished, [System.Globalization.CultureInfo]::InvariantCulture)
+    $boot = $null
+    try { $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
+    if (-not ($boot -is [datetime]) -or $boot -lt $fin) { $rebootWhy += ('instalacja z {0:yyyy-MM-dd HH:mm}' -f $fin) }
+}
+$reboot = $rebootWhy.Count -gt 0
 $running = $task -and [string]$task.State -eq 'Running'
 $ups = @(if ($st) { $st.Updates | Where-Object { $_ } })
 $okCount = @($ups | Where-Object { [string]$_.Result -like 'Zainstalowano*' }).Count
@@ -12071,6 +12082,7 @@ if ($st) { $details += @($st.Notes | Where-Object { $_ }) }
     'Rozpoczęto'      = $(if ($st -and $st.Started) { [datetime]::Parse([string]$st.Started, [System.Globalization.CultureInfo]::InvariantCulture) } else { $null })
     'Zakończono'      = $(if ($st -and $st.Finished) { [datetime]::Parse([string]$st.Finished, [System.Globalization.CultureInfo]::InvariantCulture) } else { $null })
     'Wymaga restartu' = $reboot
+    'Przyczyna restartu' = ($rebootWhy -join ', ')
     'Kod zadania'     = $code
     'Log'             = ($lines -join "`r`n")
     '__tone'          = $tone
