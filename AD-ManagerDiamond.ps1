@@ -103,6 +103,8 @@ $script:App = @{
     RunLog     = ''
 }
 $script:App.SettingsFile = Join-Path $script:App.DataDir 'settings.json'
+# Własne szablony poleceń modułu Polecenia (osobny plik - łatwo go skopiować innym administratorom)
+$script:App.CommandTemplatesFile = Join-Path $script:App.DataDir 'CommandTemplates.json'
 $script:App.LogFile = Join-Path $script:App.LogDir ('DomainOps_{0:yyyyMMdd}.log' -f (Get-Date))
 
 # Ustawienia zapamiętywane między uruchomieniami
@@ -3128,11 +3130,14 @@ function Show-SettingsDialog {
   <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"
              Text="Równoległe operacje na komputerach: 1–64. Zapytania AD: 1–16 – usługa ADWS na kontrolerze domeny odrzuca zbyt wiele żądań naraz («A connection to the directory … was unavailable»), więc przy takich błędach zmniejsz tę wartość (przejściowe błędy są i tak ponawiane). Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili. Blokada po bezczynności: 0–240 min (0 = wyłączona) – po tylu minutach bez klawisza, kliknięcia czy ruchu myszy w oknach programu wymaga PIN-u, jak przycisk z kłódką."/>
   <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
-  <WrapPanel>
-    <Button x:Name="stLogs" Margin="0,0,8,6"/>
-    <Button x:Name="stData" Margin="0,0,8,6"/>
-    <Button x:Name="stPlugins" Margin="0,0,8,6"/>
-  </WrapPanel>
+  <TextBlock Text="Pliki programu" Foreground="#8791A5" FontSize="12" Margin="0,0,0,6"/>
+  <Grid x:Name="stFiles">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="Auto"/>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="Auto"/>
+    </Grid.ColumnDefinitions>
+  </Grid>
   <TextBlock x:Name="stInfo" Foreground="#5E6779" FontSize="11.5" TextWrapping="Wrap" Margin="0,8,0,0"/>
 </StackPanel>
 '@
@@ -3155,13 +3160,43 @@ function Show-SettingsDialog {
     $idle = $w.FindName('stIdle')
     $idle.Text = [string]$script:Settings.LockIdleMinutes
     if (-not $script:UnlockPinHash) { $idle.IsEnabled = $false; $idle.ToolTip = 'Blokada PIN-em jest wyłączona (pusty skrót PIN-u w skrypcie).' }
-    $w.FindName('stLogs').Content = New-IconContent -Text 'Folder dziennika' -Icon 'E838'
-    $w.FindName('stData').Content = New-IconContent -Text 'Folder ustawień' -Icon 'E838'
-    $w.FindName('stPlugins').Content = New-IconContent -Text 'Folder modułów' -Icon 'EA86'
-    $w.FindName('stInfo').Text = "Domain Ops $($script:AppVersion) • PowerShell $($PSVersionTable.PSVersion) • moduły własne: $($script:App.ModulesDir)"
-    $w.FindName('stLogs').add_Click({ Open-Folder $script:App.LogDir })
-    $w.FindName('stData').add_Click({ Open-Folder $script:App.DataDir })
-    $w.FindName('stPlugins').add_Click({ if ($script:App.ModulesDir) { Open-Folder $script:App.ModulesDir } })
+    # Lokalizacje plików: ścieżka do skopiowania i Eksplorator z zaznaczonym plikiem (albo otwartym folderem)
+    $files = $w.FindName('stFiles')
+    $locations = @(
+        @('Ustawienia', $script:App.SettingsFile),
+        @('Szablony poleceń', $script:App.CommandTemplatesFile),
+        @('Dziennik (dziś)', $script:App.LogFile),
+        @('Moduły własne', $script:App.ModulesDir)
+    )
+    $i = 0
+    foreach ($loc in $locations) {
+        if (-not $loc[1]) { continue }
+        [void]$files.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+        $label = New-DialogText -Text $loc[0] -Color '#AEB6C4' -Size 12.5
+        $label.VerticalAlignment = 'Center'
+        $label.Margin = '0,0,12,6'
+        [System.Windows.Controls.Grid]::SetRow($label, $i)
+        $box = New-Object System.Windows.Controls.TextBox
+        $box.Text = [string]$loc[1]
+        $box.IsReadOnly = $true
+        $box.Margin = '0,0,8,6'
+        $box.ToolTip = [string]$loc[1]
+        # Długa ścieżka: widoczny koniec (nazwa pliku)
+        $box.add_Loaded({ param($s, $e) $s.ScrollToHorizontalOffset([double]::MaxValue) })
+        [System.Windows.Controls.Grid]::SetRow($box, $i)
+        [System.Windows.Controls.Grid]::SetColumn($box, 1)
+        $btn = New-PlainButton -Text 'Pokaż' -Icon 'E838' -ToolTip 'Otwórz w Eksploratorze plików (z zaznaczonym plikiem)'
+        $btn.Name = "stShow$i"
+        try { $w.RegisterName($btn.Name, $btn) } catch { }
+        $btn.Tag = [string]$loc[1]
+        $btn.Margin = '0,0,0,6'
+        $btn.add_Click({ param($s, $e) Show-InExplorer -Path ([string]$s.Tag) })
+        [System.Windows.Controls.Grid]::SetRow($btn, $i)
+        [System.Windows.Controls.Grid]::SetColumn($btn, 2)
+        foreach ($c in $label, $box, $btn) { [void]$files.Children.Add($c) }
+        $i++
+    }
+    $w.FindName('stInfo').Text = "Domain Ops $($script:AppVersion) • PowerShell $($PSVersionTable.PSVersion) • folder ustawień: $($script:App.DataDir)"
     if (-not (Invoke-Dialog $w)) { return $false }
     $script:Settings.DomainController = $w.FindName('stDc').Text.Trim()
     $script:Settings.TimeoutSec = [int]$w.FindName('stTimeout').Text.Trim()
@@ -3170,6 +3205,18 @@ function Show-SettingsDialog {
     Set-EngineThrottle ([int]$w.FindName('stThrottle').Text.Trim()) ([int]$w.FindName('stAdThrottle').Text.Trim())
     Export-Settings
     return $true
+}
+
+function Show-InExplorer {
+    # Plik: Eksplorator z zaznaczonym plikiem; folder albo plik jeszcze nieistniejący: otwarty folder (tworzony w razie potrzeby)
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('/select,"{0}"' -f $Path) }
+        catch { Show-Error "Nie można otworzyć Eksploratora dla $Path." $_ }
+        return
+    }
+    $folder = if ([System.IO.Path]::GetExtension($Path)) { Split-Path -Parent $Path } else { $Path }
+    Open-Folder $folder
 }
 
 function Open-Folder([string]$Path) {
@@ -9357,13 +9404,24 @@ $script:RemoteExecScript = {
         $userScript = [string]$P.Command
         $wrapperFor = {
             param($load)
-            # Kod startowy procesu potomnego: wynik w UTF-8, błędy liczone i dołączane do wyniku
+            # Kod startowy procesu potomnego. Programy konsolowe (ipconfig, netsh, cmd) piszą w stronie kodowej OEM
+            # (np. 852), a PowerShell dekoduje ich wyjście według [Console]::OutputEncoding - ta zostaje więc OEM,
+            # a wynik (także Write-Host i ostrzeżenia, na PowerShell 3+) zapisujemy sami w UTF-8 prosto na wyjście
+            # procesu. Błędy są liczone i dołączane do wyniku.
             "`$ProgressPreference = 'SilentlyContinue'`n" +
-            "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding `$false`n" +
+            "try { [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { }`n" +
+            "`$__out = [Console]::OpenStandardOutput()`n" +
+            "`$__utf8 = New-Object System.Text.UTF8Encoding `$false`n" +
+            "function __Write([string]`$t) { `$b = `$__utf8.GetBytes(`$t + [Environment]::NewLine); `$__out.Write(`$b, 0, `$b.Length) }`n" +
             "`$__errors = 0`n" +
-            "try { `$__sb = [scriptblock]::Create($load); & `$__sb 2>&1 | ForEach-Object { if (`$_ -is [System.Management.Automation.ErrorRecord]) { `$__errors++ }; `$_ } | Out-String -Width 250 -Stream }`n" +
-            "catch { `$__errors++; 'BŁĄD: ' + `$_.Exception.Message }`n" +
-            "'##DOMAINOPS_ERRORS=' + `$__errors`n" +
+            "try {`n" +
+            "    `$__sb = [scriptblock]::Create($load)`n" +
+            "    `$__run = [scriptblock]::Create(`$(if (`$PSVersionTable.PSVersion.Major -ge 3) { '& `$__sb *>&1' } else { '& `$__sb 2>&1' }))`n" +
+            "    & `$__run | ForEach-Object { if (`$_ -is [System.Management.Automation.ErrorRecord]) { `$__errors++ }; `$_ } | Out-String -Width 250 -Stream | ForEach-Object { __Write `$_ }`n" +
+            "}`n" +
+            "catch { `$__errors++; __Write ('BŁĄD: ' + `$_.Exception.Message) }`n" +
+            "__Write ('##DOMAINOPS_ERRORS=' + `$__errors)`n" +
+            "`$__out.Flush()`n" +
             "if (`$LASTEXITCODE) { exit `$LASTEXITCODE }"
         }
         $payload = [Convert]::ToBase64String($encoding.GetBytes($userScript))
@@ -9499,15 +9557,114 @@ $script:RemoteExecScript = {
 }
 
 $script:ExecTimeouts = [ordered]@{ '1 min' = 60; '5 min' = 300; '15 min' = 900; '30 min' = 1800; '1 godz.' = 3600; '2 godz.' = 7200; 'bez limitu' = 0 }
+$script:UserTemplateMark = '★ '
+
+function Import-CommandTemplates {
+    # Własne szablony poleceń z pliku CommandTemplates.json: @(@{ Name; Mode = PS | CMD; Text; Timeout; User = $true })
+    $file = $script:App.CommandTemplatesFile
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) { return @() }
+    $raw = $null
+    try { $raw = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { Write-Log "Nie można odczytać szablonów poleceń ($file): $($_.Exception.Message)" 'WARN' -Module ''; return @() }
+    return @(foreach ($t in @($raw)) {
+            if ($null -eq $t) { continue }
+            $name = ([string](Get-ObjectValue $t 'Name')).Trim()
+            $text = [string](Get-ObjectValue $t 'Text')
+            if (-not $name -or -not $text.Trim()) { continue }
+            $timeout = [string](Get-ObjectValue $t 'Timeout')
+            if (-not $script:ExecTimeouts.Contains($timeout)) { $timeout = '15 min' }
+            @{ Name = $name; Mode = $(if ([string](Get-ObjectValue $t 'Mode') -eq 'CMD') { 'CMD' } else { 'PS' }); Text = $text; Timeout = $timeout; User = $true }
+        })
+}
+
+function Export-CommandTemplates {
+    param([object[]]$Templates)
+    $file = $script:App.CommandTemplatesFile
+    $dir = Split-Path -Parent $file
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $data = @($Templates | Where-Object { $_ } | ForEach-Object { [ordered]@{ Name = [string]$_.Name; Mode = [string]$_.Mode; Timeout = [string]$_.Timeout; Text = [string]$_.Text } })
+    Set-Content -LiteralPath $file -Value (ConvertTo-Json -InputObject @($data) -Depth 3) -Encoding UTF8
+}
+
+function Update-CommandTemplateList {
+    # Lista szablonów: wbudowane, potem własne (oznaczone gwiazdką); -Select: nazwa własnego szablonu do zaznaczenia
+    param([Parameter(Mandatory)][hashtable]$Module, [string]$Select = '')
+    $m = $Module
+    $m.Templates = @($m.BuiltinTemplates) + @(Import-CommandTemplates)
+    $m.Data.TemplateLoading = $true
+    try {
+        $m.Template.Items.Clear()
+        $index = 0
+        for ($i = 0; $i -lt $m.Templates.Count; $i++) {
+            $t = $m.Templates[$i]
+            $isUser = $t.ContainsKey('User')
+            [void]$m.Template.Items.Add($(if ($isUser) { $script:UserTemplateMark + $t.Name } else { $t.Name }))
+            if ($Select -and $isUser -and $t.Name -eq $Select) { $index = $i }
+        }
+        $m.Template.SelectedIndex = $index
+    }
+    finally { $m.Data.TemplateLoading = $false }
+}
+
+function Save-CommandTemplate {
+    # Bieżące polecenie jako własny szablon (formularz: nazwa, interpreter, limit, treść)
+    param([Parameter(Mandatory)][hashtable]$Module)
+    $m = $Module
+    $current = $null
+    if ($m.Template.SelectedIndex -ge 0 -and $m.Template.SelectedIndex -lt $m.Templates.Count) { $current = $m.Templates[$m.Template.SelectedIndex] }
+    $fields = @(
+        @{ Key = 'Name'; Label = 'Nazwa szablonu'; Value = $(if ($current -and $current.ContainsKey('User')) { $current.Name } else { '' }); Placeholder = 'np. Wersja .NET Framework' }
+        @{ Key = 'Mode'; Label = 'Interpreter'; Type = 'Combo'; Items = @('PowerShell', 'cmd.exe'); Value = $(if ((Get-SegmentIndex $m.Mode) -eq 0) { 'PowerShell' } else { 'cmd.exe' }) }
+        @{ Key = 'Timeout'; Label = 'Limit czasu'; Type = 'Combo'; Items = @($script:ExecTimeouts.Keys); Value = [string]$m.Timeout.SelectedItem }
+        @{ Key = 'Text'; Label = 'Polecenie'; Type = 'Multi'; Value = $m.CommandBox.Text; Height = 180 }
+    )
+    $builtin = @($m.BuiltinTemplates | ForEach-Object { $_.Name })
+    $v = Show-FormDialog -Title 'Zapisz szablon polecenia' -Subtitle ("Własne szablony są zapisywane w pliku {0} (ścieżka także w Ustawieniach) i pojawiają się na liście z gwiazdką." -f $script:App.CommandTemplatesFile) `
+        -Fields $fields -OkText 'Zapisz' -Icon 'E74E' -Width 640 -Validate {
+        param($v)
+        $n = ([string]$v.Name).Trim()
+        if (-not $n) { return 'Podaj nazwę szablonu.' }
+        if ($builtin -contains $n) { return 'Tę nazwę ma szablon wbudowany – wybierz inną.' }
+        if (-not ([string]$v.Text).Trim()) { return 'Polecenie jest puste.' }
+        return ''
+    }
+    if (-not $v) { return }
+    $name = ([string]$v.Name).Trim()
+    $list = [System.Collections.ArrayList]@(Import-CommandTemplates)
+    $existing = @($list | Where-Object { $_.Name -eq $name })
+    if ($existing.Count -and -not (Confirm-Action -Text "Szablon «$name» już istnieje. Zastąpić go?" -ConfirmText 'Zastąp')) { return }
+    foreach ($e in $existing) { $list.Remove($e) }
+    [void]$list.Add(@{ Name = $name; Mode = $(if ($v.Mode -eq 'cmd.exe') { 'CMD' } else { 'PS' }); Timeout = [string]$v.Timeout; Text = [string]$v.Text })
+    try { Export-CommandTemplates -Templates @($list) }
+    catch { Show-Error "Nie można zapisać pliku szablonów $($script:App.CommandTemplatesFile)." $_; return }
+    Update-CommandTemplateList -Module $m -Select $name
+    Write-Log "Zapisano szablon polecenia «$name»."
+    Show-Toast "Zapisano szablon «$name»." 'ok'
+}
+
+function Remove-CommandTemplate {
+    param([Parameter(Mandatory)][hashtable]$Module)
+    $m = $Module
+    $i = $m.Template.SelectedIndex
+    $t = if ($i -ge 0 -and $i -lt $m.Templates.Count) { $m.Templates[$i] } else { $null }
+    if (-not $t -or -not $t.ContainsKey('User')) { Show-Warning 'Wybierz na liście własny szablon (oznaczony gwiazdką) – szablonów wbudowanych nie można usuwać.'; return }
+    if (-not (Confirm-Action -Text "Usunąć szablon «$($t.Name)»?" -ConfirmText 'Usuń' -Danger)) { return }
+    try { Export-CommandTemplates -Templates @(Import-CommandTemplates | Where-Object { $_.Name -ne $t.Name }) }
+    catch { Show-Error "Nie można zapisać pliku szablonów $($script:App.CommandTemplatesFile)." $_; return }
+    Update-CommandTemplateList -Module $m
+    Write-Log "Usunięto szablon polecenia «$($t.Name)»."
+    Show-Toast "Usunięto szablon «$($t.Name)»." 'ok'
+}
 
 Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands' -Title 'Polecenia' -Icon 'E756' `
     -Description 'Uruchamia polecenia PowerShell lub cmd.exe na zaznaczonych komputerach (sesja WinRM, bez pulpitu użytkownika). Pełny wynik w panelu szczegółów lub po dwukliku.' -Build {
     param($m)
     $m.PillColumns = @('Stan')
-    $m.Templates = @(
+    $m.BuiltinTemplates = @(
         @{ Name = '(wybierz szablon polecenia)'; Mode = ''; Text = '' }
         @{ Name = 'Wersja systemu i czas pracy'; Mode = 'PS'; Text = 'Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, LastBootUpTime' }
-        @{ Name = 'Ostatnie poprawki (10)'; Mode = 'PS'; Text = 'Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 10 HotFixID, Description, InstalledOn' }
+        # Bez Get-HotFix: jego właściwość InstalledOn rzuca wyjątek (Parse), gdy data w WMI ma inny format niż oczekiwany
+        @{ Name = 'Ostatnie poprawki (10)'; Mode = 'PS'; Text = "Get-CimInstance Win32_QuickFixEngineering | ForEach-Object {`r`n    `$raw = [string]`$_.CimInstanceProperties['InstalledOn'].Value; `$d = [datetime]::MinValue`r`n    `$ok = [datetime]::TryParse(`$raw, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]`$d)`r`n    [pscustomobject]@{ KB = `$_.HotFixID; Opis = `$_.Description; Zainstalowano = `$(if (`$ok) { `$d.ToString('yyyy-MM-dd') } else { `$raw }) }`r`n} | Sort-Object Zainstalowano -Descending | Select-Object -First 10 | Format-Table -AutoSize" }
         @{ Name = 'Konfiguracja IP'; Mode = 'CMD'; Text = 'ipconfig /all' }
         @{ Name = 'Odśwież DNS (flushdns + registerdns)'; Mode = 'CMD'; Text = 'ipconfig /flushdns && ipconfig /registerdns' }
         @{ Name = 'Wyczyść bilety Kerberos komputera'; Mode = 'CMD'; Text = 'klist -li 0x3e7 purge' }
@@ -9521,9 +9678,12 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
     $row = Add-ToolbarRow -Module $m -Title 'Interpreter'
     $m.Mode = Add-Segmented -Parent $row -Items @('PowerShell', 'cmd.exe')
     Add-Label -Parent $row -Text '   Szablon' | Out-Null
-    $m.Template = Add-ComboBox -Parent $row -Items @($m.Templates | ForEach-Object { $_.Name }) -Width 340
+    $m.Template = Add-ComboBox -Parent $row -Width 340
+    Add-Button -Parent $row -Text 'Zapisz jako szablon…' -Icon 'E74E' -Module $m -AlwaysEnabled -ToolTip 'Bieżące polecenie jako własny szablon (zapisany lokalnie)' -OnClick { param($m) Save-CommandTemplate -Module $m } | Out-Null
+    Add-Button -Parent $row -Text 'Usuń szablon' -Icon 'E74D' -Module $m -AlwaysEnabled -ToolTip 'Usuwa wybrany własny szablon (oznaczony gwiazdką)' -OnClick { param($m) Remove-CommandTemplate -Module $m } | Out-Null
     Register-ControlHandler -Control $m.Template -EventName 'SelectionChanged' -Module $m -Action {
         param($m, $s)
+        if ($m.Data['TemplateLoading'] -or $s.SelectedIndex -lt 0 -or $s.SelectedIndex -ge $m.Templates.Count) { return }
         $t = $m.Templates[$s.SelectedIndex]
         if (-not $t.Mode) { return }
         Set-SegmentIndex $m.Mode $(if ($t.Mode -eq 'PS') { 0 } else { 1 })
@@ -9535,6 +9695,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
     $row3 = Add-ToolbarRow -Module $m -Title 'Limit czasu'
     $m.Timeout = Add-ComboBox -Parent $row3 -Items @($script:ExecTimeouts.Keys) -Width 120
     $m.Timeout.SelectedIndex = 2
+    Update-CommandTemplateList -Module $m
     $m.Btn.Run = Add-Button -Parent $row3 -Text 'Uruchom na zaznaczonych' -Icon 'E768' -Module $m -Primary -OnClick {
         param($m)
         $command = $m.CommandBox.Text.Trim()
@@ -12000,7 +12161,13 @@ foreach ($kb in $P.Kbs) {
     $wu = @($history | Where-Object { $_.Title -like "*$kb*" } | Select-Object -First 1)
     $installed = ($null -ne $found -or $wu.Count -gt 0)
     $date = $null
-    if ($found -and $found.InstalledOn) { $date = $found.InstalledOn } elseif ($wu.Count -gt 0) { $date = $wu[0].Date }
+    if ($found) {
+        # Data z WMI jako tekst w formacie niezależnym od języka (np. 10/8/2026)
+        $raw = if ($found.PSObject.Properties['CimInstanceProperties']) { $found.CimInstanceProperties['InstalledOn'].Value } else { $found.InstalledOn }
+        $d = [datetime]::MinValue
+        if ($raw -is [datetime]) { $date = $raw } elseif ([datetime]::TryParse([string]$raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { $date = $d }
+    }
+    if (-not $date -and $wu.Count -gt 0) { $date = $wu[0].Date }
     [pscustomobject]@{
         'KB'              = $kb
         'Stan'            = $(if ($installed) { 'Zainstalowana' } else { 'Brak' })
@@ -12257,7 +12424,17 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'SecurityAu
             & $check 'LAPS skonfigurowany' $laps 'brak konfiguracji LAPS'
             # Aktualizacje
             $last = $null
-            try { $last = @(Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending)[0].InstalledOn } catch { }
+            try {
+                $hf = @(Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction Stop | ForEach-Object {
+                    # Data z WMI jako tekst (np. 10/8/2026) - Get-HotFix (InstalledOn) rzuca wyjątek przy innych formatach
+                    $raw = if ($_.PSObject.Properties['CimInstanceProperties']) { $_.CimInstanceProperties['InstalledOn'].Value } else { $_.InstalledOn }
+                    $d = [datetime]::MinValue
+                    if ($raw -is [datetime]) { $d = $raw } elseif (-not [datetime]::TryParse([string]$raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { $d = $null }
+                    if ($d) { [pscustomobject]@{ HotFixID = [string]$_.HotFixID; InstalledOn = $d } }
+                } | Sort-Object InstalledOn -Descending)
+                if ($hf.Count) { $last = $hf[0].InstalledOn }
+            }
+            catch { }
             $r['Ostatnia poprawka'] = $last
             & $check 'Aktualizacje świeże' $(if ($last) { ((Get-Date) - $last).TotalDays -le [int]$P.UpdateDays } else { $null }) "brak poprawek z ostatnich $($P.UpdateDays) dni"
             # Oczekujący restart
@@ -12728,6 +12905,75 @@ Register-Module -Workspace 'Remote' -Category 'Bezpieczeństwo' -Key 'Certificat
 #endregion
 
 #region Zarządzanie zdalne: Udostępnianie
+# Poziomy uprawnień udziału (SMB): nazwa na liście -> klucz (parametry New-SmbShare: ReadAccess / ChangeAccess / FullAccess)
+$script:ShareLevels = [ordered]@{ 'Odczyt' = 'Read'; 'Zmiana' = 'Change'; 'Pełna kontrola' = 'Full' }
+$script:ShareLevelTones = @{ Read = @('#1B2B40', '#8CB0FF'); Change = @('#2E2A16', '#E5B567'); Full = @('#3A1E24', '#FF7A86') }
+
+function Get-ShareLevelText([string]$Level) {
+    foreach ($k in $script:ShareLevels.Keys) { if ($script:ShareLevels[$k] -eq $Level) { return $k } }
+    return $Level
+}
+
+function Add-ShareAccessEntry {
+    # Wpisy uprawnień nowego udziału: jedno konto - jeden poziom (ponowne dodanie zmienia poziom)
+    param([Parameter(Mandatory)][hashtable]$Module, [string[]]$Accounts, [string]$Level)
+    $key = [string]$script:ShareLevels[$Level]
+    if (-not $key) { $key = 'Read' }
+    $list = $Module.Data.ShareAccess
+    foreach ($a in @($Accounts | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })) {
+        foreach ($old in @($list | Where-Object { $_.Account -eq $a })) { $list.Remove($old) }
+        [void]$list.Add(@{ Account = $a; Level = $key })
+    }
+    Update-ShareAccessView -Module $Module
+}
+
+$script:ShareAccessEvents = @{
+    Remove = {
+        param($s, $e)
+        $m = $s.Tag.Module
+        foreach ($old in @($m.Data.ShareAccess | Where-Object { $_.Account -eq $s.Tag.Account })) { $m.Data.ShareAccess.Remove($old) }
+        Update-ShareAccessView -Module $m
+    }
+}
+
+function Update-ShareAccessView {
+    # Lista wpisów jako etykiety (konto · poziom, kolor według poziomu) z przyciskiem usunięcia
+    param([Parameter(Mandatory)][hashtable]$Module)
+    $panel = $Module.AccessHost
+    $panel.Children.Clear()
+    if ($Module.Data.ShareAccess.Count -eq 0) {
+        [void](Add-Label -Parent $panel -Text 'Brak wpisów – Windows nada «Wszyscy: Odczyt». Typowo: grupy działów z poziomem Zmiana, administratorzy – Pełna kontrola; szczegółowy dostęp ustawia się w NTFS.' -Hint -MaxWidth 760)
+        return
+    }
+    foreach ($entry in @($Module.Data.ShareAccess)) {
+        $tone = $script:ShareLevelTones[$entry.Level]
+        $chip = New-Object System.Windows.Controls.Border
+        $chip.CornerRadius = 9
+        $chip.Padding = '10,3,4,3'
+        $chip.Margin = '0,0,8,6'
+        $chip.Background = Get-Brush $tone[0]
+        $sp = New-Object System.Windows.Controls.StackPanel
+        $sp.Orientation = 'Horizontal'
+        $t1 = New-Object System.Windows.Controls.TextBlock
+        $t1.Text = $entry.Account
+        $t1.VerticalAlignment = 'Center'
+        $t2 = New-Object System.Windows.Controls.TextBlock
+        $t2.Text = '  ' + (Get-ShareLevelText $entry.Level)
+        $t2.Foreground = Get-Brush $tone[1]
+        $t2.FontWeight = 'SemiBold'
+        $t2.VerticalAlignment = 'Center'
+        $x = New-PlainButton -Text '' -Icon 'E711' -Ghost
+        $x.ToolTip = "Usuń $($entry.Account) z listy"
+        $x.Padding = '5,2'
+        $x.Margin = '6,0,0,0'
+        $x.Tag = @{ Module = $Module; Account = $entry.Account }
+        $x.add_Click($script:ShareAccessEvents.Remove)
+        foreach ($c in $t1, $t2, $x) { [void]$sp.Children.Add($c) }
+        $chip.Child = $sp
+        [void]$panel.Children.Add($chip)
+    }
+}
+
 Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Title 'Udziały sieciowe' -Icon 'E72D' `
     -Description 'Udziały SMB na zaznaczonych komputerach: podgląd, uprawnienia, tworzenie (z uprawnieniami udziału i opcjonalnie NTFS) oraz usuwanie.' -Build {
     param($m)
@@ -12831,26 +13077,54 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
     $m.NewName = Add-TextBox -Parent $row2 -Width 150 -Placeholder 'Nazwa udziału'
     $m.NewPath = Add-TextBox -Parent $row2 -Width 220 -Text 'D:\Udzial' -Placeholder 'Ścieżka na komputerze'
     $m.NewDesc = Add-TextBox -Parent $row2 -Width 200 -Placeholder 'Opis'
+    # Uprawnienia udziału: konto (albo kilka) i poziom z listy, wpisy widoczne poniżej (jedno konto - jeden poziom)
+    $m.Data.ShareAccess = New-Object System.Collections.ArrayList
     $row3 = Add-ToolbarRow -Module $m -Title 'Uprawnienia'
-    $m.NewFull = Add-TextBox -Parent $row3 -Width 170 -Placeholder 'Pełna kontrola'
-    $m.NewChange = Add-TextBox -Parent $row3 -Width 170 -Placeholder 'Zmiana'
-    $m.NewRead = Add-TextBox -Parent $row3 -Width 170 -Placeholder 'Odczyt'
-    $m.NewNtfs = Add-CheckBox -Parent $row3 -Text 'Nadaj też NTFS'
-    $m.NewCreate = Add-CheckBox -Parent $row3 -Text 'Utwórz folder' -Checked $true
-    Add-Button -Parent $row3 -Text 'Utwórz' -Icon 'E710' -Module $m -OnClick {
+    $m.NewAccount = Add-TextBox -Parent $row3 -Width 260 -Placeholder 'DOMENA\grupa lub konto (kilka – po przecinku)'
+    $m.NewLevel = Add-ComboBox -Parent $row3 -Items @($script:ShareLevels.Keys) -Width 140
+    $m.NewLevel.ToolTip = 'Odczyt – przeglądanie i otwieranie plików; Zmiana – także tworzenie, zapis i usuwanie; Pełna kontrola – także zmiana uprawnień'
+    Add-Button -Parent $row3 -Text 'Dodaj' -Icon 'E710' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $accounts = @(Split-ListText $m.NewAccount.Text)
+        if ($accounts.Count -eq 0) { Show-Warning 'Podaj konto lub grupę, np. FIRMA\Księgowość albo Wszyscy.'; return }
+        Add-ShareAccessEntry -Module $m -Accounts $accounts -Level ([string]$m.NewLevel.SelectedItem)
+        $m.NewAccount.Text = ''
+    } | Out-Null
+    Add-Button -Parent $row3 -Text 'Grupy z AD…' -Icon 'E902' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $level = [string]$m.NewLevel.SelectedItem
+        $groups = Select-AdGroups -Title 'Grupy z dostępem do udziału' -Subtitle "Wybrane grupy dostaną uprawnienie udziału «$level» (poziom zmienisz na liście obok przycisku)."
+        if (-not $groups) { return }
+        $domain = if ($env:USERDOMAIN) { $env:USERDOMAIN } else { '' }
+        Add-ShareAccessEntry -Module $m -Accounts @($groups | ForEach-Object { if ($domain) { "$domain\$($_.Sam)" } else { $_.Sam } }) -Level $level
+    } | Out-Null
+    $m.AccessHost = Add-ToolbarRow -Module $m -Title 'Lista uprawnień'
+    Update-ShareAccessView -Module $m
+    $row4 = Add-ToolbarRow -Module $m -Title 'Utworzenie'
+    $m.NewNtfs = Add-CheckBox -Parent $row4 -Text 'Nadaj też NTFS na folderze' -ToolTip 'Te same konta na folderze (z dziedziczeniem): Odczyt = odczyt i wykonanie, Zmiana = modyfikacja, Pełna kontrola = pełna kontrola'
+    $m.NewCreate = Add-CheckBox -Parent $row4 -Text 'Utwórz folder, jeśli nie istnieje' -Checked $true
+    Add-Button -Parent $row4 -Text 'Utwórz udział' -Icon 'E710' -Module $m -OnClick {
         param($m)
         $name = $m.NewName.Text.Trim()
         $path = $m.NewPath.Text.Trim()
         if (-not $name -or -not $path) { Show-Warning 'Podaj nazwę udziału i ścieżkę folderu na komputerze.'; return }
         if ($path -notmatch '^[A-Za-z]:\\') { Show-Warning 'Ścieżka musi być lokalną ścieżką na komputerze, np. D:\Dane\Projekty.'; return }
+        # Konto wpisane, ale niedodane do listy - dodajemy z wybranym poziomem (żeby nie zginęło)
+        $pending = @(Split-ListText $m.NewAccount.Text)
+        if ($pending.Count) { Add-ShareAccessEntry -Module $m -Accounts $pending -Level ([string]$m.NewLevel.SelectedItem); $m.NewAccount.Text = '' }
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
+        $entries = @($m.Data.ShareAccess)
+        $byLevel = @{ Full = @(); Change = @(); Read = @() }
+        foreach ($e in $entries) { $byLevel[$e.Level] += $e.Account }
         $params = @{
             Name = $name; Path = $path; Description = $m.NewDesc.Text.Trim()
-            Full = @(Split-ListText $m.NewFull.Text); Change = @(Split-ListText $m.NewChange.Text); Read = @(Split-ListText $m.NewRead.Text)
+            Full = @($byLevel.Full); Change = @($byLevel.Change); Read = @($byLevel.Read)
             Ntfs = (Test-Checked $m.NewNtfs); CreateFolder = (Test-Checked $m.NewCreate)
         }
-        $targets = @(Confirm-Action -Text ("Utworzyć udział {0} -> {1}?" -f $name, $path) -Items $targets -ConfirmText 'Utwórz' -Select); if ($targets.Count -eq 0) { return }
+        $access = if ($entries.Count) { (@($entries | ForEach-Object { '{0} – {1}' -f $_.Account, (Get-ShareLevelText $_.Level) }) -join '; ') } else { 'brak wpisów – Windows nada «Wszyscy: Odczyt»' }
+        $text = "Utworzyć udział {0} -> {1}?`r`n`r`nUprawnienia udziału: {2}{3}" -f $name, $path, $access, $(if ($params.Ntfs -and $entries.Count) { "`r`nTe same uprawnienia zostaną nadane w NTFS na folderze." } else { '' })
+        $targets = @(Confirm-Action -Text $text -Items $targets -ConfirmText 'Utwórz' -Select); if ($targets.Count -eq 0) { return }
         Start-HostOperation -Module $m -Name 'Tworzenie udziału' -Targets $targets -Output Log -Parameters $params -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
             param($P)
             if (-not (Test-Path -LiteralPath $P.Path)) {
@@ -29219,7 +29493,13 @@ $script:ServerCheckScript = {
         else { Add-Check 'Ogólne' 'Oczekujący restart' 'OK' 'nie' }
     }
     Invoke-Check 'Ogólne' 'Aktualizacje' {
-        $last = @(Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object -Property InstalledOn -Descending | Select-Object -First 1)
+        $last = @(Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction Stop | ForEach-Object {
+            # Data z WMI jako tekst (np. 10/8/2026) - Get-HotFix (InstalledOn) rzuca wyjątek przy innych formatach
+            $raw = if ($_.PSObject.Properties['CimInstanceProperties']) { $_.CimInstanceProperties['InstalledOn'].Value } else { $_.InstalledOn }
+            $d = [datetime]::MinValue
+            if ($raw -is [datetime]) { $d = $raw } elseif (-not [datetime]::TryParse([string]$raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { $d = $null }
+            if ($d) { [pscustomobject]@{ HotFixID = [string]$_.HotFixID; InstalledOn = $d } }
+        } | Sort-Object InstalledOn -Descending)
         if (-not $last.Count) { Add-Check 'Ogólne' 'Aktualizacje' 'Ostrzeżenie' 'brak informacji o zainstalowanych poprawkach' '' 'Sprawdź Windows Update na serwerze.' }
         else {
             $d = & $days $last[0].InstalledOn
