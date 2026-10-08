@@ -5284,12 +5284,13 @@ try {
         }
         if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
         if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
-        $result.Data = @(Invoke-Command @ic)
+        # $null z bloku (np. funkcja zwracająca $null) nie trafia do wyników - OnResult pracuje pod StrictMode
+        $result.Data = @(Invoke-Command @ic | Where-Object { $null -ne $_ })
         if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { $_.Exception.Message }) }
     }
     else {
         $raw = @(& $sb $Target $P $Ctx 2>&1)
-        $result.Data = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+        $result.Data = @($raw | Where-Object { $null -ne $_ -and $_ -isnot [System.Management.Automation.ErrorRecord] })
         $result.Errors = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.Exception.Message })
     }
 }
@@ -7604,7 +7605,7 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Connectivity' 
     } | Out-Null
     Add-Button -Parent $row2 -Text 'Zaznacz tylko dostępne' -Icon 'E73E' -Module $m -AlwaysEnabled -ToolTip 'Na liście komputerów zostaną zaznaczone tylko komputery dostępne w ostatnim teście' -OnClick {
         param($m)
-        $online = @($m.Table.Rows | Where-Object { [string]$_['__tone'] -eq 'ok' } | ForEach-Object { [string]$_['Komputer'] })
+        $online = @($m.Table.Rows | Where-Object { [string](Get-ObjectValue $_ '__tone') -eq 'ok' } | ForEach-Object { [string](Get-ObjectValue $_ 'Komputer') })
         if ($online.Count -eq 0) { Show-Warning 'Brak komputerów dostępnych w ostatnim teście.'; return }
         foreach ($r in $script:UI.HostTable.Rows) { $r['Sel'] = ($online -contains [string]$r['Name']) }
         Update-TargetCount $script:UI.ComputerPanel
@@ -8004,9 +8005,10 @@ $script:ProfileClassifyScript = {
 
 function Update-ProfileStats {
     param([hashtable]$Module)
-    $rows = @($Module.Table.Rows | Where-Object { [string]$_['SID'] })
-    $candidates = @($rows | Where-Object { [string]$_['Kandydat'] -eq 'Tak' })
-    $measured = @($candidates | Where-Object { $_['Rozmiar (GB)'] -isnot [System.DBNull] })
+    # Same wiersze błędów (żaden komputer nie odpowiedział) - tabela nie ma kolumn profili
+    $rows = @($Module.Table.Rows | Where-Object { [string](Get-ObjectValue $_ 'SID') })
+    $candidates = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Kandydat') -eq 'Tak' })
+    $measured = @($candidates | Where-Object { $null -ne (Get-ObjectValue $_ 'Rozmiar (GB)') })
     $hosts = @($Module.Table.Rows | ForEach-Object { [string]$_['Komputer'] } | Select-Object -Unique)
     Set-StatTile -Module $Module -Key 'profiles' -Value ([string]$rows.Count)
     Set-StatTile -Module $Module -Key 'candidates' -Value ([string]$candidates.Count) -Tone $(if ($candidates.Count) { 'warn' } else { 'ok' })
@@ -8657,6 +8659,91 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Commands'
     Add-RowAction -Module $m -Text 'Uruchom polecenie ponownie na tych komputerach' -Icon 'E768' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Run }
 }
 
+# Uruchomienie instalatora na komputerze (w sesji WinRM): polecenie wg rozszerzenia, limit czasu, kod wyjścia z opisem.
+# Przekazywane do wątku operacji jako tekst (RunScript) - blok zewnętrzny działa w innym runspace.
+$script:InstallRunScript = {
+    param($File, $ExtraArgs, $Cleanup, $TimeoutSec)
+    $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
+    $log = [System.IO.Path]::ChangeExtension($File, '.log')
+    $exe = $File
+    $arguments = [string]$ExtraArgs
+    switch ($ext) {
+        '.msi' { $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $arguments = ('/i "{0}" /qn /norestart /l*v "{1}" {2}' -f $File, $log, $ExtraArgs) }
+        '.msp' { $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $arguments = ('/p "{0}" /qn /norestart /l*v "{1}" {2}' -f $File, $log, $ExtraArgs) }
+        '.msu' {
+            # wusa.exe w sesji WinRM kończy się kodem 5 (odmowa dostępu, KB2773898) - pakiet instaluje DISM:
+            # Windows 10 / Server 2016 i nowsze przyjmują .msu, starsze - rozpakowany pakiet .cab
+            $exe = Join-Path $env:SystemRoot 'System32\dism.exe'
+            $pkg = $File
+            if ([int](Get-CimInstance -ClassName Win32_OperatingSystem).BuildNumber -lt 10240) {
+                $xdir = [System.IO.Path]::ChangeExtension($File, '.pkg')
+                New-Item -ItemType Directory -Path $xdir -Force | Out-Null
+                & (Join-Path $env:SystemRoot 'System32\expand.exe') "-F:*" $File $xdir | Out-Null
+                $cab = @(Get-ChildItem -LiteralPath $xdir -Filter '*.cab' | Where-Object { $_.Name -notlike 'WSUSSCAN*' } | Select-Object -First 1)
+                if (-not $cab.Count) { throw 'W pakiecie .msu nie ma pliku .cab z aktualizacją.' }
+                $pkg = $cab[0].FullName
+            }
+            $arguments = ('/Online /Add-Package /PackagePath:"{0}" /Quiet /NoRestart /LogPath:"{1}" {2}' -f $pkg, $log, $ExtraArgs)
+        }
+        default { $log = '' }
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $spArgs = @{ FilePath = $exe; PassThru = $true; WindowStyle = 'Hidden' }
+    if ($arguments.Trim()) { $spArgs.ArgumentList = $arguments.Trim() }
+    $kill = New-Object System.Diagnostics.ProcessStartInfo
+    $kill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $kill.UseShellExecute = $false
+    $kill.CreateNoWindow = $true
+    $proc = Start-Process @spArgs
+    $null = $proc.Handle
+    $timedOut = $false
+    try {
+        # Czekanie w pętli (zamiast WaitForExit) pozwala przerwać operację; finally zamyka instalator
+        while (-not $proc.HasExited) {
+            if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $timedOut = $true; break }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    finally {
+        if (-not $proc.HasExited) {
+            try { $kill.Arguments = '/T /F /PID ' + $proc.Id; [void][System.Diagnostics.Process]::Start($kill).WaitForExit(10000) } catch { }
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+        }
+    }
+    if ($timedOut) {
+        if ($Cleanup) { Start-Sleep -Seconds 1; Remove-Item -LiteralPath $File -Force -ErrorAction SilentlyContinue }
+        return [pscustomobject]@{ Plik = [System.IO.Path]::GetFileName($File); Kod = $null; Wynik = "Błąd – przekroczono limit czasu ($TimeoutSec s), instalator zatrzymany (czekał na odpowiedź? sprawdź przełączniki cichej instalacji)"; Czas = [Math]::Round($sw.Elapsed.TotalSeconds); Log = $log }
+    }
+    $code = $proc.ExitCode
+    $known = @{
+        0           = 'Sukces'
+        3010        = 'Sukces – wymagany restart'
+        1641        = 'Sukces – instalator uruchomił restart'
+        1602        = 'Błąd – instalacja anulowana'
+        1603        = 'Błąd – krytyczny błąd instalacji (1603)'
+        1618        = 'Błąd – trwa inna instalacja (1618)'
+        1619        = 'Błąd – nie można otworzyć pakietu (1619)'
+        1625        = 'Błąd – instalacja zablokowana przez zasady (1625)'
+        1633        = 'Błąd – nieobsługiwana platforma (1633)'
+        1638        = 'Błąd – zainstalowana jest inna wersja produktu (1638)'
+        2359302     = 'Aktualizacja jest już zainstalowana'
+        -2145124329 = 'Aktualizacja nie dotyczy tego systemu'
+        -2146498530 = 'Aktualizacja nie dotyczy tego systemu (DISM 0x800F081E)'
+        -2147021886 = 'Sukces – wymagany restart'
+        -2146498270 = 'Błąd – instalacja pakietu nie powiodła się (DISM 0x800F0922: za mało miejsca na partycji rezerwowej systemu albo brak wymaganej aktualizacji stosu obsługi)'
+        -2146498512 = 'Błąd – brakuje wymaganej wcześniejszej aktualizacji (DISM 0x800F0830)'
+        87          = 'Błąd – nieprawidłowy parametr polecenia (87)'
+    }
+    $meaning = if ($known.ContainsKey($code)) { $known[$code] } else { "Błąd – kod wyjścia $code" }
+    if ($Cleanup) {
+        Start-Sleep -Seconds 1
+        Remove-Item -LiteralPath $File -Force -ErrorAction SilentlyContinue
+        $xdir = [System.IO.Path]::ChangeExtension($File, '.pkg')
+        if ($ext -eq '.msu' -and (Test-Path -LiteralPath $xdir)) { Remove-Item -LiteralPath $xdir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    [pscustomobject]@{ Plik = [System.IO.Path]::GetFileName($File); Kod = $code; Wynik = $meaning; Czas = [Math]::Round($sw.Elapsed.TotalSeconds); Log = $log }
+}
+
 Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' -Title 'Instalacja oprogramowania' -Icon 'E896' `
     -Description 'Kopiuje instalator (MSI, MSP, MSU, EXE) na zaznaczone komputery i uruchamia go w trybie cichym. Wynik zawiera kod wyjścia i jego znaczenie.' -Build {
     param($m)
@@ -8689,7 +8776,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
         if (-not $targets) { return }
         $targets = @(Confirm-Action -Text "Zainstalować $([System.IO.Path]::GetFileName($path)) na zaznaczonych komputerach?" -Items $targets -ConfirmText 'Zainstaluj' -Select)
         if ($targets.Count -eq 0) { return }
-        $params = @{ LocalPath = $path; FileName = [System.IO.Path]::GetFileName($path); Args = $extra; Cleanup = (Test-Checked $m.Cleanup); TimeoutSec = [int]$script:ExecTimeouts[[string]$m.Timeout.SelectedItem] }
+        $params = @{ LocalPath = $path; FileName = [System.IO.Path]::GetFileName($path); Args = $extra; Cleanup = (Test-Checked $m.Cleanup); TimeoutSec = [int]$script:ExecTimeouts[[string]$m.Timeout.SelectedItem]; RunScript = $script:InstallRunScript.ToString() }
         Start-HostOperation -Module $m -Name 'Instalacja' -Targets $targets -Local -Parameters $params -ScriptBlock {
             param($Target, $P, $Ctx)
             $ErrorActionPreference = 'Stop'
@@ -8717,67 +8804,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
                     Copy-Item -LiteralPath $P.LocalPath -Destination $remoteFile -ToSession $session -Force
                     $method = 'WinRM'
                 }
-                $res = Invoke-Command -Session $session -ArgumentList $remoteFile, $P.Args, $P.Cleanup, $P.TimeoutSec -ScriptBlock {
-                    param($File, $ExtraArgs, $Cleanup, $TimeoutSec)
-                    $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
-                    $log = [System.IO.Path]::ChangeExtension($File, '.log')
-                    $exe = $File
-                    $arguments = [string]$ExtraArgs
-                    switch ($ext) {
-                        '.msi' { $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $arguments = ('/i "{0}" /qn /norestart /l*v "{1}" {2}' -f $File, $log, $ExtraArgs) }
-                        '.msp' { $exe = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $arguments = ('/p "{0}" /qn /norestart /l*v "{1}" {2}' -f $File, $log, $ExtraArgs) }
-                        '.msu' { $exe = Join-Path $env:SystemRoot 'System32\wusa.exe'; $arguments = ('"{0}" /quiet /norestart {1}' -f $File, $ExtraArgs); $log = '' }
-                        default { $log = '' }
-                    }
-                    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                    $spArgs = @{ FilePath = $exe; PassThru = $true; WindowStyle = 'Hidden' }
-                    if ($arguments.Trim()) { $spArgs.ArgumentList = $arguments.Trim() }
-                    $kill = New-Object System.Diagnostics.ProcessStartInfo
-                    $kill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-                    $kill.UseShellExecute = $false
-                    $kill.CreateNoWindow = $true
-                    $proc = Start-Process @spArgs
-                    $null = $proc.Handle
-                    $timedOut = $false
-                    try {
-                        # Czekanie w pętli (zamiast WaitForExit) pozwala przerwać operację; finally zamyka instalator
-                        while (-not $proc.HasExited) {
-                            if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $timedOut = $true; break }
-                            Start-Sleep -Milliseconds 500
-                        }
-                    }
-                    finally {
-                        if (-not $proc.HasExited) {
-                            try { $kill.Arguments = '/T /F /PID ' + $proc.Id; [void][System.Diagnostics.Process]::Start($kill).WaitForExit(10000) } catch { }
-                            try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
-                        }
-                    }
-                    if ($timedOut) {
-                        if ($Cleanup) { Start-Sleep -Seconds 1; Remove-Item -LiteralPath $File -Force -ErrorAction SilentlyContinue }
-                        return [pscustomobject]@{ Plik = [System.IO.Path]::GetFileName($File); Kod = $null; Wynik = "Błąd – przekroczono limit czasu ($TimeoutSec s), instalator zatrzymany (czekał na odpowiedź? sprawdź przełączniki cichej instalacji)"; Czas = [Math]::Round($sw.Elapsed.TotalSeconds); Log = $log }
-                    }
-                    $code = $proc.ExitCode
-                    $known = @{
-                        0           = 'Sukces'
-                        3010        = 'Sukces – wymagany restart'
-                        1641        = 'Sukces – instalator uruchomił restart'
-                        1602        = 'Błąd – instalacja anulowana'
-                        1603        = 'Błąd – krytyczny błąd instalacji (1603)'
-                        1618        = 'Błąd – trwa inna instalacja (1618)'
-                        1619        = 'Błąd – nie można otworzyć pakietu (1619)'
-                        1625        = 'Błąd – instalacja zablokowana przez zasady (1625)'
-                        1633        = 'Błąd – nieobsługiwana platforma (1633)'
-                        1638        = 'Błąd – zainstalowana jest inna wersja produktu (1638)'
-                        2359302     = 'Aktualizacja jest już zainstalowana'
-                        -2145124329 = 'Aktualizacja nie dotyczy tego systemu'
-                    }
-                    $meaning = if ($known.ContainsKey($code)) { $known[$code] } else { "Błąd – kod wyjścia $code" }
-                    if ($Cleanup) {
-                        Start-Sleep -Seconds 1
-                        Remove-Item -LiteralPath $File -Force -ErrorAction SilentlyContinue
-                    }
-                    [pscustomobject]@{ Plik = [System.IO.Path]::GetFileName($File); Kod = $code; Wynik = $meaning; Czas = [Math]::Round($sw.Elapsed.TotalSeconds); Log = $log }
-                }
+                $res = Invoke-Command -Session $session -ArgumentList $remoteFile, $P.Args, $P.Cleanup, $P.TimeoutSec -ScriptBlock ([scriptblock]::Create($P.RunScript))
                 [pscustomobject]@{
                     'Plik'            = $res.Plik
                     'Wynik'           = $res.Wynik
@@ -10461,63 +10488,265 @@ function Hide-EventIds {
 #endregion
 
 #region Zarządzanie zdalne: Oprogramowanie
-# Skrypt instalacji aktualizacji uruchamiany na komputerze jako zadanie SYSTEM - API Windows Update
-# (pobieranie/instalacja) nie działa bezpośrednio w sesji WinRM.
+# Windows Update: API (Microsoft.Update.Session) odmawia dostępu procesom z sesji WinRM - nie tylko przy pobieraniu
+# i instalacji, ale na nowszych systemach także przy wyszukiwaniu. Dlatego wyszukiwanie, historia i instalacja działają
+# jako zadanie Harmonogramu na koncie SYSTEM: parametry w WU-<tryb>.request.json, wynik i postęp w WU-<tryb>.json
+# (zapis atomowy), dziennik w WU.log - wszystko w %SystemRoot%\Temp\DomainOps.
 $script:WuJobScript = @'
-param([switch]$AutoReboot, [switch]$IncludeDrivers)
-$log = Join-Path $PSScriptRoot 'WU.log'
-function Write-WuLog([string]$Text) {
-    Add-Content -LiteralPath $log -Value ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $Text) -Encoding UTF8
+param([string]$Mode = 'Install')
+$dir = Join-Path $env:SystemRoot 'Temp\DomainOps'
+# Dziennik instalacji: WU.log (jak w poprzednich wersjach), wyszukiwania i historii: WU-<tryb>.log
+$log = Join-Path $dir $(if ($Mode -eq 'Install') { 'WU.log' } else { "WU-$Mode.log" })
+$req = @{}
+$reqFile = Join-Path $dir ('WU-{0}.request.json' -f $Mode)
+if (Test-Path -LiteralPath $reqFile) {
+    $j = Get-Content -LiteralPath $reqFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($p in $j.PSObject.Properties) { $req[$p.Name] = $p.Value }
 }
-Write-WuLog '==== START ===='
+$state = [ordered]@{ RunId = [string]$req['RunId']; Mode = $Mode; Phase = 'Start'; Done = $false; Error = ''; HResult = ''; Started = (Get-Date).ToString('s'); Finished = ''; RebootRequired = $false; Notes = @(); Updates = @(); History = @() }
+function Write-WuLog([string]$Text) {
+    try { Add-Content -LiteralPath $log -Value ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $Text) -Encoding UTF8 } catch { }
+}
+function Save-WuState {
+    $file = Join-Path $dir ('WU-{0}.json' -f $Mode)
+    $tmp = $file + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, ($state | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmp -Destination $file -Force
+}
+function Format-HResult($Value) {
+    # Kod 32-bitowy jako 0xXXXXXXXX (HResult bywa ujemnym Int32, LastTaskResult - UInt32)
+    $n = [int64]$Value
+    if ($n -lt 0) { $n += 4294967296 }
+    return ('0x{0:X8}' -f $n)
+}
+function Get-WuHResult($Err) {
+    # HRESULT z wyjątku COM (opakowanego przez PowerShell) albo z tekstu komunikatu
+    $ex = $Err.Exception
+    while ($ex.InnerException) { $ex = $ex.InnerException }
+    $m = [regex]::Match([string]$Err.Exception.Message, '0x[0-9A-Fa-f]{8}')
+    if ($m.Success) { return $m.Value.ToUpperInvariant().Replace('0X', '0x') }
+    $hr = Format-HResult $ex.HResult
+    if ($ex.HResult -and -not $hr.StartsWith('0x8013')) { return $hr }
+    return ''
+}
+function Get-WuResultText([int]$Code, [switch]$Download) {
+    switch ($Code) { 0 { 'Nie rozpoczęto' } 1 { 'W toku' } 2 { if ($Download) { 'Pobrano' } else { 'Zainstalowano' } } 3 { if ($Download) { 'Pobrano z błędami' } else { 'Zainstalowano z błędami' } } 4 { if ($Download) { 'Błąd pobierania' } else { 'Błąd' } } 5 { 'Przerwano' } default { "Kod $Code" } }
+}
+function ConvertTo-WuRecord($u) {
+    [ordered]@{
+        Id          = [string]$u.Identity.UpdateID
+        Title       = [string]$u.Title
+        KB          = (@($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ', ')
+        Categories  = (@($u.Categories | ForEach-Object { [string]$_.Name }) -join ', ')
+        Severity    = [string]$u.MsrcSeverity
+        SizeMB      = [Math]::Round([double]$u.MaxDownloadSize / 1MB, 1)
+        Downloaded  = [bool]$u.IsDownloaded
+        Reboot      = ([int]$u.InstallationBehavior.RebootBehavior -ne 0)
+        Interactive = [bool]$u.InstallationBehavior.CanRequestUserInput
+        Result      = ''
+        HResult     = ''
+        Detail      = ''
+    }
+}
+Write-WuLog ('==== START ==== ({0})' -f $Mode)
 try {
     $session = New-Object -ComObject Microsoft.Update.Session
     $session.ClientApplicationID = 'DomainOps'
-    $criteria = "IsInstalled=0 and IsHidden=0"
-    if (-not $IncludeDrivers) { $criteria += " and Type='Software'" }
-    Write-WuLog "Wyszukiwanie aktualizacji ($criteria)…"
-    $search = $session.CreateUpdateSearcher().Search($criteria)
-    if ($search.Updates.Count -eq 0) {
-        Write-WuLog 'Brak aktualizacji do zainstalowania.'
+    $searcher = $session.CreateUpdateSearcher()
+    if ($Mode -eq 'History') {
+        $state.Phase = 'Historia'
+        $count = [int]$searcher.GetTotalHistoryCount()
+        $n = [Math]::Min($count, $(if ($req['HistoryCount']) { [int]$req['HistoryCount'] } else { 50 }))
+        $items = New-Object System.Collections.ArrayList
+        if ($n -gt 0) {
+            foreach ($h in $searcher.QueryHistory(0, $n)) {
+                if (-not $h.Title) { continue }
+                [void]$items.Add([ordered]@{ Date = ([datetime]$h.Date).ToLocalTime().ToString('s'); Title = [string]$h.Title; Operation = [int]$h.Operation; ResultCode = [int]$h.ResultCode; HResult = $(if ($h.HResult) { Format-HResult $h.HResult } else { '' }) })
+            }
+        }
+        $state.History = @($items)
     }
     else {
-        $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-        foreach ($u in $search.Updates) {
-            if (-not $u.EulaAccepted) { $u.AcceptEula() }
-            [void]$toInstall.Add($u)
-            Write-WuLog "Do instalacji: $($u.Title)"
-        }
-        Write-WuLog "Pobieranie ($($toInstall.Count))…"
-        $downloader = $session.CreateUpdateDownloader()
-        $downloader.Updates = $toInstall
-        $download = $downloader.Download()
-        Write-WuLog "Pobieranie zakończone (ResultCode=$($download.ResultCode))."
-        $ready = New-Object -ComObject Microsoft.Update.UpdateColl
-        foreach ($u in $toInstall) { if ($u.IsDownloaded) { [void]$ready.Add($u) } }
-        if ($ready.Count -eq 0) {
-            Write-WuLog 'Żadna aktualizacja nie została pobrana.'
-        }
-        else {
-            Write-WuLog "Instalacja ($($ready.Count))…"
-            $installer = $session.CreateUpdateInstaller()
-            $installer.Updates = $ready
-            $result = $installer.Install()
-            for ($i = 0; $i -lt $ready.Count; $i++) {
-                Write-WuLog ('{0} -> ResultCode={1}' -f $ready.Item($i).Title, $result.GetUpdateResult($i).ResultCode)
-            }
-            Write-WuLog "Instalacja zakończona (ResultCode=$($result.ResultCode), RebootRequired=$($result.RebootRequired))."
-            if ($result.RebootRequired -and $AutoReboot) {
-                Write-WuLog 'Restart za 5 minut.'
-                & (Join-Path $env:SystemRoot 'System32\shutdown.exe') /r /t 300 /d p:2:17 /c 'Restart po instalacji aktualizacji (Domain Ops).'
+        $criteria = 'IsInstalled=0 and IsHidden=0'
+        if (-not $req['IncludeDrivers']) { $criteria += " and Type='Software'" }
+        $state.Phase = 'Wyszukiwanie'
+        Save-WuState
+        Write-WuLog "Wyszukiwanie aktualizacji ($criteria)…"
+        $found = $searcher.Search($criteria)
+        $ids = @($req['UpdateIds'] | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $list = New-Object System.Collections.ArrayList
+        foreach ($u in $found.Updates) { if ($ids.Count -eq 0 -or $ids -contains [string]$u.Identity.UpdateID) { [void]$list.Add($u) } }
+        $recs = [ordered]@{}
+        foreach ($u in $list) { $recs[[string]$u.Identity.UpdateID] = ConvertTo-WuRecord $u }
+        $state.Updates = @($recs.Values)
+        Write-WuLog ('Znaleziono: {0}{1}.' -f $list.Count, $(if ($ids.Count) { " z $($ids.Count) wybranych" } else { '' }))
+        if ($Mode -eq 'Install') {
+            if ($ids.Count -and $list.Count -lt $ids.Count) { $state.Notes += ('{0} z wybranych aktualizacji nie jest już dostępnych (zainstalowane albo wycofane).' -f ($ids.Count - $list.Count)) }
+            if ($list.Count -eq 0) { Write-WuLog 'Brak aktualizacji do zainstalowania.'; $state.Notes += 'Brak aktualizacji do zainstalowania.' }
+            else {
+                try { if ((New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired) { $state.Notes += 'Komputer czekał na restart już przed instalacją – część aktualizacji może się zainstalować dopiero po restarcie.' } } catch { }
+                $toGet = New-Object -ComObject Microsoft.Update.UpdateColl
+                foreach ($u in $list) {
+                    $rec = $recs[[string]$u.Identity.UpdateID]
+                    if ($u.InstallationBehavior.CanRequestUserInput) { $rec.Result = 'Pominięto'; $rec.Detail = 'wymaga interakcji użytkownika – zainstaluj ręcznie'; Write-WuLog "Pominięto (wymaga interakcji): $($u.Title)"; continue }
+                    if (-not $u.EulaAccepted) { $u.AcceptEula() }
+                    [void]$toGet.Add($u)
+                    Write-WuLog "Do instalacji: $($u.Title)"
+                }
+                if ($toGet.Count -gt 0) {
+                    $state.Phase = "Pobieranie ($($toGet.Count))"
+                    Save-WuState
+                    Write-WuLog "Pobieranie ($($toGet.Count))…"
+                    $downloader = $session.CreateUpdateDownloader()
+                    $downloader.Updates = $toGet
+                    $dl = $downloader.Download()
+                    Write-WuLog "Pobieranie zakończone (ResultCode=$($dl.ResultCode))."
+                    $ready = New-Object -ComObject Microsoft.Update.UpdateColl
+                    for ($i = 0; $i -lt $toGet.Count; $i++) {
+                        $u = $toGet.Item($i)
+                        $rec = $recs[[string]$u.Identity.UpdateID]
+                        $r = $dl.GetUpdateResult($i)
+                        if ($u.IsDownloaded) { [void]$ready.Add($u) }
+                        else {
+                            $rec.Result = Get-WuResultText ([int]$r.ResultCode) -Download
+                            if ($r.HResult) { $rec.HResult = Format-HResult $r.HResult }
+                            $rec.Detail = 'nie pobrano'
+                        }
+                    }
+                    if ($ready.Count -gt 0) {
+                        $state.Phase = "Instalacja ($($ready.Count))"
+                        Save-WuState
+                        Write-WuLog "Instalacja ($($ready.Count))…"
+                        $installer = $session.CreateUpdateInstaller()
+                        try { $installer.ForceQuiet = $true } catch { }
+                        try { $installer.AllowSourcePrompts = $false } catch { }
+                        $installer.Updates = $ready
+                        $res = $installer.Install()
+                        for ($i = 0; $i -lt $ready.Count; $i++) {
+                            $u = $ready.Item($i)
+                            $rec = $recs[[string]$u.Identity.UpdateID]
+                            $r = $res.GetUpdateResult($i)
+                            $rec.Result = Get-WuResultText ([int]$r.ResultCode)
+                            if ($r.HResult) { $rec.HResult = Format-HResult $r.HResult }
+                            if ($r.RebootRequired) { $rec.Detail = 'wymaga restartu' }
+                            Write-WuLog ('{0} -> {1}{2}' -f $u.Title, $rec.Result, $(if ($rec.HResult) { " ($($rec.HResult))" } else { '' }))
+                        }
+                        $state.RebootRequired = [bool]$res.RebootRequired
+                        Write-WuLog "Instalacja zakończona (ResultCode=$($res.ResultCode), RebootRequired=$($res.RebootRequired))."
+                    }
+                    else { Write-WuLog 'Żadna aktualizacja nie została pobrana.'; $state.Notes += 'Żadna aktualizacja nie została pobrana – sprawdź połączenie z serwerem aktualizacji.' }
+                }
+                $state.Updates = @($recs.Values)
+                if ($state.RebootRequired -and $req['AutoReboot']) {
+                    Write-WuLog 'Restart za 5 minut.'
+                    $state.Notes += 'Zaplanowano restart za 5 minut.'
+                    & (Join-Path $env:SystemRoot 'System32\shutdown.exe') /r /t 300 /d p:2:17 /c 'Restart po instalacji aktualizacji (Domain Ops).'
+                }
             }
         }
     }
+    $state.Phase = 'Zakończono'
 }
 catch {
-    Write-WuLog "BŁĄD: $($_.Exception.Message)"
+    $state.Error = [string]$_.Exception.Message
+    $state.HResult = Get-WuHResult $_
+    $state.Phase = 'Błąd'
+    Write-WuLog "BŁĄD: $($state.Error)"
 }
-Write-WuLog '==== KONIEC ===='
+$state.Done = $true
+$state.Finished = (Get-Date).ToString('s')
+Save-WuState
+Write-WuLog ('==== KONIEC ==== ({0})' -f $Mode)
 '@
+
+# Wspólne funkcje bloków zdalnych Windows Update: uruchomienie zadania SYSTEM, oczekiwanie na wynik, opis błędów
+$script:WuTaskText = @'
+function Get-WuHint([string]$HResult) {
+    $hints = @{
+        '0x80070005' = 'odmowa dostępu'
+        '0x80070422' = 'usługa Windows Update (wuauserv) jest wyłączona'
+        '0x8024A000' = 'usługa Automatyczne aktualizacje nie działa'
+        '0x8024001E' = 'usługa Windows Update została zatrzymana w trakcie operacji'
+        '0x8024002E' = 'dostęp do Windows Update jest wyłączony zasadami (serwer WSUS niedostępny albo nieskonfigurowany)'
+        '0x80240438' = 'brak połączenia z usługą aktualizacji (zasady blokują Windows Update albo brak dostępu do Internetu)'
+        '0x8024402C' = 'nie można rozpoznać nazwy serwera aktualizacji (DNS albo serwer proxy)'
+        '0x8024401C' = 'serwer aktualizacji (WSUS) nie odpowiedział w czasie'
+        '0x80244018' = 'serwer aktualizacji odmówił dostępu (HTTP 403 – serwer proxy?)'
+        '0x80244019' = 'serwer aktualizacji nie znalazł zasobu (HTTP 404 – zły adres WSUS?)'
+        '0x80244022' = 'serwer aktualizacji jest niedostępny (HTTP 503 – przeciążony WSUS / pula IIS)'
+        '0x80072EFD' = 'nie można połączyć się z serwerem aktualizacji'
+        '0x80072EE2' = 'przekroczono czas połączenia z serwerem aktualizacji'
+        '0x80072EE7' = 'nie można rozpoznać nazwy serwera aktualizacji'
+        '0x80240016' = 'trwa inna instalacja albo komputer czeka na restart'
+        '0x80242014' = 'aktualizacja czeka na restart komputera'
+        '0x80240022' = 'wszystkie aktualizacje zakończyły się błędem'
+    }
+    $k = ([string]$HResult).ToUpperInvariant().Replace('0X', '0x')
+    if ($hints.ContainsKey($k)) { return $hints[$k] }
+    return ''
+}
+function Format-WuError($State) {
+    $hint = Get-WuHint ([string]$State.HResult)
+    $text = [string]$State.Error
+    if ($hint) { $text = '{0} – {1}' -f $hint, $text }
+    return $text
+}
+function Invoke-WuTask {
+    # Zadanie SYSTEM z API Windows Update. -Wait: czeka na wynik (WU-<tryb>.json z tym samym RunId) najdłużej -TimeoutSec;
+    # bez -Wait: wraca, gdy zadanie wystartuje. Zadanie, które skończy się bez wyniku, zgłasza kod LastTaskResult.
+    param([string]$Mode, [string]$Script, [hashtable]$Request = @{}, [switch]$Wait, [int]$TimeoutSec = 1800)
+    $dir = Join-Path $env:SystemRoot 'Temp\DomainOps'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $taskName = if ($Mode -eq 'Install') { 'DomainOps-WindowsUpdate' } else { "DomainOps-WU-$Mode" }
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing -and [string]$existing.State -eq 'Running') {
+        if ($Mode -eq 'Install') { throw 'Na komputerze trwa już instalacja aktualizacji (zadanie DomainOps-WindowsUpdate) – postęp: «Stan instalacji».' }
+        throw "Na komputerze trwa już to samo zadanie ($taskName) – spróbuj za chwilę."
+    }
+    $file = Join-Path $dir 'DomainOps-WU.ps1'
+    [System.IO.File]::WriteAllText($file, $Script, (New-Object System.Text.UTF8Encoding($true)))
+    $runId = [guid]::NewGuid().ToString('N')
+    $Request.RunId = $runId
+    [System.IO.File]::WriteAllText((Join-Path $dir "WU-$Mode.request.json"), ($Request | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    $out = Join-Path $dir "WU-$Mode.json"
+    # -Command z blokiem utworzonym z tekstu pliku: zasady wykonywania (także AllSigned z GPO) dotyczą plików skryptów, nie poleceń
+    $cmd = "& ([scriptblock]::Create([System.IO.File]::ReadAllText('$file'))) -Mode $Mode"
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "{0}"' -f $cmd)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    $started = Get-Date
+    Start-ScheduledTask -TaskName $taskName
+    $deadline = $started.AddSeconds($(if ($Wait) { $TimeoutSec } else { 30 }))
+    while ($true) {
+        $st = $null
+        if (Test-Path -LiteralPath $out) { try { $st = Get-Content -LiteralPath $out -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $st = $null } }
+        if ($st -and [string]$st.RunId -eq $runId -and ($st.Done -or -not $Wait)) {
+            if ($Mode -ne 'Install') { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
+            return $st
+        }
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        $running = $task -and [string]$task.State -eq 'Running'
+        $elapsed = ((Get-Date) - $started).TotalSeconds
+        if (-not $running -and $elapsed -gt 10) {
+            $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+            $code = '?'
+            if ($info) { $n = [int64]$info.LastTaskResult; if ($n -lt 0) { $n += 4294967296 }; $code = '0x{0:X8}' -f $n }
+            throw ("Zadanie {0} zakończyło się bez wyniku (kod {1}) – skrypt nie wystartował albo został przerwany; szczegóły w {2}\WU.log i w historii zadania." -f $taskName, $code, $dir)
+        }
+        if ((Get-Date) -gt $deadline) {
+            if (-not $Wait) { return [pscustomobject]@{ RunId = $runId; Phase = 'Uruchomiono'; Done = $false; Error = ''; HResult = '' } }
+            throw ("Brak wyniku po {0} min – zadanie {1} nadal działa (wynik pojawi się w {2}\WU-{3}.json)." -f [int]($TimeoutSec / 60), $taskName, $dir, $Mode)
+        }
+        Start-Sleep -Milliseconds 1500
+    }
+}
+'@
+
+function New-WuScript([string]$Body) {
+    # Blok zdalny Windows Update: param($P), wspólne funkcje (Invoke-WuTask, opisy błędów) i właściwa treść
+    return [scriptblock]::Create("param(`$P)`n" + $script:WuTaskText + "`n" + $Body)
+}
 
 # Wspólna funkcja (wklejana do bloków zdalnych): jak odinstalować program z danego wpisu rejestru.
 # Kind: msi | quiet | inno (da się po cichu), interactive (tylko z przełącznikami), none, blocked.
@@ -10807,62 +11036,204 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'Programs' -
     }
 }
 
+# Treści bloków zdalnych Windows Update (składane przez New-WuScript z funkcjami $script:WuTaskText)
+$script:WuSearchBody = @'
+$st = Invoke-WuTask -Mode 'Search' -Script $P.Script -Request @{ IncludeDrivers = [bool]$P.IncludeDrivers } -Wait -TimeoutSec 1800
+if ($st.Error) { throw ('Wyszukiwanie aktualizacji: ' + (Format-WuError $st)) }
+$ups = @($st.Updates | Where-Object { $_ })
+if ($ups.Count -eq 0) { return [pscustomobject]@{ 'Aktualizacja' = '(brak dostępnych aktualizacji)'; 'Stan' = 'Aktualny'; '__tone' = 'ok' } }
+foreach ($u in $ups) {
+    [pscustomobject]@{
+        'Aktualizacja'    = [string]$u.Title
+        'Stan'            = 'Do instalacji'
+        'KB'              = [string]$u.KB
+        'Kategoria'       = [string]$u.Categories
+        'Ważność'         = [string]$u.Severity
+        'Rozmiar (MB)'    = [double]$u.SizeMB
+        'Pobrana'         = [bool]$u.Downloaded
+        'Wymaga restartu' = [bool]$u.Reboot
+        'Uwagi'           = $(if ($u.Interactive) { 'wymaga interakcji użytkownika – instalacja z programu ją pominie' } else { '' })
+        '__id'            = [string]$u.Id
+        '__tone'          = $(if ([string]$u.Severity -eq 'Critical') { 'crit' } else { 'warn' })
+    }
+}
+'@
+
+$script:WuHistoryBody = @'
+$st = Invoke-WuTask -Mode 'History' -Script $P.Script -Request @{ HistoryCount = 50 } -Wait -TimeoutSec 600
+if ($st.Error) { throw ('Historia aktualizacji: ' + (Format-WuError $st)) }
+$hs = @($st.History | Where-Object { $_ })
+if ($hs.Count -eq 0) { return [pscustomobject]@{ 'Aktualizacja' = '(historia jest pusta)' } }
+foreach ($h in $hs) {
+    $code = [int]$h.ResultCode
+    [pscustomobject]@{
+        'Data'         = [datetime]::Parse([string]$h.Date, [System.Globalization.CultureInfo]::InvariantCulture)
+        'Aktualizacja' = [string]$h.Title
+        'Operacja'     = $(switch ([int]$h.Operation) { 1 { 'Instalacja' } 2 { 'Odinstalowanie' } default { '' } })
+        'Status'       = $(switch ($code) { 1 { 'W toku' } 2 { 'Sukces' } 3 { 'Sukces z błędami' } 4 { 'Błąd' } 5 { 'Przerwano' } default { 'Nieznany' } })
+        'Kod HRESULT'  = [string]$h.HResult
+        'Opis błędu'   = $(if ($h.HResult) { Get-WuHint ([string]$h.HResult) } else { '' })
+        '__tone'       = $(switch ($code) { 2 { 'ok' } 3 { 'warn' } 4 { 'crit' } 5 { 'warn' } default { 'info' } })
+    }
+}
+'@
+
+$script:WuKbBody = @'
+$hotfixes = @{}
+foreach ($h in @(Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction SilentlyContinue)) { $hotfixes[[string]$h.HotFixID] = $h }
+# Historia Windows Update: najpierw wprost (starsze systemy pozwalają na to przez WinRM), potem przez zadanie SYSTEM
+$history = @()
+$histNote = ''
+try {
+    $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+    $count = $searcher.GetTotalHistoryCount()
+    if ($count -gt 0) { $history = @($searcher.QueryHistory(0, [Math]::Min($count, 500)) | Where-Object { $_.Title -and $_.ResultCode -eq 2 -and $_.Operation -eq 1 } | ForEach-Object { [pscustomobject]@{ Title = [string]$_.Title; Date = ([datetime]$_.Date).ToLocalTime() } }) }
+}
+catch {
+    try {
+        $st = Invoke-WuTask -Mode 'History' -Script $P.Script -Request @{ HistoryCount = 500 } -Wait -TimeoutSec 300
+        if ($st.Error) { throw (Format-WuError $st) }
+        $history = @($st.History | Where-Object { $_ -and [int]$_.ResultCode -eq 2 -and [int]$_.Operation -eq 1 } | ForEach-Object { [pscustomobject]@{ Title = [string]$_.Title; Date = [datetime]::Parse([string]$_.Date, [System.Globalization.CultureInfo]::InvariantCulture) } })
+    }
+    catch { $histNote = 'historia Windows Update niedostępna (' + $_.Exception.Message + ') – sprawdzono tylko listę poprawek systemu' }
+}
+$os = Get-CimInstance -ClassName Win32_OperatingSystem
+foreach ($kb in $P.Kbs) {
+    $found = $hotfixes[$kb]
+    $wu = @($history | Where-Object { $_.Title -like "*$kb*" } | Select-Object -First 1)
+    $installed = ($null -ne $found -or $wu.Count -gt 0)
+    $date = $null
+    if ($found -and $found.InstalledOn) { $date = $found.InstalledOn } elseif ($wu.Count -gt 0) { $date = $wu[0].Date }
+    [pscustomobject]@{
+        'KB'              = $kb
+        'Stan'            = $(if ($installed) { 'Zainstalowana' } else { 'Brak' })
+        'Data instalacji' = $date
+        'Źródło'          = $(if ($found) { 'Win32_QuickFixEngineering' } elseif ($wu.Count -gt 0) { 'Historia Windows Update' } else { '' })
+        'Opis'            = $(if ($found) { $found.Description } elseif ($wu.Count -gt 0) { $wu[0].Title } else { '' })
+        'System'          = '{0} ({1})' -f $os.Caption, $os.BuildNumber
+        'Uwagi'           = $(if (-not $installed) { $histNote } else { '' })
+        '__tone'          = $(if ($installed) { 'ok' } elseif ($histNote) { 'warn' } else { 'crit' })
+    }
+}
+'@
+
+$script:WuInstallBody = @'
+$ids = @($P.UpdateIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
+$st = Invoke-WuTask -Mode 'Install' -Script $P.Script -Request @{ IncludeDrivers = [bool]$P.IncludeDrivers; AutoReboot = [bool]$P.AutoReboot; UpdateIds = $ids }
+if ($st.Error) { throw ('Instalacja aktualizacji: ' + (Format-WuError $st)) }
+$what = if ($ids.Count) { "wybrane aktualizacje ($($ids.Count))" } else { 'wszystkie dostępne aktualizacje' }
+if ($st.Done) {
+    $ok = @($st.Updates | Where-Object { $_ -and [string]$_.Result -like 'Zainstalowano*' }).Count
+    "Instalacja zakończona: zainstalowano $ok z $(@($st.Updates | Where-Object { $_ }).Count). Szczegóły: «Stan instalacji»."
+}
+else { "Zlecono instalację: $what (zadanie SYSTEM DomainOps-WindowsUpdate, etap: $($st.Phase)). Postęp i wyniki: «Stan instalacji»." }
+'@
+
+$script:WuStateBody = @'
+$dir = Join-Path $env:SystemRoot 'Temp\DomainOps'
+$taskName = 'DomainOps-WindowsUpdate'
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+$info = if ($task) { Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue } else { $null }
+$code = ''
+if ($info) { $n = [int64]$info.LastTaskResult; if ($n -lt 0) { $n += 4294967296 }; $code = '0x{0:X8}' -f $n }
+$st = $null
+$file = Join-Path $dir 'WU-Install.json'
+if (Test-Path -LiteralPath $file) { try { $st = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $st = $null } }
+$lines = @()
+$log = Join-Path $dir 'WU.log'
+if (Test-Path -LiteralPath $log) {
+    $all = @(Get-Content -LiteralPath $log -Encoding UTF8)
+    $start = 0
+    for ($i = $all.Count - 1; $i -ge 0; $i--) { if ($all[$i] -like '*==== START ====*') { $start = $i; break } }
+    if ($all.Count) { $lines = @($all[$start..($all.Count - 1)]) }
+}
+$reboot = $false
+try { $reboot = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired } catch { }
+$running = $task -and [string]$task.State -eq 'Running'
+$ups = @(if ($st) { $st.Updates | Where-Object { $_ } })
+$okCount = @($ups | Where-Object { [string]$_.Result -like 'Zainstalowano*' }).Count
+$badCount = @($ups | Where-Object { [string]$_.Result -match 'Błąd|Przerwano' }).Count
+$skipCount = @($ups | Where-Object { [string]$_.Result -eq 'Pominięto' }).Count
+$details = @()
+if ($running) { $stan = 'Trwa'; $tone = 'info'; $details += ('etap: ' + $(if ($st -and -not $st.Done) { [string]$st.Phase } else { 'uruchamianie' })) }
+elseif ($st -and $st.Error) { $stan = 'Błąd'; $tone = 'crit'; $details += (Format-WuError $st) }
+elseif ($st -and $st.Done) {
+    $stan = 'Zakończono'
+    $tone = $(if ($badCount) { 'crit' } elseif ($reboot) { 'warn' } else { 'ok' })
+    $details += ('zainstalowano {0} z {1}{2}{3}' -f $okCount, $ups.Count, $(if ($badCount) { "; błędy: $badCount" } else { '' }), $(if ($skipCount) { "; pominięto: $skipCount" } else { '' }))
+}
+elseif ($task -and $code -and $code -ne '0x00000000' -and $code -ne '0x00041303') { $stan = 'Błąd'; $tone = 'crit'; $details += "zadanie zakończyło się bez wyniku (kod $code) – skrypt nie wystartował albo został przerwany" }
+elseif ($task) { $stan = $(if ($lines.Count -and $lines[-1] -like '*KONIEC*') { 'Zakończono' } else { [string]$task.State }); $tone = 'info' }
+else { $stan = '(brak – instalacji nie zlecano)'; $tone = '' }
+if ($st) { $details += @($st.Notes | Where-Object { $_ }) }
+[pscustomobject]@{
+    'Element'         = 'Instalacja aktualizacji'
+    'Stan'            = $stan
+    'KB'              = ''
+    'Szczegóły'       = ($details -join '; ')
+    'Rozpoczęto'      = $(if ($st -and $st.Started) { [datetime]::Parse([string]$st.Started, [System.Globalization.CultureInfo]::InvariantCulture) } else { $null })
+    'Zakończono'      = $(if ($st -and $st.Finished) { [datetime]::Parse([string]$st.Finished, [System.Globalization.CultureInfo]::InvariantCulture) } else { $null })
+    'Wymaga restartu' = $reboot
+    'Kod zadania'     = $code
+    'Log'             = ($lines -join "`r`n")
+    '__tone'          = $tone
+}
+foreach ($u in $ups) {
+    $res = [string]$u.Result
+    if (-not $res) { $res = $(if ($running) { 'Oczekuje' } else { 'Nie zainstalowano' }) }
+    $why = @(@([string]$u.Detail, $(if ($u.HResult) { ('{0} {1}' -f $u.HResult, (Get-WuHint ([string]$u.HResult))).Trim() } else { '' })) | Where-Object { $_ })
+    [pscustomobject]@{
+        'Element'   = [string]$u.Title
+        'Stan'      = $res
+        'KB'        = [string]$u.KB
+        'Szczegóły' = ($why -join '; ')
+        '__tone'    = $(if ($res -like 'Zainstalowano*') { 'ok' } elseif ($res -match 'Błąd|Przerwano|Nie zainstalowano') { 'crit' } elseif ($res -eq 'Pominięto') { 'warn' } else { 'info' })
+    }
+}
+'@
+
+function Start-WuInstall {
+    # Instalacja: wszystkie dostępne aktualizacje na komputerach z listy (albo z wierszy) lub -Rows - zaznaczone wyniki wyszukiwania
+    param([hashtable]$Module, $Rows = $null)
+    $m = $Module
+    $base = @{ Script = $script:WuJobScript; AutoReboot = (Test-Checked $m.AutoReboot); IncludeDrivers = (Test-Checked $m.Drivers); UpdateIds = @() }
+    $reboot = if ($base.AutoReboot) { 'z automatycznym restartem, jeśli wymagany' } else { 'bez restartu' }
+    $per = @{}
+    if ($null -ne $Rows) {
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('__id', 'Aktualizacja') -Rows @($Rows)
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz aktualizacje w wynikach wyszukiwania («Wyszukaj dostępne»).'; return }
+        $items = @(foreach ($h in $byHost.Keys) { foreach ($x in $byHost[$h]) { '{0}: {1}' -f $h, $x['Aktualizacja'] } })
+        if (-not (Confirm-Action -Text "Zainstalować zaznaczone aktualizacje ($($items.Count), $reboot)?" -Items $items -ConfirmText 'Zainstaluj')) { return }
+        $targets = @($byHost.Keys)
+        foreach ($h in $targets) { $p = $base.Clone(); $p.UpdateIds = @($byHost[$h] | ForEach-Object { [string]$_['__id'] }); $per[$h] = $p }
+    }
+    else {
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $targets = @(Confirm-Action -Text "Zainstalować wszystkie dostępne aktualizacje ($reboot) na wybranych komputerach?" -Items $targets -ConfirmText 'Zainstaluj' -Select)
+        if ($targets.Count -eq 0) { return }
+    }
+    Start-HostOperation -Module $m -Name 'Instalacja aktualizacji' -Targets $targets -Output Log -Parameters $base -PerTarget $per -ScriptBlock (New-WuScript $script:WuInstallBody)
+}
+
 Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpdate' -Title 'Windows Update' -Icon 'E777' `
-    -Description 'Dostępne aktualizacje, historia, sprawdzanie konkretnych poprawek KB oraz instalacja (zadanie SYSTEM na komputerze, log w %SystemRoot%\Temp\DomainOps\WU.log). Nie wymaga modułu PSWindowsUpdate.' -Build {
+    -Description 'Dostępne aktualizacje, historia, sprawdzanie konkretnych poprawek KB oraz instalacja wszystkich albo zaznaczonych aktualizacji. API Windows Update nie działa przez WinRM, więc wyszukiwanie, historia i instalacja działają jako zadanie SYSTEM na komputerze (dziennik %SystemRoot%\Temp\DomainOps\WU.log). Nie wymaga modułu PSWindowsUpdate.' -Build {
     param($m)
     $m.ColorBools = $true
     $m.PillColumns = @('Status', 'Stan')
     $row = Add-ToolbarRow -Module $m -Title 'Sprawdzenie'
     $m.Drivers = Add-CheckBox -Parent $row -Text 'Uwzględnij sterowniki'
-    $m.Btn.Search = Add-Button -Parent $row -Text 'Wyszukaj dostępne' -Icon 'E721' -Module $m -Primary -OnClick {
+    $m.Btn.Search = Add-Button -Parent $row -Text 'Wyszukaj dostępne' -Icon 'E721' -Module $m -Primary -ToolTip 'Zadanie SYSTEM na komputerze – zwykle od kilkudziesięciu sekund do kilku minut' -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Wyszukiwanie aktualizacji' -Targets $targets -Parameters @{ IncludeDrivers = (Test-Checked $m.Drivers) } -ScriptBlock {
-            param($P)
-            $session = New-Object -ComObject Microsoft.Update.Session
-            $criteria = "IsInstalled=0 and IsHidden=0"
-            if (-not $P.IncludeDrivers) { $criteria += " and Type='Software'" }
-            $result = $session.CreateUpdateSearcher().Search($criteria)
-            if ($result.Updates.Count -eq 0) { return [pscustomobject]@{ 'Aktualizacja' = '(brak dostępnych aktualizacji)'; 'Stan' = 'Aktualny'; '__tone' = 'ok' } }
-            foreach ($u in $result.Updates) {
-                [pscustomobject]@{
-                    'Aktualizacja'    = $u.Title
-                    'Stan'            = 'Do instalacji'
-                    'KB'              = (@($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ', ')
-                    'Kategoria'       = (@($u.Categories | ForEach-Object { $_.Name }) -join ', ')
-                    'Ważność'         = $u.MsrcSeverity
-                    'Rozmiar (MB)'    = [Math]::Round([double]$u.MaxDownloadSize / 1MB, 1)
-                    'Pobrana'         = [bool]$u.IsDownloaded
-                    'Wymaga restartu' = ($u.InstallationBehavior.RebootBehavior -ne 0)
-                    '__tone'          = $(if ($u.MsrcSeverity -eq 'Critical') { 'crit' } else { 'warn' })
-                }
-            }
-        }
+        Start-HostOperation -Module $m -Name 'Wyszukiwanie aktualizacji' -Targets $targets -Parameters @{ Script = $script:WuJobScript; IncludeDrivers = (Test-Checked $m.Drivers) } -ScriptBlock (New-WuScript $script:WuSearchBody) -OnComplete { param($m) Set-EmptyColumnsHidden -Module $m -Columns @('Uwagi') }
     }
     $m.Btn.History = Add-Button -Parent $row -Text 'Historia (ostatnie 50)' -Icon 'E81C' -Module $m -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Historia aktualizacji' -Targets $targets -ScriptBlock {
-            param($P)
-            $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
-            $count = $searcher.GetTotalHistoryCount()
-            if ($count -eq 0) { return [pscustomobject]@{ 'Aktualizacja' = '(historia jest pusta)' } }
-            foreach ($h in $searcher.QueryHistory(0, [Math]::Min($count, 50))) {
-                if (-not $h.Title) { continue }
-                $status = switch ([int]$h.ResultCode) { 1 { 'W toku' } 2 { 'Sukces' } 3 { 'Sukces z błędami' } 4 { 'Błąd' } 5 { 'Przerwano' } default { 'Nieznany' } }
-                $operation = switch ([int]$h.Operation) { 1 { 'Instalacja' } 2 { 'Odinstalowanie' } default { '' } }
-                [pscustomobject]@{
-                    'Data'         = $h.Date.ToLocalTime()
-                    'Aktualizacja' = $h.Title
-                    'Operacja'     = $operation
-                    'Status'       = $status
-                    'Kod HRESULT'  = $(if ($h.HResult) { '0x{0:X8}' -f $h.HResult } else { '' })
-                    '__tone'       = $(switch ([int]$h.ResultCode) { 2 { 'ok' } 3 { 'warn' } 4 { 'crit' } 5 { 'warn' } default { 'info' } })
-                }
-            }
-        }
+        Start-HostOperation -Module $m -Name 'Historia aktualizacji' -Targets $targets -Parameters @{ Script = $script:WuJobScript } -ScriptBlock (New-WuScript $script:WuHistoryBody)
     }
     $row2 = Add-ToolbarRow -Module $m -Title 'Poprawki KB'
     $m.Kb = Add-TextBox -Parent $row2 -Width 300 -Placeholder 'np. KB5034441, KB5005565'
@@ -10872,97 +11243,24 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'WindowsUpda
         if ($kbs.Count -eq 0) { Show-Warning 'Podaj numery poprawek, np. KB5034441.'; return }
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Sprawdzanie KB' -Targets $targets -Parameters @{ Kbs = $kbs } -ScriptBlock {
-            param($P)
-            $hotfixes = @{}
-            foreach ($h in @(Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction SilentlyContinue)) { $hotfixes[[string]$h.HotFixID] = $h }
-            $history = @()
-            try {
-                $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
-                $count = $searcher.GetTotalHistoryCount()
-                if ($count -gt 0) { $history = @($searcher.QueryHistory(0, [Math]::Min($count, 500)) | Where-Object { $_.Title -and $_.ResultCode -eq 2 -and $_.Operation -eq 1 }) }
-            }
-            catch { }
-            $os = Get-CimInstance -ClassName Win32_OperatingSystem
-            foreach ($kb in $P.Kbs) {
-                $found = $hotfixes[$kb]
-                $wu = @($history | Where-Object { $_.Title -like "*$kb*" } | Select-Object -First 1)
-                $installed = ($null -ne $found -or $wu.Count -gt 0)
-                $date = $null
-                if ($found -and $found.InstalledOn) { $date = $found.InstalledOn } elseif ($wu.Count -gt 0) { $date = $wu[0].Date.ToLocalTime() }
-                [pscustomobject]@{
-                    'KB'              = $kb
-                    'Stan'            = $(if ($installed) { 'Zainstalowana' } else { 'Brak' })
-                    'Data instalacji' = $date
-                    'Źródło'          = $(if ($found) { 'Win32_QuickFixEngineering' } elseif ($wu.Count -gt 0) { 'Historia Windows Update' } else { '' })
-                    'Opis'            = $(if ($found) { $found.Description } elseif ($wu.Count -gt 0) { $wu[0].Title } else { '' })
-                    'System'          = '{0} ({1})' -f $os.Caption, $os.BuildNumber
-                    '__tone'          = $(if ($installed) { 'ok' } else { 'crit' })
-                }
-            }
-        }
+        Start-HostOperation -Module $m -Name 'Sprawdzanie KB' -Targets $targets -Parameters @{ Kbs = $kbs; Script = $script:WuJobScript } -ScriptBlock (New-WuScript $script:WuKbBody) -OnComplete { param($m) Set-EmptyColumnsHidden -Module $m -Columns @('Uwagi') }
     } | Out-Null
     $row3 = Add-ToolbarRow -Module $m -Title 'Instalacja'
     $m.AutoReboot = Add-CheckBox -Parent $row3 -Text 'Automatyczny restart po instalacji (za 5 min), jeśli wymagany'
-    $m.Btn.Install = Add-Button -Parent $row3 -Text 'Zainstaluj aktualizacje' -Icon 'E896' -Module $m -Danger -OnClick {
+    $m.Btn.Install = Add-Button -Parent $row3 -Text 'Zainstaluj wszystkie dostępne' -Icon 'E896' -Module $m -Danger -OnClick { param($m) Start-WuInstall -Module $m }
+    $m.Btn.State = Add-Button -Parent $row3 -Text 'Stan instalacji' -Icon 'E9D9' -Module $m -ToolTip 'Etap, wynik każdej aktualizacji, kod zadania i dziennik ostatniej instalacji' -OnClick {
         param($m)
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        $reboot = if (Test-Checked $m.AutoReboot) { 'z automatycznym restartem' } else { 'bez restartu' }
-        $targets = @(Confirm-Action -Text "Zainstalować wszystkie dostępne aktualizacje ($reboot) na wybranych komputerach?" -Items $targets -ConfirmText 'Zainstaluj' -Select); if ($targets.Count -eq 0) { return }
-        $params = @{ Script = $script:WuJobScript; AutoReboot = (Test-Checked $m.AutoReboot); IncludeDrivers = (Test-Checked $m.Drivers) }
-        Start-HostOperation -Module $m -Name 'Instalacja aktualizacji' -Targets $targets -Output Log -Parameters $params -ScriptBlock {
-            param($P)
-            $dir = Join-Path $env:SystemRoot 'Temp\DomainOps'
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            $file = Join-Path $dir 'Invoke-DomainOpsWU.ps1'
-            Set-Content -LiteralPath $file -Value $P.Script -Encoding UTF8
-            $taskName = 'DomainOps-WindowsUpdate'
-            $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-            if ($existing -and [string]$existing.State -eq 'Running') { return 'Instalacja już trwa (zadanie DomainOps-WindowsUpdate).' }
-            $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $file
-            if ($P.AutoReboot) { $argLine += ' -AutoReboot' }
-            if ($P.IncludeDrivers) { $argLine += ' -IncludeDrivers' }
-            $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argLine
-            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 4)
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-            'Zlecono instalację (zadanie SYSTEM). Postęp: przycisk «Stan instalacji».'
-        }
-    }
-    $m.Btn.State = Add-Button -Parent $row3 -Text 'Stan instalacji' -Icon 'E9D9' -Module $m -OnClick {
-        param($m)
-        $targets = @(Get-TargetComputers)
-        if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Stan instalacji aktualizacji' -Targets $targets -ScriptBlock {
-            param($P)
-            $log = Join-Path $env:SystemRoot 'Temp\DomainOps\WU.log'
-            $task = Get-ScheduledTask -TaskName 'DomainOps-WindowsUpdate' -ErrorAction SilentlyContinue
-            $lines = @()
-            if (Test-Path -LiteralPath $log) {
-                $all = @(Get-Content -LiteralPath $log -Encoding UTF8)
-                $start = 0
-                for ($i = $all.Count - 1; $i -ge 0; $i--) { if ($all[$i] -like '*==== START ====*') { $start = $i; break } }
-                $lines = @($all[$start..($all.Count - 1)])
-            }
-            $rebootRequired = $false
-            try { $rebootRequired = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired } catch { }
-            $state = if ($task) { [string]$task.State } else { '(brak – instalacji nie zlecano)' }
-            [pscustomobject]@{
-                'Stan'            = $(if ($state -eq 'Running') { 'Trwa instalacja' } elseif ($lines.Count -and $lines[-1] -like '*KONIEC*') { 'Zakończono' } else { $state })
-                'Ostatni wpis'    = $(if ($lines.Count) { $lines[-1] } else { '' })
-                'Wymaga restartu' = $rebootRequired
-                'Log'             = ($lines -join "`r`n")
-                '__tone'          = $(if ($state -eq 'Running') { 'info' } elseif ($rebootRequired) { 'warn' } else { 'ok' })
-            }
-        }
+        Start-HostOperation -Module $m -Name 'Stan instalacji aktualizacji' -Targets $targets -ScriptBlock (New-WuScript $script:WuStateBody)
     }
     $m.GoodWhenNo = @('Wymaga restartu')
-    Add-RowAction -Module $m -Text 'Wyszukaj dostępne aktualizacje' -Icon 'E721' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Search }
+    $m.EmptyHint = 'Wyszukiwanie, historia i instalacja działają jako zadanie SYSTEM na każdym komputerze (Windows Update nie pozwala na to przez WinRM). Z wyników wyszukiwania możesz zainstalować tylko zaznaczone aktualizacje (prawy przycisk).'
+    Add-RowAction -Module $m -Text 'Zainstaluj zaznaczone aktualizacje…' -Icon 'E896' -Danger -Action { param($m, $rows) Start-WuInstall -Module $m -Rows $rows }
+    Add-RowAction -Module $m -Text 'Wyszukaj dostępne aktualizacje' -Icon 'E721' -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Search }
     Add-RowAction -Module $m -Text 'Historia aktualizacji' -Icon 'E81C' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.History }
     Add-RowAction -Module $m -Text 'Stan instalacji' -Icon 'E9D9' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.State }
-    Add-RowAction -Module $m -Text 'Zainstaluj aktualizacje…' -Icon 'E896' -Danger -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Install }
+    Add-RowAction -Module $m -Text 'Zainstaluj wszystkie aktualizacje…' -Icon 'E896' -Danger -Separator -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Install }
 }
 #endregion
 
@@ -17244,7 +17542,8 @@ Register-Module -Workspace 'AdGroups' -Category 'Tworzenie' -Key 'LocationGroups
     $m.Actions.Preview = {
         param($m)
         foreach ($pair in @(@('Cities', $m.Cities), @('Roles', $m.Roles), @('Prefix', $m.Prefix), @('NameTpl', $m.NameTpl), @('DescTpl', $m.DescTpl))) { Set-ModuleSetting -Module $m -Name $pair[0] -Value $pair[1].Text }
-        $items = New-LocationPlan -Module $m
+        # Braki w danych (OU bazowa, lokalizacje, role) - ostrzeżenie, nie błąd
+        try { $items = New-LocationPlan -Module $m } catch { Show-Warning $_.Exception.Message; return }
         Start-AdPlanCheck -Module $m -Items $items -UniqueSam -SamMax $(if (Test-Checked $m.Sam20) { 20 } else { 0 })
     }
     $row5 = Add-ToolbarRow -Module $m -Title 'Akcje'
@@ -20117,18 +20416,20 @@ function Get-MabPolicyCheck {
         złożoność (zakaz nazwy konta w haśle) zawsze je odrzuci. Grupy zagnieżdżone nie są tu uwzględniane.
     #>
     param([hashtable]$Module, [int]$PasswordLength)
-    if (-not @($Module.Data.Policies | Where-Object { $_.Kind -eq 'domain' }).Count) { return @{ Known = $false; Ok = $true; Text = 'nie odczytano zasad haseł z AD – zgodność hasła nie została sprawdzona' } }
+    # Przed odczytem zasad Data.Policies jest $null - potok przekazałby go do bloku (StrictMode: brak właściwości Kind)
+    $domain = @($Module.Data.Policies | Where-Object { $null -ne $_ -and $_.Kind -eq 'domain' })
+    if (-not $domain.Count) { return @{ Known = $false; Ok = $true; Text = 'nie odczytano zasad haseł z AD – zgodność hasła nie została sprawdzona' } }
     $eff = Get-MabSelectedPso -Module $Module
     $src = 'PSO przypisane do konta'
     if (-not $eff) {
         $dns = @($Module.Data.Groups | ForEach-Object { [string]$_.DN })
-        $cands = @($Module.Data.PsoList | Where-Object { $ap = @($_.AppliesTo); @($dns | Where-Object { $ap -contains $_ }).Count -gt 0 })
+        $cands = @($Module.Data.PsoList | Where-Object { $null -ne $_ } | Where-Object { $ap = @($_.AppliesTo); @($dns | Where-Object { $ap -contains $_ }).Count -gt 0 })
         if ($cands.Count) {
             $eff = @($cands | Sort-Object -Property Precedence)[0]
             $src = 'PSO z grupy konta'
         }
         else {
-            $eff = $Module.Data.Policies | Where-Object { $_.Kind -eq 'domain' } | Select-Object -First 1
+            $eff = $domain[0]
             $src = 'zasady domeny'
         }
     }
@@ -23212,7 +23513,7 @@ Register-Module -Workspace 'Files' -Category 'Kontrola i naprawa' -Key 'NtfsTemp
     Add-Button -Parent $row -Text 'Wstaw podfoldery…' -Icon 'E8F4' -Module $m -AlwaysEnabled -ToolTip 'Dopisuje do listy podfoldery wskazanego folderu (np. wszystkie foldery działów)' -OnClick {
         param($m)
         $comp = $m.Computer.Text.Trim()
-        $parent = Show-InputDialog -Title 'Podfoldery' -Prompt ('Folder, którego podfoldery dopisać do listy{0}.' -f $(if ($comp) { " (na komputerze $comp)" } else { '' })) -Default (Split-Path -Path $m.Path.Text.Trim() -Parent) -Icon 'E8F4'
+        $parent = Show-InputDialog -Title 'Podfoldery' -Prompt ('Folder, którego podfoldery dopisać do listy{0}.' -f $(if ($comp) { " (na komputerze $comp)" } else { '' })) -Default $(if ($m.Path.Text.Trim()) { Split-Path -Path $m.Path.Text.Trim() -Parent } else { '' }) -Icon 'E8F4'
         if (-not $parent) { return }
         try { $subs = @(Get-NtfsSubfolders -Path $parent.Trim() -Computer $comp) } catch { Show-Error 'Nie można wyświetlić podfolderów.' $_; return }
         $tpl = $m.Path.Text.Trim()
