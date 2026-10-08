@@ -117,6 +117,8 @@ $script:Settings = [ordered]@{
     AdThrottleLimit  = 4
     TimeoutSec       = 20
     InactiveDays     = 90
+    # Blokada programu (PIN) po tylu minutach bez aktywności w jego oknach; 0 = wyłączona
+    LockIdleMinutes  = 10
     LastWorkspace    = 'Remote'
     LastModules      = @{}
     WindowWidth      = 1560
@@ -472,6 +474,7 @@ function Import-Settings {
     try { $s.AdThrottleLimit = [Math]::Min(16, [Math]::Max(1, [int]$s.AdThrottleLimit)) } catch { $s.AdThrottleLimit = 4 }
     try { $s.TimeoutSec = [Math]::Min(300, [Math]::Max(5, [int]$s.TimeoutSec)) } catch { $s.TimeoutSec = 20 }
     try { $s.InactiveDays = [Math]::Min(3650, [Math]::Max(1, [int]$s.InactiveDays)) } catch { $s.InactiveDays = 90 }
+    try { $s.LockIdleMinutes = [Math]::Min(240, [Math]::Max(0, [int]$s.LockIdleMinutes)) } catch { $s.LockIdleMinutes = 10 }
     try { $s.UserFilter = [Math]::Min(3, [Math]::Max(0, [int]$s.UserFilter)) } catch { $s.UserFilter = 0 }
     try { $s.GroupFilter = [Math]::Min(4, [Math]::Max(0, [int]$s.GroupFilter)) } catch { $s.GroupFilter = 0 }
     try { $s.LogHeight = [Math]::Min(600, [Math]::Max(90, [int]$s.LogHeight)) } catch { $s.LogHeight = 190 }
@@ -2173,6 +2176,9 @@ function Invoke-Dialog {
     if (-not ($Window.Tag -is [hashtable])) { $Window.Tag = @{} }
     # Program zablokowany (Lock-DomainOps): okno, np. wynik operacji w tle, pokaże się dopiero po odblokowaniu
     if ($script:UnlockState.Locked -and -not $Window.Tag['LockScreen']) { Wait-Unlocked }
+    # Program zamykany awaryjnie z ekranu blokady: kolejne okna już się nie pokazują
+    if ($script:UnlockState.Emergency -and -not $Window.Tag['LockScreen']) { $Window.Tag['Result'] = $false; return $false }
+    if (-not $Window.Tag['LockScreen']) { Register-IdleActivity -Window $Window }
     $Window.Tag['Result'] = $false
     $Window.Tag['Modal'] = $false
     $main = $script:UI.Window
@@ -3095,6 +3101,8 @@ function Show-SettingsDialog {
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="12"/>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="12"/>
+      <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <StackPanel>
       <TextBlock Text="Równoległe operacje" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
@@ -3112,9 +3120,13 @@ function Show-SettingsDialog {
       <TextBlock Text="Nieaktywność (dni)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
       <TextBox x:Name="stDays" HorizontalContentAlignment="Right"/>
     </StackPanel>
+    <StackPanel Grid.Row="4">
+      <TextBlock Text="Blokada po bezczynności (min)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+      <TextBox x:Name="stIdle" HorizontalContentAlignment="Right"/>
+    </StackPanel>
   </Grid>
   <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"
-             Text="Równoległe operacje na komputerach: 1–64. Zapytania AD: 1–16 – usługa ADWS na kontrolerze domeny odrzuca zbyt wiele żądań naraz («A connection to the directory … was unavailable»), więc przy takich błędach zmniejsz tę wartość (przejściowe błędy są i tak ponawiane). Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili."/>
+             Text="Równoległe operacje na komputerach: 1–64. Zapytania AD: 1–16 – usługa ADWS na kontrolerze domeny odrzuca zbyt wiele żądań naraz («A connection to the directory … was unavailable»), więc przy takich błędach zmniejsz tę wartość (przejściowe błędy są i tak ponawiane). Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili. Blokada po bezczynności: 0–240 min (0 = wyłączona) – po tylu minutach bez klawisza, kliknięcia czy ruchu myszy w oknach programu wymaga PIN-u, jak przycisk z kłódką."/>
   <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
   <WrapPanel>
     <Button x:Name="stLogs" Margin="0,0,8,6"/>
@@ -3126,7 +3138,7 @@ function Show-SettingsDialog {
 '@
     $w = New-Dialog -Title 'Ustawienia' -Subtitle 'Połączenia, wydajność i pliki programu.' -Body $body -Icon 'E713' -OkText 'Zapisz' -Width 560 -Validate {
         param($w)
-        foreach ($pair in @(@('stThrottle', 1, 64, 'Równoległe operacje'), @('stAdThrottle', 1, 16, 'Równoległe zapytania AD'), @('stTimeout', 5, 300, 'Limit połączenia'), @('stDays', 1, 3650, 'Nieaktywność'))) {
+        foreach ($pair in @(@('stThrottle', 1, 64, 'Równoległe operacje'), @('stAdThrottle', 1, 16, 'Równoległe zapytania AD'), @('stTimeout', 5, 300, 'Limit połączenia'), @('stDays', 1, 3650, 'Nieaktywność'), @('stIdle', 0, 240, 'Blokada po bezczynności'))) {
             $v = 0
             if (-not [int]::TryParse($w.FindName($pair[0]).Text.Trim(), [ref]$v) -or $v -lt $pair[1] -or $v -gt $pair[2]) {
                 Show-Warning ('{0}: podaj liczbę z zakresu {1}–{2}.' -f $pair[3], $pair[1], $pair[2])
@@ -3140,6 +3152,9 @@ function Show-SettingsDialog {
     $w.FindName('stAdThrottle').Text = [string]$script:Settings.AdThrottleLimit
     $w.FindName('stTimeout').Text = [string]$script:Settings.TimeoutSec
     $w.FindName('stDays').Text = [string]$script:Settings.InactiveDays
+    $idle = $w.FindName('stIdle')
+    $idle.Text = [string]$script:Settings.LockIdleMinutes
+    if (-not $script:UnlockPinHash) { $idle.IsEnabled = $false; $idle.ToolTip = 'Blokada PIN-em jest wyłączona (pusty skrót PIN-u w skrypcie).' }
     $w.FindName('stLogs').Content = New-IconContent -Text 'Folder dziennika' -Icon 'E838'
     $w.FindName('stData').Content = New-IconContent -Text 'Folder ustawień' -Icon 'E838'
     $w.FindName('stPlugins').Content = New-IconContent -Text 'Folder modułów' -Icon 'EA86'
@@ -3151,6 +3166,7 @@ function Show-SettingsDialog {
     $script:Settings.DomainController = $w.FindName('stDc').Text.Trim()
     $script:Settings.TimeoutSec = [int]$w.FindName('stTimeout').Text.Trim()
     $script:Settings.InactiveDays = [int]$w.FindName('stDays').Text.Trim()
+    $script:Settings.LockIdleMinutes = [int]$w.FindName('stIdle').Text.Trim()
     Set-EngineThrottle ([int]$w.FindName('stThrottle').Text.Trim()) ([int]$w.FindName('stAdThrottle').Text.Trim())
     Export-Settings
     return $true
@@ -3214,15 +3230,18 @@ $script:ToastTimers = New-Object 'System.Collections.Generic.Dictionary[object,o
 # tekstu 'DomainOps|<PIN>'. Zmiana PIN-u: wpisz tu wynik polecenia
 #   -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes('DomainOps|NOWY_PIN')) | ForEach-Object { $_.ToString('x2') })
 # i ustaw długość PIN-u. Pusty skrót wyłącza blokadę. Tryb bez okna (-RunReport) nie pyta o PIN.
-# Ten sam PIN odblokowuje program zablokowany w trakcie pracy (przycisk z kłódką, Ctrl+Shift+L - Lock-DomainOps).
+# Ten sam PIN odblokowuje program zablokowany w trakcie pracy (przycisk z kłódką, Ctrl+Shift+L, brak aktywności - Lock-DomainOps).
 $script:UnlockPinHash = 'e57ba83a98fac469e360db6045d7adfce273fa0faf2697fbc3528ebff51b52e5'
 $script:UnlockPinLength = 5
 $script:UnlockMaxAttempts = 5
 $script:UnlockCooldownSec = 30
 $script:UnlockTitle = 'Domain Ops – odblokowanie'
 $script:LockTitle = 'Domain Ops – zablokowany'
-# Stan blokady w trakcie pracy (Invoke-Dialog wstrzymuje inne okna, dopóki program jest zablokowany)
-$script:UnlockState = @{ Locked = $false }
+# Stan blokady w trakcie pracy (Invoke-Dialog wstrzymuje inne okna, dopóki program jest zablokowany).
+# Emergency: zamknięcie programu z ekranu blokady bez PIN-u; Hidden: okna, których zawartość ukryto na czas blokady.
+$script:UnlockState = @{ Locked = $false; Emergency = $false; Hidden = @() }
+# Blokada po bezczynności (ustawienie LockIdleMinutes, 0 = wyłączona): Last - ostatnia aktywność w oknach programu (UTC)
+$script:IdleLock = @{ Timer = $null; Last = [datetime]::UtcNow; Pos = $null }
 
 $script:UnlockXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -3241,6 +3260,9 @@ $script:UnlockXaml = @'
       <TextBlock x:Name="lockMsg" Foreground="#FF7A86" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" MinHeight="18" Margin="0,12,0,0"/>
       <UniformGrid x:Name="lockPad" Columns="3" Margin="0,12,0,0"/>
       <Button x:Name="lockClose" Content="Zamknij" Style="{StaticResource GhostButton}" HorizontalAlignment="Center" MinWidth="110" Margin="0,14,0,0" Focusable="False"/>
+      <Button x:Name="lockExit" Style="{StaticResource GhostButton}" HorizontalAlignment="Center" MinWidth="170" Margin="0,14,0,0" Focusable="False" Visibility="Collapsed"
+              ToolTip="Zamyka program bez odblokowania – operacje w tle zostaną przerwane"/>
+      <TextBlock x:Name="lockExitMsg" Foreground="#E5B567" FontSize="12" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,8,0,0" Visibility="Collapsed"/>
     </StackPanel>
   </Grid>
 </Window>
@@ -3274,8 +3296,22 @@ $script:UnlockEvents = @{
         Add-UnlockKey -Window $s -Key $key
     }
     Close   = { param($s, $e) Close-Dialog -Window ([System.Windows.Window]::GetWindow($s)) -Ok $false }
-    # Okno blokady zamyka tylko poprawny PIN (krzyżyk, Alt+F4 są ignorowane)
-    Closing = { param($s, $e) if ($s.Tag.Mode -eq 'Lock' -and -not $s.Tag.Result) { $e.Cancel = $true } }
+    Exit    = { param($s, $e) Request-UnlockExit -Window ([System.Windows.Window]::GetWindow($s)) }
+    # Okno blokady zamyka poprawny PIN albo potwierdzone zamknięcie awaryjne. Krzyżyk i Alt+F4 działają jak przycisk
+    # «Zakończ awaryjnie»: pierwsze naciśnięcie tylko ostrzega, drugie w czasie potwierdzenia zamyka program bez PIN-u.
+    Closing = {
+        param($s, $e)
+        if ($s.Tag.Mode -ne 'Lock' -or $s.Tag.Result -or $script:UnlockState.Emergency) { return }
+        if ([datetime]::UtcNow -lt $s.Tag.ExitArmed) {
+            if ($s.Tag.ExitTimer) { $s.Tag.ExitTimer.Stop() }
+            $script:UnlockState.Emergency = $true
+            return
+        }
+        $e.Cancel = $true
+        Request-UnlockExit -Window $s
+    }
+    # Aktywność w oknach programu (klawisz, kliknięcie, kółko myszy) odsuwa blokadę po bezczynności
+    Activity = { param($s, $e) $script:IdleLock.Last = [datetime]::UtcNow }
 }
 
 function New-UnlockWindow {
@@ -3286,6 +3322,11 @@ function New-UnlockWindow {
     if ($Lock) {
         $w.FindName('lockHint').Text = 'Program zablokowany – wpisz PIN'
         $w.FindName('lockClose').Visibility = 'Collapsed'
+        # Krzyżyk nie zamyka okna blokady, więc bez PIN-u program można zamknąć tylko tym przyciskiem (z potwierdzeniem)
+        $exit = $w.FindName('lockExit')
+        $exit.Visibility = 'Visible'
+        $exit.Content = New-IconContent -Text 'Zakończ awaryjnie' -Icon 'E7E8' -IconSize 12
+        $exit.add_Click($script:UnlockEvents.Exit)
     }
     $w.FindName('lockIcon').Text = Get-Glyph 'E72E'
     $dots = $w.FindName('lockDots')
@@ -3319,7 +3360,7 @@ function New-UnlockWindow {
     $w.FindName('lockClose').add_Click($script:UnlockEvents.Close)
     $w.add_PreviewKeyDown($script:UnlockEvents.KeyDown)
     $w.add_Closing($script:UnlockEvents.Closing)
-    $w.Tag = @{ Result = $false; Modal = $false; Pin = ''; Attempts = 0; Failed = 0; Error = $false; Locked = $false; Mode = $(if ($Lock) { 'Lock' } else { 'Start' }); LockScreen = [bool]$Lock; CooldownEnd = [datetime]::MinValue }
+    $w.Tag = @{ Result = $false; Modal = $false; Pin = ''; Attempts = 0; Failed = 0; Error = $false; Locked = $false; Mode = $(if ($Lock) { 'Lock' } else { 'Start' }); LockScreen = [bool]$Lock; CooldownEnd = [datetime]::MinValue; ExitArmed = [datetime]::MinValue; ExitTimer = $null }
     Update-UnlockView -Window $w
     return $w
 }
@@ -3410,6 +3451,49 @@ function Update-UnlockCooldown {
     return $false
 }
 
+$script:UnlockExitConfirmSec = 10
+
+function Request-UnlockExit {
+    <#
+        Zamknięcie awaryjne z ekranu blokady: pierwsze kliknięcie tylko uzbraja przycisk (ostrzeżenie pod nim),
+        drugie w ciągu kilku sekund zamyka okno blokady bez PIN-u; Lock-DomainOps zamyka wtedy program.
+        Działa też w czasie przerwy po błędnych próbach (klawiatura PIN-u jest wtedy wyłączona).
+    #>
+    param([Parameter(Mandatory)]$Window)
+    $st = $Window.Tag
+    $exit = $Window.FindName('lockExit')
+    $note = $Window.FindName('lockExitMsg')
+    if ([datetime]::UtcNow -lt $st.ExitArmed) {
+        if ($st.ExitTimer) { $st.ExitTimer.Stop() }
+        $script:UnlockState.Emergency = $true
+        Close-Dialog -Window $Window -Ok $false
+        return
+    }
+    $st.ExitArmed = [datetime]::UtcNow.AddSeconds($script:UnlockExitConfirmSec)
+    $exit.Content = New-IconContent -Text 'Potwierdź zamknięcie' -Icon 'E7BA' -IconSize 12
+    $note.Text = 'Program zostanie zamknięty bez odblokowania, a operacje w tle przerwane. Kliknij ponownie (przycisk albo krzyżyk okna), aby potwierdzić.'
+    $note.Visibility = 'Visible'
+    if (-not $st.ExitTimer) {
+        $t = New-Object System.Windows.Threading.DispatcherTimer
+        $t.Interval = [TimeSpan]::FromSeconds($script:UnlockExitConfirmSec)
+        $t.Tag = $Window
+        $t.add_Tick({ param($s, $e) $s.Stop(); Reset-UnlockExit -Window $s.Tag })
+        $st.ExitTimer = $t
+    }
+    $st.ExitTimer.Stop()
+    $st.ExitTimer.Start()
+}
+
+function Reset-UnlockExit {
+    # Brak potwierdzenia w wyznaczonym czasie: przycisk wraca do stanu wyjściowego
+    param([Parameter(Mandatory)]$Window)
+    $Window.Tag.ExitArmed = [datetime]::MinValue
+    $Window.FindName('lockExit').Content = New-IconContent -Text 'Zakończ awaryjnie' -Icon 'E7E8' -IconSize 12
+    $note = $Window.FindName('lockExitMsg')
+    $note.Text = ''
+    $note.Visibility = 'Collapsed'
+}
+
 function Unlock-DomainOps {
     # $true: można uruchomić program (PIN poprawny albo blokada wyłączona)
     if (-not $script:UnlockPinHash) { return $true }
@@ -3417,30 +3501,58 @@ function Unlock-DomainOps {
 }
 
 function Restore-AfterLock {
-    # Koniec blokady: zawartość okna głównego z powrotem, wstrzymane okna mogą się pokazać (wywołanie wielokrotne bez skutków)
+    # Koniec blokady: zawartość okna głównego i otwartych okien z powrotem, wstrzymane okna mogą się pokazać
+    # (wywołanie wielokrotne bez skutków)
     $script:UnlockState.Locked = $false
+    $script:IdleLock.Last = [datetime]::UtcNow
     $main = $script:UI.Window
     if ($main -and $main.Content) { $main.Content.Visibility = 'Visible' }
+    foreach ($c in @($script:UnlockState.Hidden)) { try { $c.Visibility = 'Visible' } catch { } }
+    $script:UnlockState.Hidden = @()
 }
 
 function Lock-DomainOps {
     <#
-        Blokada w trakcie pracy: zawartość okna głównego ukryta, nad nim okno PIN (modalne, więc okno główne jest wyłączone).
-        Okna głównego nie da się ukryć - jest pokazane przez ShowDialog, a ukrycie okna modalnego kończy ShowDialog (i program).
-        Operacje w tle trwają; okna, które chcą się pokazać w tym czasie, czekają na odblokowanie (Invoke-Dialog).
+        Blokada w trakcie pracy: zawartość okna głównego (i okien już otwartych, np. formularza) ukryta, nad nimi okno PIN
+        (modalne, więc pozostałe okna są wyłączone). Okna głównego nie da się ukryć - jest pokazane przez ShowDialog,
+        a ukrycie okna modalnego kończy ShowDialog (i program). Operacje w tle trwają; okna, które chcą się pokazać
+        w tym czasie, czekają na odblokowanie (Invoke-Dialog). -IdleMinutes: blokada po bezczynności (inny wpis dziennika).
     #>
-    if (-not $script:UnlockPinHash -or $script:UnlockState.Locked) { return }
+    param([int]$IdleMinutes = 0)
+    if (-not $script:UnlockPinHash -or $script:UnlockState.Locked -or $script:UnlockState.Emergency) { return }
     $main = $script:UI.Window
     if (-not $main) { return }
     $script:UnlockState.Locked = $true
     Clear-ClipboardSecret
-    Write-Log 'Program zablokowany.' -Module ''
+    Write-Log $(if ($IdleMinutes) { "Program zablokowany po $IdleMinutes min bez aktywności." } else { 'Program zablokowany.' }) -Module ''
     if ($main.Content) { $main.Content.Visibility = 'Hidden' }
+    $script:UnlockState.Hidden = @(foreach ($ow in @($main.OwnedWindows)) {
+            $c = $ow.Content
+            if ($c -is [System.Windows.UIElement] -and $c.Visibility -eq 'Visible') { $c.Visibility = 'Hidden'; $c }
+        })
     $w = New-UnlockWindow -Lock
     try { [void](Invoke-Dialog -Window $w) }
-    finally { Restore-AfterLock }
+    finally {
+        if ($w.Tag.ExitTimer) { $w.Tag.ExitTimer.Stop() }
+        if (-not $script:UnlockState.Emergency) { Restore-AfterLock }
+    }
+    if ($script:UnlockState.Emergency) {
+        Close-DomainOpsEmergency
+        return
+    }
     $n = [int]$w.Tag.Failed
     Write-Log ('Program odblokowany{0}.' -f $(if ($n) { " (nieudane próby: $n)" } else { '' })) $(if ($n) { 'WARN' } else { 'INFO' }) -Module ''
+}
+
+function Close-DomainOpsEmergency {
+    # Zamknięcie awaryjne z ekranu blokady: otwarte okna i okno główne zamykane bez pytań (zawartość zostaje ukryta),
+    # operacje w tle przerywa Close-Engine po zamknięciu okna głównego (Start-DomainOps)
+    $main = $script:UI.Window
+    $ops = @($script:Engine.Operations).Count
+    Write-Log ('Zamknięcie awaryjne z ekranu blokady (bez PIN-u){0}.' -f $(if ($ops) { " – przerwane operacje w tle: $ops" } else { '' })) 'WARN' -Module ''
+    if (-not $main) { return }
+    foreach ($ow in @($main.OwnedWindows)) { try { $ow.Close() } catch { } }
+    try { $main.Close() } catch { }
 }
 
 function Wait-Unlocked {
@@ -3450,9 +3562,58 @@ function Wait-Unlocked {
     $t = New-Object System.Windows.Threading.DispatcherTimer
     $t.Interval = [TimeSpan]::FromMilliseconds(200)
     $t.Tag = $frame
-    $t.add_Tick({ param($s, $e) if (-not $script:UnlockState.Locked) { $s.Stop(); $s.Tag.Continue = $false } })
+    $t.add_Tick({ param($s, $e) if (-not $script:UnlockState.Locked -or $script:UnlockState.Emergency) { $s.Stop(); $s.Tag.Continue = $false } })
     $t.Start()
     [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+
+function Register-IdleActivity {
+    # Okno programu zgłasza aktywność użytkownika (klawisze i przyciski myszy także obsłużone przez kontrolki)
+    param([Parameter(Mandatory)][System.Windows.Window]$Window)
+    foreach ($ev in [System.Windows.UIElement]::PreviewKeyDownEvent, [System.Windows.UIElement]::PreviewMouseDownEvent, [System.Windows.UIElement]::PreviewMouseWheelEvent) {
+        $Window.AddHandler($ev, ($script:UnlockEvents.Activity -as $ev.HandlerType), $true)
+    }
+}
+
+function Test-ProgramActive {
+    # Czy któreś okno programu (główne albo otwarte z niego) jest aktywne - ruch myszy w innym programie się nie liczy
+    $main = $script:UI.Window
+    if (-not $main) { return $false }
+    if ($main.IsActive) { return $true }
+    foreach ($ow in @($main.OwnedWindows)) { if ($ow.IsActive) { return $true } }
+    return $false
+}
+
+function Test-IdleLock {
+    <#
+        Takt licznika bezczynności (co kilkanaście sekund): ruch kursora nad aktywnym oknem programu też jest aktywnością
+        (sprawdzany tutaj, nie w zdarzeniu każdego ruchu myszy). Po LockIdleMinutes minut bez aktywności - Lock-DomainOps.
+        Blokada wyłączona (brak PIN-u, 0 minut) albo już trwa: licznik startuje od nowa.
+    #>
+    $st = $script:IdleLock
+    $now = [datetime]::UtcNow
+    $limit = 0
+    try { $limit = [int]$script:Settings.LockIdleMinutes } catch { }
+    $main = $script:UI.Window
+    if (-not $script:UnlockPinHash -or $limit -le 0 -or $script:UnlockState.Locked -or -not $main -or -not $main.IsVisible) { $st.Last = $now; return }
+    $pos = $null
+    try { $pos = [System.Windows.Forms.Control]::MousePosition } catch { }
+    if ($null -ne $pos -and $null -ne $st.Pos -and $pos -ne $st.Pos -and (Test-ProgramActive)) { $st.Last = $now }
+    $st.Pos = $pos
+    if (($now - $st.Last).TotalMinutes -ge $limit) { Lock-DomainOps -IdleMinutes $limit }
+}
+
+function Start-IdleLock {
+    # Licznik bezczynności - tylko w uruchomionym programie (Start-DomainOps), nie przy samym budowaniu okna
+    $st = $script:IdleLock
+    $st.Last = [datetime]::UtcNow
+    if (-not $st.Timer) {
+        $t = New-Object System.Windows.Threading.DispatcherTimer
+        $t.Interval = [TimeSpan]::FromSeconds(15)
+        $t.add_Tick({ param($s, $e) try { Test-IdleLock } catch { Write-Log "Błąd blokady po bezczynności: $($_.Exception.Message)" 'ERROR' -Module '' } })
+        $st.Timer = $t
+    }
+    $st.Timer.Start()
 }
 #endregion
 
@@ -7207,6 +7368,7 @@ function New-MainWindow {
         })
     $w.add_PreviewKeyDown($script:ShellEvents.PreviewKeyDown)
     $w.add_Closing($script:ShellEvents.Closing)
+    Register-IdleActivity -Window $w
     $w.add_SourceInitialized({ param($s, $e) Set-DarkTitleBar $s })
     $w.add_SizeChanged({ param($s, $e) try { Update-HeaderLayout } catch { } })
 
@@ -7256,7 +7418,8 @@ $script:ShellEvents = @{
     Closing        = {
         param($s, $e)
         try {
-            if ($script:Engine.Operations.Count -gt 0) {
+            # Zamknięcie awaryjne z ekranu blokady jest już potwierdzone (i żadne okno nie może się teraz pokazać)
+            if ($script:Engine.Operations.Count -gt 0 -and -not $script:UnlockState.Emergency) {
                 if (-not (Confirm-Action -Text 'Trwają operacje w tle. Zamknięcie programu je przerwie. Zamknąć mimo to?' -Title 'Zamknięcie programu' -ConfirmText 'Zamknij')) {
                     $e.Cancel = $true
                     return
@@ -7614,6 +7777,7 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Connectivity' 
     Add-StatTile -Module $m -Key 'ok' -Label 'Dostępne' -Icon 'E73E' | Out-Null
     Add-StatTile -Module $m -Key 'warn' -Label 'Częściowo (bez WinRM)' -Icon 'E7BA' | Out-Null
     Add-StatTile -Module $m -Key 'crit' -Label 'Niedostępne' -Icon 'E711' | Out-Null
+    Add-RowAction -Module $m -Text 'Diagnostyka WinRM – dlaczego niedostępny' -Icon 'E9D9' -Action { param($m, $rows) Invoke-WinRMDiagFor -Names @(Get-RowTargetNames -Rows $rows -Column 'Komputer') }
 }
 
 Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Inventory' -Title 'Inwentaryzacja' -Icon 'E7F8' `
@@ -7760,6 +7924,739 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'Power' -Title 
     Add-RowAction -Module $m -Text 'Uruchom ponownie…' -Icon 'E777' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['/r'] }
     Add-RowAction -Module $m -Text 'Wyłącz…' -Icon 'E7E8' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['/s'] }
     Add-RowAction -Module $m -Text 'Anuluj zaplanowany restart' -Icon 'E711' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn['/a'] }
+}
+#endregion
+
+#region Zarządzanie zdalne: połączenie CIM (WinRM albo DCOM), licencja Windows, diagnostyka WinRM
+# Moduły, które działają także bez WinRM: zapytania CIM z komputera administratora - najpierw WSMan (WinRM, TCP 5985),
+# a gdy niedostępny, DCOM (RPC: TCP 135 i porty dynamiczne 49152-65535, jak konsole MMC). Kod pomocniczy jest tekstem,
+# bo bloki wykonują się w wątkach silnika (osobne środowisko) - wczytuje go . ([scriptblock]::Create($P.CimHelper)).
+$script:CimHelperText = @'
+function Connect-DoCim {
+    # Sesja CIM: Transport Auto (WinRM, potem DCOM), Wsman albo Dcom; wynik @{ Session; Protocol; Errors }
+    param([string]$Computer, $Credential, [int]$TimeoutSec = 20, [string]$Transport = 'Auto')
+    $protos = switch ($Transport) { 'Wsman' { @('Wsman') } 'Dcom' { @('Dcom') } default { @('Wsman', 'Dcom') } }
+    $errors = @()
+    foreach ($proto in $protos) {
+        $label = if ($proto -eq 'Wsman') { 'WinRM' } else { 'DCOM' }
+        try {
+            $cs = @{ ComputerName = $Computer; SessionOption = (New-CimSessionOption -Protocol $proto); OperationTimeoutSec = $TimeoutSec; ErrorAction = 'Stop' }
+            if ($Credential) { $cs.Credential = $Credential }
+            $session = New-CimSession @cs
+            return @{ Session = $session; Protocol = $label; Errors = $errors }
+        }
+        catch { $errors += ('{0}: {1}' -f $label, (([string]$_.Exception.Message -split "`n")[0]).Trim()) }
+    }
+    throw ('Brak połączenia CIM – ' + ($errors -join ' | '))
+}
+
+function Get-DoCimReg {
+    # Rejestr HKLM przez StdRegProv (działa i przez DCOM). Type: String, Expand, DWord, MultiString, Keys (podklucze), Values (nazwy wartości)
+    param($Session, [string]$Key, [string]$Name = '', [string]$Type = 'String')
+    $method = @{ String = 'GetStringValue'; Expand = 'GetExpandedStringValue'; DWord = 'GetDWORDValue'; MultiString = 'GetMultiStringValue'; Keys = 'EnumKey'; Values = 'EnumValues' }[$Type]
+    $a = @{ hDefKey = [uint32]2147483650; sSubKeyName = $Key }
+    if ($Type -ne 'Keys' -and $Type -ne 'Values') { $a.sValueName = $Name }
+    $r = $null
+    try { $r = Invoke-CimMethod -CimSession $Session -Namespace 'root\default' -ClassName StdRegProv -MethodName $method -Arguments $a -ErrorAction Stop } catch { return $null }
+    if ($null -eq $r -or [int]$r.ReturnValue -ne 0) { return $null }
+    switch ($Type) {
+        'DWord' { return $r.uValue }
+        'MultiString' { return @($r.sValue) }
+        'Keys' { return @($r.sNames | Where-Object { $_ }) }
+        'Values' { return @($r.sNames | Where-Object { $_ }) }
+        default { return $r.sValue }
+    }
+}
+
+function ConvertTo-DoIpNumber([string]$Ip) {
+    $a = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip.Trim(), [ref]$a) -or $a.AddressFamily -ne 'InterNetwork') { return $null }
+    $b = $a.GetAddressBytes()
+    return ([int64]$b[0] * 16777216 + [int64]$b[1] * 65536 + [int64]$b[2] * 256 + [int64]$b[3])
+}
+
+function Test-DoIpMatch {
+    <#
+        Czy adres IPv4 pasuje do listy adresów zdalnych reguły zapory (RA4) albo filtra IPv4 WinRM: $true / $false /
+        $null (nie wiadomo - słowa kluczowe Intranet, DNS, DHCP, DefaultGateway itp.). Pusta lista = dowolny adres.
+        LocalSubnet: podsieci komputera docelowego (@{ Net; Mask } jako liczby).
+    #>
+    param([string]$Ip, [string[]]$Tokens, [object[]]$Subnets = @())
+    $parts = @($Tokens | ForEach-Object { ([string]$_) -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($parts.Count -eq 0) { return $true }
+    $n = ConvertTo-DoIpNumber $Ip
+    if ($null -eq $n) { return $null }
+    $unknown = $false
+    foreach ($t in $parts) {
+        if ($t -eq '*' -or $t -eq 'Any') { return $true }
+        if ($t -eq 'LocalSubnet') {
+            if (@($Subnets).Count -eq 0) { $unknown = $true }
+            foreach ($sn in @($Subnets)) { if (($n -band $sn.Mask) -eq ($sn.Net -band $sn.Mask)) { return $true } }
+            continue
+        }
+        if ($t -match '^(\d{1,3}(?:\.\d{1,3}){3})\s*-\s*(\d{1,3}(?:\.\d{1,3}){3})$') {
+            $lo = ConvertTo-DoIpNumber $Matches[1]; $hi = ConvertTo-DoIpNumber $Matches[2]
+            if ($null -ne $lo -and $null -ne $hi -and $n -ge $lo -and $n -le $hi) { return $true }
+            continue
+        }
+        if ($t -match '^(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})$') {
+            $net = ConvertTo-DoIpNumber $Matches[1]; $bits = [int]$Matches[2]
+            $mask = if ($bits -le 0) { [int64]0 } else { [int64](4294967296 - [Math]::Pow(2, 32 - [Math]::Min(32, $bits))) }
+            if ($null -ne $net -and ($n -band $mask) -eq ($net -band $mask)) { return $true }
+            continue
+        }
+        if ($t -match '^(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,3}(?:\.\d{1,3}){3})$') {
+            $net = ConvertTo-DoIpNumber $Matches[1]; $mask = ConvertTo-DoIpNumber $Matches[2]
+            if ($null -ne $net -and $null -ne $mask -and ($n -band $mask) -eq ($net -band $mask)) { return $true }
+            continue
+        }
+        if ($t -match '^\d{1,3}(?:\.\d{1,3}){3}$') { if ((ConvertTo-DoIpNumber $t) -eq $n) { return $true }; continue }
+        # Adresy IPv6 nie dotyczą adresu IPv4; inne słowa kluczowe - nie da się ocenić
+        if ($t -notmatch ':') { $unknown = $true }
+    }
+    if ($unknown) { return $null }
+    return $false
+}
+
+function ConvertFrom-DoFwRule {
+    # Reguła zapory zapisana w rejestrze: "v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Domain|LPort=5985|RA4=LocalSubnet|Name=...|"
+    param([string]$Text, [string]$Id = '', [string]$Source = '')
+    $r = @{ Id = $Id; Source = $Source; Action = ''; Active = $false; Dir = ''; Protocol = ''; LPort = @(); RA4 = @(); Profile = @(); Name = $Id }
+    foreach ($f in ($Text -split '\|')) {
+        $i = $f.IndexOf('=')
+        if ($i -lt 1) { continue }
+        $k = $f.Substring(0, $i); $v = $f.Substring($i + 1)
+        switch ($k) {
+            'Action' { $r.Action = $v }
+            'Active' { $r.Active = ($v -eq 'TRUE') }
+            'Dir' { $r.Dir = $v }
+            'Protocol' { $r.Protocol = $v }
+            'LPort' { $r.LPort += $v }
+            'RA4' { $r.RA4 += $v }
+            'Profile' { $r.Profile += $v }
+            'Name' { if ($v -and -not $v.StartsWith('@')) { $r.Name = $v } }
+        }
+    }
+    return $r
+}
+
+function Test-DoFwPort {
+    # Czy reguła przychodząca TCP obejmuje port (pojedynczy, zakres "a-b"; brak LPort = wszystkie porty)
+    param($Rule, [int]$Port)
+    if ($Rule.Dir -ne 'In' -or -not $Rule.Active) { return $false }
+    if ($Rule.Protocol -and $Rule.Protocol -ne '6') { return $false }
+    if (@($Rule.LPort).Count -eq 0) { return ($Rule.Protocol -eq '6') }
+    foreach ($lp in @($Rule.LPort)) {
+        foreach ($p in ($lp -split ',')) {
+            if ($p -match '^(\d+)-(\d+)$') { if ($Port -ge [int]$Matches[1] -and $Port -le [int]$Matches[2]) { return $true } }
+            elseif ($p -match '^\d+$' -and [int]$p -eq $Port) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-DoFwVerdict {
+    <#
+        Ocena zapory Windows dla portu i adresu źródłowego w jednym profilu (Domain/Private/Public):
+        @{ Result = 'Enabled-off' | 'Allowed' | 'Blocked' | 'NoRule' | 'Unknown'; Text; Rules }
+        Reguły z GPO działają zawsze, lokalne - gdy GPO nie wyłącza scalania (AllowLocalPolicyMerge = 0).
+    #>
+    param([string]$Profile, [bool]$Enabled, [bool]$LocalMerge, [object[]]$GpoRules, [object[]]$LocalRules, [int]$Port, [string]$SourceIp, [object[]]$Subnets)
+    if (-not $Enabled) { return @{ Result = 'Off'; Text = 'zapora wyłączona'; Rules = @() } }
+    $rules = @($GpoRules) + $(if ($LocalMerge) { @($LocalRules) } else { @() })
+    $rules = @($rules | Where-Object { $_ -and (Test-DoFwPort $_ $Port) -and (@($_.Profile).Count -eq 0 -or @($_.Profile) -contains $Profile) })
+    $blocks = @($rules | Where-Object { $_.Action -eq 'Block' })
+    $allows = @($rules | Where-Object { $_.Action -eq 'Allow' })
+    foreach ($b in $blocks) {
+        if ((Test-DoIpMatch -Ip $SourceIp -Tokens $b.RA4 -Subnets $Subnets) -eq $true) { return @{ Result = 'Blocked'; Text = "reguła blokująca «$($b.Name)» ($($b.Source))"; Rules = @($b) } }
+    }
+    if ($allows.Count -eq 0) {
+        $t = 'brak reguły zezwalającej na TCP {0}' -f $Port
+        if (-not $LocalMerge) { $t += ' (GPO wyłącza lokalne reguły zapory)' }
+        return @{ Result = 'NoRule'; Text = $t; Rules = @() }
+    }
+    $unknown = @()
+    foreach ($a in $allows) {
+        $m = Test-DoIpMatch -Ip $SourceIp -Tokens $a.RA4 -Subnets $Subnets
+        if ($m -eq $true) { return @{ Result = 'Allowed'; Text = "dopuszcza: «$($a.Name)» ($($a.Source))"; Rules = @($a) } }
+        if ($null -eq $m) { $unknown += $a }
+    }
+    if ($unknown.Count) { return @{ Result = 'Unknown'; Text = ('nie wiadomo – zakres: {0}' -f ((@($unknown | ForEach-Object { @($_.RA4) -join ',' }) | Select-Object -Unique) -join '; ')); Rules = $unknown } }
+    $scopes = (@($allows | ForEach-Object { '«{0}» ({1}): {2}' -f $_.Name, $_.Source, (@($_.RA4) -join ',') }) -join '; ')
+    return @{ Result = 'Blocked'; Text = "adres $SourceIp poza zakresem reguł – $scopes"; Rules = $allows; Scope = $true }
+}
+
+function Resolve-DoAddress([string]$Name) {
+    if (ConvertTo-DoIpNumber $Name) { return @($Name) }
+    try { return @([System.Net.Dns]::GetHostAddresses($Name) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) }
+    catch { return @() }
+}
+
+function Test-DoPing([string]$Address) {
+    try { return ((New-Object System.Net.NetworkInformation.Ping).Send($Address, 1000).Status -eq 'Success') } catch { return $false }
+}
+
+function Get-DoSourceAddress([string]$Address) {
+    # Adres tego komputera, z którego wychodzi ruch do celu (wybór trasy, bez wysyłania pakietów)
+    $udp = New-Object System.Net.Sockets.UdpClient
+    try { $udp.Connect($Address, 5985); return $udp.Client.LocalEndPoint.Address.ToString() } catch { return '' } finally { $udp.Close() }
+}
+
+function Test-DoPorts {
+    # Porty TCP równolegle: otwarty / odrzucony (RST - komputer odpowiada, nic nie nasłuchuje) / brak odpowiedzi (filtrowany)
+    param([string]$Address, [int[]]$Ports, [int]$TimeoutMs = 2500)
+    $probes = foreach ($port in $Ports) {
+        $cl = New-Object System.Net.Sockets.TcpClient
+        $ar = $null
+        try { $ar = $cl.BeginConnect($Address, $port, $null, $null) } catch { }
+        @{ Port = $port; Client = $cl; Ar = $ar }
+    }
+    $deadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $res = @{}
+    foreach ($pr in $probes) {
+        $state = 'brak odpowiedzi'
+        if ($pr.Ar) {
+            $left = [int][Math]::Max(0, ($deadline - [datetime]::UtcNow).TotalMilliseconds)
+            if ($pr.Ar.AsyncWaitHandle.WaitOne($left)) {
+                try { $pr.Client.EndConnect($pr.Ar); $state = 'otwarty' } catch { $state = 'odrzucony' }
+            }
+        }
+        else { $state = 'błąd' }
+        try { $pr.Client.Close() } catch { }
+        $res[$pr.Port] = $state
+    }
+    return $res
+}
+
+function Test-DoWsman([string]$Computer) {
+    # Odpowiedź usługi WinRM bez uwierzytelniania (jak Test-WSMan)
+    try {
+        $r = Test-WSMan -ComputerName $Computer -ErrorAction Stop
+        if ([string]$r.ProductVersion -match 'Stack:\s*(\S+)') { return @{ Ok = $true; Text = "odpowiada (WS-Management $($Matches[1]))" } }
+        return @{ Ok = $true; Text = 'odpowiada' }
+    }
+    catch { return @{ Ok = $false; Text = (([string]$_.Exception.Message -split "`n")[0]).Trim() } }
+}
+
+function Test-DoPsSession([string]$Computer, $Ctx) {
+    try {
+        $ic = @{ ComputerName = $Computer; ScriptBlock = { $PSVersionTable.PSVersion.ToString() }; ErrorAction = 'Stop' }
+        if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
+        if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
+        return @{ Ok = $true; Kind = 'ok'; Text = 'działa (PS ' + (Invoke-Command @ic) + ')' }
+    }
+    catch {
+        $msg = (([string]$_.Exception.Message -split "`n")[0]).Trim()
+        $kind = if ($msg -match 'Access is denied|Odmowa dostępu|AccessDenied') { 'denied' } elseif ($msg -match 'Kerberos|SPN|TrustedHosts|authentication') { 'auth' } else { 'other' }
+        return @{ Ok = $false; Kind = $kind; Text = $msg }
+    }
+}
+'@
+
+# Licencje (SoftwareLicensingProduct): Windows i opcjonalnie Office 2013+ (ta sama usługa licencjonowania)
+$script:LicenseScript = {
+    param($Target, $P, $Ctx)
+    . ([scriptblock]::Create($P.CimHelper))
+    $c = Connect-DoCim -Computer $Target -Credential $Ctx.Credential -TimeoutSec $P.TimeoutSec -Transport $P.Transport
+    $s = $c.Session
+    try {
+        $os = Get-CimInstance -CimSession $s -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $cv = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+        $release = Get-DoCimReg $s $cv 'DisplayVersion'
+        if (-not $release) { $release = Get-DoCimReg $s $cv 'ReleaseId' }
+        # Windows 7 / 2008 R2 / 2012 R2: bez wydania - numer wersji jądra (np. 6.1, 6.3)
+        if (-not $release) { $release = Get-DoCimReg $s $cv 'CurrentVersion' }
+        $ubr = Get-DoCimReg $s $cv 'UBR' 'DWord'
+        $build = [string]$os.BuildNumber
+        if ($null -ne $ubr) { $build += ".$ubr" }
+        $type = switch ([int]$os.ProductType) { 1 { 'Stacja robocza' } 2 { 'Kontroler domeny' } 3 { 'Serwer' } default { '' } }
+        if ((Get-DoCimReg $s $cv 'InstallationType') -eq 'Server Core') { $type += ' (Server Core)' }
+        $svc = @(Get-CimInstance -CimSession $s -ClassName SoftwareLicensingService -ErrorAction SilentlyContinue) | Select-Object -First 1
+        $oem = $null
+        if ($svc -and $svc.PSObject.Properties['OA3xOriginalProductKey']) { $oem = [bool][string]$svc.OA3xOriginalProductKey }
+        $apps = @("ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'")
+        if ($P.Office) { $apps += "ApplicationID='0ff1ce15-a989-479d-af46-f275c6370663'" }
+        $products = @(Get-CimInstance -CimSession $s -ClassName SoftwareLicensingProduct -Filter ('PartialProductKey IS NOT NULL AND ({0})' -f ($apps -join ' OR ')) -ErrorAction Stop)
+        $base = [ordered]@{
+            'Stan' = ''; 'Połączenie' = $c.Protocol; 'System' = ([string]$os.Caption).Trim(); 'Edycja' = (Get-DoCimReg $s $cv 'EditionID')
+            'Wersja' = $release; 'Kompilacja' = $build; 'Typ' = $type; 'Architektura' = [string]$os.OSArchitecture
+        }
+        if ($products.Count -eq 0) {
+            $row = [ordered]@{}
+            foreach ($k in $base.Keys) { $row[$k] = $base[$k] }
+            $row['Stan'] = 'Brak klucza'
+            $row['Produkt'] = 'Windows – brak zainstalowanego klucza produktu'
+            $row['Uwagi'] = 'Zainstaluj klucz (slmgr /ipk) albo klucz klienta KMS (GVLK) właściwy dla tej edycji.'
+            $row['__tone'] = 'crit'
+            [pscustomobject]$row
+            return
+        }
+        $statusText = @{ 0 = 'Bez licencji'; 1 = 'Aktywowany'; 2 = 'Okres prolongaty (przed aktywacją)'; 3 = 'Prolongata – wymagana ponowna aktywacja'; 4 = 'Nieoryginalny – prolongata'; 5 = 'Tryb powiadomień (nieaktywowany)'; 6 = 'Rozszerzona prolongata' }
+        $reasonHint = @{
+            'C004F074' = 'brak kontaktu z serwerem KMS (rekord DNS _vlmcs._tcp, port TCP 1688)'
+            '8007232B' = 'brak rekordu DNS serwera KMS (_vlmcs._tcp) – ustaw serwer KMS ręcznie (slmgr /skms)'
+            'C004F038' = 'serwer KMS ma za mało klientów (minimum 5 serwerów albo 25 stacji)'
+            'C004F06C' = 'różnica czasu między komputerem a serwerem KMS'
+            'C004C003' = 'klucz zablokowany przez Microsoft'
+            'C004C008' = 'wyczerpany limit aktywacji klucza MAK'
+            'C004F050' = 'nieprawidłowy klucz produktu'
+            'C004F009' = 'okres prolongaty minął'
+            '4004F00C' = 'okres prolongaty – wymagana aktywacja'
+            '4004F00D' = 'okres prolongaty po zmianie sprzętu lub wygaśnięciu aktywacji KMS'
+        }
+        foreach ($prod in $products) {
+            $desc = [string]$prod.Description
+            $name = [string]$prod.Name
+            $kmsClient = $desc -match 'VOLUME_KMSCLIENT'
+            $eval = ($desc -match 'EVAL') -or ($name -match 'Eval')
+            # Kanał z opisu produktu (jest w każdej wersji systemu; ProductKeyChannel dopiero od Windows 8 / 2012)
+            $channel = if ($kmsClient) { 'Volume: KMS (klient – klucz GVLK)' }
+            elseif ($desc -match 'VOLUME_KMS|CSVLK') { 'Volume: KMS (host – klucz CSVLK)' }
+            elseif ($desc -match 'VOLUME_MAK') { 'Volume: MAK' }
+            elseif ($desc -match 'VIRTUAL_MACHINE_ACTIVATION') { 'AVMA (aktywacja maszyn wirtualnych Hyper-V)' }
+            elseif ($desc -match 'EVAL') { 'Ewaluacyjna' }
+            elseif ($desc -match 'OEM') { 'OEM' }
+            elseif ($desc -match 'RETAIL') { 'Retail' }
+            elseif ($prod.PSObject.Properties['ProductKeyChannel'] -and $prod.ProductKeyChannel) { [string]$prod.ProductKeyChannel }
+            else { $desc }
+            $status = [int]$prod.LicenseStatus
+            $grace = [int64]$prod.GracePeriodRemaining
+            $expires = $null
+            if ($eval -and $prod.PSObject.Properties['EvaluationEndDate'] -and $prod.EvaluationEndDate -is [datetime] -and $prod.EvaluationEndDate.Year -gt 1601) { $expires = $prod.EvaluationEndDate }
+            elseif ($grace -gt 0) { $expires = (Get-Date).AddMinutes($grace) }
+            $days = if ($expires) { [int][Math]::Floor(($expires - (Get-Date)).TotalDays) } else { $null }
+            $kms = ''
+            if ($kmsClient) {
+                $set = [string]$prod.KeyManagementServiceMachine
+                $found = if ($prod.PSObject.Properties['DiscoveredKeyManagementServiceMachineName']) { [string]$prod.DiscoveredKeyManagementServiceMachineName } else { '' }
+                if ($set) { $kms = '{0}:{1} (ustawiony ręcznie)' -f $set, $(if ([int]$prod.KeyManagementServicePort) { [int]$prod.KeyManagementServicePort } else { 1688 }) }
+                elseif ($found) { $kms = '{0}:{1} (z DNS)' -f $found, $(if ($prod.PSObject.Properties['DiscoveredKeyManagementServiceMachinePort'] -and [int]$prod.DiscoveredKeyManagementServiceMachinePort) { [int]$prod.DiscoveredKeyManagementServiceMachinePort } else { 1688 }) }
+                else { $kms = '(nie znaleziono)' }
+            }
+            $code = ''
+            if ($status -ne 1 -and $prod.PSObject.Properties['LicenseStatusReason'] -and $null -ne $prod.LicenseStatusReason) {
+                $code = '0x{0:X8}' -f ([uint32]([int64]$prod.LicenseStatusReason -band 0xFFFFFFFFL))
+            }
+            $notes = @()
+            if ($code -and $reasonHint.ContainsKey($code.Substring(2))) { $notes += $reasonHint[$code.Substring(2)] }
+            $tone = 'ok'
+            $state = 'Aktywowany'
+            if ($status -ne 1) {
+                $state = @{ 0 = 'Bez licencji'; 2 = 'Prolongata'; 3 = 'Prolongata'; 4 = 'Nieoryginalny'; 5 = 'Nieaktywowany'; 6 = 'Prolongata' }[$status]
+                if (-not $state) { $state = "Stan $status" }
+                $tone = if ((@(2, 3, 6) -contains $status) -and ($null -eq $days -or $days -gt 7)) { 'warn' } else { 'crit' }
+                $notes += 'Aktywuj: menu pod prawym przyciskiem albo slmgr /ato na komputerze.'
+            }
+            if ($eval) {
+                $state = 'Ewaluacja'
+                $tone = if ($null -ne $days -and $days -le 14) { 'crit' } else { 'warn' }
+                $notes += 'Wersja ewaluacyjna – po wygaśnięciu system wyłącza się co godzinę. Konwersja do pełnej: DISM /Online /Set-Edition:<edycja> /ProductKey:<klucz> /AcceptEula.'
+            }
+            elseif ($status -eq 1 -and $kmsClient -and $null -ne $days -and $days -lt 30) {
+                $tone = 'warn'
+                $notes += 'Aktywacja KMS odnawia się co 7 dni i jest ważna 180 dni – zbliża się koniec ważności, sprawdź dostęp do serwera KMS.'
+            }
+            $row = [ordered]@{}
+            foreach ($k in $base.Keys) { $row[$k] = $base[$k] }
+            $row['Stan'] = $state
+            $row['Produkt'] = $(if ($name) { $name } else { $desc })
+            $row['Kanał'] = $channel
+            $row['Licencja'] = $(if ($statusText.ContainsKey($status)) { $statusText[$status] } else { "Stan $status" })
+            $row['Klucz (końcówka)'] = [string]$prod.PartialProductKey
+            $row['Ważna do'] = $expires
+            $row['Pozostało (dni)'] = $days
+            $row['Serwer KMS'] = $kms
+            $row['Klucz OEM w UEFI'] = $oem
+            $row['Kod przyczyny'] = $code
+            $row['Uwagi'] = ($notes -join ' ')
+            $row['__tone'] = $tone
+            $row['__id'] = [string]$prod.ID
+            [pscustomobject]$row
+        }
+    }
+    finally { Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue }
+}
+
+$script:LicenseActivateScript = {
+    # Aktywacja wybranych produktów (odpowiednik slmgr /ato) przez tę samą sesję CIM
+    param($Target, $P, $Ctx)
+    . ([scriptblock]::Create($P.CimHelper))
+    $c = Connect-DoCim -Computer $Target -Credential $Ctx.Credential -TimeoutSec ([Math]::Max(60, [int]$P.TimeoutSec)) -Transport $P.Transport
+    $s = $c.Session
+    try {
+        foreach ($id in @($P.Ids)) {
+            $safe = ([string]$id) -replace "[^0-9A-Fa-f-]", ''
+            $prod = @(Get-CimInstance -CimSession $s -ClassName SoftwareLicensingProduct -Filter "ID='$safe'" -ErrorAction Stop) | Select-Object -First 1
+            if (-not $prod) { [pscustomobject]@{ 'Produkt' = $safe; 'Wynik' = 'Błąd – produkt nie istnieje na komputerze' }; continue }
+            try {
+                $r = Invoke-CimMethod -CimSession $s -InputObject $prod -MethodName Activate -ErrorAction Stop
+                if ($r -and [int64]$r.ReturnValue -ne 0) { throw ('kod 0x{0:X8}' -f ([uint32]([int64]$r.ReturnValue -band 0xFFFFFFFFL))) }
+                [pscustomobject]@{ 'Produkt' = [string]$prod.Name; 'Wynik' = "OK – aktywowano ($($c.Protocol))" }
+            }
+            catch { [pscustomobject]@{ 'Produkt' = [string]$prod.Name; 'Wynik' = 'Błąd – ' + (([string]$_.Exception.Message -split "`n")[0]).Trim() } }
+        }
+        $svc = @(Get-CimInstance -CimSession $s -ClassName SoftwareLicensingService -ErrorAction SilentlyContinue) | Select-Object -First 1
+        if ($svc) { try { $null = Invoke-CimMethod -CimSession $s -InputObject $svc -MethodName RefreshLicenseStatus -ErrorAction Stop } catch { } }
+    }
+    finally { Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue }
+}
+
+Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'License' -Title 'Licencja i wersja Windows' -Icon 'E8D7' -Badge 'nowe' `
+    -Description 'Wersja systemu (edycja, wydanie, kompilacja), stan aktywacji, kanał licencji (Retail, OEM, MAK, KMS, AVMA, ewaluacja), końcówka klucza, serwer KMS i data ważności – dla serwerów i stacji. Działa przez WinRM, a gdy jest niedostępny, przez DCOM (WMI, jak konsole MMC). Aktywacja z menu pod prawym przyciskiem.' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $m.PillColumns = @('Stan')
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $params = @{ CimHelper = $script:CimHelperText; TimeoutSec = [int]$script:Settings.TimeoutSec; Transport = @('Auto', 'Wsman', 'Dcom')[$m.Transport.SelectedIndex]; Office = (Test-Checked $m.Office) }
+        Reset-StatTiles $m
+        Start-HostOperation -Module $m -Name 'Licencja Windows' -Targets $targets -Local -Parameters $params -ScriptBlock $script:LicenseScript -OnComplete {
+            param($m)
+            $counts = @{ ok = 0; warn = 0; crit = 0; dcom = 0 }
+            foreach ($row in $m.Table.Rows) {
+                $t = [string](Get-ObjectValue $row '__tone')
+                if ([string](Get-ObjectValue $row 'Status') -eq 'Błąd') { $t = 'crit' }
+                if ($counts.ContainsKey($t)) { $counts[$t]++ }
+                if ([string](Get-ObjectValue $row 'Połączenie') -eq 'DCOM') { $counts.dcom++ }
+            }
+            Set-StatTile -Module $m -Key 'ok' -Value ([string]$counts.ok) -Tone 'ok'
+            Set-StatTile -Module $m -Key 'warn' -Value ([string]$counts.warn) -Tone $(if ($counts.warn) { 'warn' } else { '' })
+            Set-StatTile -Module $m -Key 'crit' -Value ([string]$counts.crit) -Tone $(if ($counts.crit) { 'crit' } else { '' })
+            Set-StatTile -Module $m -Key 'dcom' -Value ([string]$counts.dcom)
+        }
+    }
+    $m.Actions.Activate = {
+        param($m, $Rows)
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('__id') -Rows $Rows
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli produkty (wiersze z kluczem), które mają zostać aktywowane.'; return }
+        $items = Get-HostItemList -ByHost $byHost -Format { param($i) [string](Get-RowValue $i.__row 'Produkt') }
+        if (-not (Confirm-Action -Text 'Aktywować wybrane produkty? Komputer łączy się z serwerem KMS albo z usługą aktywacji Microsoft (klucze Retail i MAK – wymagany dostęp do Internetu).' -Items $items -ConfirmText 'Aktywuj')) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) { $per[$h] = @{ CimHelper = $script:CimHelperText; TimeoutSec = [int]$script:Settings.TimeoutSec; Transport = @('Auto', 'Wsman', 'Dcom')[$m.Transport.SelectedIndex]; Ids = @($byHost[$h] | ForEach-Object { [string]$_['__id'] }) } }
+        $m.Data.ActionHosts = @($byHost.Keys)
+        Start-HostOperation -Module $m -Name 'Aktywacja Windows' -Targets @($byHost.Keys) -Local -PerTarget $per -Output Log -ScriptBlock $script:LicenseActivateScript `
+            -OnComplete { param($m) Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } }
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Sprawdzenie'
+    Add-Label -Parent $row -Text 'Połączenie' | Out-Null
+    $m.Transport = Add-ComboBox -Parent $row -Items @('WinRM, potem DCOM', 'Tylko WinRM', 'Tylko DCOM (WMI)') -Width 190
+    $m.Transport.ToolTip = 'Automatycznie: WinRM, a gdy jest niedostępny – DCOM (WMI, jak konsole MMC)'
+    $m.Office = Add-CheckBox -Parent $row -Text 'Także Office' -ToolTip 'Licencje Office 2013 i nowszego w usłudze licencjonowania Windows (wersje zbiorcze i detaliczne)'
+    Add-Button -Parent $row -Text 'Sprawdź licencje' -Icon 'E8D7' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
+    Add-StatTile -Module $m -Key 'ok' -Label 'Aktywowane' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'warn' -Label 'Wymagają uwagi' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'crit' -Label 'Nieaktywne / błędy' -Icon 'E711' | Out-Null
+    Add-StatTile -Module $m -Key 'dcom' -Label 'Odczytane przez DCOM' -Icon 'E968' | Out-Null
+    Add-RowAction -Module $m -Text 'Aktywuj (slmgr /ato)' -Icon 'E8D7' -Action { param($m, $rows) & $m.Actions.Activate $m $rows }
+}
+
+# Diagnostyka WinRM: z tego komputera (porty, WSMan, sesja) i z komputera docelowego przez DCOM (usługa, listener,
+# profil sieci, zapora z regułami lokalnymi i z GPO, filtr IPv4 zasady WinRM) - wniosek i zalecenie
+$script:WinRMDiagScript = {
+    param($Target, $P, $Ctx)
+    . ([scriptblock]::Create($P.CimHelper))
+    $row = [ordered]@{ 'Stan' = ''; 'Wniosek' = ''; 'Adres IP' = ''; 'Mój adres' = ''; 'Ping' = $null }
+    $tone = 'crit'
+    $addresses = @(Resolve-DoAddress $Target)
+    if ($addresses.Count -eq 0) {
+        $row['Stan'] = 'Brak w DNS'
+        $row['Wniosek'] = 'Nazwa komputera nie rozwiązuje się w DNS.'
+        $row['Ping'] = $false
+        $row['Zalecenie'] = 'Sprawdź rekord A w DNS (rejestracja dynamiczna klienta DHCP/DNS) albo użyj pełnej nazwy.'
+        $row['__tone'] = 'crit'
+        [pscustomobject]$row
+        return
+    }
+    $ip = $addresses[0]
+    $src = Get-DoSourceAddress $ip
+    $row['Adres IP'] = ($addresses -join ', ')
+    $row['Mój adres'] = $src
+    $row['Ping'] = Test-DoPing $ip
+    $ports = Test-DoPorts -Address $ip -Ports @(5985, 5986, 135, 445) -TimeoutMs $P.PortTimeoutMs
+    foreach ($port in 5985, 5986, 135, 445) { $row["TCP $port"] = $ports[$port] }
+    $ws = @{ Ok = $false; Text = 'pominięto – port 5985 nie jest otwarty' }
+    $ps = @{ Ok = $false; Kind = ''; Text = 'pominięto' }
+    if ($ports[5985] -eq 'otwarty') {
+        $ws = Test-DoWsman $Target
+        if ($ws.Ok) { $ps = Test-DoPsSession $Target $Ctx }
+    }
+    $row['WSMan'] = $ws.Text
+    $row['Sesja PowerShell'] = $ps.Text
+    # Odczyt konfiguracji przez DCOM (gdy RPC 135 odpowiada) - także wtedy, gdy WinRM działa (pełny obraz)
+    $d = $null
+    $dcomText = 'pominięto – port 135 nie jest otwarty'
+    if ($ports[135] -eq 'otwarty') {
+        try {
+            $c = Connect-DoCim -Computer $Target -Credential $Ctx.Credential -TimeoutSec $P.TimeoutSec -Transport 'Dcom'
+            $dcomText = 'działa'
+            $s = $c.Session
+            try {
+                $d = @{}
+                $svc = @(Get-CimInstance -CimSession $s -ClassName Win32_Service -Filter "Name='WinRM'" -ErrorAction SilentlyContinue) | Select-Object -First 1
+                $d.Service = if ($svc) { '{0}, {1}' -f $svc.State, $svc.StartMode } else { '(brak usługi)' }
+                $d.Running = ($svc -and [string]$svc.State -eq 'Running')
+                $pol = 'SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+                $d.AutoConfig = Get-DoCimReg $s $pol 'AllowAutoConfig' 'DWord'
+                $d.Filter4 = [string](Get-DoCimReg $s $pol 'IPv4Filter')
+                $listeners = @(Get-DoCimReg $s 'SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Listener' -Type Keys | Where-Object { $_ })
+                $d.Listener = if ($listeners.Count) { $listeners -join ', ' } elseif ($d.AutoConfig -eq 1) { 'z GPO (Allow remote server management through WinRM)' } else { '' }
+                $d.Subnets = @()
+                $ifIndex = $null
+                foreach ($nic in @(Get-CimInstance -CimSession $s -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = True' -ErrorAction SilentlyContinue)) {
+                    $ips = @($nic.IPAddress); $masks = @($nic.IPSubnet)
+                    if ($ips -contains $ip -and $nic.PSObject.Properties['InterfaceIndex']) { $ifIndex = $nic.InterfaceIndex }
+                    for ($i = 0; $i -lt $ips.Count; $i++) {
+                        $n = ConvertTo-DoIpNumber ([string]$ips[$i]); $mk = if ($i -lt $masks.Count) { ConvertTo-DoIpNumber ([string]$masks[$i]) } else { $null }
+                        if ($null -ne $n -and $null -ne $mk) { $d.Subnets += @{ Net = $n; Mask = $mk } }
+                    }
+                }
+                $d.Profiles = @()
+                $d.ProfileText = ''
+                try {
+                    $cats = @(Get-CimInstance -CimSession $s -Namespace 'root\StandardCimv2' -ClassName MSFT_NetConnectionProfile -ErrorAction Stop)
+                    $d.ProfileText = (@($cats | ForEach-Object { '{0}: {1}' -f $_.InterfaceAlias, @{ 0 = 'Publiczny'; 1 = 'Prywatny'; 2 = 'Domena' }[[int]$_.NetworkCategory] }) -join ', ')
+                    # Profil zapory jest przypisany do karty sieciowej - liczy się karta z adresem, z którym się łączymy
+                    $own = @($cats | Where-Object { $null -ne $ifIndex -and $_.PSObject.Properties['InterfaceIndex'] -and [int]$_.InterfaceIndex -eq [int]$ifIndex })
+                    if ($own.Count) { $cats = $own; if (@($d.ProfileText -split ', ').Count -gt 1) { $d.ProfileText += " (adres $ip`: $($own[0].InterfaceAlias))" } }
+                    $d.Profiles = @($cats | ForEach-Object { @{ 0 = 'Public'; 1 = 'Private'; 2 = 'Domain' }[[int]$_.NetworkCategory] } | Where-Object { $_ } | Select-Object -Unique)
+                }
+                catch { $d.ProfileText = '(niedostępne – starszy system)' }
+                $profiles = if ($d.Profiles.Count) { $d.Profiles } else { @('Domain', 'Private', 'Public') }
+                # Zapora: reguły z GPO (wszystkie) i lokalne - bez wbudowanych reguł innych grup Windows (np. CoreNet-DNS-Out-UDP),
+                # bo każda wartość to osobne wywołanie przez DCOM; reguły WinRM, własne i aplikacji są czytane
+                $gpoKey = 'SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules'
+                $gpoRules = @(foreach ($v in @(Get-DoCimReg $s $gpoKey -Type Values | Where-Object { $_ })) { $t = Get-DoCimReg $s $gpoKey $v; if ($t) { ConvertFrom-DoFwRule -Text $t -Id $v -Source 'GPO' } })
+                $locKey = 'SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules'
+                $locRules = @(foreach ($v in @(Get-DoCimReg $s $locKey -Type Values | Where-Object { $_ -and ($_ -match 'WINRM|5985' -or $_ -notmatch '^[A-Za-z0-9]+(-[A-Za-z0-9]+)*-(In|Out)(-[A-Za-z0-9]+)*$') })) { $t = Get-DoCimReg $s $locKey $v; if ($t) { ConvertFrom-DoFwRule -Text $t -Id $v -Source 'lokalna' } })
+                $verdicts = @()
+                foreach ($pf in $profiles) {
+                    $locName = @{ Domain = 'DomainProfile'; Private = 'StandardProfile'; Public = 'PublicProfile' }[$pf]
+                    $gpoName = @{ Domain = 'DomainProfile'; Private = 'PrivateProfile'; Public = 'PublicProfile' }[$pf]
+                    $en = Get-DoCimReg $s "SOFTWARE\Policies\Microsoft\WindowsFirewall\$gpoName" 'EnableFirewall' 'DWord'
+                    if ($null -eq $en) { $en = Get-DoCimReg $s "SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\$locName" 'EnableFirewall' 'DWord' }
+                    $merge = Get-DoCimReg $s "SOFTWARE\Policies\Microsoft\WindowsFirewall\$gpoName" 'AllowLocalPolicyMerge' 'DWord'
+                    $v = Get-DoFwVerdict -Profile $pf -Enabled ($en -ne 0) -LocalMerge ($merge -ne 0) -GpoRules $gpoRules -LocalRules $locRules -Port 5985 -SourceIp $src -Subnets $d.Subnets
+                    $v.Profile = $pf
+                    $v.Merge = ($merge -ne 0)
+                    $verdicts += $v
+                }
+                $d.Verdicts = $verdicts
+            }
+            finally { Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue }
+        }
+        catch { $dcomText = (([string]$_.Exception.Message -split "`n")[0]).Trim() -replace '^Brak połączenia CIM – DCOM: ', '' }
+    }
+    $row['DCOM (WMI)'] = $dcomText
+    $plName = @{ Domain = 'Domena'; Private = 'Prywatny'; Public = 'Publiczny' }
+    foreach ($k in 'Usługa WinRM', 'Listener', 'Filtr IPv4 (GPO)', 'Profil sieci', 'Zapora (5985)') { $row[$k] = '' }
+    $row['Zalecenie'] = ''
+    if ($d) {
+        $row['Usługa WinRM'] = $d.Service
+        $row['Listener'] = $(if ($d.Listener) { $d.Listener } else { 'brak' })
+        $row['Filtr IPv4 (GPO)'] = $(if ($d.Filter4) { $m4 = Test-DoIpMatch -Ip $ip -Tokens @($d.Filter4); '{0} – {1}' -f $d.Filter4, $(if ($m4 -eq $false) { "NIE obejmuje adresu $ip" } else { "obejmuje $ip" }) } else { 'nie ustawiono' })
+        $row['Profil sieci'] = $d.ProfileText
+        $row['Zapora (5985)'] = (@($d.Verdicts | ForEach-Object { '{0}: {1}' -f $plName[$_.Profile], $_.Text }) -join ' • ')
+    }
+    # Wniosek - od przyczyn najbardziej prawdopodobnych
+    $gpoFw = 'GPO › Konfiguracja komputera › Zasady › Ustawienia systemu Windows › Ustawienia zabezpieczeń › Zapora Windows Defender z zabezpieczeniami zaawansowanymi › Reguły przychodzące: reguła predefiniowana «Windows Remote Management» (albo port TCP 5985) dla profilu Domena, zakres adresów zdalnych: podsieci administracyjne.'
+    $blocked = @(if ($d) { @($d.Verdicts | Where-Object { $_.Result -eq 'Blocked' -or $_.Result -eq 'NoRule' }) })
+    $allowedAll = $d -and @($d.Verdicts).Count -gt 0 -and @($d.Verdicts | Where-Object { $_.Result -eq 'Allowed' -or $_.Result -eq 'Off' }).Count -eq @($d.Verdicts).Count
+    $publicOnDomain = $d -and @($d.Profiles) -contains 'Public'
+    if ($ps.Ok) {
+        $tone = 'ok'; $row['Stan'] = 'WinRM działa'
+        $row['Wniosek'] = 'WinRM i sesja PowerShell działają z tego komputera.'
+    }
+    elseif ($ws.Ok -and $ps.Kind -eq 'denied') {
+        $tone = 'warn'; $row['Stan'] = 'Brak uprawnień'
+        $row['Wniosek'] = 'WinRM odpowiada, ale konto nie ma prawa do sesji zdalnej.'
+        $row['Zalecenie'] = 'Konto w grupie Administratorzy albo «Remote Management Users» na komputerze (GPO: Grupy z ograniczonym dostępem albo Preferencje › Lokalni użytkownicy i grupy).'
+    }
+    elseif ($ws.Ok -and $ps.Kind -eq 'auth') {
+        $tone = 'warn'; $row['Stan'] = 'Uwierzytelnianie'
+        $row['Wniosek'] = 'WinRM odpowiada, ale uwierzytelnianie Kerberos się nie udaje.'
+        $row['Zalecenie'] = 'Używaj pełnej nazwy DNS komputera (nie adresu IP – dla IP potrzebne HTTPS albo TrustedHosts), sprawdź rekord DNS i SPN HTTP/<nazwa> (setspn -L <komputer>) oraz czas na komputerze.'
+    }
+    elseif ($ws.Ok) {
+        $tone = 'warn'; $row['Stan'] = 'Sesja nieudana'
+        $row['Wniosek'] = 'WinRM odpowiada, ale sesja PowerShell się nie udaje: ' + $ps.Text
+    }
+    elseif ($ports[5985] -eq 'otwarty') {
+        $tone = 'warn'; $row['Stan'] = 'WinRM nie odpowiada'
+        $row['Wniosek'] = 'Port 5985 jest otwarty, ale usługa WinRM nie odpowiada poprawnie: ' + $ws.Text
+        if ($d -and $d.Filter4 -and (Test-DoIpMatch -Ip $ip -Tokens @($d.Filter4)) -eq $false) { $row['Zalecenie'] = "Filtr IPv4 zasady WinRM nie obejmuje adresu $ip – ustaw w GPO «Allow remote server management through WinRM» filtr IPv4 = * (albo zakres z adresami serwerów)." }
+    }
+    elseif ($d -and -not $d.Running) {
+        $row['Stan'] = 'Usługa zatrzymana'
+        $row['Wniosek'] = "Usługa WinRM nie działa ($($d.Service))."
+        $row['Zalecenie'] = 'GPO › Zasady › Ustawienia zabezpieczeń › Usługi systemowe: Zdalne zarządzanie systemem Windows (WS-Management) – Automatyczny; albo «Włącz WinRM przez DCOM» w tym module.'
+    }
+    elseif ($d -and -not $d.Listener) {
+        $row['Stan'] = 'Brak listenera'
+        $row['Wniosek'] = 'Usługa WinRM działa, ale nie ma listenera HTTP.'
+        $row['Zalecenie'] = 'GPO › Szablony administracyjne › Składniki systemu Windows › Zdalne zarządzanie systemem Windows › Usługa WinRM › «Allow remote server management through WinRM» = Włączone, filtr IPv4 = *; albo «Włącz WinRM przez DCOM».'
+    }
+    elseif ($d -and $d.Filter4 -and (Test-DoIpMatch -Ip $ip -Tokens @($d.Filter4)) -eq $false) {
+        $row['Stan'] = 'Filtr IPv4'
+        $row['Wniosek'] = "Filtr IPv4 zasady WinRM ($($d.Filter4)) nie obejmuje adresu $ip – usługa na nim nie nasłuchuje."
+        $row['Zalecenie'] = 'GPO «Allow remote server management through WinRM»: filtr IPv4 to adresy KOMPUTERA, na których WinRM nasłuchuje (nie adresy klientów) – ustaw * albo zakres obejmujący adresy serwerów.'
+    }
+    elseif ($blocked.Count) {
+        $row['Stan'] = 'Zapora Windows'
+        $why = (@($blocked | ForEach-Object { '{0}: {1}' -f $plName[$_.Profile], $_.Text }) -join ' • ')
+        $row['Wniosek'] = "Zapora Windows na komputerze nie dopuszcza TCP 5985 z adresu $src – $why"
+        $adv = @()
+        if (@($blocked | Where-Object { $_['Scope'] -and (@($_.Rules | ForEach-Object { @($_.RA4) }) -match 'LocalSubnet') }).Count) { $adv += 'Reguła WinRM dopuszcza tylko podsieć lokalną (tak tworzy ją Enable-PSRemoting / winrm quickconfig, a w profilu Publicznym zawsze) – dlatego z innej podsieci WinRM jest niedostępny mimo działającej usługi.' }
+        if ($publicOnDomain) { $adv += 'Karta sieciowa ma profil Publiczny zamiast Domena – usługa NLA nie rozpoznała sieci domenowej (np. brak dostępu do kontrolera domeny przy starcie); po naprawie działa reguła profilu Domena.' }
+        if (@($blocked | Where-Object { -not $_.Merge }).Count) { $adv += 'GPO wyłącza lokalne reguły zapory («Zastosuj lokalne reguły zapory: Nie») – reguła WinRM musi być w GPO.' }
+        $adv += $gpoFw
+        $row['Zalecenie'] = ($adv -join ' ')
+    }
+    elseif ($allowedAll -and $ports[5985] -eq 'brak odpowiedzi') {
+        $tone = 'warn'; $row['Stan'] = 'Blokada w sieci'
+        $row['Wniosek'] = "Usługa, listener i zapora Windows na komputerze dopuszczają TCP 5985 z adresu $src, a połączenie nie dochodzi – port blokuje zapora sieciowa albo ACL między podsieciami."
+        $row['Zalecenie'] = 'Odblokuj TCP 5985 (i 5986 dla HTTPS) z podsieci administracyjnej na zaporze sieciowej / routerze między VLAN-ami.'
+    }
+    elseif ($d) {
+        $tone = 'warn'; $row['Stan'] = 'Niejasne'
+        $row['Wniosek'] = 'Nie udało się jednoznacznie wskazać przyczyny – szczegóły w kolumnach zapory, profilu sieci i filtra.'
+        $row['Zalecenie'] = $gpoFw
+    }
+    elseif ($ports[135] -eq 'otwarty') {
+        $row['Stan'] = 'Brak dostępu DCOM'
+        $row['Wniosek'] = "Port 5985 nie odpowiada, a odczyt konfiguracji przez DCOM się nie udał: $dcomText"
+        $row['Zalecenie'] = 'Sprawdź uprawnienia (administrator komputera) albo zaporę dla WMI (reguły «Windows Management Instrumentation (DCOM-In/WMI-In)»).'
+    }
+    elseif ($row['Ping'] -or $ports[445] -eq 'otwarty' -or $ports[5985] -eq 'odrzucony' -or $ports[135] -eq 'odrzucony') {
+        $row['Stan'] = 'Filtrowany'
+        $row['Wniosek'] = 'Komputer odpowiada, ale WinRM (5985) i RPC (135) nie są dostępne z tego komputera – zapora na komputerze albo w sieci; bez DCOM nie da się odczytać konfiguracji.'
+        $row['Zalecenie'] = $gpoFw + ' Przy okazji: reguły «Windows Management Instrumentation (WMI-In)» i «Remote Event Log/Service Management» dla tych samych podsieci umożliwią diagnostykę i konsole MMC.'
+    }
+    else {
+        $row['Stan'] = 'Niedostępny'
+        $row['Wniosek'] = 'Komputer nie odpowiada na ping ani na żadnym z badanych portów – wyłączony, poza siecią albo całkowicie odfiltrowany.'
+    }
+    $row['__tone'] = $tone
+    $row['__src'] = $src
+    [pscustomobject]$row
+}
+
+# Włączenie WinRM przez DCOM: proces na komputerze docelowym (Win32_Process.Create) z Enable-PSRemoting
+# (albo winrm quickconfig na PowerShell 2.0); opcjonalnie reguła zapory tylko dla adresu tego komputera
+$script:WinRMEnableScript = {
+    param($Target, $P, $Ctx)
+    . ([scriptblock]::Create($P.CimHelper))
+    $src = ''
+    if ($P.AddRule) {
+        $a = @(Resolve-DoAddress $Target)
+        if ($a.Count) { $src = Get-DoSourceAddress $a[0] }
+        if (-not $src) { throw 'Nie można ustalić adresu tego komputera dla reguły zapory.' }
+    }
+    $remote = @'
+$ErrorActionPreference = 'Continue'
+$dir = Join-Path $env:SystemRoot 'Temp\DomainOps'
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+$log = Join-Path $dir 'EnableWinRM.log'
+& {
+    "Start: $(Get-Date -Format s)"
+    try { Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop; 'Enable-PSRemoting: OK' }
+    catch { "Enable-PSRemoting: $($_.Exception.Message)"; winrm quickconfig -quiet 2>&1 }
+    Set-Service -Name WinRM -StartupType Automatic
+    Start-Service -Name WinRM
+    if ('__SRC__') {
+        netsh advfirewall firewall delete rule name="Domain Ops - WinRM (HTTP-In)" 2>&1 | Out-Null
+        netsh advfirewall firewall add rule name="Domain Ops - WinRM (HTTP-In)" dir=in action=allow protocol=TCP localport=5985 remoteip=__SRC__ profile=any 2>&1
+    }
+    "Koniec: $(Get-Date -Format s)"
+} 2>&1 | Out-File -FilePath $log -Encoding UTF8
+'@
+    $remote = $remote.Replace('__SRC__', $src)
+    $cmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($remote))
+    $c = Connect-DoCim -Computer $Target -Credential $Ctx.Credential -TimeoutSec ([Math]::Max(60, [int]$P.TimeoutSec)) -Transport 'Dcom'
+    $s = $c.Session
+    try {
+        $r = Invoke-CimMethod -CimSession $s -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd } -ErrorAction Stop
+        if ([int]$r.ReturnValue -ne 0) { throw "Win32_Process.Create zwrócił kod $($r.ReturnValue) (2 – brak dostępu, 8 – nieznany błąd, 9 – brak ścieżki)." }
+        $procId = [int]$r.ProcessId
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 180) {
+            if (-not @(Get-CimInstance -CimSession $s -ClassName Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue).Count) { break }
+            Start-Sleep -Seconds 2
+        }
+        $done = $sw.Elapsed.TotalSeconds -lt 180
+        $text = ''
+        try { $text = (Get-Content -LiteralPath "\\$Target\ADMIN$\Temp\DomainOps\EnableWinRM.log" -ErrorAction Stop | Where-Object { $_ -and $_ -notmatch '^\s*$' }) -join ' | ' } catch { }
+        [pscustomobject]@{
+            'Wynik'    = $(if ($done) { 'OK – polecenie wykonane (proces ' + $procId + ')' } else { 'Polecenie nadal trwa (proces ' + $procId + ')' })
+            'Reguła'   = $(if ($src) { "TCP 5985 tylko z $src" } else { '' })
+            'Dziennik' = $(if ($text) { $text } else { 'C:\Windows\Temp\DomainOps\EnableWinRM.log na komputerze (brak dostępu do ADMIN$)' })
+        }
+    }
+    finally { Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue }
+}
+
+function Invoke-WinRMDiagFor {
+    # Diagnostyka WinRM dla podanych komputerów (np. z menu modułu Łączność) - otwiera moduł i uruchamia test
+    param([string[]]$Names)
+    $diagNames = @($Names | Where-Object { $_ })
+    if ($diagNames.Count -eq 0) { return }
+    Show-Module -Key 'WinRMDiag'
+    $diagModule = $script:UI.Modules['WinRMDiag']
+    if (-not $diagModule) { return }
+    Invoke-WithTargets -Kind Computer -Names $diagNames -Action { & $diagModule.Actions.Run $diagModule }
+}
+
+Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'WinRMDiag' -Title 'Diagnostyka WinRM' -Icon 'E9D9' -Badge 'nowe' `
+    -Description 'Dlaczego WinRM jest niedostępny: porty 5985/5986/135/445 z tego komputera, odpowiedź WSMan i sesja PowerShell, a przez DCOM (WMI) – usługa WinRM, listener, profil sieci, reguły zapory (lokalne i z GPO, z zakresem adresów zdalnych) i filtr IPv4 zasady WinRM. Wniosek i zalecenie GPO; awaryjnie włączenie WinRM przez DCOM.' -Build {
+    param($m)
+    $m.ColorBools = $true
+    $m.PillColumns = @('Stan')
+    $m.Actions.Run = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $params = @{ CimHelper = $script:CimHelperText; TimeoutSec = [int]$script:Settings.TimeoutSec; PortTimeoutMs = (Get-Num $m.PortTimeout) }
+        Reset-StatTiles $m
+        Start-HostOperation -Module $m -Name 'Diagnostyka WinRM' -Targets $targets -Local -Parameters $params -ScriptBlock $script:WinRMDiagScript -OnComplete {
+            param($m)
+            $counts = @{ ok = 0; warn = 0; crit = 0 }
+            foreach ($row in $m.Table.Rows) {
+                $t = [string](Get-ObjectValue $row '__tone')
+                if (-not $counts.ContainsKey($t)) { $t = 'crit' }
+                $counts[$t]++
+            }
+            Set-StatTile -Module $m -Key 'ok' -Value ([string]$counts.ok) -Tone 'ok'
+            Set-StatTile -Module $m -Key 'warn' -Value ([string]$counts.warn) -Tone $(if ($counts.warn) { 'warn' } else { '' })
+            Set-StatTile -Module $m -Key 'crit' -Value ([string]$counts.crit) -Tone $(if ($counts.crit) { 'crit' } else { '' })
+        }
+    }
+    $m.Actions.Enable = {
+        param($m, $Rows)
+        $targets = if ($null -ne $Rows) { @(Get-RowTargetNames -Rows $Rows -Column 'Komputer') } else { @(Get-TargetComputers) }
+        if (-not $targets) { return }
+        $addRule = Test-Checked $m.AddRule
+        $text = 'Uruchomić na komputerach przez DCOM (WMI) polecenie Enable-PSRemoting (na PowerShell 2.0: winrm quickconfig) i ustawić usługę WinRM na automatyczną?'
+        if ($addRule) { $text += ' Zostanie też dodana reguła zapory «Domain Ops - WinRM (HTTP-In)» dopuszczająca TCP 5985 tylko z adresu tego komputera.' }
+        $text += ' To rozwiązanie doraźne: zasady GPO mają pierwszeństwo (np. wyłączone lokalne reguły zapory), a docelowo WinRM należy skonfigurować w GPO.'
+        $targets = @(Confirm-Action -Text $text -Items $targets -ConfirmText 'Włącz WinRM' -Select)
+        if ($targets.Count -eq 0) { return }
+        $m.Data.ActionHosts = @($targets)
+        $params = @{ CimHelper = $script:CimHelperText; TimeoutSec = [int]$script:Settings.TimeoutSec; AddRule = $addRule }
+        Start-HostOperation -Module $m -Name 'Włączenie WinRM przez DCOM' -Targets $targets -Local -Parameters $params -Output Log -ScriptBlock $script:WinRMEnableScript `
+            -OnComplete { param($m) Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.Run $m } }
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Diagnostyka'
+    Add-Label -Parent $row -Text 'Limit portu (ms)' | Out-Null
+    $m.PortTimeout = Add-Numeric -Parent $row -Value 2500 -Minimum 500 -Maximum 10000 -Width 70
+    Add-Button -Parent $row -Text 'Diagnozuj WinRM' -Icon 'E9D9' -Module $m -Primary -OnClick $m.Actions.Run | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Naprawa doraźna'
+    $m.AddRule = Add-CheckBox -Parent $row2 -Text 'Z regułą zapory tylko dla mojego adresu' -Checked $true -ToolTip 'Reguła «Domain Ops - WinRM (HTTP-In)»: TCP 5985 z adresu tego komputera, wszystkie profile sieci'
+    Add-Button -Parent $row2 -Text 'Włącz WinRM przez DCOM' -Icon 'E7E8' -Module $m -OnClick { param($m) & $m.Actions.Enable $m $null } | Out-Null
+    Add-StatTile -Module $m -Key 'ok' -Label 'WinRM działa' -Icon 'E73E' | Out-Null
+    Add-StatTile -Module $m -Key 'warn' -Label 'Częściowo' -Icon 'E7BA' | Out-Null
+    Add-StatTile -Module $m -Key 'crit' -Label 'Niedostępny' -Icon 'E711' | Out-Null
+    Add-RowAction -Module $m -Text 'Włącz WinRM przez DCOM…' -Icon 'E7E8' -Action { param($m, $rows) & $m.Actions.Enable $m $rows }
 }
 #endregion
 
@@ -28900,9 +29797,11 @@ function Start-DomainOps {
     if (-not (Unlock-DomainOps)) { return }
     $w = Initialize-MainWindow
     try {
+        Start-IdleLock
         [void]$w.ShowDialog()
     }
     finally {
+        if ($script:IdleLock.Timer) { $script:IdleLock.Timer.Stop() }
         Close-Engine
     }
 }
