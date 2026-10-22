@@ -3737,7 +3737,10 @@ $script:ModuleViewXaml = @'
     <TextBlock x:Name="resultHint" Grid.Column="3" Foreground="#5E6779" FontSize="12" VerticalAlignment="Center" Margin="6,0,12,0" TextTrimming="CharacterEllipsis"/>
     <TextBox x:Name="filterBox" Grid.Column="4" Width="260" Tag="Filtruj wyniki (Ctrl+F)…" Margin="0,0,8,0"/>
     <CheckBox x:Name="chkReveal" Grid.Column="5" Content="Pokaż poufne" Margin="4,0,12,0" Visibility="Collapsed"/>
-    <Button x:Name="btnDetail" Grid.Column="6" Style="{StaticResource GhostButton}" ToolTip="Panel szczegółów wiersza" Margin="0,0,4,0"/>
+    <StackPanel Grid.Column="6" Orientation="Horizontal">
+      <Button x:Name="btnColumns" Style="{StaticResource GhostButton}" ToolTip="Wybierz kolumny do pokazania – ukryte nie trafiają do kopiowania ani eksportu" Margin="0,0,4,0"/>
+      <Button x:Name="btnDetail" Style="{StaticResource GhostButton}" ToolTip="Panel szczegółów wiersza" Margin="0,0,4,0"/>
+    </StackPanel>
     <Button x:Name="btnCopy" Grid.Column="7" Style="{StaticResource GhostButton}" ToolTip="Kopiuj zaznaczone wiersze lub całą tabelę (format Excel)" Margin="0,0,4,0"/>
     <Button x:Name="btnExport" Grid.Column="8" ToolTip="Eksport widocznych wierszy do CSV lub raportu HTML"/>
   </Grid>
@@ -3789,7 +3792,7 @@ function New-ModuleView {
     $root = New-UiElement $script:ModuleViewXaml
     $Module.Root = $root
     foreach ($n in 'paramsCard', 'paramsStack', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
-        'btnDetail', 'btnCopy', 'btnExport', 'grid', 'emptyState', 'emptyIcon', 'emptyText', 'emptyHint', 'detailCol', 'detailSplit',
+        'btnDetail', 'btnColumns', 'btnCopy', 'btnExport', 'grid', 'emptyState', 'emptyIcon', 'emptyText', 'emptyHint', 'detailCol', 'detailSplit',
         'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse', 'btnStopOp') {
         $Module.View_[$n] = $root.FindName($n)
     }
@@ -3808,6 +3811,7 @@ function New-ModuleView {
     $v = $Module.View_
     $v.btnDetail.Content = New-IconContent -Text '' -Icon 'E8A1'
     $v.btnCopy.Content = New-IconContent -Text '' -Icon 'E8C8'
+    $v.btnColumns.Content = New-IconContent -Text '' -Icon 'E8FD'
     $v.btnExport.Content = New-IconContent -Text 'Eksport' -Icon 'EDE1'
     $v.btnDetailCopy.Content = New-IconContent -Text '' -Icon 'E8C8' -IconSize 11
     $v.btnCollapse.Content = New-IconContent -Text '' -Icon 'E70E' -IconSize 12
@@ -3822,6 +3826,7 @@ function New-ModuleView {
 
     Register-ControlHandler -Control $v.filterBox -EventName 'TextChanged' -Module $Module -Action { param($m) Request-ResultFilter -Module $m }
     Register-ControlHandler -Control $v.btnCopy -EventName 'Click' -Module $Module -Action { param($m) Copy-ResultView -Module $m }
+    Register-ControlHandler -Control $v.btnColumns -EventName 'Click' -Module $Module -Action { param($m) Select-ResultColumns -Module $m }
     Register-ControlHandler -Control $v.btnExport -EventName 'Click' -Module $Module -Action { param($m) Export-ResultView -Module $m }
     Register-ControlHandler -Control $v.btnFilters -EventName 'Click' -Module $Module -Action { param($m) Clear-ColumnFilters -Module $m; Show-Toast 'Wyczyszczono filtry kolumn.' 'info' 2 }
     Register-ControlHandler -Control $v.btnDetail -EventName 'Click' -Module $Module -Action {
@@ -3969,6 +3974,14 @@ function Update-GridMenu {
                 Set-ClipboardText ([string]$value)
                 Show-Toast "Skopiowano: $name" 'ok' 2
             }))
+    if ($Module.MenuCell -and $Module.MenuCell.Column -and $Module.View) {
+        # Wartości jednej kolumny (np. loginy do importu): zaznaczone wiersze albo wszystkie widoczne
+        $colName = [string]$Module.MenuCell.Column
+        if ($rows.Count -gt 1) {
+            [void]$menu.Items.Add((New-MenuItem -Text ("Kopiuj kolumnę «{0}» – zaznaczone wiersze ({1})" -f $colName, $rows.Count) -Icon 'E8C8' -Module $Module -Action { param($m) Copy-ColumnValues -Module $m -Column $m.MenuCell.Column -SelectedOnly }))
+        }
+        [void]$menu.Items.Add((New-MenuItem -Text ("Kopiuj kolumnę «{0}» – wszystkie widoczne ({1})" -f $colName, $Module.View.Count) -Icon 'E8C8' -Module $Module -Action { param($m) Copy-ColumnValues -Module $m -Column $m.MenuCell.Column }))
+    }
     [void]$menu.Items.Add((New-MenuItem -Text 'Kopiuj zaznaczone wiersze' -Icon 'E8C8' -Module $Module -Enabled $hasRows -Action { param($m) Copy-ResultView -Module $m -SelectedOnly }))
     [void]$menu.Items.Add((New-MenuItem -Text 'Eksport…' -Icon 'EDE1' -Module $Module -Action { param($m) Export-ResultView -Module $m }))
     if ($Module.MenuCell -or $Module.ColumnFilters.Count -gt 0) {
@@ -4157,6 +4170,7 @@ function Reset-ResultTable {
         $g.ItemsSource = $view
     }
     Update-ResultFilter -Module $Module
+    Update-ColumnsButton -Module $Module
 }
 
 function Add-GridColumn {
@@ -4209,6 +4223,10 @@ function Add-GridColumn {
     $col.MaxWidth = 520
     $col.MinWidth = 54
     $g.Columns.Add($col)
+    if ((Get-UserHiddenColumns -Module $Module).Contains($Name)) {
+        $col.Visibility = 'Collapsed'
+        Update-ColumnsButton -Module $Module
+    }
 }
 
 function Add-ResultRows {
@@ -4380,7 +4398,7 @@ function Set-EmptyColumnsHidden {
             $v = $r[$name]
             if ($v -isnot [System.DBNull] -and [string]$v -ne '') { $has = $true; break }
         }
-        $c.Visibility = $(if ($has) { 'Visible' } else { 'Collapsed' })
+        $c.Visibility = $(if ($has -and -not (Get-UserHiddenColumns -Module $Module).Contains($name)) { 'Visible' } else { 'Collapsed' })
     }
 }
 
@@ -4540,6 +4558,68 @@ function Show-RowDetails {
         if ($v) { $title = "Szczegóły – $v"; break }
     }
     Show-TextDialog -Title $title -Subtitle $Module.Title -Text (Format-RowDetails -Module $Module -Row $Row)
+}
+
+function Get-UserHiddenColumns {
+    param([hashtable]$Module)
+    if ($null -eq $Module['UserHidden']) { $Module['UserHidden'] = New-Object 'System.Collections.Generic.HashSet[string]' }
+    return , $Module['UserHidden']
+}
+
+function Update-ColumnsButton {
+    # Przycisk «Kolumny» nad tabelą: liczba kolumn ukrytych przez użytkownika
+    param([hashtable]$Module)
+    $b = $Module.View_['btnColumns']
+    if (-not $b -or -not $Module.Grid) { return }
+    $set = Get-UserHiddenColumns -Module $Module
+    $n = @($Module.Grid.Columns | Where-Object { $_.Visibility -ne 'Visible' -and $set.Contains([string]$_.SortMemberPath) }).Count
+    $b.Content = New-IconContent -Text $(if ($n) { "ukryte: $n" } else { '' }) -Icon 'E8FD'
+}
+
+function Set-ResultColumns {
+    # Widoczne tylko podane kolumny, pozostałe ukryte - także w kopiowaniu i eksporcie, a po odświeżeniu wyników dalej ukryte
+    param([Parameter(Mandatory)][hashtable]$Module, [string[]]$Visible)
+    $set = Get-UserHiddenColumns -Module $Module
+    foreach ($c in @($Module.Grid.Columns)) {
+        $n = [string]$c.SortMemberPath
+        if ($Visible -contains $n) { $c.Visibility = 'Visible'; [void]$set.Remove($n) }
+        else { $c.Visibility = 'Collapsed'; [void]$set.Add($n) }
+    }
+    Update-ColumnsButton -Module $Module
+}
+
+function Select-ResultColumns {
+    # Okno wyboru kolumn (lista z polami wyboru, filtr nazw, zaznacz / odznacz / odwróć)
+    param([Parameter(Mandatory)][hashtable]$Module)
+    $cols = @(if ($Module.Grid) { $Module.Grid.Columns | Sort-Object DisplayIndex })
+    if ($cols.Count -eq 0) { Show-Warning 'Brak kolumn – najpierw pobierz dane.'; return }
+    $names = @($cols | ForEach-Object { [string]$_.SortMemberPath })
+    $visible = @($cols | Where-Object { $_.Visibility -eq 'Visible' } | ForEach-Object { [string]$_.SortMemberPath })
+    $chosen = @(Confirm-Action -Title 'Kolumny widoku' -Text 'Pokazane zostaną tylko zaznaczone kolumny – pozostałe nie trafią do kopiowania ani eksportu (np. lista do importu). Kolejność zmienisz, przeciągając nagłówki tabeli; «Pokaż wszystkie kolumny» w menu nagłówka przywraca resztę.' `
+            -Items $names -Checked $visible -Select -ConfirmText 'Pokaż zaznaczone' -SelectHint 'Zaznacz kolumny do pokazania (kopiowanie i eksport w kolejności z tabeli).')
+    if ($chosen.Count -eq 0) { return }
+    Set-ResultColumns -Module $Module -Visible $chosen
+}
+
+function Get-ColumnTextValues {
+    # Wartości jednej kolumny jako tekst (bez tabulatorów i nowych linii): widoczne wiersze albo zaznaczone; -Unique bez pustych i powtórzeń
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Column, [switch]$SelectedOnly, [switch]$Unique)
+    $rows = if ($SelectedOnly) { @(Get-SelectedResultRows -Module $Module) } elseif ($Module.View) { @($Module.View | ForEach-Object { $_ }) } else { @() }
+    $values = @(foreach ($r in $rows) { ([string](Get-ExportValue -Module $Module -Row $r -Column $Column)) -replace '[\t\r\n]+', ' ' })
+    if ($Unique) {
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $values = @($values | Where-Object { $_.Trim() -ne '' -and $seen.Add($_.Trim()) })
+    }
+    return $values
+}
+
+function Copy-ColumnValues {
+    # Wartości kolumny do schowka - każda w osobnej linii (np. lista loginów do importu albo do pola innego modułu)
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Column, [switch]$SelectedOnly, [switch]$Unique)
+    $values = @(Get-ColumnTextValues -Module $Module -Column $Column -SelectedOnly:$SelectedOnly -Unique:$Unique)
+    if ($values.Count -eq 0) { Show-Warning "Brak wartości w kolumnie «$Column» do skopiowania."; return }
+    Set-ClipboardText ($values -join "`r`n")
+    Show-Toast ("Skopiowano wartości kolumny «{0}»: {1}{2}" -f $Column, $values.Count, $(if ($Unique) { ' (bez powtórzeń)' } else { '' })) 'ok'
 }
 
 function Get-VisibleColumnNames {
@@ -5305,6 +5385,11 @@ function Update-HeaderMenu {
     [void]$Menu.Items.Add((New-MenuItem -Text 'Sortuj rosnąco' -Icon 'E74A' -Module $Module -Action { param($m) Set-ResultSort -Module $m -Column $m.MenuCell.Column }))
     [void]$Menu.Items.Add((New-MenuItem -Text 'Sortuj malejąco' -Icon 'E74B' -Module $Module -Action { param($m) Set-ResultSort -Module $m -Column $m.MenuCell.Column -Descending }))
     [void]$Menu.Items.Add((New-MenuSeparator))
+    # Wartości całej kolumny (wiersze widoczne po filtrach), każda w osobnej linii
+    $count = if ($Module.View) { $Module.View.Count } else { 0 }
+    [void]$Menu.Items.Add((New-MenuItem -Text ("Kopiuj wartości kolumny ({0})" -f $count) -Icon 'E8C8' -Module $Module -Enabled ($count -gt 0) -Action { param($m) Copy-ColumnValues -Module $m -Column $m.MenuCell.Column }))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Kopiuj wartości bez powtórzeń i pustych' -Icon 'E8C8' -Module $Module -Enabled ($count -gt 0) -Action { param($m) Copy-ColumnValues -Module $m -Column $m.MenuCell.Column -Unique }))
+    [void]$Menu.Items.Add((New-MenuSeparator))
     [void]$Menu.Items.Add((New-MenuItem -Text 'Filtruj…' -Icon 'E71C' -Module $Module -Enabled $canFilter -Action { param($m) Show-ColumnFilter -Module $m -Column $m.MenuCell.Column }))
     [void]$Menu.Items.Add((New-MenuItem -Text 'Wyczyść filtr kolumny' -Icon 'E894' -Module $Module -Enabled ($Module.ColumnFilters.Contains($name)) -Action { param($m) Clear-ColumnFilters -Module $m -Column $m.MenuCell.Column }))
     [void]$Menu.Items.Add((New-MenuItem -Text 'Wyczyść wszystkie filtry kolumn' -Icon 'E894' -Module $Module -Enabled ($Module.ColumnFilters.Count -gt 0) -Action { param($m) Clear-ColumnFilters -Module $m }))
@@ -5312,13 +5397,19 @@ function Update-HeaderMenu {
     [void]$Menu.Items.Add((New-MenuItem -Text 'Ukryj kolumnę' -Icon 'ED1A' -Module $Module -Action {
                 param($m)
                 foreach ($c in $m.Grid.Columns) { if ([string]$c.SortMemberPath -eq $m.MenuCell.Column) { $c.Visibility = 'Collapsed' } }
+                [void](Get-UserHiddenColumns -Module $m).Add([string]$m.MenuCell.Column)
+                Update-ColumnsButton -Module $m
                 Show-Toast "Ukryto kolumnę «$($m.MenuCell.Column)» – nie trafi do eksportu. «Pokaż wszystkie kolumny» w menu nagłówka ją przywróci." 'info'
             }))
     $hidden = @($Module.Grid.Columns | Where-Object { $_.Visibility -ne 'Visible' }).Count
     [void]$Menu.Items.Add((New-MenuItem -Text $(if ($hidden) { "Pokaż wszystkie kolumny (ukryte: $hidden)" } else { 'Pokaż wszystkie kolumny' }) -Icon 'E7B3' -Module $Module -Enabled ($hidden -gt 0) -Action {
                 param($m)
                 foreach ($c in $m.Grid.Columns) { $c.Visibility = 'Visible' }
+                (Get-UserHiddenColumns -Module $m).Clear()
+                Update-ColumnsButton -Module $m
             }))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Pokaż tylko tę kolumnę' -Icon 'E8FD' -Module $Module -Action { param($m) Set-ResultColumns -Module $m -Visible @([string]$m.MenuCell.Column) }))
+    [void]$Menu.Items.Add((New-MenuItem -Text 'Wybierz kolumny…' -Icon 'E8FD' -Module $Module -Action { param($m) Select-ResultColumns -Module $m }))
 }
 
 function Find-VisualParent {
@@ -6076,6 +6167,8 @@ function New-ModuleContext {
         PillColumns    = @()
         GoodWhenNo     = @()
         HiddenColumns  = @()
+        # Kolumny ukryte przez użytkownika (wybór kolumn, «Ukryj kolumnę») - zostają ukryte po odświeżeniu wyników
+        UserHidden     = New-Object 'System.Collections.Generic.HashSet[string]'
         EditableColumns = @()
         OnCellEdit     = $null
         Loading        = $false
