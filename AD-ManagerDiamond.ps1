@@ -3979,7 +3979,7 @@ $script:ModuleViewXaml = @'
           <TextBlock x:Name="hdrCategory" FontSize="11" Foreground="#8791A5"/>
         </Border>
       </StackPanel>
-      <TextBlock x:Name="hdrDesc" Foreground="#8791A5" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxHeight="38" Margin="0,4,0,0" MaxWidth="1000" HorizontalAlignment="Left"/>
+      <TextBlock x:Name="hdrDesc" Foreground="#8791A5" TextWrapping="Wrap" Margin="0,4,0,0" MaxWidth="1000" HorizontalAlignment="Left"/>
     </StackPanel>
     <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top">
       <Border x:Name="busyChip" Style="{StaticResource Chip}" Background="#1A2640" Padding="12,5" Visibility="Collapsed" VerticalAlignment="Center">
@@ -4002,9 +4002,7 @@ $script:ModuleViewXaml = @'
       <ScrollViewer x:Name="paramsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
         <StackPanel x:Name="paramsStack"/>
       </ScrollViewer>
-      <Canvas x:Name="paramsSideCanvas" Grid.Column="1" Width="320" Margin="14,0,4,6" Visibility="Collapsed">
-        <Border x:Name="paramsSide" Width="{Binding ActualWidth, ElementName=paramsSideCanvas}" Height="{Binding ActualHeight, ElementName=paramsSideCanvas}"/>
-      </Canvas>
+      <Border x:Name="paramsSide" Grid.Column="1" Width="320" Margin="14,0,4,6" VerticalAlignment="Top" Visibility="Collapsed"/>
     </Grid>
   </Border>
 
@@ -4084,7 +4082,7 @@ function New-ModuleView {
     param([Parameter(Mandatory)][hashtable]$Module)
     $root = New-UiElement $script:ModuleViewXaml
     $Module.Root = $root
-    foreach ($n in 'paramsCard', 'paramsStack', 'paramsScroll', 'paramsSideCanvas', 'paramsSide', 'hdrGrid', 'resHeader', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
+    foreach ($n in 'paramsCard', 'paramsStack', 'paramsScroll', 'paramsSide', 'hdrGrid', 'resHeader', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
         'btnDetail', 'btnColumns', 'btnCopy', 'btnExport', 'grid', 'emptyState', 'emptyIcon', 'emptyText', 'emptyHint', 'detailCol', 'detailSplit',
         'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse', 'btnStopOp') {
         $Module.View_[$n] = $root.FindName($n)
@@ -4099,7 +4097,7 @@ function New-ModuleView {
     $root.FindName('hdrTitle').Text = $Module.Title
     $root.FindName('hdrCategory').Text = $(if ($Module.WorkspaceTitle) { $Module.WorkspaceTitle + '  •  ' + $Module.Category } else { $Module.Category })
     $desc = $root.FindName('hdrDesc')
-    if ($Module.Description) { $desc.Text = $Module.Description; $desc.ToolTip = $Module.Description } else { $desc.Visibility = 'Collapsed' }
+    if ($Module.Description) { $desc.Text = $Module.Description } else { $desc.Visibility = 'Collapsed' }
 
     $v = $Module.View_
     $v.btnDetail.Content = New-IconContent -Text '' -Icon 'E8A1'
@@ -4145,8 +4143,9 @@ function New-ModuleView {
     [void]$grid.CommandBindings.Add((New-Object System.Windows.Input.CommandBinding([System.Windows.Input.ApplicationCommands]::Copy, [System.Windows.Input.ExecutedRoutedEventHandler]$script:GridEvents.Copy)))
     Reset-ResultTable -Module $Module
     Update-DetailPane -Module $Module
-    # Wysokość panelu parametrów zależy od miejsca w oknie (nagłówek, kafelki, tabela)
-    foreach ($e in @($root, $v.hdrGrid, $v.statsGrid)) {
+    # Wysokość panelu parametrów zależy od miejsca w oknie (nagłówek, kafelki, tabela); bez nasłuchu na nagłówek -
+    # jego wysokość (opis przycinany do dwóch linii) bywa niestabilna między przebiegami układu
+    foreach ($e in @($root, $v.statsGrid)) {
         $script:ParamsFitModules[$e] = $Module
         $e.add_SizeChanged($script:ParamsFitHandler)
     }
@@ -4154,10 +4153,24 @@ function New-ModuleView {
 
 $script:MinResultsHeight = 240
 $script:ParamsFitModules = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
+$script:ParamsFitPending = New-Object System.Collections.ArrayList
+# Wysokość liczona po zakończeniu układu (priorytet Background), nie w trakcie SizeChanged: zmiana MaxHeight w środku
+# przebiegu układu potrafiła zapętlić układ okna (zawieszenie przy pokazaniu modułu)
 $script:ParamsFitHandler = {
     param($s, $e)
     $m = $null
-    try { if ($script:ParamsFitModules.TryGetValue($s, [ref]$m)) { Update-ParamsMaxHeight -Module $m } } catch { }
+    try {
+        if (-not $script:ParamsFitModules.TryGetValue($s, [ref]$m)) { return }
+        foreach ($x in $script:ParamsFitPending) { if ([object]::ReferenceEquals($x, $m)) { return } }
+        [void]$script:ParamsFitPending.Add($m)
+        if ($script:ParamsFitPending.Count -eq 1) { [void]$s.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [System.Action]$script:ParamsFitFlush) }
+    }
+    catch { }
+}
+$script:ParamsFitFlush = {
+    $mods = @($script:ParamsFitPending)
+    $script:ParamsFitPending.Clear()
+    foreach ($m in $mods) { try { Update-ParamsMaxHeight -Module $m } catch { } }
 }
 
 function Update-ParamsMaxHeight {
@@ -4170,16 +4183,24 @@ function Update-ParamsMaxHeight {
     # Nagłówek z marginesem, pasek nad tabelą, karta parametrów (margines, dopełnienie, ramka), ramka i margines tabeli
     $used = $v.hdrGrid.ActualHeight + 16 + $v.resHeader.ActualHeight + 8 + 12 + 22 + 2 + 9
     if ($v.statsGrid.Visibility -eq 'Visible') { $used += $v.statsGrid.ActualHeight + 12 }
-    $v.paramsScroll.MaxHeight = [Math]::Max(120, $h - $used - $script:MinResultsHeight)
+    [double]$max = [Math]::Floor([Math]::Max(120.0, $h - $used - $script:MinResultsHeight))
+    [double]$cur = $v.paramsScroll.MaxHeight
+    # Bez drobnych zmian (zaokrąglenia układu) - każda zmiana MaxHeight to kolejny przebieg układu
+    if ([double]::IsInfinity($cur) -or ($cur - $max) -ge 2 -or ($max - $cur) -ge 2) {
+        $v.paramsScroll.MaxHeight = $max
+        # Panel boczny (np. drzewo OU): stała wysokość z kodu, bez wiązania z rozmiarem innych elementów
+        if ($v.paramsSide.Visibility -eq 'Visible') { $v.paramsSide.Height = [Math]::Max($v.paramsScroll.MinHeight, [Math]::Min($max, 420)) }
+    }
 }
 
 function Set-ParamsSidePanel {
-    # Element stale widoczny po prawej stronie panelu parametrów (np. drzewo OU); jego wysokość = wysokość parametrów
-    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)]$Content, [double]$Width = 320, [double]$MinHeight = 220)
+    # Element stale widoczny po prawej stronie panelu parametrów (np. drzewo OU); wysokość ustawia Update-ParamsMaxHeight
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)]$Content, [double]$Width = 320, [double]$MinHeight = 180)
     $v = $Module.View_
     $v.paramsSide.Child = $Content
-    $v.paramsSideCanvas.Width = $Width
-    $v.paramsSideCanvas.Visibility = 'Visible'
+    $v.paramsSide.Width = $Width
+    $v.paramsSide.Height = $MinHeight
+    $v.paramsSide.Visibility = 'Visible'
     $v.paramsScroll.MinHeight = $MinHeight
     $Module.ParamsCard.Visibility = 'Visible'
 }
