@@ -1619,6 +1619,71 @@ function Add-TopControl {
     return $Control
 }
 
+function Add-ParamSection {
+    <#
+        Zwijana grupa wierszy panelu parametrów: nagłówek z tytułem i podsumowaniem (Set-ParamSectionSummary).
+        Wiersze dodane po nim aż do Complete-ParamSection są pokazywane i ukrywane razem; -Remember: stan
+        rozwinięcia zapamiętany w ustawieniach modułu.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Title, [string]$Remember = '', [bool]$Expanded = $false)
+    $open = if ($Remember) { [bool](Get-ModuleSetting -Module $Module -Name $Remember -Default $Expanded) } else { $Expanded }
+    $b = New-Object System.Windows.Controls.Button
+    $b.Style = Get-ThemeResource 'GhostButton'
+    $b.HorizontalAlignment = 'Left'
+    $b.Padding = '6,4'
+    $b.Margin = '0,4,8,2'
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Orientation = 'Horizontal'
+    $chevron = New-GlyphBlock -Code 'E76C' -Size 11 -Color '#8791A5'
+    $chevron.Margin = '0,0,8,0'
+    $chevron.VerticalAlignment = 'Center'
+    $caption = New-Object System.Windows.Controls.TextBlock
+    $caption.Text = $Title
+    $caption.FontWeight = 'SemiBold'
+    $caption.Foreground = Get-Brush '#C9D1DE'
+    $summary = New-Object System.Windows.Controls.TextBlock
+    $summary.Margin = '12,0,0,0'
+    $summary.FontSize = 12
+    $summary.Foreground = Get-Brush '#7B8496'
+    $summary.TextTrimming = 'CharacterEllipsis'
+    $summary.MaxWidth = 760
+    foreach ($e in @($chevron, $caption, $summary)) { [void]$sp.Children.Add($e) }
+    $b.Content = $sp
+    $section = @{ Button = $b; Chevron = $chevron; Summary = $summary; Rows = @(); Open = $open; Remember = $Remember; Start = 0 }
+    $script:ParamSections[$b] = $section
+    Register-ControlHandler -Control $b -EventName 'Click' -Module $Module -Action {
+        param($m, $s)
+        $sec = $script:ParamSections[$s]
+        $sec.Open = -not $sec.Open
+        if ($sec.Remember) { Set-ModuleSetting -Module $m -Name $sec.Remember -Value $sec.Open }
+        Update-ParamSection -Section $sec
+    }
+    [void](Add-TopControl -Module $Module -Control $b)
+    $section.Start = $Module.ParamsStack.Children.Count
+    return $section
+}
+
+function Complete-ParamSection {
+    # Zamyka grupę: należą do niej wiersze dodane od Add-ParamSection
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][hashtable]$Section)
+    $Section.Rows = @(for ($i = $Section.Start; $i -lt $Module.ParamsStack.Children.Count; $i++) { $Module.ParamsStack.Children[$i] })
+    Update-ParamSection -Section $Section
+}
+
+function Update-ParamSection {
+    param([Parameter(Mandatory)][hashtable]$Section)
+    foreach ($r in @($Section.Rows)) { $r.Visibility = if ($Section.Open) { 'Visible' } else { 'Collapsed' } }
+    $Section.Chevron.Text = Get-Glyph $(if ($Section.Open) { 'E70D' } else { 'E76C' })
+    $Section.Button.ToolTip = if ($Section.Open) { 'Zwiń' } else { 'Rozwiń' }
+}
+
+function Set-ParamSectionSummary {
+    param([Parameter(Mandatory)][hashtable]$Section, [AllowEmptyString()][string]$Text, [string]$Color = '#7B8496')
+    $Section.Summary.Text = $Text
+    $Section.Summary.Foreground = Get-Brush $Color
+}
+$script:ParamSections = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
+
 function Add-Label {
     param([Parameter(Mandatory)]$Parent, [Parameter(Mandatory)][AllowEmptyString()][string]$Text, [switch]$Hint, [switch]$Bold, [double]$MaxWidth = 0)
     $t = New-Object System.Windows.Controls.TextBlock
@@ -2951,6 +3016,130 @@ function Update-OuTree {
     if (-not $tree.SelectedItem -and -not $Filter) { $root.IsSelected = $true }
 }
 
+$script:OuPanelXaml = @'
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Background="#141A22" BorderBrush="#242B36" BorderThickness="1" CornerRadius="8" Padding="8,8,6,6">
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <Grid Margin="2,0,0,6">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <StackPanel VerticalAlignment="Center">
+        <TextBlock x:Name="ouTitle" FontWeight="SemiBold" Foreground="#C9D1DE" FontSize="12.5"/>
+        <TextBlock x:Name="ouDomain" Foreground="#7B8496" FontSize="11.5" TextTrimming="CharacterEllipsis"/>
+      </StackPanel>
+      <Button x:Name="ouRefresh" Grid.Column="1" Style="{StaticResource GhostButton}" Padding="7,3" MinHeight="26" VerticalAlignment="Top" ToolTip="Wczytaj ponownie jednostki z AD"/>
+    </Grid>
+    <TextBox x:Name="ouSearch" Grid.Row="1" Tag="Szukaj jednostki…" Margin="0,0,0,6"/>
+    <TreeView x:Name="ouTree" Grid.Row="2" BorderThickness="0" Background="Transparent"/>
+    <TextBlock x:Name="ouStatus" Grid.Row="3" Foreground="#7B8496" FontSize="11.5" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxHeight="48" Margin="2,6,0,0"/>
+  </Grid>
+</Border>
+'@
+
+function New-OuTreePanel {
+    <#
+        Drzewo jednostek organizacyjnych stale widoczne w module (np. obok parametrów - Set-ParamsSidePanel):
+        kliknięcie jednostki wpisuje jej DN do pola -Box. Lista wczytywana w tle przy otwarciu modułu i przyciskiem
+        odświeżania; domena i ewentualny błąd odczytu z AD są widoczne w panelu.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)]$Box, [string]$Title = 'Jednostka organizacyjna')
+    $p = New-UiElement $script:OuPanelXaml
+    $p.Tag = @{ Module = $Module; Box = $Box; Data = $null; Selected = $Box.Text.Trim(); Rebuilding = $false }
+    $p.FindName('ouTitle').Text = $Title
+    $p.FindName('ouDomain').Text = 'domena: …'
+    $p.FindName('ouRefresh').Content = New-IconContent -Text '' -Icon 'E72C' -IconSize 12
+    $tree = $p.FindName('ouTree')
+    $search = $p.FindName('ouSearch')
+    $refresh = $p.FindName('ouRefresh')
+    foreach ($c in @($tree, $search, $refresh)) { $script:OuPanels[$c] = $p }
+    $tree.add_SelectedItemChanged($script:OuPanelEvents.Selected)
+    $search.add_TextChanged($script:OuPanelEvents.Search)
+    $refresh.add_Click($script:OuPanelEvents.Refresh)
+    $Module.Data.OuPanel = $p
+    try { Start-OuTreeLoad -Panel $p } catch { $p.FindName('ouStatus').Text = 'Nie wczytano jednostek z AD: ' + $_.Exception.Message }
+    return $p
+}
+
+function Update-OuPanelTree {
+    # Drzewo panelu po wczytaniu albo zmianie filtra; zaznaczona jednostka = DN z pola
+    param($Panel)
+    $t = $Panel.Tag
+    if (-not $t.Data) { return }
+    $t.Selected = ([string]$t.Box.Text).Trim()
+    $t.Rebuilding = $true
+    try { Update-OuTree -Window $Panel -Filter ([string]$Panel.FindName('ouSearch').Text).Trim() }
+    finally { $t.Rebuilding = $false }
+    $item = $Panel.FindName('ouTree').SelectedItem
+    $status = $Panel.FindName('ouStatus')
+    if ($item -and $t.Selected -and [string]$item.Tag -eq $t.Selected) { $status.Text = $t.Selected; try { $item.BringIntoView() } catch { } }
+    elseif ($t.Selected) { $status.Text = 'Jednostki z pola nie ma na liście: ' + $t.Selected }
+    else { $status.Text = 'Kliknij jednostkę, aby ją wybrać.' }
+}
+
+function Start-OuTreeLoad {
+    param($Panel)
+    if (-not $Panel) { return }
+    $t = $Panel.Tag
+    $status = $Panel.FindName('ouStatus')
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) { $status.Text = 'Brak modułu ActiveDirectory (RSAT) – wpisz DN jednostki w polu.'; return }
+    $status.Text = 'Wczytywanie jednostek z AD…'
+    Start-AdOperation -Module $t.Module -Name 'Jednostki organizacyjne' -Targets @('AD') -Output None -Quiet -Background -ScriptBlock {
+        $d = Get-AdDomainInfo -AdParams $ad
+        $items = New-Object System.Collections.ArrayList
+        foreach ($ou in @(Get-ADOrganizationalUnit -Filter * @ad)) { [void]$items.Add([string]$ou.DistinguishedName) }
+        foreach ($c in @($d.ComputersContainer, $d.UsersContainer)) { if ($c) { [void]$items.Add([string]$c) } }
+        [pscustomobject]@{ Domain = [string]$d.DNSRoot; RootDN = [string]$d.DistinguishedName; Items = @($items) }
+    } -OnResult {
+        param($m, $r)
+        $p = $m.Data.OuPanel
+        if (-not $p) { return }
+        if (-not $r.Ok -or -not @($r.Data).Count) {
+            $p.FindName('ouDomain').Text = 'domena: nie odczytano'
+            $p.FindName('ouStatus').Text = 'Nie wczytano jednostek z AD: ' + (Get-FriendlyAdError ((@($r.Errors)) -join ' ')) + ' – wpisz DN jednostki w polu albo odśwież.'
+            return
+        }
+        $d = @($r.Data)[-1]
+        $p.Tag.Data = @{ Domain = [string]$d.Domain; RootDN = [string]$d.RootDN; Items = @($d.Items) }
+        $p.FindName('ouDomain').Text = 'domena: ' + [string]$d.Domain
+        Update-OuPanelTree -Panel $p
+    }
+}
+
+$script:OuPanels = New-Object 'System.Collections.Generic.Dictionary[object,object]'
+$script:OuPanelEvents = @{
+    Selected = {
+        param($s, $e)
+        try {
+            $p = $script:OuPanels[$s]
+            $t = $p.Tag
+            $item = $s.SelectedItem
+            if (-not $item -or $t.Rebuilding -or -not $t.Data) { return }
+            $dn = [string]$item.Tag
+            if ($dn -eq $t.Data.RootDN) { $p.FindName('ouStatus').Text = 'Wybierz jednostkę organizacyjną (nie korzeń domeny).'; return }
+            $t.Selected = $dn
+            $t.Box.Text = $dn
+            $p.FindName('ouStatus').Text = $dn
+        }
+        catch { Write-Log "Błąd wyboru jednostki: $($_.Exception.Message)" 'ERROR' }
+    }
+    Search   = {
+        param($s, $e)
+        try { Update-OuPanelTree -Panel $script:OuPanels[$s] } catch { Write-Log "Błąd filtra jednostek: $($_.Exception.Message)" 'ERROR' }
+    }
+    Refresh  = {
+        param($s, $e)
+        try { Start-OuTreeLoad -Panel $script:OuPanels[$s] } catch { Write-Log "Błąd wczytywania jednostek: $($_.Exception.Message)" 'ERROR' }
+    }
+}
+
 function Find-AdGroup {
     # Wyszukiwanie grup (nazwa, sAMAccountName, opis); zwraca obiekty z Name, Sam, Scope, Category, Description, DN
     param([string]$Text)
@@ -3228,13 +3417,44 @@ function Open-Folder([string]$Path) {
 }
 
 function Show-Toast {
-    # Krótkie powiadomienie w prawym dolnym rogu okna (znika samo)
-    param([Parameter(Mandatory)][string]$Text, [ValidateSet('info', 'ok', 'warn', 'crit')][string]$Tone = 'info', [int]$Seconds = 4)
+    <#
+        Powiadomienie w prawym dolnym rogu okna. Krótkie (domyślne) znika po -Seconds. -Large: duże, w kolorze
+        wyniku, z tytułem (-Title, np. nazwa operacji) - po zakończeniu operacji; udane znika po 8 s, z błędami
+        zostaje do zamknięcia. Kliknięcie: przejście do modułu -ModuleKey (gdy nie jest otwarty), przy błędach
+        także otwarcie dziennika.
+    #>
+    param([Parameter(Mandatory)][string]$Text, [ValidateSet('info', 'ok', 'warn', 'crit')][string]$Tone = 'info', [int]$Seconds = 4,
+        [string]$Title = '', [switch]$Large, [string]$ModuleKey = '')
     $toastHost = $script:UI.Controls['toastHost']
     if (-not $toastHost) { return }
     try {
         $toneDef = $script:DialogTones[$Tone]
-        $xaml = @'
+        if ($Large) {
+            $toast = New-UiElement $script:ToastLargeXaml
+            $toast.Background = Get-Brush $toneDef.Back
+            $toast.BorderBrush = Get-Brush $toneDef.Fore
+            $toast.FindName('accent').Background = Get-Brush $toneDef.Fore
+            $icon = $toast.FindName('icon')
+            $icon.Text = Get-Glyph $toneDef.Icon
+            $icon.Foreground = Get-Brush $toneDef.Fore
+            $toast.FindName('title').Text = $(if ($Title) { $Title } else { 'Operacja' })
+            $toast.FindName('text').Text = $Text
+            $hint = @()
+            $active = $script:UI.ActiveModule
+            $def = if ($ModuleKey) { Get-ModuleDefinition $ModuleKey } else { $null }
+            if ($def -and -not ($active -and $active.Key -eq $ModuleKey)) { $hint += ('moduł «{0}» – kliknij, aby przejść' -f $def.Title) }
+            if ($Tone -eq 'warn' -or $Tone -eq 'crit') { $hint += 'kliknij, aby zobaczyć dziennik' }
+            if ($hint.Count) { $h = $toast.FindName('hint'); $h.Text = ($hint -join ' · '); $h.Visibility = 'Visible' }
+            $close = $toast.FindName('close')
+            $close.Content = New-IconContent -Text '' -Icon 'E711' -IconSize 11
+            $script:ToastInfo[$toast] = @{ Toast = $toast; ModuleKey = $(if ($def) { $ModuleKey } else { '' }); ShowLog = ($Tone -eq 'warn' -or $Tone -eq 'crit') }
+            $script:ToastInfo[$close] = $script:ToastInfo[$toast]
+            $toast.add_MouseLeftButtonUp($script:ToastEvents.Open)
+            $close.add_Click($script:ToastEvents.Close)
+            $Seconds = if ($Tone -eq 'ok' -or $Tone -eq 'info') { 8 } else { 0 }
+        }
+        else {
+            $xaml = @'
 <Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="#1E2530" BorderBrush="#2F3846" BorderThickness="1"
         CornerRadius="9" Padding="14,10" Margin="0,8,0,0" MaxWidth="420" HorizontalAlignment="Right">
   <Border.Effect><DropShadowEffect BlurRadius="18" ShadowDepth="3" Opacity="0.45" Color="Black"/></Border.Effect>
@@ -3244,13 +3464,16 @@ function Show-Toast {
   </StackPanel>
 </Border>
 '@
-        $toast = New-UiElement $xaml
-        $icon = $toast.FindName('icon')
-        $icon.Text = Get-Glyph $toneDef.Icon
-        $icon.Foreground = Get-Brush $toneDef.Fore
-        $toast.FindName('text').Text = $Text
-        while ($toastHost.Children.Count -ge 4) { $toastHost.Children.RemoveAt(0) }
+            $toast = New-UiElement $xaml
+            $icon = $toast.FindName('icon')
+            $icon.Text = Get-Glyph $toneDef.Icon
+            $icon.Foreground = Get-Brush $toneDef.Fore
+            $toast.FindName('text').Text = $Text
+        }
+        while ($toastHost.Children.Count -ge 4) { Remove-Toast $toastHost.Children[0] }
         [void]$toastHost.Children.Add($toast)
+        try { $toast.BeginAnimation([System.Windows.UIElement]::OpacityProperty, (New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0, (New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(220)))))) } catch { }
+        if ($Seconds -le 0) { return }
         $timer = New-Object System.Windows.Threading.DispatcherTimer
         $timer.Interval = [TimeSpan]::FromSeconds([Math]::Max(2, $Seconds))
         $script:ToastTimers[$timer] = $toast
@@ -3260,15 +3483,68 @@ function Show-Toast {
                 $t = $null
                 if ($script:ToastTimers.TryGetValue($s, [ref]$t)) {
                     [void]$script:ToastTimers.Remove($s)
-                    $h = $script:UI.Controls['toastHost']
-                    if ($h -and $h.Children.Contains($t)) { $h.Children.Remove($t) }
+                    Remove-Toast $t
                 }
             })
         $timer.Start()
     }
     catch { }
 }
+
+function Remove-Toast($Toast) {
+    $h = $script:UI.Controls['toastHost']
+    if ($h -and $Toast -and $h.Children.Contains($Toast)) { $h.Children.Remove($Toast) }
+    foreach ($k in @($script:ToastInfo.Keys)) { if ([object]::ReferenceEquals($script:ToastInfo[$k].Toast, $Toast)) { [void]$script:ToastInfo.Remove($k) } }
+}
+
+$script:ToastLargeXaml = @'
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        BorderThickness="1" CornerRadius="10" Margin="0,10,0,0" Width="460" HorizontalAlignment="Right" Cursor="Hand">
+  <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="4" Opacity="0.6" Color="Black"/></Border.Effect>
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="6"/>
+      <ColumnDefinition Width="Auto"/>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="Auto"/>
+    </Grid.ColumnDefinitions>
+    <Border x:Name="accent" CornerRadius="9,0,0,9"/>
+    <Border Grid.Column="1" Width="42" Height="42" CornerRadius="21" Background="#22000000" Margin="14,14,12,14" VerticalAlignment="Top">
+      <TextBlock x:Name="icon" Style="{StaticResource Glyph}" FontSize="21" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+    <StackPanel Grid.Column="2" Margin="0,13,4,13" VerticalAlignment="Center">
+      <TextBlock x:Name="title" FontSize="15.5" FontWeight="SemiBold" Foreground="White" TextWrapping="Wrap"/>
+      <TextBlock x:Name="text" FontSize="13.5" Foreground="#D5DBE5" TextWrapping="Wrap" Margin="0,3,0,0"/>
+      <TextBlock x:Name="hint" FontSize="11.5" Foreground="#9AA3B2" TextWrapping="Wrap" Margin="0,6,0,0" Visibility="Collapsed"/>
+    </StackPanel>
+    <Button x:Name="close" Grid.Column="3" Style="{StaticResource GhostButton}" Padding="7,3" MinHeight="24" Margin="0,8,8,0" VerticalAlignment="Top" ToolTip="Zamknij"/>
+  </Grid>
+</Border>
+'@
 $script:ToastTimers = New-Object 'System.Collections.Generic.Dictionary[object,object]'
+$script:ToastInfo = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
+$script:ToastEvents = @{
+    Open  = {
+        param($s, $e)
+        try {
+            $i = $null
+            if (-not $script:ToastInfo.TryGetValue($s, [ref]$i)) { return }
+            Remove-Toast $s
+            if ($i.ModuleKey -and -not ($script:UI.ActiveModule -and $script:UI.ActiveModule.Key -eq $i.ModuleKey)) { Show-Module -Key $i.ModuleKey }
+            if ($i.ShowLog) { Set-LogVisible $true }
+        }
+        catch { Write-Log "Błąd powiadomienia: $($_.Exception.Message)" 'ERROR' }
+    }
+    Close = {
+        param($s, $e)
+        try {
+            $i = $null
+            if ($script:ToastInfo.TryGetValue($s, [ref]$i)) { Remove-Toast $i.Toast }
+            $e.Handled = $true
+        }
+        catch { }
+    }
+}
 #endregion
 
 #region Odblokowanie programu (PIN)
@@ -3681,7 +3957,7 @@ $script:ModuleViewXaml = @'
     <RowDefinition Height="*" MinHeight="160"/>
   </Grid.RowDefinitions>
 
-  <Grid Margin="0,0,0,16">
+  <Grid x:Name="hdrGrid" Margin="0,0,0,16">
     <Grid.ColumnDefinitions>
       <ColumnDefinition Width="Auto"/>
       <ColumnDefinition Width="*"/>
@@ -3697,7 +3973,7 @@ $script:ModuleViewXaml = @'
           <TextBlock x:Name="hdrCategory" FontSize="11" Foreground="#8791A5"/>
         </Border>
       </StackPanel>
-      <TextBlock x:Name="hdrDesc" Foreground="#8791A5" TextWrapping="Wrap" Margin="0,4,0,0" MaxWidth="1000" HorizontalAlignment="Left"/>
+      <TextBlock x:Name="hdrDesc" Foreground="#8791A5" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxHeight="38" Margin="0,4,0,0" MaxWidth="1000" HorizontalAlignment="Left"/>
     </StackPanel>
     <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top">
       <Border x:Name="busyChip" Style="{StaticResource Chip}" Background="#1A2640" Padding="12,5" Visibility="Collapsed" VerticalAlignment="Center">
@@ -3712,12 +3988,23 @@ $script:ModuleViewXaml = @'
   </Grid>
 
   <Border x:Name="paramsCard" Grid.Row="1" Style="{StaticResource Card}" Padding="16,14,10,8" Margin="0,0,0,12" Visibility="Collapsed">
-    <StackPanel x:Name="paramsStack"/>
+    <Grid>
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <ScrollViewer x:Name="paramsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
+        <StackPanel x:Name="paramsStack"/>
+      </ScrollViewer>
+      <Canvas x:Name="paramsSideCanvas" Grid.Column="1" Width="320" Margin="14,0,4,6" Visibility="Collapsed">
+        <Border x:Name="paramsSide" Width="{Binding ActualWidth, ElementName=paramsSideCanvas}" Height="{Binding ActualHeight, ElementName=paramsSideCanvas}"/>
+      </Canvas>
+    </Grid>
   </Border>
 
   <UniformGrid x:Name="statsGrid" Grid.Row="2" Rows="1" Margin="0,0,-10,12" Visibility="Collapsed"/>
 
-  <Grid Grid.Row="3" Margin="2,0,0,8">
+  <Grid x:Name="resHeader" Grid.Row="3" Margin="2,0,0,8">
     <Grid.ColumnDefinitions>
       <ColumnDefinition Width="Auto"/>
       <ColumnDefinition Width="Auto"/>
@@ -3791,7 +4078,7 @@ function New-ModuleView {
     param([Parameter(Mandatory)][hashtable]$Module)
     $root = New-UiElement $script:ModuleViewXaml
     $Module.Root = $root
-    foreach ($n in 'paramsCard', 'paramsStack', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
+    foreach ($n in 'paramsCard', 'paramsStack', 'paramsScroll', 'paramsSideCanvas', 'paramsSide', 'hdrGrid', 'resHeader', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
         'btnDetail', 'btnColumns', 'btnCopy', 'btnExport', 'grid', 'emptyState', 'emptyIcon', 'emptyText', 'emptyHint', 'detailCol', 'detailSplit',
         'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse', 'btnStopOp') {
         $Module.View_[$n] = $root.FindName($n)
@@ -3806,7 +4093,7 @@ function New-ModuleView {
     $root.FindName('hdrTitle').Text = $Module.Title
     $root.FindName('hdrCategory').Text = $(if ($Module.WorkspaceTitle) { $Module.WorkspaceTitle + '  •  ' + $Module.Category } else { $Module.Category })
     $desc = $root.FindName('hdrDesc')
-    if ($Module.Description) { $desc.Text = $Module.Description } else { $desc.Visibility = 'Collapsed' }
+    if ($Module.Description) { $desc.Text = $Module.Description; $desc.ToolTip = $Module.Description } else { $desc.Visibility = 'Collapsed' }
 
     $v = $Module.View_
     $v.btnDetail.Content = New-IconContent -Text '' -Icon 'E8A1'
@@ -3852,6 +4139,43 @@ function New-ModuleView {
     [void]$grid.CommandBindings.Add((New-Object System.Windows.Input.CommandBinding([System.Windows.Input.ApplicationCommands]::Copy, [System.Windows.Input.ExecutedRoutedEventHandler]$script:GridEvents.Copy)))
     Reset-ResultTable -Module $Module
     Update-DetailPane -Module $Module
+    # Wysokość panelu parametrów zależy od miejsca w oknie (nagłówek, kafelki, tabela)
+    foreach ($e in @($root, $v.hdrGrid, $v.statsGrid)) {
+        $script:ParamsFitModules[$e] = $Module
+        $e.add_SizeChanged($script:ParamsFitHandler)
+    }
+}
+
+$script:MinResultsHeight = 240
+$script:ParamsFitModules = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
+$script:ParamsFitHandler = {
+    param($s, $e)
+    $m = $null
+    try { if ($script:ParamsFitModules.TryGetValue($s, [ref]$m)) { Update-ParamsMaxHeight -Module $m } } catch { }
+}
+
+function Update-ParamsMaxHeight {
+    # Panel parametrów nie wypycha tabeli wyników poza okno: ponad dostępną wysokość przewija się,
+    # a tabela zachowuje co najmniej $script:MinResultsHeight (gdy okno jest bardzo niskie - panel ma min. 120 px)
+    param([hashtable]$Module)
+    $v = $Module.View_
+    $h = $Module.Root.ActualHeight
+    if ($h -le 0) { return }
+    # Nagłówek z marginesem, pasek nad tabelą, karta parametrów (margines, dopełnienie, ramka), ramka i margines tabeli
+    $used = $v.hdrGrid.ActualHeight + 16 + $v.resHeader.ActualHeight + 8 + 12 + 22 + 2 + 9
+    if ($v.statsGrid.Visibility -eq 'Visible') { $used += $v.statsGrid.ActualHeight + 12 }
+    $v.paramsScroll.MaxHeight = [Math]::Max(120, $h - $used - $script:MinResultsHeight)
+}
+
+function Set-ParamsSidePanel {
+    # Element stale widoczny po prawej stronie panelu parametrów (np. drzewo OU); jego wysokość = wysokość parametrów
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)]$Content, [double]$Width = 320, [double]$MinHeight = 220)
+    $v = $Module.View_
+    $v.paramsSide.Child = $Content
+    $v.paramsSideCanvas.Width = $Width
+    $v.paramsSideCanvas.Visibility = 'Visible'
+    $v.paramsScroll.MinHeight = $MinHeight
+    $Module.ParamsCard.Visibility = 'Visible'
 }
 
 $script:GridModules = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
@@ -4104,11 +4428,13 @@ function Update-ParamsCollapse {
     $v.paramsCard.Visibility = if ($collapsed -or $Module.ParamsStack.Children.Count -eq 0) { 'Collapsed' } else { 'Visible' }
     $v.statsGrid.Visibility = if ($collapsed -or $Module.StatsGrid.Children.Count -eq 0) { 'Collapsed' } else { 'Visible' }
     $v.btnCollapse.Content = New-IconContent -Text $(if ($collapsed) { 'Parametry' } else { '' }) -Icon $(if ($collapsed) { 'E70D' } else { 'E70E' }) -IconSize 12
+    Update-ParamsMaxHeight -Module $Module
 }
 
 function Request-ResultSpace {
-    # Po przygotowaniu podglądu: gdy tabela wyników jest za niska, zwija panel parametrów (przycisk «Parametry» go rozwinie)
-    param([hashtable]$Module, [double]$MinHeight = 240)
+    # Po przygotowaniu podglądu: gdy tabela wyników jest za niska, zwija panel parametrów (przycisk «Parametry» go rozwinie).
+    # Zwykle tabela ma co najmniej $script:MinResultsHeight (Update-ParamsMaxHeight) - zwinięcie tylko w bardzo niskim oknie.
+    param([hashtable]$Module, [double]$MinHeight = 180)
     if ($Module.ParamsCollapsed -or -not $Module.Grid -or -not $Module.Root.IsVisible) { return }
     try { $Module.Root.UpdateLayout() } catch { }
     if ($Module.Grid.ActualHeight -gt 0 -and $Module.Grid.ActualHeight -lt $MinHeight) {
@@ -5675,6 +6001,8 @@ function Start-HostOperation {
                        tak samo działa w trakcie Invoke-WithTargets -Refresh
         -Quiet       : bez wpisów w dzienniku i powiadomień o starcie, wynikach i zakończeniu (operacje cykliczne,
                        np. śledzenie nowych zdarzeń - błędy obsługuje -OnResult)
+        -Background  : pomocnicze wczytanie w tle (np. lista OU w panelu) - nie blokuje modułu i nie czeka na inne
+                       jego operacje; zwykle razem z -Output None i -Quiet
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Module,
@@ -5691,9 +6019,10 @@ function Start-HostOperation {
         [scriptblock]$OnComplete,
         [ValidateSet('Default', 'AD')][string]$Pool = 'Default',
         [switch]$ReplaceRows,
-        [switch]$Quiet
+        [switch]$Quiet,
+        [switch]$Background
     )
-    if ($Module.Busy) {
+    if ($Module.Busy -and -not $Background) {
         Show-Warning "Poprzednia operacja w module «$($Module.Title)» jeszcze trwa. Poczekaj na jej zakończenie lub przerwij ją na pasku stanu."
         return
     }
@@ -5744,6 +6073,8 @@ function Start-HostOperation {
         CancelAt     = $null
         Started      = Get-Date
         Quiet        = [bool]$Quiet
+        Background   = [bool]$Background
+        FirstError   = ''
         # Cele podstawione przez akcję wiersza - odświeżenie po zakończeniu (OnComplete) dotyczy tylko ich
         Override     = Get-TargetOverride
     }
@@ -5761,7 +6092,7 @@ function Start-HostOperation {
     }
 
     [void]$script:Engine.Operations.Add($op)
-    Set-ModuleBusy -Module $Module -Busy $true -Text ("{0}: 0/{1}" -f $Name, $items.Count)
+    if (-not $Background) { Set-ModuleBusy -Module $Module -Busy $true -Text ("{0}: 0/{1}" -f $Name, $items.Count) }
     $list = (@($items | Select-Object -First 8) -join ', ')
     if ($items.Count -gt 8) { $list += ", … (+$($items.Count - 8))" }
     if (-not $Quiet) { Write-Log ("{0} – start ({1}): {2}" -f $Name, $items.Count, $list) -Module $Module.Title }
@@ -5883,7 +6214,7 @@ function Update-Operations {
                 }
                 Complete-OperationItem -Operation $op -Result $r
             }
-            if ($changed -and -not $op.Cancelled -and $op.Module.View_['busyText']) {
+            if ($changed -and -not $op.Cancelled -and -not $op.Background -and $op.Module.View_['busyText']) {
                 $text = '{0}: {1}/{2}' -f $op.Name, $op.Done, $op.Total
                 if ($op.Failed -gt 0) { $text += " • błędy: $($op.Failed)" }
                 $op.Module.View_['busyText'].Text = $text
@@ -5923,6 +6254,7 @@ function Complete-OperationItem {
         $errorText = (@($Result.Errors | Where-Object { $_ } | Select-Object -Unique)) -join ' | '
         if (-not $Result.Ok) {
             $Operation.Failed++
+            if (-not $Operation.FirstError) { $Operation.FirstError = '{0}: {1}' -f $Result.Target, $errorText }
             if (-not $Operation.Quiet) { Write-Log ("[{0}] {1}" -f $Result.Target, $errorText) 'ERROR' }
             if ($Operation.Output -eq 'Grid') {
                 # Bez kolumny obiektu docelowego wiersz błędu sam mówi, czego dotyczy
@@ -5963,21 +6295,26 @@ function Complete-Operation {
     param([hashtable]$Operation)
     [void]$script:Engine.Operations.Remove($Operation)
     $m = $Operation.Module
-    Set-ModuleBusy -Module $m -Busy $false
+    if (-not $Operation.Background) { Set-ModuleBusy -Module $m -Busy $false }
     $seconds = [Math]::Round(((Get-Date) - $Operation.Started).TotalSeconds, 1)
     $okCount = $Operation.Done - $Operation.Failed
+    $time = '{0} s' -f $seconds.ToString([System.Globalization.CultureInfo]::GetCultureInfo('pl-PL'))
     if ($Operation.Cancelled) {
         Write-Log ("{0} – przerwano (zakończone: {1}, czas {2} s)" -f $Operation.Name, $okCount, $seconds) 'WARN' -Module $m.Title
-        Show-Toast ("{0}: przerwano" -f $Operation.Name) 'warn'
+        if (-not $Operation.Quiet) { Show-Toast -Title $Operation.Name -Text ('Przerwano – zakończone: {0} z {1}' -f $okCount, $Operation.Total) -Tone 'warn' -ModuleKey $m.Key -Large }
     }
     elseif (-not $Operation.Quiet) {
         $level = if ($Operation.Failed -gt 0) { 'WARN' } else { 'OK' }
         Write-Log ("{0} – zakończono: {1} OK, {2} z błędem, czas {3} s" -f $Operation.Name, $okCount, $Operation.Failed, $seconds) $level -Module $m.Title
-        if ($Operation.Total -gt 1 -or $Operation.Failed -gt 0 -or $seconds -ge 3) {
-            $tone = if ($Operation.Failed -eq 0) { 'ok' } elseif ($okCount -gt 0) { 'warn' } else { 'crit' }
-            $text = if ($Operation.Failed -eq 0) { '{0}: gotowe ({1}, {2} s)' -f $Operation.Name, $okCount, $seconds }
-            else { '{0}: {1} OK, {2} z błędem' -f $Operation.Name, $okCount, $Operation.Failed }
-            Show-Toast $text $tone
+        # Duże powiadomienie po każdej operacji z wynikami albo dłuższej / na wielu obiektach / z błędami
+        if ($Operation.Output -ne 'None' -or $Operation.Total -gt 1 -or $Operation.Failed -gt 0 -or $seconds -ge 3) {
+            if ($Operation.Failed -eq 0) { $tone = 'ok'; $text = 'Zakończono bez błędów: {0} z {1} · {2}' -f $okCount, $Operation.Total, $time }
+            else {
+                $tone = if ($okCount -gt 0) { 'warn' } else { 'crit' }
+                $text = 'Z błędami: {0} OK, {1} z błędem · {2}' -f $okCount, $Operation.Failed, $time
+                if ($Operation.FirstError) { $text += "`r`n" + $(if ($Operation.FirstError.Length -gt 180) { $Operation.FirstError.Substring(0, 180) + '…' } else { $Operation.FirstError }) }
+            }
+            Show-Toast -Title $Operation.Name -Text $text -Tone $tone -ModuleKey $m.Key -Large
         }
     }
     if ($Operation.OnComplete -and -not $Operation.Cancelled) {
@@ -15934,7 +16271,9 @@ function Start-AdOperation {
         [string]$TargetColumn = '',
         [switch]$Append,
         [scriptblock]$OnResult,
-        [scriptblock]$OnComplete
+        [scriptblock]$OnComplete,
+        [switch]$Quiet,
+        [switch]$Background
     )
     if (-not (Test-AdAvailable)) { return }
     $sp = @{
@@ -15952,6 +16291,8 @@ function Start-AdOperation {
     }
     if ($OnResult) { $sp.OnResult = $OnResult }
     if ($OnComplete) { $sp.OnComplete = $OnComplete }
+    if ($Quiet) { $sp.Quiet = $true }
+    if ($Background) { $sp.Background = $true }
     Start-HostOperation @sp
 }
 
@@ -22124,6 +22465,22 @@ function Update-MabPolicyInfo {
     $about = if ($pso) { 'PSO «{0}»: pierwszeństwo {1}, min. {2} znaków, złożoność {3}, przypisane do {4} obiektów. ' -f $pso.Name, $pso.Precedence, $pso.MinLen, $(if ($pso.Complex) { 'włączona' } else { 'wyłączona' }), @($pso.AppliesTo).Count } else { '' }
     $m.PolicyInfo.Text = $about + 'Skutek: ' + $chk.Text
     $m.PolicyInfo.Foreground = Get-Brush $(if (-not $chk.Known) { '#F5C46B' } elseif ($chk.Ok) { '#7B8496' } else { '#FF7A86' })
+    Update-MabSummary -Module $m
+}
+
+function Update-MabSummary {
+    # Podsumowanie zwiniętej sekcji ustawień: format, zasady haseł, grupy, opcje; niezgodne hasło na czerwono
+    param([hashtable]$Module)
+    $m = $Module
+    if (-not $m['Settings']) { return }
+    $fmt = Format-MacAddress -Hex '001122aabbcc' -Format (Get-MabFormatKey -Module $m)
+    $pso = Get-MabSelectedPso -Module $m
+    $parts = @("format $fmt", $(if ($pso) { "PSO $($pso.Name)" } else { 'zasady haseł z grup / domeny' }), ('grupy: {0}' -f @($m.Data.Groups).Count))
+    if (Test-Checked $m.PrimaryFirst) { $parts += 'bez Domain Users' }
+    if (Test-Checked $m.Reversible) { $parts += 'szyfrowanie odwracalne' }
+    $chk = Get-MabPolicyCheck -Module $m -PasswordLength $fmt.Length
+    if ($chk.Known -and -not $chk.Ok) { $parts += 'HASŁO NIEZGODNE Z ZASADAMI – rozwiń'; $color = '#FF7A86' } else { $color = '#7B8496' }
+    Set-ParamSectionSummary -Section $m.Settings -Text ($parts -join '  ·  ') -Color $color
 }
 
 function Update-MabGroupsInfo {
@@ -22527,6 +22884,32 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'MabAcc
         $m.Data.Stale = $true
     }
 
+    $m.Input = Add-StretchTextBox -Module $m -Title 'Adresy MAC' -Multiline -Height 86 -Placeholder "Jeden adres w wierszu, dowolny zapis; opcjonalnie [TAB] nazwa urządzenia [TAB] opis – wklej z Excela.`r`n00:11:22:AA:BB:CC [TAB] Drukarka 1 piętro [TAB] Pokój 101`r`n0011.22aa.bbcd"
+    $row6 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row6 -Text 'Wklej ze schowka' -Icon 'E77F' -Module $m -AlwaysEnabled -OnClick {
+        param($m)
+        $clip = Get-ClipboardText
+        if (-not $clip.Trim()) { Show-Warning 'Schowek nie zawiera tekstu.'; return }
+        $m.Input.Text = $clip
+        Invoke-MabPreview -Module $m
+    } | Out-Null
+    Add-Button -Parent $row6 -Text 'Sprawdź' -Icon 'E9D5' -Module $m -Primary -OnClick { param($m) Invoke-MabPreview -Module $m } | Out-Null
+    Add-Button -Parent $row6 -Text 'Sprawdź ponownie' -Icon 'E72C' -Module $m -ToolTip 'Sprawdza wiersze tabeli po edycji albo zmianie PSO / grup (bez ponownego wczytywania adresów)' -OnClick {
+        param($m)
+        if (@(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'plan' }).Count -eq 0) { Invoke-MabPreview -Module $m; return }
+        Start-MabCheck -Module $m
+    } | Out-Null
+    Add-Button -Parent $row6 -Text 'Utwórz konta' -Icon 'E8FA' -Module $m -OnClick { param($m) Invoke-MabCreate -Module $m } | Out-Null
+    Add-Button -Parent $row6 -Text 'Pokaż konta w OU' -Icon 'E8FD' -Module $m -ToolTip 'Istniejące konta w jednostce MAB: stan, ostatnie logowanie, zasady haseł' -OnClick { param($m) Invoke-MabList -Module $m } | Out-Null
+    $rowOu = Add-ToolbarRow -Module $m -Title 'Jednostka (OU)'
+    $m.Ou = Add-TextBox -Parent $rowOu -Width 380 -Placeholder 'Wybierz z listy po prawej albo wpisz DN' -Text ([string](Get-ModuleSetting -Module $m -Name 'Ou' -Default ''))
+    $m.Ou.ToolTip = 'Jednostka, w której powstaną konta – kliknij ją na liście po prawej. Z niej czyta też «Pokaż konta w OU».'
+    Register-ControlHandler -Control $m.Ou -EventName 'TextChanged' -Module $m -Action { param($m) Set-ModuleSetting -Module $m -Name 'Ou' -Value $m.Ou.Text.Trim() }
+    $rowDesc = Add-ToolbarRow -Module $m -Title 'Opis domyślny'
+    $m.DescDefault = Add-TextBox -Parent $rowDesc -Width 380 -Text ([string](Get-ModuleSetting -Module $m -Name 'DescDefault' -Default 'Konto MAB (802.1X)'))
+    Register-ControlHandler -Control $m.DescDefault -EventName 'TextChanged' -Module $m -Action { param($m) Set-ModuleSetting -Module $m -Name 'DescDefault' -Value $m.DescDefault.Text }
+    # Ustawienia zmieniane rzadko - zwinięte, z podsumowaniem w nagłówku (ostrzeżenie o zasadach haseł na czerwono)
+    $m.Settings = Add-ParamSection -Module $m -Title 'Ustawienia kont' -Remember 'SettingsOpen'
     $row = Add-ToolbarRow -Module $m -Title 'Format'
     $m.Format = Add-ComboBox -Parent $row -Items @($script:MabFormats.Values | ForEach-Object { $_.Text }) -Width 330
     $keys = @($script:MabFormats.Keys)
@@ -22546,12 +22929,6 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'MabAcc
         }
         $m.Data.Stale = $true
     }
-    $row2 = Add-ToolbarRow -Module $m -Title 'Konto'
-    Add-Label -Parent $row2 -Text 'OU' | Out-Null
-    $m.Ou = Add-OuField -Parent $row2 -Module $m -Width 330 -Placeholder 'np. OU=MAB,OU=Urządzenia,…' -DialogTitle 'Jednostka dla kont MAB' -Remember 'Ou'
-    Add-Label -Parent $row2 -Text '   Opis domyślny' | Out-Null
-    $m.DescDefault = Add-TextBox -Parent $row2 -Width 200 -Text ([string](Get-ModuleSetting -Module $m -Name 'DescDefault' -Default 'Konto MAB (802.1X)'))
-    Register-ControlHandler -Control $m.DescDefault -EventName 'TextChanged' -Module $m -Action { param($m) Set-ModuleSetting -Module $m -Name 'DescDefault' -Value $m.DescDefault.Text }
     $row3 = Add-ToolbarRow -Module $m -Title 'Opcje'
     $m.NeverExpires = Add-CheckBox -Parent $row3 -Text 'Hasło nigdy nie wygasa' -Checked ([bool](Get-ModuleSetting -Module $m -Name 'NeverExpires' -Default $true))
     $m.CannotChange = Add-CheckBox -Parent $row3 -Text 'Użytkownik nie może zmienić hasła' -Checked ([bool](Get-ModuleSetting -Module $m -Name 'CannotChange' -Default $true))
@@ -22564,6 +22941,7 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'MabAcc
                 param($m, $s)
                 foreach ($k in 'NeverExpires', 'CannotChange', 'Reversible', 'PrimaryFirst') { if ([object]::ReferenceEquals($m.Data["Box_$k"], $s)) { Set-ModuleSetting -Module $m -Name $k -Value (Test-Checked $s) } }
                 $m.Data.Stale = $true
+                Update-MabSummary -Module $m
             }
         }
     }
@@ -22602,23 +22980,9 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'MabAcc
     } | Out-Null
     $m.GroupsInfo = Add-Label -Parent $row5 -Text '' -Hint -MaxWidth 800
     Update-MabGroupsInfo -Module $m
-    $m.Input = Add-StretchTextBox -Module $m -Title 'Adresy MAC' -Multiline -Height 100 -Placeholder "Jeden adres w wierszu, dowolny zapis; opcjonalnie [TAB] nazwa urządzenia [TAB] opis – wklej z Excela.`r`n00:11:22:AA:BB:CC [TAB] Drukarka 1 piętro [TAB] Pokój 101`r`n0011.22aa.bbcd"
-    $row6 = Add-ToolbarRow -Module $m -Title 'Akcje'
-    Add-Button -Parent $row6 -Text 'Wklej ze schowka' -Icon 'E77F' -Module $m -AlwaysEnabled -OnClick {
-        param($m)
-        $clip = Get-ClipboardText
-        if (-not $clip.Trim()) { Show-Warning 'Schowek nie zawiera tekstu.'; return }
-        $m.Input.Text = $clip
-        Invoke-MabPreview -Module $m
-    } | Out-Null
-    Add-Button -Parent $row6 -Text 'Sprawdź' -Icon 'E9D5' -Module $m -Primary -OnClick { param($m) Invoke-MabPreview -Module $m } | Out-Null
-    Add-Button -Parent $row6 -Text 'Sprawdź ponownie' -Icon 'E72C' -Module $m -ToolTip 'Sprawdza wiersze tabeli po edycji albo zmianie PSO / grup (bez ponownego wczytywania adresów)' -OnClick {
-        param($m)
-        if (@(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'plan' }).Count -eq 0) { Invoke-MabPreview -Module $m; return }
-        Start-MabCheck -Module $m
-    } | Out-Null
-    Add-Button -Parent $row6 -Text 'Utwórz konta' -Icon 'E8FA' -Module $m -OnClick { param($m) Invoke-MabCreate -Module $m } | Out-Null
-    Add-Button -Parent $row6 -Text 'Pokaż konta w OU' -Icon 'E8FD' -Module $m -ToolTip 'Istniejące konta w jednostce MAB: stan, ostatnie logowanie, zasady haseł' -OnClick { param($m) Invoke-MabList -Module $m } | Out-Null
+    Complete-ParamSection -Module $m -Section $m.Settings
+    Set-ParamsSidePanel -Module $m -Width 290 -Content (New-OuTreePanel -Module $m -Box $m.Ou -Title 'Lokalizacja kont (OU)')
+    Update-MabSummary -Module $m
     Add-StatTile -Module $m -Key 'ready' -Label 'Gotowe do utworzenia' -Icon 'E9D5' | Out-Null
     Add-StatTile -Module $m -Key 'done' -Label 'Utworzone' -Icon 'E73E' | Out-Null
     Add-StatTile -Module $m -Key 'exists' -Label 'Istniejące' -Icon 'E8FD' | Out-Null
@@ -30585,7 +30949,8 @@ function Initialize-MainWindow {
     $c.panelGroups = $gp.Root
 
     Initialize-Navigation
-    Set-LogVisible ([bool]$script:Settings.LogVisible)
+    # Dziennik operacji zawsze zwinięty po uruchomieniu (Ctrl+L / przycisk «Dziennik»; powiadomienia o błędach go otwierają)
+    Set-LogVisible $false
     $w.Dispatcher.add_UnhandledException({
             param($s, $e)
             $e.Handled = $true
