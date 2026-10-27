@@ -7944,6 +7944,28 @@ function Start-Tool {
     try { Start-Process -FilePath $FilePath -ArgumentList $Arguments | Out-Null }
     catch { Show-Error "Nie można uruchomić $FilePath." $_ }
 }
+
+function Send-ComputerMessage {
+    # Wiadomość do wszystkich zalogowanych na komputerach (msg * przez WinRM, okno na 5 min) - bez listowania sesji
+    param([string[]]$Names)
+    $list = @($Names | Where-Object { $_ } | Select-Object -Unique)
+    if (-not $list.Count) { return }
+    $shown = (@($list | Select-Object -First 5) -join ', ') + $(if ($list.Count -gt 5) { " i $($list.Count - 5) więcej" } else { '' })
+    $text = Show-InputDialog -Title 'Wiadomość do zalogowanych' -Prompt "Wiadomość pojawi się na 5 minut u wszystkich zalogowanych użytkowników (konsola i pulpit zdalny): $shown." -Icon 'E715' -Validate {
+        param($t)
+        $v = ([string]$t).Trim()
+        if (-not $v) { return 'Wpisz treść wiadomości.' }
+        if ($v.Length -gt 250) { return 'Wiadomość może mieć najwyżej 250 znaków.' }
+        return ''
+    }
+    if ($null -eq $text) { return }
+    Start-HostOperation -Module $script:UI.Modules['__computers'] -Name 'Wiadomość do zalogowanych' -Targets $list -Parameters @{ Message = $text.Trim() } -Output Log -ScriptBlock {
+        param($P)
+        $out = @(& msg.exe '*' '/TIME:300' ([string]$P.Message) 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+        if ($LASTEXITCODE -eq 0) { 'Wysłano wiadomość do zalogowanych użytkowników.' }
+        else { 'Błąd – msg.exe, kod {0}: {1}' -f $LASTEXITCODE, ($out -join ' ') }
+    }
+}
 #endregion
 
 #region Panel komputerów
@@ -8024,6 +8046,8 @@ function Initialize-ComputerPanel {
         @{ Text = 'Odznacz wybrane'; Icon = 'E739'; Action = { param($panel) Set-TargetCheck -Panel $panel -Mode UncheckSelected } }
         '-'
         @{ Text = 'Pulpit zdalny'; Icon = 'E8AF'; Action = { param($panel, $names) Start-Tool -FilePath 'mstsc.exe' -Arguments @("/v:$($names[0])") -Name $names[0] } }
+        @{ Text = 'Zaoferuj pomoc zdalną'; Icon = 'E8F2'; Action = { param($panel, $names) Start-Tool -FilePath 'msra.exe' -Arguments @('/offerRA', $names[0]) -Name $names[0] } }
+        @{ Text = 'Wiadomość do zalogowanych…'; Icon = 'E715'; Action = { param($panel, $names) Send-ComputerMessage -Names $names } }
         @{ Text = 'Zarządzanie komputerem'; Icon = 'E912'; Action = { param($panel, $names) Start-Tool -FilePath 'compmgmt.msc' -Arguments @("/computer:\\$($names[0])") -Name $names[0] } }
         @{ Text = 'Usługi'; Icon = 'E9F5'; Action = { param($panel, $names) Start-Tool -FilePath 'services.msc' -Arguments @("/computer:\\$($names[0])") -Name $names[0] } }
         @{ Text = 'Podgląd zdarzeń'; Icon = 'E81C'; Action = { param($panel, $names) Start-Tool -FilePath 'eventvwr.exe' -Arguments @("\\$($names[0])") -Name $names[0] } }
@@ -11567,8 +11591,99 @@ $script:DiskSpaceScript = {
     }
 }
 
+# Czyszczenie dysków: kategorie plików (starszych niż N dni; Kosz i pobrane aktualizacje w całości). $P.Preview - tylko
+# rozmiary (ile się zwolni). Wiersz na kategorię i podsumowanie dysku systemowego. Pomijany folder programu Temp\DomainOps.
+$script:DiskCleanupScript = {
+    param($P)
+    $sysDrive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+    $before = [double]$sysDrive.FreeSpace
+    $limit = (Get-Date).AddDays( - [int]$P.OlderThanDays)
+    $cats = New-Object System.Collections.ArrayList
+    if ($P.WindowsTemp) { [void]$cats.Add(@{ Name = 'Windows\Temp'; Roots = @(Join-Path $env:SystemRoot 'Temp'); Age = $true }) }
+    if ($P.UserTemp) {
+        $roots = @(Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = False' -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.LocalPath 'AppData\Local\Temp' })
+        [void]$cats.Add(@{ Name = 'TEMP profili użytkowników'; Roots = $roots; Age = $true })
+    }
+    if ($P.Wer) { [void]$cats.Add(@{ Name = 'Raporty błędów (WER)'; Roots = @('ReportArchive', 'ReportQueue', 'Temp' | ForEach-Object { Join-Path $env:ProgramData "Microsoft\Windows\WER\$_" }); Age = $true }) }
+    if ($P.DeliveryOpt) { [void]$cats.Add(@{ Name = 'Optymalizacja dostarczania'; Roots = @(Join-Path $env:SystemRoot 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache'); Age = $true }) }
+    if ($P.Dumps) { [void]$cats.Add(@{ Name = 'Zrzuty pamięci'; Roots = @((Join-Path $env:SystemRoot 'Minidump'), (Join-Path $env:SystemRoot 'LiveKernelReports')); Files = @(Join-Path $env:SystemRoot 'MEMORY.DMP'); Age = $true }) }
+    if ($P.WuCache) { [void]$cats.Add(@{ Name = 'Pobrane aktualizacje'; Roots = @(Join-Path $env:SystemRoot 'SoftwareDistribution\Download'); Age = $false; Service = 'wuauserv' }) }
+    if ($P.RecycleBin) {
+        $bins = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3' | ForEach-Object { $_.DeviceID + '\$Recycle.Bin' } | Where-Object { Test-Path -LiteralPath $_ })
+        [void]$cats.Add(@{ Name = 'Kosz'; Bins = $bins; Age = $false })
+    }
+    $sizeOf = {
+        param($Item)
+        if ($Item.PSIsContainer) { $sum = 0; foreach ($f in @(Get-ChildItem -LiteralPath $Item.FullName -Recurse -Force -File -ErrorAction SilentlyContinue)) { $sum += $f.Length }; return $sum }
+        return [long]$Item.Length
+    }
+    $totalCand = 0.0
+    foreach ($c in $cats) {
+        $all = 0.0; $cand = 0.0; $candCount = 0; $freed = 0.0; $removed = 0; $failed = 0
+        $note = ''
+        $items = New-Object System.Collections.ArrayList
+        if ($c.ContainsKey('Bins')) {
+            # Kosz: elementy w folderach użytkowników ($R… i $I…, bez desktop.ini) - w całości
+            foreach ($bin in $c.Bins) {
+                foreach ($sidDir in @(Get-ChildItem -LiteralPath $bin -Force -Directory -ErrorAction SilentlyContinue)) {
+                    foreach ($it in @(Get-ChildItem -LiteralPath $sidDir.FullName -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })) { [void]$items.Add(@{ Item = $it; Size = (& $sizeOf $it); Cand = $true }) }
+                }
+            }
+        }
+        else {
+            foreach ($root in @($c.Roots)) {
+                if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+                if ($c.Age) {
+                    foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike '*\Temp\DomainOps\*' })) {
+                        [void]$items.Add(@{ Item = $f; Size = [double]$f.Length; Cand = ($f.LastWriteTime -lt $limit) })
+                    }
+                }
+                else {
+                    foreach ($it in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) { [void]$items.Add(@{ Item = $it; Size = (& $sizeOf $it); Cand = $true }) }
+                }
+            }
+            foreach ($file in @($c.Files)) {
+                if ($file -and (Test-Path -LiteralPath $file -PathType Leaf)) { $f = Get-Item -LiteralPath $file -Force; [void]$items.Add(@{ Item = $f; Size = [double]$f.Length; Cand = ($f.LastWriteTime -lt $limit) }) }
+            }
+        }
+        foreach ($i in $items) { $all += $i.Size; if ($i.Cand) { $cand += $i.Size; $candCount++ } }
+        $totalCand += $cand
+        if (-not $P.Preview -and $candCount) {
+            $stopped = $false
+            if ($c.Service) {
+                try { Stop-Service -Name $c.Service -Force -ErrorAction Stop; $stopped = $true } catch { $note = "nie zatrzymano usługi $($c.Service): $($_.Exception.Message)" }
+            }
+            try {
+                foreach ($i in @($items | Where-Object { $_.Cand })) {
+                    try { Remove-Item -LiteralPath $i.Item.FullName -Recurse -Force -ErrorAction Stop; $removed++; $freed += $i.Size } catch { $failed++ }
+                }
+                if ($c.Age) {
+                    # Puste podfoldery (bez samego folderu kategorii)
+                    foreach ($root in @($c.Roots)) {
+                        if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+                        Get-ChildItem -LiteralPath $root -Recurse -Force -Directory -ErrorAction SilentlyContinue |
+                            Where-Object { $_.FullName -notlike '*\Temp\DomainOps*' } |
+                            Sort-Object { $_.FullName.Length } -Descending |
+                            ForEach-Object { if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } }
+                    }
+                }
+            }
+            finally { if ($stopped) { Start-Service -Name $c.Service -ErrorAction SilentlyContinue } }
+        }
+        $row = [ordered]@{ 'Kategoria' = $c.Name; 'Rozmiar (MB)' = [Math]::Round($all / 1MB, 1); 'Do usunięcia (MB)' = [Math]::Round($cand / 1MB, 1); 'Do usunięcia (pliki)' = $candCount }
+        if (-not $P.Preview) { $row['Usunięto (MB)'] = [Math]::Round($freed / 1MB, 1); $row['Usunięto'] = $removed; $row['Nie usunięto (w użyciu)'] = $failed }
+        $row['Uwagi'] = $(if ($note) { $note } elseif (-not $c.Age) { 'w całości' } else { "starsze niż $([int]$P.OlderThanDays) dni" })
+        [pscustomobject]$row
+    }
+    $after = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)).FreeSpace
+    $sum = [ordered]@{ 'Kategoria' = "(dysk systemowy $env:SystemDrive)"; 'Do usunięcia (MB)' = [Math]::Round($totalCand / 1MB, 1) }
+    if (-not $P.Preview) { $sum['Odzyskano (GB)'] = [Math]::Round(($after - $before) / 1GB, 2) }
+    $sum['Wolne (GB)'] = [Math]::Round($after / 1GB, 1)
+    [pscustomobject]$sum
+}
+
 Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dyski' -Icon 'EDA2' `
-    -Description 'Zajętość dysków lokalnych oraz czyszczenie plików tymczasowych i Kosza (z raportem odzyskanego miejsca).' -Build {
+    -Description 'Zajętość dysków lokalnych oraz czyszczenie: pliki tymczasowe, Kosz, raporty błędów, pamięć optymalizacji dostarczania, zrzuty pamięci i pobrane aktualizacje – z podglądem, ile miejsca się zwolni, i raportem odzyskanego miejsca.' -Build {
     param($m)
     $m.PillColumns = @('Stan')
     $row = Add-ToolbarRow -Module $m -Title 'Zajętość'
@@ -11581,80 +11696,42 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
     $row2 = Add-ToolbarRow -Module $m -Title 'Czyszczenie'
     $m.WinTemp = Add-CheckBox -Parent $row2 -Text 'Windows\Temp' -Checked $true
     $m.UserTemp = Add-CheckBox -Parent $row2 -Text 'TEMP profili użytkowników' -Checked $true
-    $m.Recycle = Add-CheckBox -Parent $row2 -Text 'Kosz (wszystkie dyski)' -Checked $true
-    $m.WuCache = Add-CheckBox -Parent $row2 -Text 'Pobrane aktualizacje (SoftwareDistribution\Download)' -ToolTip 'Usługa Windows Update zostanie na chwilę zatrzymana'
-    Add-Label -Parent $row2 -Text 'Starsze niż (dni)' | Out-Null
-    $m.Days = Add-Numeric -Parent $row2 -Value 2 -Minimum 0 -Maximum 365 -Width 60
-    $m.Btn.Clean = Add-Button -Parent $row2 -Text 'Wyczyść na zaznaczonych' -Icon 'E74D' -Module $m -Danger -OnClick {
-        param($m)
-        if (-not ((Test-Checked $m.WinTemp) -or (Test-Checked $m.UserTemp) -or (Test-Checked $m.Recycle) -or (Test-Checked $m.WuCache))) { Show-Warning 'Wybierz, co ma zostać wyczyszczone.'; return }
+    $m.Recycle = Add-CheckBox -Parent $row2 -Text 'Kosz (wszystkie dyski)' -Checked $true -ToolTip 'Kosz opróżniany w całości, niezależnie od wieku plików'
+    $m.Wer = Add-CheckBox -Parent $row2 -Text 'Raporty błędów (WER)' -Checked $true
+    $m.DeliveryOpt = Add-CheckBox -Parent $row2 -Text 'Optymalizacja dostarczania' -Checked $true -ToolTip 'Pamięć podręczna aktualizacji udostępnianych innym komputerom (Delivery Optimization)'
+    $m.Dumps = Add-CheckBox -Parent $row2 -Text 'Zrzuty pamięci' -ToolTip 'Minidump, LiveKernelReports i MEMORY.DMP – bywają potrzebne do diagnozy awarii'
+    $m.WuCache = Add-CheckBox -Parent $row2 -Text 'Pobrane aktualizacje (SoftwareDistribution\Download)' -ToolTip 'Całość; usługa Windows Update zostanie na chwilę zatrzymana'
+    $row3 = Add-ToolbarRow -Module $m -Title ''
+    Add-Label -Parent $row3 -Text 'Starsze niż (dni)' | Out-Null
+    $m.Days = Add-Numeric -Parent $row3 -Value 2 -Minimum 0 -Maximum 365 -Width 60
+    $m.Actions.Cleanup = {
+        # Podgląd (-Preview: ile miejsca się zwolni, nic nie jest usuwane) albo czyszczenie wybranych kategorii
+        param($m, [switch]$Preview)
+        $params = @{
+            WindowsTemp = (Test-Checked $m.WinTemp); UserTemp = (Test-Checked $m.UserTemp); RecycleBin = (Test-Checked $m.Recycle); WuCache = (Test-Checked $m.WuCache)
+            Wer = (Test-Checked $m.Wer); DeliveryOpt = (Test-Checked $m.DeliveryOpt); Dumps = (Test-Checked $m.Dumps); OlderThanDays = (Get-Num $m.Days); Preview = [bool]$Preview
+        }
+        if (-not ($params.WindowsTemp -or $params.UserTemp -or $params.RecycleBin -or $params.WuCache -or $params.Wer -or $params.DeliveryOpt -or $params.Dumps)) { Show-Warning 'Wybierz, co ma zostać wyczyszczone.'; return }
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
-        $targets = @(Confirm-Action -Text "Usunąć pliki tymczasowe na wybranych komputerach?" -Items $targets -ConfirmText 'Wyczyść' -Danger -Select); if ($targets.Count -eq 0) { return }
-        $params = @{ WindowsTemp = (Test-Checked $m.WinTemp); UserTemp = (Test-Checked $m.UserTemp); RecycleBin = (Test-Checked $m.Recycle); WuCache = (Test-Checked $m.WuCache); OlderThanDays = (Get-Num $m.Days) }
-        Start-HostOperation -Module $m -Name 'Czyszczenie dysków' -Targets $targets -Parameters $params -ScriptBlock {
-            param($P)
-            $drive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
-            $before = [double]$drive.FreeSpace
-            $limit = (Get-Date).AddDays( - [int]$P.OlderThanDays)
-            $roots = @()
-            if ($P.WindowsTemp) { $roots += (Join-Path $env:SystemRoot 'Temp') }
-            if ($P.UserTemp) {
-                $profiles = Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = False' -ErrorAction SilentlyContinue
-                foreach ($pr in $profiles) {
-                    $t = Join-Path $pr.LocalPath 'AppData\Local\Temp'
-                    if (Test-Path -LiteralPath $t) { $roots += $t }
-                }
+        if (-not $Preview) {
+            $targets = @(Confirm-Action -Text "Usunąć pliki z wybranych kategorii na tych komputerach? Pliki w użyciu zostaną pominięte. Ile miejsca się zwolni, pokazuje «Podgląd»." -Items $targets -ConfirmText 'Wyczyść' -Danger -Select)
+            if ($targets.Count -eq 0) { return }
+        }
+        $m.Data.CleanPreview = [bool]$Preview
+        Start-HostOperation -Module $m -Name $(if ($Preview) { 'Podgląd czyszczenia dysków' } else { 'Czyszczenie dysków' }) -Targets $targets -Parameters $params -ScriptBlock $script:DiskCleanupScript -OnComplete {
+            param($m)
+            $mb = 0.0
+            foreach ($r in @(Get-ResultRowsAll -Module $m)) {
+                if ([string](Get-ObjectValue $r 'Kategoria') -like '(*') { continue }
+                $v = [string](Get-ObjectValue $r $(if ($m.Data.CleanPreview) { 'Do usunięcia (MB)' } else { 'Usunięto (MB)' }))
+                if ($v) { $mb += [double]($v -replace ',', '.') }
             }
-            $removed = 0
-            $failed = 0
-            foreach ($root in $roots) {
-                Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.LastWriteTime -lt $limit -and $_.FullName -notlike '*\Temp\DomainOps\*' } |
-                    ForEach-Object {
-                        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $removed++ } catch { $failed++ }
-                    }
-                Get-ChildItem -LiteralPath $root -Recurse -Force -Directory -ErrorAction SilentlyContinue |
-                    Where-Object { $_.FullName -notlike '*\Temp\DomainOps*' } |
-                    Sort-Object { $_.FullName.Length } -Descending |
-                    ForEach-Object {
-                        if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue)) {
-                            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                        }
-                    }
-            }
-            if ($P.RecycleBin) {
-                foreach ($d in Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3') {
-                    $bin = $d.DeviceID + '\$Recycle.Bin'
-                    if (-not (Test-Path -LiteralPath $bin)) { continue }
-                    foreach ($sidDir in Get-ChildItem -LiteralPath $bin -Force -Directory -ErrorAction SilentlyContinue) {
-                        Get-ChildItem -LiteralPath $sidDir.FullName -Force -ErrorAction SilentlyContinue |
-                            Where-Object { $_.Name -ne 'desktop.ini' } |
-                            ForEach-Object {
-                                try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop; $removed++ } catch { $failed++ }
-                            }
-                    }
-                }
-            }
-            if ($P.WuCache) {
-                $download = Join-Path $env:SystemRoot 'SoftwareDistribution\Download'
-                try {
-                    Stop-Service -Name wuauserv -Force -ErrorAction Stop
-                    Get-ChildItem -LiteralPath $download -Force -ErrorAction SilentlyContinue | ForEach-Object {
-                        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop; $removed++ } catch { $failed++ }
-                    }
-                }
-                finally { Start-Service -Name wuauserv -ErrorAction SilentlyContinue }
-            }
-            $after = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)).FreeSpace
-            [pscustomobject]@{
-                'Usunięte elementy'            = $removed
-                'Nie udało się usunąć'         = $failed
-                'Odzyskano na systemowym (GB)' = [Math]::Round(($after - $before) / 1GB, 2)
-                'Wolne na systemowym (GB)'     = [Math]::Round($after / 1GB, 1)
-            }
+            Show-Toast ('{0}: {1:N2} GB' -f $(if ($m.Data.CleanPreview) { 'Do zwolnienia' } else { 'Zwolniono' }), ($mb / 1024)) 'ok' 6
         }
     }
+    Add-Button -Parent $row3 -Text 'Podgląd' -Icon 'E7B3' -Module $m -ToolTip 'Ile miejsca zwolni czyszczenie wybranych kategorii (nic nie jest usuwane)' -OnClick { param($m) & $m.Actions.Cleanup $m -Preview } | Out-Null
+    $m.Btn.Clean = Add-Button -Parent $row3 -Text 'Wyczyść na zaznaczonych' -Icon 'E74D' -Module $m -Danger -OnClick { param($m) & $m.Actions.Cleanup $m }
     Add-RowAction -Module $m -Text 'Wyczyść pliki tymczasowe…' -Icon 'E74D' -Danger -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Clean }
 }
 
@@ -15079,6 +15156,36 @@ function Get-DoOneDriveAccounts {
     }
 }
 
+function ConvertFrom-DoBinaryText($Value) {
+    # Wpis binarny z tekstem UTF-16 (np. Resiliency\DisabledItems: nagłówek, ścieżka i nazwa dodatku) -> czytelny tekst
+    if ($null -eq $Value) { return '' }
+    if ($Value -isnot [array]) { return [string]$Value }
+    $t = [System.Text.Encoding]::Unicode.GetString([byte[]]$Value)
+    return (($t -replace '[\x00-\x1F]+', ' ') -replace '[^\u0020-\uFFFF]', ' ').Trim()
+}
+
+function Get-DoAddinFile {
+    # Plik dodatku: manifest VSTO albo biblioteka COM (ProgID -> CLSID -> InprocServer32)
+    param($Addin)
+    if ($Addin.Manifest) { return ($Addin.Manifest -replace '\|vstolocal$', '' -replace '^file:///', '' -replace '/', '\') }
+    foreach ($cls in 'HKLM:\SOFTWARE\Classes', 'HKLM:\SOFTWARE\WOW6432Node\Classes') {
+        $clsid = [string](Get-DoProp (Get-ItemProperty -LiteralPath "$cls\$($Addin.Prog)\CLSID" -ErrorAction SilentlyContinue) '(default)')
+        if (-not $clsid) { continue }
+        foreach ($c2 in 'HKLM:\SOFTWARE\Classes', 'HKLM:\SOFTWARE\WOW6432Node\Classes') {
+            $dll = [string](Get-DoProp (Get-ItemProperty -LiteralPath "$c2\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue) '(default)')
+            if ($dll) { return $dll }
+        }
+    }
+    return ''
+}
+
+function Test-DoAddinMatch {
+    # Czy tekst wpisu (np. wyłączonego elementu) dotyczy dodatku: ProgID, nazwa, plik albo nazwa pliku
+    param([string]$Text, [string[]]$Tokens)
+    foreach ($t in @($Tokens | Where-Object { $_ -and $_.Length -ge 3 })) { if ($Text.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
+    return $false
+}
+
 function Find-DoFiles {
     # Pliki według wzorców w drzewach folderów - bez podążania za punktami ponownej analizy (pętle, OneDrive na żądanie),
     # z pominięciem folderów systemowych w katalogu głównym dysku; $State.Truncated = $true po przekroczeniu limitu czasu
@@ -15277,16 +15384,139 @@ $script:M365PstScript = {
     if ($state.Truncated) { [pscustomobject][ordered]@{ 'Plik' = '(wyniki niepełne)'; 'Uwagi' = "Przeszukiwanie przerwane po limicie czasu ($($P.MaxSeconds) s)."; '__tone' = 'warn' } }
 }
 
+# Dodatki COM Outlooka: rejestracja komputera (HKLM) i użytkownika, sposób wczytywania, wyłączone przez Outlooka
+# (Resiliency\DisabledItems), lista «nie wyłączaj» (DoNotDisableAddinList) i zasady grupy (Resiliency\AddinList)
+$script:M365AddinsScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $lbText = @{ 0 = 'nie wczytuje się'; 1 = 'wczytany (jednorazowo)'; 2 = 'przy starcie – teraz niewczytany'; 3 = 'przy starcie'; 8 = 'na żądanie'; 9 = 'na żądanie (wczytany)'; 16 = 'przy pierwszym użyciu' }
+    $polText = @{ '0' = 'zasady: zawsze wyłączony'; '1' = 'zasady: zawsze włączony'; '2' = 'zasady: decyduje użytkownik' }
+    $read = {
+        param([string]$Base, [string]$Scope)
+        foreach ($k in @(Get-ChildItem -LiteralPath $Base -ErrorAction SilentlyContinue)) {
+            $v = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+            [pscustomobject]@{ Prog = $k.PSChildName; Name = [string](Get-DoProp $v 'FriendlyName'); Desc = [string](Get-DoProp $v 'Description'); LB = (Get-DoProp $v 'LoadBehavior'); Manifest = [string](Get-DoProp $v 'Manifest'); Scope = $Scope }
+        }
+    }
+    $machine = @(& $read 'HKLM:\SOFTWARE\Microsoft\Office\Outlook\Addins' 'komputer') + @(& $read 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\Outlook\Addins' 'komputer (32-bit)')
+    $profiles = @(Get-DoProfiles -UserFilter $P.UserFilter)
+    $skipped = @($profiles | Where-Object { -not $_.Loaded }).Count
+    $emitted = 0
+    foreach ($pr in $profiles) {
+        try {
+            $rows = @(Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
+                    param($Root, $Source)
+                    $user = @(& $read "$Root\Software\Microsoft\Office\Outlook\Addins" 'użytkownik') + @(& $read "$Root\Software\Wow6432Node\Microsoft\Office\Outlook\Addins" 'użytkownik (32-bit)')
+                    $res = "$Root\Software\Microsoft\Office\16.0\Outlook\Resiliency"
+                    $disabled = @()
+                    try { $dk = Get-Item -LiteralPath "$res\DisabledItems" -ErrorAction Stop; $disabled = @($dk.GetValueNames() | ForEach-Object { ConvertFrom-DoBinaryText $dk.GetValue($_) }) } catch { }
+                    $dnd = @()
+                    try { $nk = Get-Item -LiteralPath "$res\DoNotDisableAddinList" -ErrorAction Stop; $dnd = @($nk.GetValueNames() | Where-Object { [string]$nk.GetValue($_) -eq '1' }) } catch { }
+                    $pol = @{}
+                    try { $pk = Get-Item -LiteralPath "$Root\Software\Policies\Microsoft\Office\16.0\Outlook\Resiliency\AddinList" -ErrorAction Stop; foreach ($n in $pk.GetValueNames()) { $pol[$n] = [string]$pk.GetValue($n) } } catch { }
+                    $progs = @(@($machine) + @($user) | ForEach-Object { $_.Prog } | Select-Object -Unique)
+                    foreach ($prog in $progs) {
+                        $mm = @($machine | Where-Object { $_.Prog -eq $prog }) | Select-Object -First 1
+                        $uu = @($user | Where-Object { $_.Prog -eq $prog }) | Select-Object -First 1
+                        $src = if ($uu -and ($uu.Name -or $uu.Manifest -or -not $mm)) { $uu } else { $mm }
+                        $lb = if ($uu -and $null -ne $uu.LB) { [int]$uu.LB } elseif ($mm -and $null -ne $mm.LB) { [int]$mm.LB } else { $null }
+                        $name = @($(if ($uu) { $uu.Name }), $(if ($mm) { $mm.Name }), $prog) | Where-Object { $_ } | Select-Object -First 1
+                        $file = Get-DoAddinFile -Addin $src
+                        $tokens = @($prog, $name, $file, $(if ($file) { Split-Path -Leaf $file }))
+                        $off = @($disabled | Where-Object { Test-DoAddinMatch -Text $_ -Tokens $tokens }).Count -gt 0
+                        $state = if ($off) { 'wyłączony przez Outlooka' } elseif ($pol[$prog] -eq '0') { 'wyłączony zasadami' } elseif ($null -eq $lb) { '' } elseif ($lb -band 1 -or $lb -eq 3 -or $lb -eq 16 -or $lb -eq 8) { 'włączony' } else { 'wyłączony' }
+                        [pscustomobject][ordered]@{
+                            'Użytkownik' = $pr.User; 'Dodatek' = $name; 'Stan' = $state
+                            'Wczytywanie' = $(if ($null -eq $lb) { '' } elseif ($lbText.ContainsKey($lb)) { $lbText[$lb] } else { "LoadBehavior = $lb" })
+                            'Zawsze włączony' = $(if ($pol.ContainsKey($prog)) { $polText[$pol[$prog]] } elseif ($dnd -contains $prog) { 'tak (lista «nie wyłączaj»)' } else { '' })
+                            'Zakres' = $(if ($mm -and $uu) { $mm.Scope + ' + ustawienie użytkownika' } elseif ($mm) { $mm.Scope } else { $uu.Scope })
+                            'ProgID' = $prog; 'Plik' = $file; 'Opis' = $(if ($src.Desc) { $src.Desc } elseif ($mm) { $mm.Desc } else { '' })
+                            'Zalogowany' = $pr.Loaded; '__sid' = $pr.Sid; '__prog' = $prog; '__lb' = $(if ($null -eq $lb) { '' } else { [string]$lb })
+                            '__tone' = $(if ($off -or $pol[$prog] -eq '0') { 'crit' } elseif ($state -eq 'wyłączony') { 'warn' } elseif ($state -eq 'włączony') { 'ok' } else { '' })
+                        }
+                    }
+                })
+            $emitted += $rows.Count
+            $rows
+        }
+        catch { [pscustomobject][ordered]@{ 'Użytkownik' = $pr.User; 'Dodatek' = ''; 'Zalogowany' = $pr.Loaded; 'Opis' = 'Błąd – ' + $_.Exception.Message } }
+    }
+    if (-not $emitted) {
+        # Nikt nie jest zalogowany (albo bez Outlooka w profilach): sama rejestracja komputera
+        foreach ($a in $machine) {
+            $lb = if ($null -ne $a.LB) { [int]$a.LB } else { $null }
+            [pscustomobject][ordered]@{
+                'Użytkownik' = '(rejestracja komputera)'; 'Dodatek' = $(if ($a.Name) { $a.Name } else { $a.Prog }); 'Stan' = ''
+                'Wczytywanie' = $(if ($null -eq $lb) { '' } elseif ($lbText.ContainsKey($lb)) { $lbText[$lb] } else { "LoadBehavior = $lb" })
+                'Zakres' = $a.Scope; 'ProgID' = $a.Prog; 'Plik' = (Get-DoAddinFile -Addin $a); 'Opis' = $a.Desc
+            }
+        }
+    }
+    if ($skipped -and -not $P.Offline) {
+        [pscustomobject][ordered]@{ 'Użytkownik' = "(niezalogowani: $skipped)"; 'Dodatek' = ''; 'Zalogowany' = $false; 'Opis' = 'Stan dodatków u niezalogowanych – zaznacz «Także niezalogowani».' }
+    }
+}
+
+# Zmiana dodatku u zalogowanego użytkownika (jego gałąź rejestru): Enable - usunięcie z wyłączonych przez Outlooka,
+# lista «nie wyłączaj» i wczytywanie przy starcie; Disable - wczytywanie wyłączone (LoadBehavior 0). Działa po
+# ponownym uruchomieniu Outlooka.
+$script:M365AddinActionScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    foreach ($it in @($P.Items)) {
+        $root = "Registry::HKEY_USERS\$($it.Sid)"
+        try {
+            if (-not (Test-Path -LiteralPath $root)) { throw 'użytkownik nie jest zalogowany – zmiany dodatków tylko dla zalogowanych' }
+            $res = "$root\Software\Microsoft\Office\16.0\Outlook\Resiliency"
+            $ukey = "$root\Software\Microsoft\Office\Outlook\Addins\$($it.Prog)"
+            $dndKey = "$res\DoNotDisableAddinList"
+            $note = New-Object System.Collections.Generic.List[string]
+            if ($P.Op -eq 'Enable') {
+                $removed = 0
+                if (Test-Path -LiteralPath "$res\DisabledItems") {
+                    $dk = Get-Item -LiteralPath "$res\DisabledItems"
+                    foreach ($n in @($dk.GetValueNames())) {
+                        if (Test-DoAddinMatch -Text (ConvertFrom-DoBinaryText $dk.GetValue($n)) -Tokens @($it.Prog, $it.Name, $it.File, $(if ($it.File) { Split-Path -Leaf $it.File }))) {
+                            Remove-ItemProperty -LiteralPath "$res\DisabledItems" -Name $n -ErrorAction Stop
+                            $removed++
+                        }
+                    }
+                }
+                if ($removed) { $note.Add("usunięto z wyłączonych przez Outlooka ($removed)") }
+                if (-not (Test-Path -LiteralPath $dndKey)) { New-Item -Path $dndKey -Force | Out-Null }
+                New-ItemProperty -LiteralPath $dndKey -Name $it.Prog -Value 1 -PropertyType DWord -Force | Out-Null
+                $note.Add('na liście «nie wyłączaj»')
+                if ([string]$it.Lb -notin '3', '9', '8', '16') {
+                    if (-not (Test-Path -LiteralPath $ukey)) { New-Item -Path $ukey -Force | Out-Null }
+                    New-ItemProperty -LiteralPath $ukey -Name 'LoadBehavior' -Value 3 -PropertyType DWord -Force | Out-Null
+                    $note.Add('wczytywanie przy starcie')
+                }
+                $result = 'włączony'
+            }
+            else {
+                if (-not (Test-Path -LiteralPath $ukey)) { New-Item -Path $ukey -Force | Out-Null }
+                New-ItemProperty -LiteralPath $ukey -Name 'LoadBehavior' -Value 0 -PropertyType DWord -Force | Out-Null
+                if ((Test-Path -LiteralPath $dndKey) -and $null -ne (Get-DoProp (Get-ItemProperty -LiteralPath $dndKey) $it.Prog)) { Remove-ItemProperty -LiteralPath $dndKey -Name $it.Prog; $note.Add('usunięto z listy «nie wyłączaj»') }
+                $result = 'wyłączony'
+            }
+            $note.Add('działa po ponownym uruchomieniu Outlooka')
+            [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Dodatek' = $it.Name; 'Wynik' = $result; 'Uwagi' = ($note -join '; ') }
+        }
+        catch { [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Dodatek' = $it.Name; 'Wynik' = 'Błąd – ' + $_.Exception.Message } }
+    }
+}
+
 $script:M365Views = @(
     @{ Name = 'Office i Microsoft 365'; Op = 'Office i stan urządzenia'; Script = $script:M365DeviceScript; Hint = 'Office Click-to-Run (wersja, kanał, produkty, licencja współdzielona), dołączenie do Entra ID (dsregcmd) i zapis w Intune.' }
     @{ Name = 'Konta i skrzynki'; Op = 'Konta i skrzynki użytkowników'; Script = $script:M365AccountsScript; Hint = 'Konta Office i OneDrive, profile Outlooka (konta, pliki PST i OST) oraz skrzynki współdzielone i archiwa z automapowania (pamięć Autodiscover Outlooka). Skrzynki otwierane ręcznie przez «Otwórz skrzynkę» nie są zapisywane w profilu.' }
-    @{ Name = 'Pliki PST'; Op = 'Wyszukiwanie plików PST'; Script = $script:M365PstScript; Hint = 'Pliki PST (opcjonalnie OST) w profilach użytkowników albo na wszystkich dyskach lokalnych, z informacją, czy są otwarte w profilu Outlooka.' }
+    @{ Name = 'Pliki PST'; Op = 'Wyszukiwanie plików PST'; Script = $script:M365PstScript; Hint = 'Pliki PST (opcjonalnie OST) w profilach użytkowników albo na wszystkich dyskach lokalnych, z informacją, czy są otwarte w profilu Outlooka. Zaznaczone pliki skopiujesz na udział z menu wiersza.' }
+    @{ Name = 'Dodatki Outlooka'; Op = 'Dodatki Outlooka'; Script = $script:M365AddinsScript; Hint = 'Dodatki COM Outlooka u każdego użytkownika: czy się wczytują, czy wyłączył je Outlook (np. za wolne albo po awarii), lista «nie wyłączaj» i zasady grupy. Włączenie albo wyłączenie dodatku – menu wiersza (zalogowani, działa po ponownym uruchomieniu Outlooka).' }
 )
 
 function Update-M365Options {
     param([hashtable]$Module)
     $v = Get-SegmentIndex $Module.ViewSel
-    $Module.UserFilter.IsEnabled = ($v -eq 1)
+    $Module.UserFilter.IsEnabled = ($v -eq 1 -or $v -eq 3)
     $Module.Offline.IsEnabled = ($v -ne 0)
     $Module.Scope.IsEnabled = ($v -eq 2)
     $Module.Ost.IsEnabled = ($v -eq 2)
@@ -15325,7 +15555,7 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'M365' -Titl
             foreach ($r in $rows) { $v = Get-ObjectValue $r 'Rozmiar (MB)'; if ($v -is [double] -or $v -is [int] -or $v -is [decimal]) { $mb += [double]$v } elseif ([string]$v) { $mb += [double]([string]$v -replace ',', '.') } }
             Set-StatTile -Module $m -Key 'items' -Value ([string]$rows.Count)
             Set-StatTile -Module $m -Key 'users' -Value $(if ((Get-SegmentIndex $m.ViewSel) -eq 0) { '—' } else { [string]$users })
-            Set-StatTile -Module $m -Key 'size' -Value $(if ((Get-SegmentIndex $m.ViewSel) -eq 0) { '—' } else { ('{0:N1}' -f ($mb / 1024)) })
+            Set-StatTile -Module $m -Key 'size' -Value $(if ((Get-SegmentIndex $m.ViewSel) -in 0, 3) { '—' } else { ('{0:N1}' -f ($mb / 1024)) })
         }
     }
     $m.Actions.OpenFolder = {
@@ -15353,6 +15583,90 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'M365' -Titl
         Set-ClipboardText (@($paths | Select-Object -Unique) -join [Environment]::NewLine)
         Show-Toast "Skopiowano ścieżek: $(@($paths | Select-Object -Unique).Count)" 'ok'
     }
+    $m.Actions.CopyPst = {
+        # Kopia zaznaczonych plików PST do folderu (udziału): <folder>\<komputer>\<użytkownik>\plik.pst. Kopiuje ten komputer
+        # przez udział administracyjny (bez podwójnego przeskoku WinRM); plik otwarty w Outlooku jest pomijany
+        param($m, $Rows)
+        $seen = @{}
+        $files = @(foreach ($r in @($Rows)) {
+                $path = [string](Get-RowValue $r 'Ścieżka')
+                if (-not $path) { $path = [string](Get-RowValue $r 'Plik') }
+                if ($path -notmatch '\.pst$') { continue }
+                $c = [string](Get-RowValue $r 'Komputer')
+                $unc = Get-M365UncPath -Computer $c -Path $path
+                if (-not $unc -or $seen.ContainsKey($unc.ToLowerInvariant())) { continue }
+                $seen[$unc.ToLowerInvariant()] = $true
+                $mb = Get-RowValue $r 'Rozmiar (MB)'
+                @{ Computer = $c; Unc = $unc; User = [string](Get-RowValue $r 'Użytkownik'); Mb = $(if ([string]$mb) { [double]([string]$mb -replace ',', '.') } else { 0 }) }
+            })
+        if (-not $files.Count) { Show-Warning 'Zaznacz w tabeli pliki PST (widok «Pliki PST» albo wiersze «Plik PST» w widoku kont).'; return }
+        $dest = Show-InputDialog -Title 'Kopiowanie plików PST' -Prompt 'Folder docelowy, np. \\serwer\pst$ – pliki trafią do podfolderów <komputer>\<użytkownik>. Kopiuje ten komputer przez udział administracyjny (C$); plik otwarty w Outlooku zostanie pominięty (poproś użytkownika o zamknięcie Outlooka). Oryginały zostają na miejscu.' -Default ([string](Get-ModuleSetting -Module $m -Name 'PstTarget' -Default '')) -Icon 'E8C8' -Validate {
+            param($t)
+            $v = ([string]$t).Trim()
+            if (-not $v) { return 'Podaj folder docelowy.' }
+            if (-not (Test-Path -LiteralPath $v -PathType Container)) { return 'Folder nie istnieje albo nie ma do niego dostępu z tego komputera.' }
+            return ''
+        }
+        if ($null -eq $dest) { return }
+        $dest = $dest.Trim().TrimEnd('\')
+        Set-ModuleSetting -Module $m -Name 'PstTarget' -Value $dest
+        $total = 0.0
+        foreach ($f in $files) { $total += $f.Mb }
+        $items = @($files | ForEach-Object { '{0}: {1}{2}' -f $_.Computer, $_.Unc, $(if ($_.Mb) { ' ({0:N0} MB)' -f $_.Mb } else { '' }) })
+        if (-not (Confirm-Action -Text ('Skopiować {0} plików PST ({1:N0} MB) do {2}?' -f $files.Count, $total, $dest) -Items $items -ConfirmText 'Kopiuj')) { return }
+        $per = @{}
+        foreach ($f in $files) {
+            if (-not $per.ContainsKey($f.Computer)) { $per[$f.Computer] = @{ Dest = $dest; Files = New-Object System.Collections.ArrayList } }
+            [void]$per[$f.Computer].Files.Add(@{ Unc = $f.Unc; User = $f.User })
+        }
+        Write-Log ('Kopiowanie plików PST: {0} plików do {1}.' -f $files.Count, $dest) -Module $m.Title
+        Start-HostOperation -Module $m -Name 'Kopiowanie plików PST' -Targets @($per.Keys) -PerTarget $per -Local -Output Log -ScriptBlock {
+            param($Target, $P, $Ctx)
+            foreach ($f in @($P.Files)) {
+                $src = [string]$f.Unc
+                $leaf = Split-Path -Leaf $src
+                $user = ([string]$f.User -replace '[\\/:*?"<>|]', '_').Trim()
+                if (-not $user) { $user = '_bez_uzytkownika' }
+                $dir = Join-Path (Join-Path $P.Dest ($Target -replace '[\\/:*?"<>|]', '_')) $user
+                $dst = Join-Path $dir $leaf
+                try {
+                    $si = Get-Item -LiteralPath $src -ErrorAction Stop
+                    if (Test-Path -LiteralPath $dst) {
+                        $di = Get-Item -LiteralPath $dst
+                        if ($di.Length -eq $si.Length -and $di.LastWriteTimeUtc -eq $si.LastWriteTimeUtc) { [pscustomobject][ordered]@{ 'Plik' = $src; 'Wynik' = 'Pominięto – ta sama kopia już jest'; 'Cel' = $dst }; continue }
+                        $dst = Join-Path $dir ('{0}_{1:yyyyMMdd_HHmmss}{2}' -f [System.IO.Path]::GetFileNameWithoutExtension($leaf), (Get-Date), [System.IO.Path]::GetExtension($leaf))
+                    }
+                    # Otwarty w Outlooku: Outlook trzyma plik z prawem zapisu, więc odczyt bez współdzielenia zapisu się nie uda
+                    try { $fs = [System.IO.File]::Open($src, 'Open', 'Read', 'Read'); $fs.Dispose() }
+                    catch { [pscustomobject][ordered]@{ 'Plik' = $src; 'Wynik' = 'Pominięto – plik jest otwarty (Outlook działa u użytkownika?)' }; continue }
+                    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                    Copy-Item -LiteralPath $src -Destination $dst -ErrorAction Stop
+                    $len = (Get-Item -LiteralPath $dst).Length
+                    if ($len -ne $si.Length) { throw ('rozmiar kopii ({0} B) różni się od oryginału ({1} B)' -f $len, $si.Length) }
+                    [pscustomobject][ordered]@{ 'Plik' = $src; 'Wynik' = ('Skopiowano ({0:N1} MB, {1:N0} s)' -f ($si.Length / 1MB), $sw.Elapsed.TotalSeconds); 'Cel' = $dst }
+                }
+                catch { [pscustomobject][ordered]@{ 'Plik' = $src; 'Wynik' = 'Błąd – ' + $_.Exception.Message } }
+            }
+        }
+    }
+    $m.Actions.Addin = {
+        # Włączenie / wyłączenie dodatku u zalogowanych użytkowników z zaznaczonych wierszy (widok «Dodatki Outlooka»)
+        param($m, $Rows, [string]$Op)
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('__sid', '__prog') -Rows $Rows
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz dodatki w widoku «Dodatki Outlooka» (wiersze użytkowników).'; return }
+        $items = Get-HostItemList -ByHost $byHost -Format { param($i) '{0} – {1}' -f (Get-RowValue $i.__row 'Użytkownik'), (Get-RowValue $i.__row 'Dodatek') }
+        $text = if ($Op -eq 'Enable') { 'Włączyć te dodatki na stałe? Zostaną usunięte z listy wyłączonych przez Outlooka i dopisane do listy «nie wyłączaj», a wyłączone wczytywanie zmieni się na «przy starcie». Zmiana działa po ponownym uruchomieniu Outlooka.' } else { 'Wyłączyć te dodatki u wybranych użytkowników? Outlook przestanie je wczytywać po ponownym uruchomieniu (rejestracja dodatku na komputerze zostaje).' }
+        if (-not (Confirm-Action -Text $text -Items $items -ConfirmText $(if ($Op -eq 'Enable') { 'Włącz' } else { 'Wyłącz' }) -Danger:($Op -ne 'Enable'))) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) {
+            $per[$h] = @{ Helpers = $script:M365Helpers; Op = $Op; Items = @($byHost[$h] | ForEach-Object { @{ Sid = [string]$_['__sid']; Prog = [string]$_['__prog']; Name = [string](Get-RowValue $_.__row 'Dodatek'); File = [string](Get-RowValue $_.__row 'Plik'); Lb = [string](Get-RowValue $_.__row '__lb'); User = [string](Get-RowValue $_.__row 'Użytkownik') } }) }
+        }
+        $m.Data.ActionHosts = @($byHost.Keys)
+        Start-HostOperation -Module $m -Name $(if ($Op -eq 'Enable') { 'Włączanie dodatków Outlooka' } else { 'Wyłączanie dodatków Outlooka' }) -Targets @($byHost.Keys) -PerTarget $per -Output Log -ScriptBlock $script:M365AddinActionScript `
+            -OnComplete { param($m) if ((Get-SegmentIndex $m.ViewSel) -eq 3) { Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } } }
+    }
+    $m.PillColumns = @('Stan')
     $row = Add-ToolbarRow -Module $m -Title 'Widok'
     $m.ViewSel = Add-Segmented -Parent $row -Items @($script:M365Views | ForEach-Object { $_.Name }) -Module $m -OnChange { param($m) Update-M365Options -Module $m }
     $row2 = Add-ToolbarRow -Module $m -Title 'Opcje'
@@ -15368,6 +15682,9 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'M365' -Titl
     Add-StatTile -Module $m -Key 'size' -Label 'Pliki (GB)' -Icon 'EDA2' | Out-Null
     Add-RowAction -Module $m -Text 'Pokaż plik w Eksploratorze (udział administracyjny)' -Icon 'E838' -Action { param($m, $rows) & $m.Actions.OpenFolder $m $rows }
     Add-RowAction -Module $m -Text 'Kopiuj ścieżkę sieciową pliku' -Icon 'E8C8' -Action { param($m, $rows) & $m.Actions.CopyPaths $m $rows }
+    Add-RowAction -Module $m -Text 'Kopiuj pliki PST na udział…' -Icon 'E8C8' -Action { param($m, $rows) & $m.Actions.CopyPst $m $rows }
+    Add-RowAction -Module $m -Text 'Dodatek: włącz na stałe…' -Icon 'E73E' -Separator -Action { param($m, $rows) & $m.Actions.Addin $m $rows 'Enable' }
+    Add-RowAction -Module $m -Text 'Dodatek: wyłącz u użytkownika…' -Icon 'E711' -Danger -Action { param($m, $rows) & $m.Actions.Addin $m $rows 'Disable' }
 }
 #endregion
 
@@ -24453,6 +24770,135 @@ Register-Module -Workspace 'AdUsers' -Category 'Tworzenie i import' -Key 'MabAcc
 }
 #endregion
 
+#region Użytkownicy AD: gdzie zalogowany
+# Sesje wskazanych kont na komputerach z AD (stacje robocze, serwery albo wszystkie; włączone, aktywne w ostatnich N
+# dniach, najwyżej M najświeższych): odczyt sesji jak w module «Sesje użytkowników» (WTS, w razie potrzeby quser).
+# W tabeli tylko sesje szukanych kont; komputery bez połączenia są liczone na kafelku i wypisane w dzienniku.
+function Get-LogonSearchUsers {
+    # Loginy z pola (także DOMENA\login) albo zaznaczone na liście po lewej
+    param([hashtable]$Module)
+    $typed = @(Split-ListText $Module.Users.Text | ForEach-Object { ($_ -split '\\')[-1].Trim() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($typed.Count) { return $typed }
+    return @(Get-TargetUsers)
+}
+
+function Update-LogonSearchTiles {
+    param([hashtable]$Module)
+    $s = $Module.Data.Search
+    Set-StatTile -Module $Module -Key 'checked' -Value ('{0} z {1}' -f $s.Checked, $s.Total)
+    Set-StatTile -Module $Module -Key 'offline' -Value ([string]$s.Failed.Count)
+    Set-StatTile -Module $Module -Key 'found' -Value ([string]$s.Found)
+}
+
+function Start-LogonSearch {
+    # Sesje na komputerach; -Refresh (po akcji na sesji): wiersze tych komputerów zastępowane nowymi
+    param([hashtable]$Module, [string[]]$Computers, [switch]$Refresh)
+    $m = $Module
+    $s = $m.Data.Search
+    if ($Refresh) { Remove-ResultRows -Module $m -Rows @(Get-ResultRowsAll -Module $m | Where-Object { $Computers -contains [string]$_['Komputer'] }) }
+    else {
+        $s.Checked = 0
+        $s.Found = 0
+        $s.Failed = New-Object System.Collections.ArrayList
+        $s.Total = $Computers.Count
+        Update-LogonSearchTiles -Module $m
+    }
+    Start-HostOperation -Module $m -Name 'Gdzie zalogowany' -Targets $Computers -Parameters (New-RdsSessionParameters) -ScriptBlock $script:RdsSessionScript -Output None -Quiet -OnResult {
+        param($m, $r)
+        $s = $m.Data.Search
+        if (-not $m.Data.SearchRefresh) { $s.Checked++ }
+        if (-not $r.Ok) {
+            if (-not $s.Failed.Contains([string]$r.Target)) { [void]$s.Failed.Add([string]$r.Target) }
+        }
+        else {
+            $hits = @($r.Data | Where-Object { $s.Users -contains (([string](Get-ObjectValue $_ 'Użytkownik')) -split '\\')[-1] })
+            if ($hits.Count) {
+                if (-not $m.Data.SearchRefresh) { $s.Found += $hits.Count }
+                Add-ResultRows -Module $m -Computer ([string]$r.Target) -Objects $hits
+            }
+        }
+        Update-LogonSearchTiles -Module $m
+    } -OnComplete {
+        param($m)
+        $s = $m.Data.Search
+        if ($m.Data.SearchRefresh) { $m.Data.SearchRefresh = $false; return }
+        $s.Found = @(Get-ResultRowsAll -Module $m).Count
+        Update-LogonSearchTiles -Module $m
+        if ($s.Failed.Count) {
+            $list = (@($s.Failed | Select-Object -First 25) -join ', ') + $(if ($s.Failed.Count -gt 25) { ' …' } else { '' })
+            Write-Log ('Gdzie zalogowany – bez połączenia ({0}): {1}' -f $s.Failed.Count, $list) 'WARN' -Module $m.Title
+        }
+        $who = (@($s.Users) -join ', ')
+        if ($s.Found) { Show-Toast -Title 'Gdzie zalogowany' -Text ('{0}: sesje {1} na sprawdzonych komputerach ({2} z {3}).' -f $who, $s.Found, ($s.Checked - $s.Failed.Count), $s.Total) -Tone ok -ModuleKey $m.Key -Large }
+        else { Show-Toast -Title 'Gdzie zalogowany' -Text ('{0}: brak sesji na sprawdzonych komputerach ({1} z {2} odpowiedziało).' -f $who, ($s.Checked - $s.Failed.Count), $s.Total) -Tone info -ModuleKey $m.Key -Large }
+    }
+    $m.Data.SearchRefresh = [bool]$Refresh
+}
+
+Register-Module -Workspace 'AdUsers' -Category 'Raporty' -Key 'WhereLoggedOn' -Title 'Gdzie zalogowany' -Icon 'E7EE' -Badge 'nowe' `
+    -Description 'Na których komputerach są zalogowani wskazani użytkownicy: komputery z AD (stacje robocze, serwery albo wszystkie, aktywne w ostatnich dniach), sesje konsoli i pulpitu zdalnego ze stanem, klientem i czasem bezczynności. Z menu wiersza: wiadomość, podgląd, pomoc zdalna, rozłączenie, wylogowanie.' -Build {
+    param($m)
+    $m.PillColumns = @('Stan')
+    $m.Actions.Search = {
+        param($m)
+        $users = @(Get-LogonSearchUsers -Module $m)
+        if (-not $users.Count) { return }
+        $kind = @('Workstations', 'Servers', 'All')[[Math]::Max(0, $m.Kind.SelectedIndex)]
+        $ou = $m.Ou.Text.Trim()
+        Set-ModuleSetting -Module $m -Name 'Ou' -Value $ou
+        Set-ModuleSetting -Module $m -Name 'Kind' -Value $m.Kind.SelectedIndex
+        $m.Data.Search = @{ Users = $users; Max = (Get-Num $m.Max); Ad = $null; Checked = 0; Found = 0; Total = 0; Failed = (New-Object System.Collections.ArrayList) }
+        $m.Data.SearchRefresh = $false
+        Reset-ResultTable -Module $m
+        Reset-StatTiles $m
+        Start-AdOperation -Module $m -Name 'Gdzie zalogowany – komputery z AD' -Targets @('Active Directory') -Output None -Parameters @{ Kind = $kind; Days = (Get-Num $m.Days); SearchBase = $ou } -ScriptBlock {
+            $os = @{ Servers = '(operatingSystem=*Server*)'; Workstations = '(!(operatingSystem=*Server*))'; All = '' }[[string]$P.Kind]
+            $active = if ([int]$P.Days -gt 0) { '(lastLogonTimestamp>={0})' -f (Get-Date).AddDays( - [int]$P.Days).ToFileTimeUtc() } else { '' }
+            $q = @{ LDAPFilter = "(&(objectCategory=computer)$os(!(userAccountControl:1.2.840.113556.1.4.803:=2))$active)"; Properties = @('dNSHostName', 'LastLogonDate') }
+            if ($P.SearchBase) { $q.SearchBase = $P.SearchBase }
+            # Najświeższe logowania komputera najpierw (limit liczby komputerów bierze aktywne)
+            foreach ($c in @(Get-ADComputer @q @ad | Sort-Object -Property LastLogonDate -Descending)) { if ($c.DNSHostName) { [string]$c.DNSHostName } else { [string]$c.Name } }
+        } -OnResult { param($m, $r) $m.Data.Search.Ad = $r } -OnComplete {
+            param($m)
+            $s = $m.Data.Search
+            $r = $s.Ad
+            if (-not $r -or -not $r.Ok) { Show-Warning ('Nie udało się odczytać komputerów z AD: {0}' -f $(if ($r) { (@($r.Errors) -join ' | ') } else { 'brak wyniku' })); return }
+            $names = @($r.Data | ForEach-Object { [string]$_ } | Where-Object { $_ } | Select-Object -Unique)
+            if (-not $names.Count) { Show-Warning 'Nie znaleziono w AD włączonych komputerów spełniających warunki (rodzaj, aktywność, OU).'; return }
+            if ($names.Count -gt $s.Max) {
+                Write-Log ('Gdzie zalogowany: komputerów w AD {0} – sprawdzam {1} z najświeższym logowaniem (limit «Najwyżej»).' -f $names.Count, $s.Max) 'WARN' -Module $m.Title
+                $names = @($names | Select-Object -First $s.Max)
+            }
+            Write-Log ('Gdzie zalogowany: {0} – sprawdzam {1} komputerów.' -f (@($s.Users) -join ', '), $names.Count) -Module $m.Title
+            Start-LogonSearch -Module $m -Computers $names
+        }
+    }
+    $m.Actions.List = {
+        # Odświeżenie po akcji na sesji (wylogowanie, rozłączenie): ponowne sprawdzenie tych komputerów
+        param($m)
+        $hosts = @(Get-TargetComputers -Quiet)
+        if (-not $hosts.Count -or -not $m.Data.Search) { return }
+        Start-LogonSearch -Module $m -Computers $hosts -Refresh
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Szukane konta'
+    $m.Users = Add-TextBox -Parent $row -Width 360 -Placeholder 'loginy (oddzielone przecinkami); puste = zaznaczeni po lewej'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Komputery'
+    $m.Kind = Add-ComboBox -Parent $row2 -Items @('Stacje robocze', 'Serwery', 'Wszystkie') -Width 160
+    $m.Kind.SelectedIndex = [int](Get-ModuleSetting -Module $m -Name 'Kind' -Default 0)
+    Add-Label -Parent $row2 -Text 'Aktywne w ostatnich (dni)' | Out-Null
+    $m.Days = Add-Numeric -Parent $row2 -Value 30 -Minimum 0 -Maximum 3650 -Width 60
+    Add-Label -Parent $row2 -Text 'Najwyżej' | Out-Null
+    $m.Max = Add-Numeric -Parent $row2 -Value 500 -Minimum 1 -Maximum 5000 -Width 70
+    $m.Ou = Add-TextBox -Parent $row2 -Width 260 -Placeholder 'OU (puste = cała domena)' -Text ([string](Get-ModuleSetting -Module $m -Name 'Ou' -Default ''))
+    Add-Button -Parent $row2 -Text 'Szukaj' -Icon 'E721' -Module $m -Primary -OnClick $m.Actions.Search | Out-Null
+    Add-Label -Parent $row2 -Text 'Sprawdzane są sesje konsoli i pulpitu zdalnego (WinRM). «Aktywne w ostatnich» – według ostatniego logowania komputera w AD (0 = wszystkie).' -Hint -MaxWidth 760 | Out-Null
+    Add-StatTile -Module $m -Key 'checked' -Label 'Sprawdzone komputery' -Icon 'E977' | Out-Null
+    Add-StatTile -Module $m -Key 'offline' -Label 'Bez połączenia' -Icon 'E871' | Out-Null
+    Add-StatTile -Module $m -Key 'found' -Label 'Znalezione sesje' -Icon 'E7EE' | Out-Null
+    Add-RdsSessionRowActions -Module $m
+}
+#endregion
+
 #region Pliki i uprawnienia: nadawanie uprawnień NTFS, raport uprawnień, sumy kontrolne
 $script:NtfsRights = [ordered]@{
     'Odczyt'               = [int][System.Security.AccessControl.FileSystemRights]::Read
@@ -31648,11 +32094,18 @@ function Add-RdsSessionRowActions {
     Add-RowAction -Module $Module -Text 'Wyślij wiadomość…' -Icon 'E715' -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Message -Rows $rows }
     Add-RowAction -Module $Module -Text 'Podgląd sesji (shadow)' -Icon 'E7B3' -Action {
         param($m, $rows)
-        $r = @(Get-RdsSessionRows $rows)[0]
+        $r = Get-RdsSessionRows $rows | Select-Object -First 1
         if (-not $r) { return }
         Start-Tool -FilePath 'mstsc.exe' -Arguments @(('/v:{0}' -f (Get-ObjectValue $r 'Komputer')), ('/shadow:{0}' -f (Get-ObjectValue $r 'ID')), '/control') -Name ([string](Get-ObjectValue $r 'Komputer'))
     }
     Add-RowAction -Module $Module -Text 'Procesy w sesji' -Icon 'E9D9' -Action { param($m, $rows) Show-RdsSessionProcesses -Module $m -Rows $rows }
+    Add-RowAction -Module $Module -Text 'Zaoferuj pomoc zdalną' -Icon 'E8F2' -Action {
+        # Pomoc zdalna Windows: msra pokazuje sesje komputera do wyboru, użytkownik musi zaakceptować
+        param($m, $rows)
+        $r = Get-RdsSessionRows $rows | Select-Object -First 1
+        if (-not $r) { return }
+        Start-Tool -FilePath 'msra.exe' -Arguments @('/offerRA', [string](Get-ObjectValue $r 'Komputer')) -Name ([string](Get-ObjectValue $r 'Komputer'))
+    }
     Add-RowAction -Module $Module -Text 'Rozłącz' -Icon 'E8CD' -Separator -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Disconnect -Rows $rows }
     Add-RowAction -Module $Module -Text 'Wyloguj' -Icon 'E7E8' -Danger -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Logoff -Rows $rows }
     Add-RowAction -Module $Module -Text 'Resetuj sesję (rwinsta)…' -Icon 'E72C' -Danger -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Reset -Rows $rows }
