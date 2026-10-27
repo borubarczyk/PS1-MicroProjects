@@ -11462,7 +11462,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Services' -Title 'U
         if (-not $pids.Count) { Show-Warning 'Zaznaczone usługi nie działają (brak PID) – odśwież listę usług.'; return }
         Show-Module -Key 'Processes'
         $pm = $script:UI.Modules['Processes']
-        & $pm.Actions.List $pm $pids
+        & $pm.Actions.List $pm $null $pids
     }
     $row = Add-ToolbarRow -Module $m -Title 'Lista'
     Add-Label -Parent $row -Text 'Nazwa' | Out-Null
@@ -11493,8 +11493,9 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Processes' -Title '
     -Description 'Procesy uruchomione na zaznaczonych komputerach (pamięć, właściciel, wiersz poleceń) i kończenie wybranych procesów.' -Build {
     param($m)
     $m.Actions.List = {
-        # -Pids: @{ komputer = @(PID, …) } - tylko te procesy (np. z «Pokaż proces usługi»), bez filtra nazwy
-        param($m, [hashtable]$Pids = $null)
+        # -Pids: @{ komputer = @(PID, …) } - tylko te procesy (np. z «Pokaż proces usługi»), bez filtra nazwy;
+        # drugi parametr to nadawca, gdy akcję wywołuje przycisk
+        param($m, $Source = $null, [hashtable]$Pids = $null)
         $per = @{}
         if ($Pids) {
             $targets = @($Pids.Keys)
