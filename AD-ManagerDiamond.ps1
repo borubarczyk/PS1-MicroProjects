@@ -13358,10 +13358,12 @@ $script:NetDrivesScript = {
                 foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Network" -ErrorAction SilentlyContinue)) {
                     $v = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
                     $path = [string]$v.RemotePath
+                    # UserName: konto podane przy mapowaniu; własne konto użytkownika Windows zapisuje jako DWORD 0 albo pusty tekst
+                    $account = if ($v.UserName -is [string]) { $v.UserName } else { '' }
                     [pscustomobject][ordered]@{
                         'Użytkownik' = $pr.User; 'Litera' = ($k.PSChildName.ToUpperInvariant() + ':'); 'Ścieżka' = $path
                         'Serwer' = $(if ($path -match '^\\\\([^\\]+)') { $Matches[1] } else { '' })
-                        'Konto połączenia' = [string]$v.UserName; 'Trwałe' = $true; 'Zalogowany' = $pr.Loaded; 'Źródło' = $Source
+                        'Konto połączenia' = $account; 'Trwałe' = $true; 'Zalogowany' = $pr.Loaded; 'Źródło' = $Source
                     }
                 }
                 if ($P.History) {
