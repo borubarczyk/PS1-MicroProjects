@@ -13257,6 +13257,323 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
 }
 #endregion
 
+#region Zarządzanie zdalne: zasoby sieciowe użytkowników (dyski, dyski z GPO, drukarki, sesje SMB)
+# Polecenie w sesji WinRM widzi tylko połączenia tej sesji - mapowania użytkowników są czytane z ich gałęzi rejestru
+# (HKEY_USERS\<SID> zalogowanych; opcjonalnie NTUSER.DAT pozostałych, ładowany na chwilę), mapowania z Preferencji
+# zasad grupy z historii GPP (profil użytkownika, ProgramData), a nazwy GPO z zapisanego stanu zasad grupy. Kod pomocniczy jako tekst
+# ($P.Helpers), bo blok wykonuje się na komputerze docelowym.
+$script:NetResHelpers = @'
+function Get-DoProfiles {
+    # Profile kont użytkowników (S-1-5-21-…): SID, folder, nazwa konta, czy gałąź rejestru jest załadowana (zalogowany)
+    param([string]$UserFilter = '')
+    foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue)) {
+        $sid = $k.PSChildName
+        if ($sid -notmatch '^S-1-5-21-') { continue }
+        $path = [string](Get-ItemProperty -LiteralPath $k.PSPath -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
+        $path = [Environment]::ExpandEnvironmentVariables($path)
+        $name = ''
+        try { $name = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value } catch { $name = Split-Path -Leaf $path }
+        if ($UserFilter -and $name -notlike "*$UserFilter*") { continue }
+        [pscustomobject]@{ Sid = $sid; Path = $path; User = $name; Loaded = (Test-Path -LiteralPath "Registry::HKEY_USERS\$sid") }
+    }
+}
+
+function Use-DoUserHive {
+    <#
+        Wywołuje $Action z korzeniem gałęzi użytkownika: załadowana (zalogowany) albo - z -LoadOffline - plik NTUSER.DAT
+        ładowany na chwilę pod tymczasową nazwą (reg load) i od razu zwalniany. $Action: param($Root, $Source)
+    #>
+    param($Profile, [bool]$LoadOffline, [scriptblock]$Action)
+    $root = "Registry::HKEY_USERS\$($Profile.Sid)"
+    if (Test-Path -LiteralPath $root) { & $Action $root 'rejestr (zalogowany)'; return }
+    if (-not $LoadOffline) { return }
+    $dat = @('NTUSER.DAT', 'NTUSER.MAN' | ForEach-Object { Join-Path $Profile.Path $_ } | Where-Object { Test-Path -LiteralPath $_ }) | Select-Object -First 1
+    if (-not $dat) { return }
+    $name = 'DomainOps_' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    # stderr reg.exe w Windows PowerShell to rekordy błędów - przy Stop przerwałyby odczyt; w komunikacie sam tekst
+    $ErrorActionPreference = 'Continue'
+    $out = & reg.exe load "HKU\$name" $dat 2>&1
+    if ($LASTEXITCODE -ne 0) { throw ('nie załadowano {0}: {1}' -f $dat, ((@($out | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) -join ' '))) }
+    try { & $Action "Registry::HKEY_USERS\$name" 'NTUSER.DAT (niezalogowany)' }
+    finally {
+        # Uchwyty kluczy muszą zostać zamknięte, zanim gałąź da się zwolnić
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        for ($i = 0; $i -lt 6; $i++) { & reg.exe unload "HKU\$name" 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep -Milliseconds 400 }
+    }
+}
+
+function Get-DoGpHistoryRoots {
+    # Historia Preferencji zasad grupy: ustawienia użytkownika w jego profilu (Vista i nowsze), starsze/komputerowe w ProgramData
+    param([string]$ProfilePath)
+    if ($ProfilePath) { Join-Path $ProfilePath 'AppData\Local\Microsoft\Group Policy\History' }
+    Join-Path $env:ProgramData 'Microsoft\Group Policy\History'
+}
+
+function Get-DoGpoNames {
+    # Nazwy GPO według GUID z zapisanego stanu zasad grupy (komputer i każdy użytkownik, który się tu logował)
+    $map = @{}
+    foreach ($list in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State' -ErrorAction SilentlyContinue)) {
+        foreach ($g in @(Get-ChildItem -LiteralPath (Join-Path $list.PSPath 'GPO-List') -ErrorAction SilentlyContinue)) {
+            $v = Get-ItemProperty -LiteralPath $g.PSPath -ErrorAction SilentlyContinue
+            if ($v -and $v.GPOName -and $v.DisplayName) { $map[([string]$v.GPOName).ToUpperInvariant()] = [string]$v.DisplayName }
+        }
+    }
+    return $map
+}
+
+function Get-DoGppItems {
+    <#
+        Elementy Preferencji zasad grupy zastosowane dla użytkownika (historia GPP w profilu i w ProgramData):
+        Kind = Drives | Printers; wynik: @{ Gpo; Node (element XML); Props (Properties) }
+        Nazwy elementów przez LocalName: .Name elementu z atrybutem name zwraca wartość atrybutu.
+    #>
+    param($Profile, [string]$Kind)
+    $seen = @{}
+    foreach ($gpo in @(Get-DoGpHistoryRoots -ProfilePath $Profile.Path | ForEach-Object { Get-ChildItem -LiteralPath $_ -Directory -ErrorAction SilentlyContinue })) {
+        # Ten sam GPO w obu miejscach: liczy się kopia z profilu (pierwsza)
+        if ($seen.ContainsKey($gpo.Name.ToUpperInvariant())) { continue }
+        $file = Join-Path $gpo.FullName ('{0}\Preferences\{1}\{1}.xml' -f $Profile.Sid, $Kind)
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $seen[$gpo.Name.ToUpperInvariant()] = $true
+        $xml = $null
+        try { [xml]$xml = [System.IO.File]::ReadAllText($file) } catch { continue }
+        foreach ($node in @($xml.DocumentElement.ChildNodes | Where-Object { $_.NodeType -eq 'Element' })) {
+            $props = @($node.ChildNodes | Where-Object { $_.LocalName -eq 'Properties' })[0]
+            if ($props) { [pscustomobject]@{ Gpo = $gpo.Name; Node = $node; Props = $props } }
+        }
+    }
+}
+'@
+
+# Zmapowane dyski: HKEY_USERS\<SID>\Network\<litera> (połączenia trwałe), opcjonalnie historia Eksploratora (MountPoints2)
+$script:NetDrivesScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $profiles = @(Get-DoProfiles -UserFilter $P.UserFilter)
+    $skipped = @($profiles | Where-Object { -not $_.Loaded }).Count
+    foreach ($pr in $profiles) {
+        try {
+            Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
+                param($Root, $Source)
+                foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Network" -ErrorAction SilentlyContinue)) {
+                    $v = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+                    $path = [string]$v.RemotePath
+                    [pscustomobject][ordered]@{
+                        'Użytkownik' = $pr.User; 'Litera' = ($k.PSChildName.ToUpperInvariant() + ':'); 'Ścieżka' = $path
+                        'Serwer' = $(if ($path -match '^\\\\([^\\]+)') { $Matches[1] } else { '' })
+                        'Konto połączenia' = [string]$v.UserName; 'Trwałe' = $true; 'Zalogowany' = $pr.Loaded; 'Źródło' = $Source
+                    }
+                }
+                if ($P.History) {
+                    $seen = @{}
+                    foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2" -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like '##*' })) {
+                        $path = '\\' + $k.PSChildName.Substring(2).Replace('#', '\')
+                        if ($seen.ContainsKey($path)) { continue }
+                        $seen[$path] = $true
+                        [pscustomobject][ordered]@{
+                            'Użytkownik' = $pr.User; 'Litera' = ''; 'Ścieżka' = $path; 'Serwer' = $(if ($path -match '^\\\\([^\\]+)') { $Matches[1] } else { '' })
+                            'Konto połączenia' = ''; 'Trwałe' = $false; 'Zalogowany' = $pr.Loaded; 'Źródło' = 'historia Eksploratora (MountPoints2)'
+                        }
+                    }
+                }
+            }
+        }
+        catch { [pscustomobject][ordered]@{ 'Użytkownik' = $pr.User; 'Litera' = ''; 'Ścieżka' = ''; 'Zalogowany' = $pr.Loaded; 'Źródło' = 'błąd'; 'Uwagi' = $_.Exception.Message } }
+    }
+    if ($skipped -and -not $P.Offline) {
+        [pscustomobject][ordered]@{ 'Użytkownik' = "(niezalogowani: $skipped)"; 'Litera' = ''; 'Ścieżka' = ''; 'Zalogowany' = $false; 'Źródło' = 'pominięto'; 'Uwagi' = 'Zaznacz «Także niezalogowani», aby odczytać ich mapowania z NTUSER.DAT.' }
+    }
+}
+
+# Dyski z Preferencji zasad grupy (Drives.xml w historii GPP) z nazwą GPO
+$script:NetGpoDrivesScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $names = Get-DoGpoNames
+    $actions = @{ C = 'Utwórz'; R = 'Zastąp'; U = 'Aktualizuj'; D = 'Usuń' }
+    foreach ($pr in @(Get-DoProfiles -UserFilter $P.UserFilter)) {
+        foreach ($it in @(Get-DoGppItems -Profile $pr -Kind 'Drives')) {
+            $x = $it.Props
+            $letter = [string]$x.GetAttribute('letter')
+            $useLetter = [string]$x.GetAttribute('useLetter')
+            $guid = $it.Gpo.ToUpperInvariant()
+            $path = [string]$x.GetAttribute('path')
+            [pscustomobject][ordered]@{
+                'Użytkownik' = $pr.User
+                'Litera' = $(if ($letter -and $useLetter -ne '0') { $letter.ToUpperInvariant() + ':' } elseif ($useLetter -eq '0') { '(pierwsza wolna)' } else { '' })
+                'Ścieżka' = $path
+                'Serwer' = $(if ($path -match '^\\\\([^\\]+)') { $Matches[1] } else { '' })
+                'Akcja' = $(if ($actions.ContainsKey([string]$x.GetAttribute('action'))) { $actions[[string]$x.GetAttribute('action')] } else { [string]$x.GetAttribute('action') })
+                'Trwałe' = ([string]$x.GetAttribute('persistent') -eq '1')
+                'Etykieta' = [string]$x.GetAttribute('label')
+                'Targetowanie' = $(if (@($it.Node.ChildNodes | Where-Object { $_.LocalName -eq 'Filters' -and $_.HasChildNodes }).Count) { 'tak' } else { '' })
+                'GPO' = $(if ($names.ContainsKey($guid)) { $names[$guid] } else { $it.Gpo })
+                'Zmieniono' = [string]$it.Node.GetAttribute('changed')
+                'Zalogowany' = $pr.Loaded
+            }
+        }
+    }
+}
+
+# Drukarki sieciowe użytkowników: Printers\Connections (,,serwer,drukarka), drukarka domyślna i drukarki z GPP
+$script:NetPrintersScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $names = Get-DoGpoNames
+    $profiles = @(Get-DoProfiles -UserFilter $P.UserFilter)
+    $skipped = @($profiles | Where-Object { -not $_.Loaded }).Count
+    foreach ($pr in $profiles) {
+        try {
+            Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
+                param($Root, $Source)
+                $device = [string](Get-ItemProperty -LiteralPath "$Root\Software\Microsoft\Windows NT\CurrentVersion\Windows" -Name Device -ErrorAction SilentlyContinue).Device
+                $default = ($device -split ',')[0]
+                foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Printers\Connections" -ErrorAction SilentlyContinue)) {
+                    $parts = @($k.PSChildName -split ',' | Where-Object { $_ })
+                    $path = '\\' + ($parts -join '\')
+                    [pscustomobject][ordered]@{
+                        'Użytkownik' = $pr.User; 'Drukarka' = $path; 'Serwer' = $(if ($parts.Count) { $parts[0] } else { '' })
+                        'Domyślna' = ($default -and $default -ieq $path); 'Zalogowany' = $pr.Loaded; 'Źródło' = $Source
+                    }
+                }
+            }
+        }
+        catch { [pscustomobject][ordered]@{ 'Użytkownik' = $pr.User; 'Drukarka' = ''; 'Zalogowany' = $pr.Loaded; 'Źródło' = 'błąd'; 'Uwagi' = $_.Exception.Message } }
+        foreach ($it in @(Get-DoGppItems -Profile $pr -Kind 'Printers' | Where-Object { $_.Node.LocalName -eq 'SharedPrinter' })) {
+            $x = $it.Props
+            $path = [string]$x.GetAttribute('path')
+            $guid = $it.Gpo.ToUpperInvariant()
+            [pscustomobject][ordered]@{
+                'Użytkownik' = $pr.User; 'Drukarka' = $path; 'Serwer' = $(if ($path -match '^\\\\([^\\]+)') { $Matches[1] } else { '' })
+                'Domyślna' = ([string]$x.GetAttribute('default') -eq '1'); 'Zalogowany' = $pr.Loaded
+                'Źródło' = 'GPO: ' + $(if ($names.ContainsKey($guid)) { $names[$guid] } else { $it.Gpo })
+            }
+        }
+    }
+    if ($skipped -and -not $P.Offline) {
+        [pscustomobject][ordered]@{ 'Użytkownik' = "(niezalogowani: $skipped)"; 'Drukarka' = ''; 'Zalogowany' = $false; 'Źródło' = 'pominięto'; 'Uwagi' = 'Zaznacz «Także niezalogowani», aby odczytać ich drukarki z NTUSER.DAT (drukarki z GPO są pokazane).' }
+    }
+}
+
+# Kto jest podłączony do komputera: sesje SMB (klient, konto, otwarte pliki, czas) i opcjonalnie otwarte pliki
+$script:NetSmbSessionsScript = {
+    param($P)
+    $fmt = { param($s) $t = [TimeSpan]::FromSeconds([double]$s); if ($t.TotalHours -ge 1) { '{0} godz. {1} min' -f [int][Math]::Floor($t.TotalHours), $t.Minutes } elseif ($t.TotalMinutes -ge 1) { '{0} min' -f [int][Math]::Floor($t.TotalMinutes) } else { '{0} s' -f [int]$t.TotalSeconds } }
+    if (Get-Command Get-SmbSession -ErrorAction SilentlyContinue) {
+        foreach ($s in @(Get-SmbSession -ErrorAction Stop)) {
+            [pscustomobject][ordered]@{
+                'Rodzaj' = 'Sesja'; 'Klient' = [string]$s.ClientComputerName; 'Użytkownik' = [string]$s.ClientUserName; 'Udział / plik' = ''
+                'Otwarte pliki' = [int]$s.NumOpens; 'Połączony od' = (Get-Date).AddSeconds(-[double]$s.SecondsExists); 'Bezczynność' = (& $fmt $s.SecondsIdle)
+                'Dialekt SMB' = [string]$s.Dialect; '__sid' = [string]$s.SessionId; '__fid' = ''
+            }
+        }
+        if ($P.Files) {
+            foreach ($f in @(Get-SmbOpenFile -ErrorAction Stop)) {
+                [pscustomobject][ordered]@{
+                    'Rodzaj' = 'Plik'; 'Klient' = [string]$f.ClientComputerName; 'Użytkownik' = [string]$f.ClientUserName; 'Udział / plik' = [string]$f.Path
+                    'Blokady' = [int]$f.Locks; '__sid' = [string]$f.SessionId; '__fid' = [string]$f.FileId
+                }
+            }
+        }
+    }
+    else {
+        # Starsze systemy: Win32_ServerSession (bez zamykania z programu)
+        foreach ($s in @(Get-CimInstance -ClassName Win32_ServerSession -ErrorAction Stop)) {
+            [pscustomobject][ordered]@{
+                'Rodzaj' = 'Sesja'; 'Klient' = [string]$s.ComputerName; 'Użytkownik' = [string]$s.UserName; 'Udział / plik' = ''
+                'Otwarte pliki' = [int]$s.ResourcesOpened; 'Połączony od' = (Get-Date).AddSeconds(-[double]$s.ActiveTime); 'Bezczynność' = (& $fmt $s.IdleTime); '__sid' = ''; '__fid' = ''
+            }
+        }
+    }
+}
+
+$script:NetResViews = @(
+    @{ Name = 'Dyski zmapowane'; Op = 'Zmapowane dyski użytkowników'; Script = $script:NetDrivesScript; Hint = 'Zalogowani: rejestr ich sesji (połączenia trwałe). Mapowania nietrwałe (np. net use bez /persistent) widzi tylko sesja użytkownika.' }
+    @{ Name = 'Dyski z GPO'; Op = 'Dyski z zasad grupy'; Script = $script:NetGpoDrivesScript; Hint = 'Dyski z Preferencji zasad grupy zastosowane na komputerze (historia GPP), z nazwą GPO. Mapowania ze skryptów logowania nie są tu widoczne.' }
+    @{ Name = 'Drukarki sieciowe'; Op = 'Drukarki sieciowe użytkowników'; Script = $script:NetPrintersScript; Hint = 'Połączenia drukarek z rejestru użytkowników oraz drukarki z Preferencji zasad grupy; «Domyślna» – drukarka domyślna użytkownika.' }
+    @{ Name = 'Podłączeni do komputera (SMB)'; Op = 'Sesje SMB'; Script = $script:NetSmbSessionsScript; Hint = 'Klienci podłączeni do udziałów tego komputera. Zamknięcie sesji lub otwartego pliku – prawy przycisk myszy na wierszu.' }
+)
+
+function Update-NetResOptions {
+    # Opcje dotyczące wybranego widoku (pozostałe wyłączone)
+    param([hashtable]$Module)
+    $v = Get-SegmentIndex $Module.ViewSel
+    $Module.Offline.IsEnabled = ($v -eq 0 -or $v -eq 2)
+    $Module.History.IsEnabled = ($v -eq 0)
+    $Module.Files.IsEnabled = ($v -eq 3)
+    $Module.UserFilter.IsEnabled = ($v -ne 3)
+    $Module.ViewHint.Text = $script:NetResViews[$v].Hint
+}
+
+Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'NetResources' -Title 'Zasoby sieciowe użytkowników' -Icon 'E8CE' -Badge 'nowe' `
+    -Description 'Co mają podpięte użytkownicy zaznaczonych komputerów: zmapowane dyski (zalogowani, opcjonalnie także niezalogowani i historia połączeń Eksploratora), dyski z zasad grupy (Preferencje GPO, z nazwą GPO), drukarki sieciowe (także z GPO, z domyślną) oraz kto jest podłączony do komputera – sesje SMB i otwarte pliki z możliwością ich zamknięcia.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $view = $script:NetResViews[(Get-SegmentIndex $m.ViewSel)]
+        $params = @{ Helpers = $script:NetResHelpers; UserFilter = $m.UserFilter.Text.Trim(); Offline = (Test-Checked $m.Offline); History = (Test-Checked $m.History); Files = (Test-Checked $m.Files) }
+        if ($params.Offline) { Write-Log 'Odczyt zasobów niezalogowanych użytkowników: pliki NTUSER.DAT ładowane na chwilę (reg load / unload).' -Module $m.Title }
+        Reset-StatTiles $m
+        Start-HostOperation -Module $m -Name $view.Op -Targets $targets -Parameters $params -ScriptBlock $view.Script -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Status') -ne 'Błąd' -and [string](Get-ObjectValue $_ 'Źródło') -notin 'pominięto', 'błąd' })
+            $users = @($rows | ForEach-Object { '{0}|{1}' -f (Get-ObjectValue $_ 'Komputer'), (Get-ObjectValue $_ 'Użytkownik') } | Select-Object -Unique).Count
+            $servers = @($rows | ForEach-Object { ([string](Get-ObjectValue $_ 'Serwer')).ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique).Count
+            Set-StatTile -Module $m -Key 'items' -Value ([string]$rows.Count)
+            Set-StatTile -Module $m -Key 'users' -Value ([string]$users)
+            Set-StatTile -Module $m -Key 'servers' -Value $(if ((Get-SegmentIndex $m.ViewSel) -eq 3) { '—' } else { [string]$servers })
+        }
+    }
+    $m.Actions.Close = {
+        # Zamknięcie sesji SMB albo otwartych plików na komputerze (użytkownik straci niezapisane zmiany w tych plikach)
+        param($m, $Rows, [string]$What)
+        $col = if ($What -eq 'File') { '__fid' } else { '__sid' }
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @($col) -Rows $Rows
+        if ($byHost.Count -eq 0) { Show-Warning $(if ($What -eq 'File') { 'Zaznacz w tabeli otwarte pliki (widok «Podłączeni», opcja «Także otwarte pliki»).' } else { 'Zaznacz w tabeli sesje SMB (widok «Podłączeni do komputera»).' }); return }
+        $items = Get-HostItemList -ByHost $byHost -Format { param($i) '{0} ({1}){2}' -f (Get-RowValue $i.__row 'Użytkownik'), (Get-RowValue $i.__row 'Klient'), $(if ([string](Get-RowValue $i.__row 'Udział / plik')) { ' – ' + (Get-RowValue $i.__row 'Udział / plik') } else { '' }) }
+        $text = if ($What -eq 'File') { 'Zamknąć wybrane otwarte pliki? Niezapisane zmiany użytkowników w tych plikach zostaną utracone.' } else { 'Zamknąć wybrane sesje SMB? Wszystkie pliki otwarte w tych sesjach zostaną zamknięte (niezapisane zmiany przepadną), a klient połączy się ponownie przy następnym dostępie.' }
+        if (-not (Confirm-Action -Text $text -Items $items -ConfirmText 'Zamknij' -Danger)) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) { $per[$h] = @{ What = $What; Ids = @($byHost[$h] | ForEach-Object { [string]$_[$col] } | Select-Object -Unique) } }
+        $m.Data.ActionHosts = @($byHost.Keys)
+        Start-HostOperation -Module $m -Name $(if ($What -eq 'File') { 'Zamykanie plików' } else { 'Zamykanie sesji SMB' }) -Targets @($byHost.Keys) -PerTarget $per -Output Log `
+            -OnComplete { param($m) Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } } -ScriptBlock {
+            param($P)
+            foreach ($id in @($P.Ids)) {
+                try {
+                    if ($P.What -eq 'File') { Close-SmbOpenFile -FileId ([uint64]$id) -Force -ErrorAction Stop } else { Close-SmbSession -SessionId ([uint64]$id) -Force -ErrorAction Stop }
+                    [pscustomobject]@{ 'Id' = $id; 'Wynik' = $(if ($P.What -eq 'File') { 'Zamknięto plik' } else { 'Zamknięto sesję' }) }
+                }
+                catch { [pscustomobject]@{ 'Id' = $id; 'Wynik' = 'Błąd – ' + $_.Exception.Message } }
+            }
+        }
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Widok'
+    $m.ViewSel = Add-Segmented -Parent $row -Items @($script:NetResViews | ForEach-Object { $_.Name }) -Module $m -OnChange { param($m) Update-NetResOptions -Module $m }
+    $row2 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.UserFilter = Add-TextBox -Parent $row2 -Width 170 -Placeholder 'Użytkownik (fragment)'
+    $m.Offline = Add-CheckBox -Parent $row2 -Text 'Także niezalogowani (NTUSER.DAT)' -ToolTip 'Pliki NTUSER.DAT niezalogowanych użytkowników są na chwilę ładowane do rejestru komputera (reg load) i od razu zwalniane – nie używaj, gdy użytkownicy właśnie się logują.'
+    $m.History = Add-CheckBox -Parent $row2 -Text 'Także historia połączeń Eksploratora' -ToolTip 'Udziały, z którymi użytkownik się łączył (MountPoints2) – także bez litery dysku'
+    $m.Files = Add-CheckBox -Parent $row2 -Text 'Także otwarte pliki' -ToolTip 'Pliki otwarte przez klientów w udziałach tego komputera (Get-SmbOpenFile)'
+    Add-Button -Parent $row2 -Text 'Pokaż' -Icon 'E72C' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
+    $m.ViewHint = Add-Label -Parent $row2 -Text '' -Hint -MaxWidth 760
+    Update-NetResOptions -Module $m
+    Add-StatTile -Module $m -Key 'items' -Label 'Pozycje' -Icon 'E8CE' | Out-Null
+    Add-StatTile -Module $m -Key 'users' -Label 'Użytkownicy' -Icon 'E77B' | Out-Null
+    Add-StatTile -Module $m -Key 'servers' -Label 'Serwery' -Icon 'E968' | Out-Null
+    Add-RowAction -Module $m -Text 'Otwórz ścieżkę w Eksploratorze' -Icon 'E838' -Action {
+        param($m, $rows)
+        $paths = @($rows | ForEach-Object { [string](Get-RowValue $_ 'Ścieżka'); [string](Get-RowValue $_ 'Drukarka') } | Where-Object { $_ -match '^\\\\[^\\%]+\\' -and $_ -notmatch '%' } | Select-Object -Unique)
+        if (-not $paths.Count) { Show-Warning 'Zaznaczone wiersze nie mają ścieżki sieciowej bez zmiennych (np. %LogonUser%).'; return }
+        foreach ($path in @($paths | Select-Object -First 5)) { try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $path) } catch { Show-Error "Nie można otworzyć $path." $_ } }
+    }
+    Add-RowAction -Module $m -Text 'Zamknij sesję SMB…' -Icon 'E711' -Danger -Separator -Action { param($m, $rows) & $m.Actions.Close $m $rows 'Session' }
+    Add-RowAction -Module $m -Text 'Zamknij otwarty plik…' -Icon 'E711' -Danger -Action { param($m, $rows) & $m.Actions.Close $m $rows 'File' }
+}
+#endregion
+
 #region Zarządzanie zdalne: analiza wydajności (co obciąża komputer lub serwer)
 # Pomiar na komputerze docelowym: kilka próbek surowych liczników wydajności (klasy Win32_PerfRawData_* - nazwy
 # niezależne od języka systemu) w zadanym oknie czasu. Z różnic między próbkami liczone są prawdziwe średnie
