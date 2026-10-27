@@ -3999,7 +3999,19 @@ $script:ModuleViewXaml = @'
         <ColumnDefinition Width="*"/>
         <ColumnDefinition Width="Auto"/>
       </Grid.ColumnDefinitions>
+      <!-- Pasek przewijania nad treścią (nie zabiera jej szerokości): pojawienie się paska nie zmienia zawijania wierszy,
+           więc układ nie oscyluje między «z paskiem» i «bez paska» -->
       <ScrollViewer x:Name="paramsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
+        <ScrollViewer.Template>
+          <ControlTemplate TargetType="ScrollViewer">
+            <Grid>
+              <ScrollContentPresenter x:Name="PART_ScrollContentPresenter" Margin="0,0,12,0" CanContentScroll="False"/>
+              <ScrollBar x:Name="PART_VerticalScrollBar" HorizontalAlignment="Right" Orientation="Vertical"
+                         Value="{TemplateBinding VerticalOffset}" Maximum="{TemplateBinding ScrollableHeight}"
+                         ViewportSize="{TemplateBinding ViewportHeight}" Visibility="{TemplateBinding ComputedVerticalScrollBarVisibility}"/>
+            </Grid>
+          </ControlTemplate>
+        </ScrollViewer.Template>
         <StackPanel x:Name="paramsStack"/>
       </ScrollViewer>
       <Border x:Name="paramsSide" Grid.Column="1" Width="320" Margin="14,0,4,6" VerticalAlignment="Top" Visibility="Collapsed"/>
@@ -4143,11 +4155,16 @@ function New-ModuleView {
     [void]$grid.CommandBindings.Add((New-Object System.Windows.Input.CommandBinding([System.Windows.Input.ApplicationCommands]::Copy, [System.Windows.Input.ExecutedRoutedEventHandler]$script:GridEvents.Copy)))
     Reset-ResultTable -Module $Module
     Update-DetailPane -Module $Module
-    # Wysokość panelu parametrów zależy od miejsca w oknie (nagłówek, kafelki, tabela); bez nasłuchu na nagłówek -
-    # jego wysokość (opis przycinany do dwóch linii) bywa niestabilna między przebiegami układu
-    foreach ($e in @($root, $v.statsGrid)) {
-        $script:ParamsFitModules[$e] = $Module
-        $e.add_SizeChanged($script:ParamsFitHandler)
+    # Wysokość panelu parametrów zależy od miejsca na moduł (obszar treści okna) i kafelków - liczona przy pokazaniu
+    # modułu, zmianie rozmiaru okna i kafelków; nie od rozmiaru samego modułu (zależy od parametrów - sprzężenie zwrotne)
+    $script:ParamsFitModules[$root] = $Module
+    $root.add_IsVisibleChanged($script:ParamsFitVisibleHandler)
+    $script:ParamsFitModules[$v.statsGrid] = $Module
+    $v.statsGrid.add_SizeChanged($script:ParamsFitHandler)
+    $contentHost = $script:UI.Controls['contentHost']
+    if ($contentHost -and -not $script:ParamsFitHostHooked) {
+        $script:ParamsFitHostHooked = $true
+        $contentHost.add_SizeChanged($script:ParamsFitHostHandler)
     }
 }
 
@@ -4156,16 +4173,27 @@ $script:ParamsFitModules = New-Object 'System.Collections.Generic.Dictionary[obj
 $script:ParamsFitPending = New-Object System.Collections.ArrayList
 # Wysokość liczona po zakończeniu układu (priorytet Background), nie w trakcie SizeChanged: zmiana MaxHeight w środku
 # przebiegu układu potrafiła zapętlić układ okna (zawieszenie przy pokazaniu modułu)
+$script:ParamsFitHostHooked = $false
+function Request-ParamsFit {
+    param([hashtable]$Module, $Dispatcher)
+    if (-not $Module -or -not $Module.Root) { return }
+    foreach ($x in $script:ParamsFitPending) { if ([object]::ReferenceEquals($x, $Module)) { return } }
+    [void]$script:ParamsFitPending.Add($Module)
+    if ($script:ParamsFitPending.Count -eq 1) { [void]$Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [System.Action]$script:ParamsFitFlush) }
+}
 $script:ParamsFitHandler = {
     param($s, $e)
     $m = $null
-    try {
-        if (-not $script:ParamsFitModules.TryGetValue($s, [ref]$m)) { return }
-        foreach ($x in $script:ParamsFitPending) { if ([object]::ReferenceEquals($x, $m)) { return } }
-        [void]$script:ParamsFitPending.Add($m)
-        if ($script:ParamsFitPending.Count -eq 1) { [void]$s.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [System.Action]$script:ParamsFitFlush) }
-    }
-    catch { }
+    try { if ($script:ParamsFitModules.TryGetValue($s, [ref]$m)) { Request-ParamsFit -Module $m -Dispatcher $s.Dispatcher } } catch { }
+}
+$script:ParamsFitVisibleHandler = {
+    param($s, $e)
+    $m = $null
+    try { if ($s.IsVisible -and $script:ParamsFitModules.TryGetValue($s, [ref]$m)) { Request-ParamsFit -Module $m -Dispatcher $s.Dispatcher } } catch { }
+}
+$script:ParamsFitHostHandler = {
+    param($s, $e)
+    try { Request-ParamsFit -Module $script:UI.ActiveModule -Dispatcher $s.Dispatcher } catch { }
 }
 $script:ParamsFitFlush = {
     $mods = @($script:ParamsFitPending)
@@ -4178,8 +4206,9 @@ function Update-ParamsMaxHeight {
     # a tabela zachowuje co najmniej $script:MinResultsHeight (gdy okno jest bardzo niskie - panel ma min. 120 px)
     param([hashtable]$Module)
     $v = $Module.View_
-    $h = $Module.Root.ActualHeight
-    if ($h -le 0) { return }
+    $area = $Module.Root.Parent
+    $h = if ($area -is [System.Windows.FrameworkElement]) { $area.ActualHeight } else { $Module.Root.ActualHeight }
+    if ($h -le 0 -or -not $Module.Root.IsVisible) { return }
     # Nagłówek z marginesem, pasek nad tabelą, karta parametrów (margines, dopełnienie, ramka), ramka i margines tabeli
     $used = $v.hdrGrid.ActualHeight + 16 + $v.resHeader.ActualHeight + 8 + 12 + 22 + 2 + 9
     if ($v.statsGrid.Visibility -eq 'Visible') { $used += $v.statsGrid.ActualHeight + 12 }
