@@ -5410,6 +5410,7 @@ function Reset-ResultTable {
     $Module.Table = $table
     $Module.View = $view
     $Module.ColumnIndex = @{}
+    $Module['ErrorColumnLast'] = $false
     $g = $Module.Grid
     if ($g) {
         $g.ItemsSource = $null
@@ -5470,6 +5471,12 @@ function Add-GridColumn {
     $col.MaxWidth = 520
     $col.MinWidth = 54
     $g.Columns.Add($col)
+    if ($Name -ne 'Szczegóły' -and $Module['ErrorColumnLast']) {
+        # Kolumnę «Szczegóły» założył wiersz błędu (np. komputer bez połączenia odpowiedział pierwszy) - zostaje
+        # za kolumnami danych, zamiast rozpychać je w prawo
+        $err = $g.Columns | Where-Object { [string]$_.SortMemberPath -eq 'Szczegóły' } | Select-Object -First 1
+        if ($err) { $col.DisplayIndex = $err.DisplayIndex }
+    }
     if ((Get-UserHiddenColumns -Module $Module).Contains($Name)) {
         $col.Visibility = 'Collapsed'
         Update-ColumnsButton -Module $Module
@@ -7182,6 +7189,7 @@ function Complete-OperationItem {
                 $errRow = [ordered]@{ 'Status' = 'Błąd' }
                 if (-not $Operation.TargetColumn) { $errRow['Obiekt'] = $Result.Target }
                 $errRow['Szczegóły'] = $errorText
+                if (-not $m.ColumnIndex.ContainsKey('Szczegóły')) { $m['ErrorColumnLast'] = $true }
                 Add-ResultRows -Module $m -Computer $Result.Target -TargetColumn $Operation.TargetColumn -Objects @([pscustomobject]$errRow)
             }
         }
@@ -11351,29 +11359,86 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Services' -Title 'U
             Stop        = 'Zatrzymać wybrane usługi? Zatrzymane zostaną też usługi od nich zależne.'
             Restart     = 'Uruchomić ponownie wybrane usługi?'
             StartupType = "Ustawić typ uruchamiania «$startupText» dla wybranych usług?"
+            KillRestart = 'Zakończyć proces wybranych usług i uruchomić je ponownie? To sposób na usługę, która się zawiesiła (np. stan «Zatrzymywanie» albo brak reakcji na Restart) – proces jest kończony bez czekania, więc niezapisane dane usługi przepadną. Usługi zależne, które działały, zostaną uruchomione ponownie. Usługa działająca we wspólnym procesie z innymi (svchost) albo krytyczna dla systemu zostanie pominięta.'
         }[$Op]
         $items = Get-HostItemList -ByHost $byHost -Format { param($i) $i['Nazwa'] }
-        if (-not (Confirm-Action -Text $question -Items $items -ConfirmText 'Wykonaj' -Danger:($Op -eq 'Stop'))) { return }
+        if (-not (Confirm-Action -Text $question -Items $items -ConfirmText $(if ($Op -eq 'KillRestart') { 'Zakończ i uruchom' } else { 'Wykonaj' }) -Danger:($Op -in 'Stop', 'KillRestart'))) { return }
         $per = @{}
         foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $Op; StartupType = $startup; Names = @($byHost[$h] | ForEach-Object { [string]$_['Nazwa'] }) } }
-        Start-HostOperation -Module $m -Name "Usługi – $Op" -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
+        $opName = if ($Op -eq 'KillRestart') { 'Usługi – zakończenie procesu i ponowne uruchomienie' } else { "Usługi – $Op" }
+        $m.Data.ActionHosts = @($byHost.Keys)
+        # Po operacji odświeżenie listy tylko na komputerach, których dotyczyła (niezależnie od zaznaczenia po lewej)
+        Start-HostOperation -Module $m -Name $opName -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } } -ScriptBlock {
             param($P)
             foreach ($name in $P.Names) {
                 try {
-                    switch ($P.Op) {
-                        'Start' { Start-Service -Name $name -ErrorAction Stop }
-                        'Stop' { Stop-Service -Name $name -Force -ErrorAction Stop }
-                        'Restart' { Restart-Service -Name $name -Force -ErrorAction Stop }
-                        'StartupType' { Set-Service -Name $name -StartupType $P.StartupType -ErrorAction Stop }
+                    $note = ''
+                    if ($P.Op -eq 'KillRestart') {
+                        # Zawieszona usługa: koniec jej procesu (SCM uzna ją za zatrzymaną), start usługi i zależnych, które działały.
+                        # Pominięte: proces wspólny z innymi usługami (zatrzymałby je wszystkie), procesy i usługi krytyczne
+                        # (zakończenie = restart systemu) oraz WinRM (przerwałoby to połączenie)
+                        $svc = @(Get-CimInstance -ClassName Win32_Service -Filter ("Name = '{0}'" -f $name.Replace("'", "''")) -ErrorAction Stop)[0]
+                        if (-not $svc) { throw 'nie ma takiej usługi' }
+                        $procId = [int]$svc.ProcessId
+                        $skip = ''
+                        $deps = @()
+                        if ($name -in 'WinRM', 'RpcSs', 'RpcEptMapper', 'DcomLaunch', 'LSM', 'BrokerInfrastructure', 'SamSs' -or [string]$svc.ErrorControl -eq 'Critical') { $skip = 'usługa krytyczna dla systemu albo połączenia zdalnego – użyj Restart albo uruchom ponownie komputer' }
+                        elseif ($procId -gt 0) {
+                            $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+                            $pname = if ($proc) { [string]$proc.ProcessName } else { '' }
+                            $shared = @(Get-CimInstance -ClassName Win32_Service -Filter "ProcessId = $procId" -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne $name } | ForEach-Object { [string]$_.Name } | Sort-Object)
+                            if ($pname -in 'lsass', 'csrss', 'wininit', 'services', 'smss', 'winlogon', 'System', 'Idle') { $skip = "proces $pname jest krytyczny dla systemu" }
+                            elseif ($shared.Count) { $skip = "proces $pname (PID $procId) obsługuje też: $($shared -join ', ') – jego zakończenie zatrzymałoby je wszystkie (proces można zakończyć ręcznie w module «Procesy»)" }
+                            else {
+                                $deps = @((Get-Service -Name $name).DependentServices | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { [string]$_.Name })
+                                Stop-Process -Id $procId -Force -ErrorAction Stop
+                                try { Wait-Process -Id $procId -Timeout 20 -ErrorAction Stop } catch { }
+                                $note = "zakończono proces $pname (PID $procId)"
+                            }
+                        }
+                        else { $note = 'usługa nie miała procesu' }
+                        if ($skip) {
+                            [pscustomobject]@{ 'Usługa' = $name; 'Operacja' = $P.Op; 'Wynik' = "Pominięto – $skip"; 'Stan' = [string]$svc.State }
+                            continue
+                        }
+                        # Menedżer usług zauważa koniec procesu z opóźnieniem
+                        $g = Get-Service -Name $name
+                        try { $g.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15)) } catch { }
+                        Start-Service -Name $name -ErrorAction Stop
+                        $failed = @()
+                        foreach ($d in $deps) { try { Start-Service -Name $d -ErrorAction Stop } catch { $failed += $d } }
+                        $okDeps = @($deps | Where-Object { $failed -notcontains $_ })
+                        if ($okDeps.Count) { $note += '; zależne uruchomione ponownie: ' + ($okDeps -join ', ') }
+                        if ($failed.Count) { $note += '; nie uruchomiono zależnych: ' + ($failed -join ', ') }
                     }
+                    elseif ($P.Op -eq 'Start') { Start-Service -Name $name -ErrorAction Stop }
+                    elseif ($P.Op -eq 'Stop') { Stop-Service -Name $name -Force -ErrorAction Stop }
+                    elseif ($P.Op -eq 'Restart') { Restart-Service -Name $name -Force -ErrorAction Stop }
+                    elseif ($P.Op -eq 'StartupType') { Set-Service -Name $name -StartupType $P.StartupType -ErrorAction Stop }
                     $svc = Get-Service -Name $name
-                    [pscustomobject]@{ 'Usługa' = $name; 'Operacja' = $P.Op; 'Wynik' = 'OK'; 'Stan' = [string]$svc.Status }
+                    $out = [ordered]@{ 'Usługa' = $name; 'Operacja' = $P.Op; 'Wynik' = 'OK'; 'Stan' = [string]$svc.Status }
+                    if ($note) { $out['Uwagi'] = $note.TrimStart(';', ' ') }
+                    [pscustomobject]$out
                 }
                 catch {
                     [pscustomobject]@{ 'Usługa' = $name; 'Operacja' = $P.Op; 'Wynik' = "Błąd – $($_.Exception.Message)" }
                 }
             }
         }
+    }
+    $m.Actions.ShowProcess = {
+        # Procesy zaznaczonych usług w module «Procesy» (PID na każdym komputerze osobno)
+        param($m, $Rows)
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('PID') -Rows $Rows
+        $pids = @{}
+        foreach ($h in $byHost.Keys) {
+            $ids = @($byHost[$h] | ForEach-Object { [int]$_['PID'] } | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+            if ($ids.Count) { $pids[$h] = $ids }
+        }
+        if (-not $pids.Count) { Show-Warning 'Zaznaczone usługi nie działają (brak PID) – odśwież listę usług.'; return }
+        Show-Module -Key 'Processes'
+        $pm = $script:UI.Modules['Processes']
+        & $pm.Actions.List $pm $pids
     }
     $row = Add-ToolbarRow -Module $m -Title 'Lista'
     Add-Label -Parent $row -Text 'Nazwa' | Out-Null
@@ -11389,9 +11454,12 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Services' -Title 'U
     Add-Label -Parent $row2 -Text '   Typ uruchamiania' | Out-Null
     $m.StartupType = Add-ComboBox -Parent $row2 -Items @('Automatyczny', 'Ręczny', 'Wyłączony') -Width 140
     $b = Add-Button -Parent $row2 -Text 'Ustaw' -Module $m -OnClick { param($m, $s) & $m.Actions.Change $m 'StartupType' $null }
+    Add-Button -Parent $row2 -Text 'Zakończ proces i uruchom…' -Icon 'E711' -Module $m -Danger -ToolTip 'Dla zawieszonej usługi: kończy jej proces i uruchamia ją ponownie' -OnClick { param($m) & $m.Actions.Change $m 'KillRestart' $null } | Out-Null
     Add-RowAction -Module $m -Text 'Uruchom' -Icon 'E768' -Action { param($m, $rows) & $m.Actions.Change $m 'Start' $rows }
     Add-RowAction -Module $m -Text 'Zatrzymaj' -Icon 'E71A' -Action { param($m, $rows) & $m.Actions.Change $m 'Stop' $rows }
     Add-RowAction -Module $m -Text 'Uruchom ponownie' -Icon 'E72C' -Action { param($m, $rows) & $m.Actions.Change $m 'Restart' $rows }
+    Add-RowAction -Module $m -Text 'Zakończ proces usługi i uruchom ponownie…' -Icon 'E711' -Danger -Action { param($m, $rows) & $m.Actions.Change $m 'KillRestart' $rows }
+    Add-RowAction -Module $m -Text 'Pokaż proces usługi' -Icon 'E7EF' -Action { param($m, $rows) & $m.Actions.ShowProcess $m $rows }
     Add-RowAction -Module $m -Text 'Typ uruchamiania: automatyczny' -Icon 'E768' -Separator -Action { param($m, $rows) & $m.Actions.Change $m 'StartupType' $rows 'Automatic' }
     Add-RowAction -Module $m -Text 'Typ uruchamiania: ręczny' -Icon 'E7C3' -Action { param($m, $rows) & $m.Actions.Change $m 'StartupType' $rows 'Manual' }
     Add-RowAction -Module $m -Text 'Typ uruchamiania: wyłączony' -Icon 'E711' -Action { param($m, $rows) & $m.Actions.Change $m 'StartupType' $rows 'Disabled' }
@@ -11401,13 +11469,29 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Processes' -Title '
     -Description 'Procesy uruchomione na zaznaczonych komputerach (pamięć, właściciel, wiersz poleceń) i kończenie wybranych procesów.' -Build {
     param($m)
     $m.Actions.List = {
-        param($m)
-        $targets = @(Get-TargetComputers)
-        if (-not $targets) { return }
-        Start-HostOperation -Module $m -Name 'Procesy' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); WithOwner = (Test-Checked $m.WithOwner) } -ScriptBlock {
+        # -Pids: @{ komputer = @(PID, …) } - tylko te procesy (np. z «Pokaż proces usługi»), bez filtra nazwy
+        param($m, [hashtable]$Pids = $null)
+        $per = @{}
+        if ($Pids) {
+            $targets = @($Pids.Keys)
+            foreach ($h in $targets) { $per[$h] = @{ Filter = ''; WithOwner = (Test-Checked $m.WithOwner); Pids = @($Pids[$h]) } }
+        }
+        else {
+            $targets = @(Get-TargetComputers)
+            if (-not $targets) { return }
+        }
+        Start-HostOperation -Module $m -Name 'Procesy' -Targets $targets -Parameters @{ Filter = $m.Filter.Text.Trim(); WithOwner = (Test-Checked $m.WithOwner); Pids = @() } -PerTarget $per -ScriptBlock {
             param($P)
             $procs = @(Get-CimInstance -ClassName Win32_Process)
-            if ($P.Filter) { $procs = @($procs | Where-Object { $_.Name -like "*$($P.Filter)*" }) }
+            if (@($P.Pids).Count) { $procs = @($procs | Where-Object { @($P.Pids) -contains [int]$_.ProcessId }) }
+            elseif ($P.Filter) { $procs = @($procs | Where-Object { $_.Name -like "*$($P.Filter)*" }) }
+            # Usługi działające w każdym procesie (svchost obsługuje często kilka)
+            $svcByPid = @{}
+            foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Filter 'ProcessId <> 0' -ErrorAction SilentlyContinue)) {
+                $k = [int]$s.ProcessId
+                if (-not $svcByPid.ContainsKey($k)) { $svcByPid[$k] = New-Object System.Collections.Generic.List[string] }
+                $svcByPid[$k].Add([string]$s.Name)
+            }
             $procs | Sort-Object WorkingSetSize -Descending | ForEach-Object {
                 $owner = ''
                 if ($P.WithOwner) {
@@ -11424,6 +11508,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Processes' -Title '
                     'Właściciel'     = $owner
                     'Sesja'          = $_.SessionId
                     'Uruchomiony'    = $_.CreationDate
+                    'Usługi'         = $(if ($svcByPid.ContainsKey([int]$_.ProcessId)) { (@($svcByPid[[int]$_.ProcessId] | Sort-Object)) -join ', ' } else { '' })
                     'Wiersz poleceń' = $_.CommandLine
                 }
             }
@@ -11434,7 +11519,8 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Processes' -Title '
         $byHost = Get-SelectedRowsByHost -Module $m -Columns @('PID', 'Proces') -Rows $Rows
         if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz w tabeli procesy do zakończenia.'; return }
         $items = Get-HostItemList -ByHost $byHost -Format { param($i) '{0} (PID {1})' -f $i['Proces'], $i['PID'] }
-        if (-not (Confirm-Action -Text 'Zakończyć wybrane procesy? Niezapisane dane w tych programach zostaną utracone.' -Items $items -ConfirmText 'Zakończ procesy' -Danger)) { return }
+        $svcNote = if (@($byHost.Values | ForEach-Object { $_ } | Where-Object { [string](Get-RowValue $_.__row 'Usługi') }).Count) { ' Część procesów obsługuje usługi (kolumna «Usługi») – zostaną zatrzymane; uruchom je potem ponownie w module «Usługi».' } else { '' }
+        if (-not (Confirm-Action -Text ('Zakończyć wybrane procesy? Niezapisane dane w tych programach zostaną utracone.' + $svcNote) -Items $items -ConfirmText 'Zakończ procesy' -Danger)) { return }
         $per = @{}
         foreach ($h in $byHost.Keys) { $per[$h] = @{ Ids = @($byHost[$h] | ForEach-Object { [int]$_['PID'] }) } }
         Start-HostOperation -Module $m -Name 'Kończenie procesów' -Targets @($byHost.Keys) -PerTarget $per -Output Log -OnComplete { param($m) & $m.Actions.List $m } -ScriptBlock {
@@ -14855,6 +14941,433 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'NetResource
     }
     Add-RowAction -Module $m -Text 'Zamknij sesję SMB…' -Icon 'E711' -Danger -Separator -Action { param($m, $rows) & $m.Actions.Close $m $rows 'Session' }
     Add-RowAction -Module $m -Text 'Zamknij otwarty plik…' -Icon 'E711' -Danger -Action { param($m, $rows) & $m.Actions.Close $m $rows 'File' }
+}
+#endregion
+
+#region Zarządzanie zdalne: Outlook i Microsoft 365 (Office, Entra ID / Intune, konta i skrzynki, pliki PST)
+# Office Click-to-Run i stan urządzenia z rejestru komputera i dsregcmd; konta Office, OneDrive i profile Outlooka
+# z gałęzi rejestru użytkowników (jak w module zasobów sieciowych: zalogowani, opcjonalnie NTUSER.DAT pozostałych);
+# skrzynki dodane automatycznie (automapowanie) i archiwa online z kopii odpowiedzi Autodiscover, którą Outlook
+# zapisuje w profilu użytkownika. Wartości profilu Outlooka (MAPI) są binarne - tekst UTF-16LE zakończony zerami.
+$script:M365Helpers = $script:NetResHelpers + @'
+
+function Get-DoProp($Object, [string]$Name) {
+    # Wartość właściwości; tablica (np. REG_BINARY - byte[]) w całości, bez rozwijania w potoku
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if (-not $p) { return $null }
+    if ($p.Value -is [array]) { return , $p.Value }
+    return $p.Value
+}
+
+function ConvertFrom-DoRegText($Value) {
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [array]) { return ([System.Text.Encoding]::Unicode.GetString([byte[]]$Value)).Trim([char]0).Trim() }
+    return ([string]$Value).Trim([char]0).Trim()
+}
+
+function Get-DoOutlookProfiles {
+    # Profile Outlooka użytkownika (Outlook 2016 / Microsoft 365, 2013, starsze - Windows Messaging Subsystem)
+    param([string]$Root)
+    foreach ($base in "$Root\Software\Microsoft\Office\16.0\Outlook", "$Root\Software\Microsoft\Office\15.0\Outlook", "$Root\Software\Microsoft\Windows NT\CurrentVersion\Windows Messaging Subsystem") {
+        $key = "$base\Profiles"
+        if (-not (Test-Path -LiteralPath $key)) { continue }
+        $default = [string](Get-DoProp (Get-ItemProperty -LiteralPath $base -ErrorAction SilentlyContinue) 'DefaultProfile')
+        foreach ($p in @(Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinue)) {
+            [pscustomobject]@{ Name = $p.PSChildName; Path = $p.PSPath; Default = ($default -and $p.PSChildName -eq $default) }
+        }
+        return
+    }
+}
+
+function Get-DoOutlookProfileItems {
+    # Konta (sekcja 9375CFF0413111d3B88A00104B2A6676) i pliki danych profilu: PST (001f6700), OST (001f6610)
+    param($OutlookProfile)
+    $seen = @{}
+    foreach ($sec in @(Get-ChildItem -LiteralPath $OutlookProfile.Path -ErrorAction SilentlyContinue)) {
+        if ($sec.PSChildName -eq '9375CFF0413111d3B88A00104B2A6676') {
+            foreach ($acc in @(Get-ChildItem -LiteralPath $sec.PSPath -ErrorAction SilentlyContinue)) {
+                $v = Get-ItemProperty -LiteralPath $acc.PSPath -ErrorAction SilentlyContinue
+                $name = ConvertFrom-DoRegText (Get-DoProp $v 'Account Name')
+                $email = ConvertFrom-DoRegText (Get-DoProp $v 'Email')
+                if (-not $name -and -not $email) { continue }
+                $type = if ($null -ne (Get-DoProp $v 'IMAP Server')) { 'IMAP' } elseif ($null -ne (Get-DoProp $v 'POP3 Server')) { 'POP3' } else { 'Exchange / Microsoft 365' }
+                [pscustomobject]@{ Kind = 'Account'; Name = $name; Email = $(if ($email) { $email } elseif ($name -match '@') { $name } else { '' }); Type = $type; File = '' }
+            }
+            continue
+        }
+        $v = Get-ItemProperty -LiteralPath $sec.PSPath -ErrorAction SilentlyContinue
+        if (-not $v) { continue }
+        $display = ConvertFrom-DoRegText (Get-DoProp $v '001f3001')
+        foreach ($pair in @(@('001f6700', 'PST'), @('001f6610', 'OST'))) {
+            $file = ConvertFrom-DoRegText (Get-DoProp $v $pair[0])
+            if (-not $file -or $seen.ContainsKey($file.ToLowerInvariant())) { continue }
+            $seen[$file.ToLowerInvariant()] = $true
+            [pscustomobject]@{ Kind = $pair[1]; Name = $display; Email = ''; Type = $pair[1]; File = $file }
+        }
+    }
+}
+
+function Get-DoAutodMailboxes {
+    # Skrzynki z kopii odpowiedzi Autodiscover zapisanej przez Outlooka (%LOCALAPPDATA%\Microsoft\Outlook, także \16):
+    # AlternativeMailbox - Delegate (skrzynka współdzielona / delegowana, automapowanie), Archive (archiwum online),
+    # TeamMailbox (skrzynka grupy / witryny). Plik jest w profilu, więc działa też dla niezalogowanych.
+    param([string]$ProfilePath)
+    $dir = Join-Path $ProfilePath 'AppData\Local\Microsoft\Outlook'
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    $seen = @{}
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.xml' -File -Recurse -Depth 1 -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'AutoD.*' -or $_.Name -like '*Autodiscover.xml' } | Sort-Object LastWriteTime -Descending)
+    foreach ($f in $files) {
+        $x = $null
+        try { [xml]$x = [System.IO.File]::ReadAllText($f.FullName) } catch { continue }
+        $all = @($x.GetElementsByTagName('*'))
+        $account = @($all | Where-Object { $_.LocalName -eq 'AutoDiscoverSMTPAddress' } | ForEach-Object { $_.InnerText.Trim() })[0]
+        foreach ($am in @($all | Where-Object { $_.LocalName -eq 'AlternativeMailbox' })) {
+            $get = @{}
+            foreach ($c in @($am.ChildNodes | Where-Object { $_.NodeType -eq 'Element' })) { $get[$c.LocalName] = $c.InnerText.Trim() }
+            $type = [string]$get['Type']
+            $smtp = [string]$get['SmtpAddress']
+            $key = ('{0}|{1}|{2}' -f $type, $smtp, $get['DisplayName']).ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            [pscustomobject]@{ Type = $type; DisplayName = [string]$get['DisplayName']; Smtp = $smtp; Owner = [string]$get['OwnerSmtpAddress']; Account = [string]$account; File = $f.FullName; Modified = $f.LastWriteTime }
+        }
+    }
+}
+
+function Get-DoOfficeIdentities {
+    # Konta zalogowane w aplikacjach Office (16.0\Common\Identity\Identities)
+    param([string]$Root)
+    $seen = @{}
+    foreach ($i in @(Get-ChildItem -LiteralPath "$Root\Software\Microsoft\Office\16.0\Common\Identity\Identities" -ErrorAction SilentlyContinue)) {
+        $v = Get-ItemProperty -LiteralPath $i.PSPath -ErrorAction SilentlyContinue
+        $email = [string](Get-DoProp $v 'EmailAddress')
+        if (-not $email) { $email = [string](Get-DoProp $v 'SignInName') }
+        if (-not $email -or $seen.ContainsKey($email.ToLowerInvariant())) { continue }
+        $seen[$email.ToLowerInvariant()] = $true
+        $provider = [string](Get-DoProp $v 'ProviderId')
+        [pscustomobject]@{
+            Email = $email; Name = [string](Get-DoProp $v 'FriendlyName')
+            Kind = $(if ($provider -match 'LiveId|MSA') { 'konto Microsoft (prywatne)' } elseif ($provider -match 'ADAL|OrgId|AAD') { 'konto służbowe (Entra ID)' } else { $provider })
+        }
+    }
+}
+
+function Get-DoOneDriveAccounts {
+    # Konta OneDrive użytkownika i foldery znane (Pulpit, Dokumenty, Obrazy) przekierowane do OneDrive
+    param([string]$Root, [string]$ProfilePath)
+    $shell = $null
+    try { $shell = Get-Item -LiteralPath "$Root\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction Stop } catch { }
+    foreach ($a in @(Get-ChildItem -LiteralPath "$Root\Software\Microsoft\OneDrive\Accounts" -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'Business*' -or $_.PSChildName -eq 'Personal' })) {
+        $v = Get-ItemProperty -LiteralPath $a.PSPath -ErrorAction SilentlyContinue
+        $email = [string](Get-DoProp $v 'UserEmail')
+        $folder = [string](Get-DoProp $v 'UserFolder')
+        if (-not $email -and -not $folder) { continue }
+        $kfm = @()
+        if ($shell -and $folder) {
+            foreach ($pair in @(@('Desktop', 'Pulpit'), @('Personal', 'Dokumenty'), @('My Pictures', 'Obrazy'))) {
+                # Ścieżki z %USERPROFILE% - bez rozwijania w sesji administratora (inny profil)
+                $raw = [string]$shell.GetValue($pair[0], '', 'DoNotExpandEnvironmentNames')
+                $path = $raw -ireplace '%USERPROFILE%', $ProfilePath
+                if ($path -and $path.StartsWith($folder.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $kfm += $pair[1] }
+            }
+        }
+        [pscustomobject]@{
+            Email = $email; Folder = $folder; Kind = $(if ($a.PSChildName -eq 'Personal') { 'OneDrive (prywatny)' } else { 'OneDrive dla Firm' })
+            Tenant = [string](Get-DoProp $v 'DisplayName'); Kfm = $kfm
+        }
+    }
+}
+
+function Find-DoFiles {
+    # Pliki według wzorców w drzewach folderów - bez podążania za punktami ponownej analizy (pętle, OneDrive na żądanie),
+    # z pominięciem folderów systemowych w katalogu głównym dysku; $State.Truncated = $true po przekroczeniu limitu czasu
+    param([string[]]$Roots, [string[]]$Patterns, [datetime]$Deadline, [hashtable]$State)
+    $skipRoot = @('Windows', '$Recycle.Bin', 'System Volume Information', '$WinREAgent', 'Recovery', 'Config.Msi')
+    $stack = New-Object System.Collections.Stack
+    foreach ($r in $Roots) { $stack.Push($r) }
+    while ($stack.Count) {
+        if ([datetime]::UtcNow -gt $Deadline) { $State.Truncated = $true; return }
+        $d = [string]$stack.Pop()
+        $di = New-Object System.IO.DirectoryInfo($d)
+        $isRoot = ($null -eq $di.Parent)
+        try {
+            foreach ($sub in $di.EnumerateDirectories()) {
+                if ($sub.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                if ($isRoot -and $skipRoot -contains $sub.Name) { continue }
+                $stack.Push($sub.FullName)
+            }
+        }
+        catch { $State.Denied++ }
+        foreach ($p in $Patterns) {
+            try { foreach ($f in $di.EnumerateFiles($p)) { $f } } catch { }
+        }
+    }
+}
+'@
+
+# Kanały aktualizacji Microsoft 365 Apps (identyfikator z adresu CDN / UpdateChannel)
+$script:M365Channels = @{
+    '492350f6-3a01-4f97-b9c0-c7c6ddf67d60' = 'Bieżący (Current)'
+    '64256afe-f5d9-4f86-8936-8840a6a4f5be' = 'Bieżący – wersja zapoznawcza'
+    '55336b82-a18d-4dd6-b5f6-9e5095c314a6' = 'Miesięczny dla przedsiębiorstw'
+    '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114' = 'Półroczny dla przedsiębiorstw'
+    'b8f9b850-328d-4355-9145-c59439a0c4cf' = 'Półroczny – wersja zapoznawcza'
+    '5440fd1f-7ecb-4221-8110-145efaa6372f' = 'Beta'
+    'f2e724c1-748f-4b47-8fb8-8e0d210e9208' = 'LTSC 2019 (licencja zbiorcza)'
+    '5030841d-c919-4594-8d2d-84ae4f96e58e' = 'LTSC 2021 (licencja zbiorcza)'
+    '7983bac0-e531-40cf-be00-fd24fe66619c' = 'LTSC 2024 (licencja zbiorcza)'
+}
+
+# Office i stan urządzenia: jeden wiersz na komputer
+$script:M365DeviceScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $row = [ordered]@{ 'Office' = ''; 'Wersja' = ''; 'Kanał' = ''; 'Architektura' = ''; 'Licencja współdzielona' = ''; 'Aktualizacje' = ''; 'Dołączenie' = ''; 'Dzierżawa' = ''; 'Intune' = ''; 'Uwagi' = '' }
+    $notes = New-Object System.Collections.Generic.List[string]
+    $c = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+    if ($c) {
+        $ids = @(([string](Get-DoProp $c 'ProductReleaseIds')) -split ',' | Where-Object { $_ })
+        $row['Office'] = $(if ($ids.Count) { $ids -join ', ' } else { 'Click-to-Run' })
+        $row['Wersja'] = [string](Get-DoProp $c 'VersionToReport')
+        $row['Architektura'] = [string](Get-DoProp $c 'Platform')
+        $url = [string](Get-DoProp $c 'UpdateChannel')
+        if (-not $url) { $url = [string](Get-DoProp $c 'CDNBaseUrl') }
+        $guid = if ($url -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') { $Matches[1].ToLowerInvariant() } else { '' }
+        $row['Kanał'] = $(if ($guid -and $P.Channels.ContainsKey($guid)) { $P.Channels[$guid] } elseif ($guid) { $guid } else { '' })
+        $row['Licencja współdzielona'] = $(if ([string](Get-DoProp $c 'SharedComputerLicensing') -eq '1') { 'tak' } else { 'nie' })
+        $upd = [string](Get-DoProp $c 'UpdatesEnabled')
+        $row['Aktualizacje'] = $(if ($upd -eq 'False') { 'wyłączone' } elseif ($upd) { 'włączone' } else { '' })
+        $pol = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\office\16.0\common\officeupdate' -ErrorAction SilentlyContinue
+        if ($pol -and (Get-DoProp $pol 'updatebranch')) { $notes.Add('kanał z zasad grupy: ' + (Get-DoProp $pol 'updatebranch')) }
+    }
+    else {
+        foreach ($ver in '16.0', '15.0', '14.0') {
+            $root = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Office\$ver\Common\InstallRoot" -ErrorAction SilentlyContinue
+            if (-not $root) { $root = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\$ver\Common\InstallRoot" -ErrorAction SilentlyContinue }
+            if ($root -and (Get-DoProp $root 'Path')) { $row['Office'] = "Office $ver (instalator MSI)"; $notes.Add('Office z instalatora MSI – bez kanałów Microsoft 365'); break }
+        }
+        if (-not $row['Office']) { $row['Office'] = 'brak' }
+    }
+    # Dołączenie do Entra ID (dsregcmd /status - klucze po angielsku niezależnie od języka systemu)
+    $ds = @{}
+    if (Get-Command -Name 'dsregcmd.exe' -ErrorAction SilentlyContinue) {
+        foreach ($line in @(& dsregcmd.exe /status 2>$null)) {
+            if ([string]$line -match '^\s*([A-Za-z]+)\s*:\s*(.*?)\s*$' -and -not $ds.ContainsKey($Matches[1])) { $ds[$Matches[1]] = $Matches[2] }
+        }
+    }
+    else { $notes.Add('brak dsregcmd (system starszy niż Windows 10)') }
+    $aad = [string]$ds['AzureAdJoined'] -eq 'YES'
+    $dom = [string]$ds['DomainJoined'] -eq 'YES'
+    $wpj = [string]$ds['WorkplaceJoined'] -eq 'YES'
+    $row['Dołączenie'] = $(if ($aad -and $dom) { 'hybrydowo (AD + Entra ID)' } elseif ($aad) { 'Entra ID' } elseif ($dom) { 'tylko AD (bez Entra ID)' } elseif ($wpj) { 'zarejestrowane (Workplace Join)' } elseif ($ds.Count) { 'nie' } else { '' })
+    $row['Dzierżawa'] = [string]$ds['TenantName']
+    if ($aad -and [string]$ds['DeviceAuthStatus'] -and [string]$ds['DeviceAuthStatus'] -ne 'SUCCESS') { $notes.Add('uwierzytelnienie urządzenia: ' + $ds['DeviceAuthStatus']) }
+    # Zapis w Intune: rejestracja MDM (Enrollments, ProviderID «MS DM Server», stan 1)
+    $mdm = @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue } | Where-Object { [string](Get-DoProp $_ 'ProviderID') -eq 'MS DM Server' -and [string](Get-DoProp $_ 'EnrollmentState') -eq '1' })
+    $row['Intune'] = $(if ($mdm.Count) { 'tak' + $(if ([string](Get-DoProp $mdm[0] 'UPN')) { ' (' + (Get-DoProp $mdm[0] 'UPN') + ')' } else { '' }) } else { 'nie' })
+    $row['Uwagi'] = $notes -join '; '
+    $row['__tone'] = $(if ($row['Office'] -eq 'brak') { '' } elseif ($row['Aktualizacje'] -eq 'wyłączone') { 'warn' } else { 'ok' })
+    [pscustomobject]$row
+}
+
+# Konta i skrzynki użytkowników: konta Office, OneDrive, profile Outlooka (konta, PST, OST) i skrzynki z Autodiscover
+$script:M365AccountsScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $profiles = @(Get-DoProfiles -UserFilter $P.UserFilter)
+    $skipped = @($profiles | Where-Object { -not $_.Loaded }).Count
+    $mk = {
+        param($pr, [string]$Kind, [string]$Name, [string]$Email, [string]$ProfileName, [string]$File, [string]$Details, [string]$Source)
+        $size = $null
+        if ($Kind -like 'Plik *' -and $File -notmatch '%') {
+            try { $size = [Math]::Round((Get-Item -LiteralPath $File -ErrorAction Stop).Length / 1MB, 1) } catch { $Details = (@($Details, 'pliku nie ma na dysku') | Where-Object { $_ }) -join '; ' }
+        }
+        [pscustomobject][ordered]@{
+            'Użytkownik' = $pr.User; 'Rodzaj' = $Kind; 'Nazwa' = $Name; 'Adres e-mail' = $Email; 'Profil Outlook' = $ProfileName
+            'Plik' = $File; 'Rozmiar (MB)' = $size; 'Szczegóły' = $Details; 'Zalogowany' = $pr.Loaded; 'Źródło' = $Source
+        }
+    }
+    foreach ($pr in $profiles) {
+        try {
+            Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
+                param($Root, $Source)
+                foreach ($id in @(Get-DoOfficeIdentities -Root $Root)) { & $mk $pr 'Konto Office' $id.Name $id.Email '' '' $id.Kind $Source }
+                foreach ($od in @(Get-DoOneDriveAccounts -Root $Root -ProfilePath $pr.Path)) {
+                    $det = @($(if ($od.Tenant) { $od.Tenant }), $(if (@($od.Kfm).Count) { 'w OneDrive: ' + (@($od.Kfm) -join ', ') } else { 'foldery znane poza OneDrive' })) | Where-Object { $_ }
+                    & $mk $pr $od.Kind '' $od.Email '' $od.Folder ($det -join '; ') $Source
+                }
+                foreach ($op in @(Get-DoOutlookProfiles -Root $Root)) {
+                    $pname = $op.Name + $(if ($op.Default) { ' (domyślny)' } else { '' })
+                    $items = @(Get-DoOutlookProfileItems -OutlookProfile $op)
+                    if (-not $items.Count) { & $mk $pr 'Profil Outlook bez kont' '' '' $pname '' 'profil pusty albo nieskonfigurowany' $Source }
+                    foreach ($it in $items) {
+                        if ($it.Kind -eq 'Account') { & $mk $pr 'Konto Outlook' $it.Name $it.Email $pname '' $it.Type $Source }
+                        elseif ($it.Kind -eq 'PST') { & $mk $pr 'Plik PST' $it.Name '' $pname $it.File 'plik danych podpięty w profilu' $Source }
+                        else { & $mk $pr 'Plik OST' $it.Name '' $pname $it.File 'kopia offline skrzynki (tryb buforowany)' $Source }
+                    }
+                }
+            }
+        }
+        catch { [pscustomobject][ordered]@{ 'Użytkownik' = $pr.User; 'Rodzaj' = ''; 'Zalogowany' = $pr.Loaded; 'Źródło' = 'błąd'; 'Szczegóły' = $_.Exception.Message } }
+        foreach ($am in @(Get-DoAutodMailboxes -ProfilePath $pr.Path)) {
+            $kind = switch ($am.Type) { 'Delegate' { 'Skrzynka współdzielona / delegowana' } 'Archive' { 'Archiwum online' } 'TeamMailbox' { 'Skrzynka grupy' } default { "Skrzynka ($($am.Type))" } }
+            $det = @('automapowanie', $(if ($am.Account) { 'dla konta ' + $am.Account }), ('stan z {0:yyyy-MM-dd}' -f $am.Modified)) | Where-Object { $_ }
+            & $mk $pr $kind $am.DisplayName $am.Smtp '' '' ($det -join '; ') 'pamięć Autodiscover Outlooka'
+        }
+    }
+    if ($skipped -and -not $P.Offline) {
+        [pscustomobject][ordered]@{ 'Użytkownik' = "(niezalogowani: $skipped)"; 'Rodzaj' = ''; 'Zalogowany' = $false; 'Źródło' = 'pominięto'; 'Szczegóły' = 'Konta Office, OneDrive i profile Outlooka niezalogowanych – zaznacz «Także niezalogowani». Skrzynki z Autodiscover są pokazane.' }
+    }
+}
+
+# Pliki PST (i opcjonalnie OST): profile użytkowników albo wszystkie dyski lokalne, z oznaczeniem podpiętych w Outlooku
+$script:M365PstScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $profiles = @(Get-DoProfiles)
+    $attached = @{}
+    $checked = @{}
+    foreach ($pr in $profiles) {
+        try {
+            Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
+                param($Root, $Source)
+                $checked[$pr.Sid] = $true
+                foreach ($op in @(Get-DoOutlookProfiles -Root $Root)) {
+                    foreach ($it in @(Get-DoOutlookProfileItems -OutlookProfile $op | Where-Object { $_.File })) { $attached[$it.File.ToLowerInvariant()] = '{0} (profil {1})' -f $pr.User, $op.Name }
+                }
+            }
+        }
+        catch { }
+    }
+    $roots = if ($P.Scope -eq 'All') { @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3' | ForEach-Object { $_.DeviceID + '\' }) }
+    else {
+        $list = @($profiles | ForEach-Object { $_.Path })
+        $usersDir = Join-Path $env:SystemDrive 'Users'
+        $list += @(Get-ChildItem -LiteralPath $usersDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) } | ForEach-Object { $_.FullName })
+        @($list | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Sort-Object -Unique)
+    }
+    $patterns = @('*.pst')
+    if ($P.Ost) { $patterns += '*.ost' }
+    $state = @{ Truncated = $false; Denied = 0 }
+    $deadline = [datetime]::UtcNow.AddSeconds([Math]::Max(30, [int]$P.MaxSeconds))
+    $seen = @{}
+    foreach ($f in @(Find-DoFiles -Roots $roots -Patterns $patterns -Deadline $deadline -State $state)) {
+        $key = $f.FullName.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $owner = @($profiles | Where-Object { $key.StartsWith($_.Path.ToLowerInvariant().TrimEnd('\') + '\') } | Sort-Object { $_.Path.Length } -Descending)[0]
+        $fileOwner = ''
+        try { $fileOwner = [string]$f.GetAccessControl().GetOwner([System.Security.Principal.NTAccount]).Value } catch { }
+        $mb = [Math]::Round($f.Length / 1MB, 1)
+        $days = [int]([datetime]::Now - $f.LastWriteTime).TotalDays
+        $isOst = $f.Extension -ieq '.ost'
+        $att = if ($attached.ContainsKey($key)) { $attached[$key] } elseif ($owner -and -not $checked.ContainsKey($owner.Sid)) { '(nie sprawdzono – niezalogowany)' } else { 'nie' }
+        $notes = New-Object System.Collections.Generic.List[string]
+        if ($f.Length -ge 45GB) { $notes.Add('blisko domyślnego limitu 50 GB') } elseif ($f.Length -ge 20GB) { $notes.Add('duży plik') }
+        if ($att -eq 'nie') { $notes.Add($(if ($isOst) { 'osierocony OST (żaden profil go nie używa) – można usunąć' } else { 'nie jest otwarty w Outlooku' })) }
+        if ($days -ge 365) { $notes.Add("nieużywany od $days dni") }
+        [pscustomobject][ordered]@{
+            'Plik' = $f.Name; 'Typ' = $(if ($isOst) { 'OST' } else { 'PST' }); 'Rozmiar (MB)' = $mb; 'Zmodyfikowano' = $f.LastWriteTime; 'Nieużywany (dni)' = $days
+            'Użytkownik' = $(if ($owner) { $owner.User } else { '' }); 'Właściciel pliku' = $fileOwner; 'Podpięty w Outlooku' = $att; 'Ścieżka' = $f.FullName
+            'Uwagi' = $notes -join '; '
+            '__tone' = $(if ($f.Length -ge 45GB) { 'crit' } elseif ($f.Length -ge 20GB) { 'warn' } else { '' })
+        }
+    }
+    if ($state.Truncated) { [pscustomobject][ordered]@{ 'Plik' = '(wyniki niepełne)'; 'Uwagi' = "Przeszukiwanie przerwane po limicie czasu ($($P.MaxSeconds) s)."; '__tone' = 'warn' } }
+}
+
+$script:M365Views = @(
+    @{ Name = 'Office i Microsoft 365'; Op = 'Office i stan urządzenia'; Script = $script:M365DeviceScript; Hint = 'Office Click-to-Run (wersja, kanał, produkty, licencja współdzielona), dołączenie do Entra ID (dsregcmd) i zapis w Intune.' }
+    @{ Name = 'Konta i skrzynki'; Op = 'Konta i skrzynki użytkowników'; Script = $script:M365AccountsScript; Hint = 'Konta Office i OneDrive, profile Outlooka (konta, pliki PST i OST) oraz skrzynki współdzielone i archiwa z automapowania (pamięć Autodiscover Outlooka). Skrzynki otwierane ręcznie przez «Otwórz skrzynkę» nie są zapisywane w profilu.' }
+    @{ Name = 'Pliki PST'; Op = 'Wyszukiwanie plików PST'; Script = $script:M365PstScript; Hint = 'Pliki PST (opcjonalnie OST) w profilach użytkowników albo na wszystkich dyskach lokalnych, z informacją, czy są otwarte w profilu Outlooka.' }
+)
+
+function Update-M365Options {
+    param([hashtable]$Module)
+    $v = Get-SegmentIndex $Module.ViewSel
+    $Module.UserFilter.IsEnabled = ($v -eq 1)
+    $Module.Offline.IsEnabled = ($v -ne 0)
+    $Module.Scope.IsEnabled = ($v -eq 2)
+    $Module.Ost.IsEnabled = ($v -eq 2)
+    $Module.ViewHint.Text = $script:M365Views[$v].Hint
+}
+
+function Get-M365UncPath {
+    # Ścieżka lokalna na komputerze -> udział administracyjny (\\komputer\C$\…)
+    param([string]$Computer, [string]$Path)
+    if ($Path -match '^([A-Za-z]):\\(.*)$') { return ('\\{0}\{1}$\{2}' -f $Computer, $Matches[1].ToUpperInvariant(), $Matches[2]) }
+    if ($Path -match '^\\\\') { return $Path }
+    return ''
+}
+
+Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'M365' -Title 'Outlook i Microsoft 365' -Icon 'E715' -Badge 'nowe' `
+    -Description 'Office i Microsoft 365 na zaznaczonych komputerach: wersja i kanał Office, dołączenie do Entra ID i Intune; konta Office, OneDrive i profile Outlooka użytkowników z podpiętymi skrzynkami (także współdzielonymi z automapowania i archiwami) oraz wyszukiwanie plików PST/OST.' -Build {
+    param($m)
+    $m.Actions.List = {
+        param($m)
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $vi = Get-SegmentIndex $m.ViewSel
+        $view = $script:M365Views[$vi]
+        $params = @{
+            Helpers = $script:M365Helpers; Channels = $script:M365Channels; UserFilter = $m.UserFilter.Text.Trim(); Offline = (Test-Checked $m.Offline)
+            Scope = $(if ($m.Scope.SelectedIndex -eq 1) { 'All' } else { 'Profiles' }); Ost = (Test-Checked $m.Ost); MaxSeconds = 600
+        }
+        if ($params.Offline -and $vi -ne 0) { Write-Log 'Odczyt danych niezalogowanych użytkowników: pliki NTUSER.DAT ładowane na chwilę (reg load / unload).' -Module $m.Title }
+        if ($vi -eq 2 -and $params.Scope -eq 'All') { Write-Log 'Przeszukiwanie wszystkich dysków lokalnych może potrwać (limit 10 min na komputer).' -Module $m.Title }
+        Reset-StatTiles $m
+        Start-HostOperation -Module $m -Name $view.Op -Targets $targets -Parameters $params -ScriptBlock $view.Script -OnComplete {
+            param($m)
+            $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Status') -ne 'Błąd' -and [string](Get-ObjectValue $_ 'Źródło') -notin 'pominięto', 'błąd' -and [string](Get-ObjectValue $_ 'Plik') -ne '(wyniki niepełne)' })
+            $users = @($rows | ForEach-Object { [string](Get-ObjectValue $_ 'Użytkownik') } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique).Count
+            $mb = 0.0
+            foreach ($r in $rows) { $v = Get-ObjectValue $r 'Rozmiar (MB)'; if ($v -is [double] -or $v -is [int] -or $v -is [decimal]) { $mb += [double]$v } elseif ([string]$v) { $mb += [double]([string]$v -replace ',', '.') } }
+            Set-StatTile -Module $m -Key 'items' -Value ([string]$rows.Count)
+            Set-StatTile -Module $m -Key 'users' -Value $(if ((Get-SegmentIndex $m.ViewSel) -eq 0) { '—' } else { [string]$users })
+            Set-StatTile -Module $m -Key 'size' -Value $(if ((Get-SegmentIndex $m.ViewSel) -eq 0) { '—' } else { ('{0:N1}' -f ($mb / 1024)) })
+        }
+    }
+    $m.Actions.OpenFolder = {
+        param($m, $Rows)
+        $paths = @(foreach ($r in @($Rows)) {
+                $file = [string](Get-RowValue $r 'Ścieżka')
+                if (-not $file) { $file = [string](Get-RowValue $r 'Plik') }
+                $unc = Get-M365UncPath -Computer ([string](Get-RowValue $r 'Komputer')) -Path $file
+                if ($unc) { $unc }
+            })
+        if (-not $paths.Count) { Show-Warning 'Zaznaczone wiersze nie mają ścieżki pliku.'; return }
+        foreach ($p in @($paths | Select-Object -Unique -First 5)) {
+            try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('/select,"{0}"' -f $p) } catch { Show-Error "Nie można otworzyć $p." $_ }
+        }
+    }
+    $m.Actions.CopyPaths = {
+        param($m, $Rows)
+        $paths = @(foreach ($r in @($Rows)) {
+                $file = [string](Get-RowValue $r 'Ścieżka')
+                if (-not $file) { $file = [string](Get-RowValue $r 'Plik') }
+                $unc = Get-M365UncPath -Computer ([string](Get-RowValue $r 'Komputer')) -Path $file
+                if ($unc) { $unc }
+            })
+        if (-not $paths.Count) { Show-Warning 'Zaznaczone wiersze nie mają ścieżki pliku.'; return }
+        Set-ClipboardText (@($paths | Select-Object -Unique) -join [Environment]::NewLine)
+        Show-Toast "Skopiowano ścieżek: $(@($paths | Select-Object -Unique).Count)" 'ok'
+    }
+    $row = Add-ToolbarRow -Module $m -Title 'Widok'
+    $m.ViewSel = Add-Segmented -Parent $row -Items @($script:M365Views | ForEach-Object { $_.Name }) -Module $m -OnChange { param($m) Update-M365Options -Module $m }
+    $row2 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.UserFilter = Add-TextBox -Parent $row2 -Width 170 -Placeholder 'Użytkownik (fragment)'
+    $m.Offline = Add-CheckBox -Parent $row2 -Text 'Także niezalogowani (NTUSER.DAT)' -ToolTip 'Pliki NTUSER.DAT niezalogowanych użytkowników są na chwilę ładowane do rejestru komputera (reg load) i od razu zwalniane – nie używaj, gdy użytkownicy właśnie się logują.'
+    $m.Scope = Add-ComboBox -Parent $row2 -Items @('Profile użytkowników', 'Wszystkie dyski lokalne (wolniej)') -Width 250
+    $m.Ost = Add-CheckBox -Parent $row2 -Text 'Także pliki OST' -ToolTip 'Kopie offline skrzynek Exchange – osierocone (bez profilu, który ich używa) można usunąć'
+    Add-Button -Parent $row2 -Text 'Pokaż' -Icon 'E72C' -Module $m -Primary -OnClick $m.Actions.List | Out-Null
+    $m.ViewHint = Add-Label -Parent $row2 -Text '' -Hint -MaxWidth 760
+    Update-M365Options -Module $m
+    Add-StatTile -Module $m -Key 'items' -Label 'Pozycje' -Icon 'E715' | Out-Null
+    Add-StatTile -Module $m -Key 'users' -Label 'Użytkownicy' -Icon 'E77B' | Out-Null
+    Add-StatTile -Module $m -Key 'size' -Label 'Pliki (GB)' -Icon 'EDA2' | Out-Null
+    Add-RowAction -Module $m -Text 'Pokaż plik w Eksploratorze (udział administracyjny)' -Icon 'E838' -Action { param($m, $rows) & $m.Actions.OpenFolder $m $rows }
+    Add-RowAction -Module $m -Text 'Kopiuj ścieżkę sieciową pliku' -Icon 'E8C8' -Action { param($m, $rows) & $m.Actions.CopyPaths $m $rows }
 }
 #endregion
 
