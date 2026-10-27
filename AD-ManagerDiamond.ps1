@@ -105,6 +105,7 @@ $script:App = @{
 $script:App.SettingsFile = Join-Path $script:App.DataDir 'settings.json'
 # Własne szablony poleceń modułu Polecenia (osobny plik - łatwo go skopiować innym administratorom)
 $script:App.CommandTemplatesFile = Join-Path $script:App.DataDir 'CommandTemplates.json'
+$script:App.MfaFile = Join-Path $script:App.DataDir 'Mfa.json'
 $script:App.LogFile = Join-Path $script:App.LogDir ('DomainOps_{0:yyyyMMdd}.log' -f (Get-Date))
 
 # Ustawienia zapamiętywane między uruchomieniami
@@ -1537,8 +1538,12 @@ function Invoke-UiAction {
         $null = & $Action $Module $Source
     }
     catch {
-        Write-Log "Błąd: $($_.Exception.Message)" 'ERROR'
-        Show-Error 'Operacja nie powiodła się.' $_
+        # Brak dostępu konta MFA do modułu (Show-Module) - ostrzeżenie, wpis WARN jest już w dzienniku
+        if ($_.Exception.Data['DomainOpsAccess']) { Show-Warning $_.Exception.Message }
+        else {
+            Write-Log "Błąd: $($_.Exception.Message)" 'ERROR'
+            Show-Error 'Operacja nie powiodła się.' $_
+        }
     }
     finally {
         $script:LogContext = $previous
@@ -3284,6 +3289,7 @@ function Invoke-WithWaitCursor {
 }
 
 function Show-SettingsDialog {
+    if (-not (Test-AppAllowed 'Settings')) { Show-AccessDenied 'Ustawienia programu'; return $false }
     $body = @'
 <StackPanel>
   <TextBlock Text="Kontroler domeny" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
@@ -3325,6 +3331,16 @@ function Show-SettingsDialog {
   <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"
              Text="Równoległe operacje na komputerach: 1–64. Zapytania AD: 1–16 – usługa ADWS na kontrolerze domeny odrzuca zbyt wiele żądań naraz («A connection to the directory … was unavailable»), więc przy takich błędach zmniejsz tę wartość (przejściowe błędy są i tak ponawiane). Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili. Blokada po bezczynności: 0–240 min (0 = wyłączona) – po tylu minutach bez klawisza, kliknięcia czy ruchu myszy w oknach programu wymaga PIN-u, jak przycisk z kłódką."/>
   <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
+  <TextBlock Text="Zabezpieczenia" Foreground="#8791A5" FontSize="12" Margin="0,0,0,6"/>
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="Auto"/>
+    </Grid.ColumnDefinitions>
+    <TextBlock x:Name="stMfaInfo" Foreground="#AEB6C4" FontSize="12.5" TextWrapping="Wrap" VerticalAlignment="Center" Margin="0,0,12,0"/>
+    <Button x:Name="stMfa" Grid.Column="1"/>
+  </Grid>
+  <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
   <TextBlock Text="Pliki programu" Foreground="#8791A5" FontSize="12" Margin="0,0,0,6"/>
   <Grid x:Name="stFiles">
     <Grid.ColumnDefinitions>
@@ -3360,6 +3376,7 @@ function Show-SettingsDialog {
     $locations = @(
         @('Ustawienia', $script:App.SettingsFile),
         @('Szablony poleceń', $script:App.CommandTemplatesFile),
+        @('MFA (konta, klucze)', $script:App.MfaFile),
         @('Dziennik (dziś)', $script:App.LogFile),
         @('Moduły własne', $script:App.ModulesDir)
     )
@@ -3391,6 +3408,10 @@ function Show-SettingsDialog {
         foreach ($c in $label, $box, $btn) { [void]$files.Children.Add($c) }
         $i++
     }
+    $mfaBtn = $w.FindName('stMfa')
+    $mfaBtn.Content = New-IconContent -Text 'MFA – konta i klucze…' -Icon 'E8D7'
+    $mfaBtn.add_Click({ param($s, $e) Show-MfaManager; Update-SettingsMfaInfo -Window ([System.Windows.Window]::GetWindow($s)) })
+    Update-SettingsMfaInfo -Window $w
     $w.FindName('stInfo').Text = "Domain Ops $($script:AppVersion) • PowerShell $($PSVersionTable.PSVersion) • folder ustawień: $($script:App.DataDir)"
     if (-not (Invoke-Dialog $w)) { return $false }
     $script:Settings.DomainController = $w.FindName('stDc').Text.Trim()
@@ -3400,6 +3421,15 @@ function Show-SettingsDialog {
     Set-EngineThrottle ([int]$w.FindName('stThrottle').Text.Trim()) ([int]$w.FindName('stAdThrottle').Text.Trim())
     Export-Settings
     return $true
+}
+
+function Update-SettingsMfaInfo {
+    param([Parameter(Mandatory)]$Window)
+    $n = 0
+    try { $n = @((Read-MfaStore).Accounts).Count } catch { }
+    $Window.FindName('stMfaInfo').Text = if (-not $script:UnlockPinHash) { 'Blokada PIN-em jest wyłączona w skrypcie.' }
+    elseif ($n) { "MFA włączone – kont: $n. Odblokowanie wymaga PIN-u i kodu z aplikacji w telefonie." }
+    else { 'MFA wyłączone – program odblokowuje sam PIN. Można dodać kod z aplikacji (Microsoft / Google Authenticator).' }
 }
 
 function Show-InExplorer {
@@ -3536,7 +3566,10 @@ $script:ToastEvents = @{
             $i = $null
             if (-not $script:ToastInfo.TryGetValue($s, [ref]$i)) { return }
             Remove-Toast $s
-            if ($i.ModuleKey -and -not ($script:UI.ActiveModule -and $script:UI.ActiveModule.Key -eq $i.ModuleKey)) { Show-Module -Key $i.ModuleKey }
+            if ($i.ModuleKey -and -not ($script:UI.ActiveModule -and $script:UI.ActiveModule.Key -eq $i.ModuleKey)) {
+                if (Test-ModuleAllowed $i.ModuleKey) { Show-Module -Key $i.ModuleKey }
+                else { Show-AccessDenied ('moduł «{0}»' -f (Get-ModuleDefinition $i.ModuleKey).Title) }
+            }
             if ($i.ShowLog) { Set-LogVisible $true }
         }
         catch { Write-Log "Błąd powiadomienia: $($_.Exception.Message)" 'ERROR' }
@@ -3560,6 +3593,7 @@ $script:ToastEvents = @{
 #   -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes('DomainOps|NOWY_PIN')) | ForEach-Object { $_.ToString('x2') })
 # i ustaw długość PIN-u. Pusty skrót wyłącza blokadę. Tryb bez okna (-RunReport) nie pyta o PIN.
 # Ten sam PIN odblokowuje program zablokowany w trakcie pracy (przycisk z kłódką, Ctrl+Shift+L, brak aktywności - Lock-DomainOps).
+# Z włączonym MFA (26b-mfa.ps1) po PIN-ie wymagany jest kod z aplikacji; konta dodatkowe mają własny PIN i klucz.
 $script:UnlockPinHash = 'e57ba83a98fac469e360db6045d7adfce273fa0faf2697fbc3528ebff51b52e5'
 $script:UnlockPinLength = 5
 $script:UnlockMaxAttempts = 5
@@ -3568,7 +3602,8 @@ $script:UnlockTitle = 'Domain Ops – odblokowanie'
 $script:LockTitle = 'Domain Ops – zablokowany'
 # Stan blokady w trakcie pracy (Invoke-Dialog wstrzymuje inne okna, dopóki program jest zablokowany).
 # Emergency: zamknięcie programu z ekranu blokady bez PIN-u; Hidden: okna, których zawartość ukryto na czas blokady.
-$script:UnlockState = @{ Locked = $false; Emergency = $false; Hidden = @() }
+# User: nazwa konta MFA, które odblokowało program ('' - sam PIN); AccountId: '#primary' (PIN ze skryptu) albo Id konta
+$script:UnlockState = @{ Locked = $false; Emergency = $false; Hidden = @(); User = ''; AccountId = '#primary' }
 # Blokada po bezczynności (ustawienie LockIdleMinutes, 0 = wyłączona): Last - ostatnia aktywność w oknach programu (UTC)
 $script:IdleLock = @{ Timer = $null; Last = [datetime]::UtcNow; Pos = $null }
 
@@ -3585,6 +3620,7 @@ $script:UnlockXaml = @'
       </Border>
       <TextBlock Text="Domain Ops" FontSize="18" FontWeight="SemiBold" Foreground="White" HorizontalAlignment="Center" Margin="0,14,0,0"/>
       <TextBlock x:Name="lockHint" Text="Wpisz PIN, aby odblokować program" Foreground="#8791A5" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,4,0,0"/>
+      <ComboBox x:Name="lockUser" Margin="0,14,0,0" Visibility="Collapsed" ToolTip="Konto MFA"/>
       <StackPanel x:Name="lockDots" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,22,0,0"/>
       <TextBlock x:Name="lockMsg" Foreground="#FF7A86" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" MinHeight="18" Margin="0,12,0,0"/>
       <UniformGrid x:Name="lockPad" Columns="3" Margin="0,12,0,0"/>
@@ -3625,6 +3661,8 @@ $script:UnlockEvents = @{
         Add-UnlockKey -Window $s -Key $key
     }
     Close   = { param($s, $e) Close-Dialog -Window ([System.Windows.Window]::GetWindow($s)) -Ok $false }
+    # Inne konto MFA: od nowa od PIN-u
+    User    = { param($s, $e) $w = [System.Windows.Window]::GetWindow($s); $w.FindName('lockMsg').Text = ''; Set-UnlockPhase -Window $w -Phase 'Pin' }
     Exit    = { param($s, $e) Request-UnlockExit -Window ([System.Windows.Window]::GetWindow($s)) }
     # Okno blokady zamyka poprawny PIN albo potwierdzone zamknięcie awaryjne. Krzyżyk i Alt+F4 działają jak przycisk
     # «Zakończ awaryjnie»: pierwsze naciśnięcie tylko ostrzega, drugie w czasie potwierdzenia zamyka program bez PIN-u.
@@ -3649,23 +3687,12 @@ function New-UnlockWindow {
     $w = New-UiElement $script:UnlockXaml
     $w.Title = $(if ($Lock) { $script:LockTitle } else { $script:UnlockTitle })
     if ($Lock) {
-        $w.FindName('lockHint').Text = 'Program zablokowany – wpisz PIN'
         $w.FindName('lockClose').Visibility = 'Collapsed'
         # Krzyżyk nie zamyka okna blokady, więc bez PIN-u program można zamknąć tylko tym przyciskiem (z potwierdzeniem)
         $exit = $w.FindName('lockExit')
         $exit.Visibility = 'Visible'
         $exit.Content = New-IconContent -Text 'Zakończ awaryjnie' -Icon 'E7E8' -IconSize 12
         $exit.add_Click($script:UnlockEvents.Exit)
-    }
-    $w.FindName('lockIcon').Text = Get-Glyph 'E72E'
-    $dots = $w.FindName('lockDots')
-    for ($i = 0; $i -lt $script:UnlockPinLength; $i++) {
-        $d = New-Object System.Windows.Shapes.Ellipse
-        $d.Width = 14
-        $d.Height = 14
-        $d.Margin = New-Object System.Windows.Thickness(7, 0, 7, 0)
-        $d.StrokeThickness = 2
-        [void]$dots.Children.Add($d)
     }
     $pad = $w.FindName('lockPad')
     foreach ($key in '1', '2', '3', '4', '5', '6', '7', '8', '9', 'Clear', '0', 'Back') {
@@ -3689,9 +3716,55 @@ function New-UnlockWindow {
     $w.FindName('lockClose').add_Click($script:UnlockEvents.Close)
     $w.add_PreviewKeyDown($script:UnlockEvents.KeyDown)
     $w.add_Closing($script:UnlockEvents.Closing)
-    $w.Tag = @{ Result = $false; Modal = $false; Pin = ''; Attempts = 0; Failed = 0; Error = $false; Locked = $false; Mode = $(if ($Lock) { 'Lock' } else { 'Start' }); LockScreen = [bool]$Lock; CooldownEnd = [datetime]::MinValue; ExitArmed = [datetime]::MinValue; ExitTimer = $null }
-    Update-UnlockView -Window $w
+    $w.Tag = @{ Result = $false; Modal = $false; Pin = ''; Attempts = 0; Failed = 0; Error = $false; Locked = $false; Mode = $(if ($Lock) { 'Lock' } else { 'Start' }); LockScreen = [bool]$Lock; CooldownEnd = [datetime]::MinValue; ExitArmed = [datetime]::MinValue; ExitTimer = $null; Phase = 'Pin'; Need = $script:UnlockPinLength; Accounts = @(); Switched = $false }
+    # MFA: konta tej instancji (pusta lista - sam PIN); przy kilku kontach wybór konta nad klawiaturą
+    $w.Tag.Accounts = @(Get-MfaUnlockAccounts)
+    if ($w.Tag.Accounts.Count -gt 1) {
+        $combo = $w.FindName('lockUser')
+        foreach ($a in $w.Tag.Accounts) { [void]$combo.Items.Add([string]$a.Name) }
+        $combo.SelectedIndex = 0
+        $combo.Visibility = 'Visible'
+        $combo.add_SelectionChanged($script:UnlockEvents.User)
+    }
+    Set-UnlockPhase -Window $w -Phase 'Pin'
     return $w
+}
+
+function Get-UnlockAccount {
+    # Wybrane konto MFA albo $null (MFA wyłączone)
+    param([Parameter(Mandatory)]$Window)
+    $list = @($Window.Tag.Accounts)
+    if (-not $list.Count) { return $null }
+    $i = [Math]::Max(0, $Window.FindName('lockUser').SelectedIndex)
+    if ($i -ge $list.Count) { $i = 0 }
+    return $list[$i]
+}
+
+function Set-UnlockPhase {
+    # Pin: PIN konta; Code: kod z aplikacji (po poprawnym PIN-ie konta z MFA). Kropki według długości wpisu.
+    param([Parameter(Mandatory)]$Window, [ValidateSet('Pin', 'Code')][string]$Phase)
+    $st = $Window.Tag
+    $st.Phase = $Phase
+    $st.Need = if ($Phase -eq 'Code') { $script:MfaDigits } else { $script:UnlockPinLength }
+    $st.Pin = ''
+    $st.Error = $false
+    $dots = $Window.FindName('lockDots')
+    $dots.Children.Clear()
+    for ($i = 0; $i -lt $st.Need; $i++) {
+        $d = New-Object System.Windows.Shapes.Ellipse
+        $d.Width = 14
+        $d.Height = 14
+        $d.Margin = New-Object System.Windows.Thickness($(if ($st.Need -gt 5) { 5 } else { 7 }), 0, $(if ($st.Need -gt 5) { 5 } else { 7 }), 0)
+        $d.StrokeThickness = 2
+        [void]$dots.Children.Add($d)
+    }
+    $acc = Get-UnlockAccount -Window $Window
+    $who = if ($acc -and @($st.Accounts).Count -gt 1) { " (konto: $($acc.Name))" } else { '' }
+    $Window.FindName('lockIcon').Text = Get-Glyph $(if ($Phase -eq 'Code') { 'E8EA' } else { 'E72E' })
+    $Window.FindName('lockHint').Text = if ($Phase -eq 'Code') { "Wpisz kod z aplikacji uwierzytelniającej$who" }
+    elseif ($st.Mode -eq 'Lock') { "Program zablokowany – wpisz PIN$who" }
+    else { "Wpisz PIN, aby odblokować program$who" }
+    Update-UnlockView -Window $Window
 }
 
 function Update-UnlockView {
@@ -3708,22 +3781,68 @@ function Update-UnlockView {
 }
 
 function Add-UnlockKey {
-    # Cyfra, 'Back' albo 'Clear'; po wpisaniu pełnego PIN-u od razu sprawdzenie
+    # Cyfra, 'Back' albo 'Clear'; po wpisaniu pełnego PIN-u (albo kodu z aplikacji) od razu sprawdzenie
     param([Parameter(Mandatory)]$Window, [Parameter(Mandatory)][string]$Key)
     $st = $Window.Tag
     if ($st.Locked) { return }
     if ($st.Error) { $st.Error = $false }
     switch -Regex ($Key) {
-        '^\d$' { if ($st.Pin.Length -lt $script:UnlockPinLength) { $st.Pin += $Key } }
+        '^\d$' { if ($st.Pin.Length -lt $st.Need) { $st.Pin += $Key } }
         '^Back$' { if ($st.Pin.Length) { $st.Pin = $st.Pin.Substring(0, $st.Pin.Length - 1) } }
         '^Clear$' { $st.Pin = '' }
     }
     $msg = $Window.FindName('lockMsg')
-    if ($st.Pin.Length -lt $script:UnlockPinLength) { Update-UnlockView -Window $Window; return }
-    if (Test-UnlockPin $st.Pin) {
+    if ($st.Pin.Length -lt $st.Need) { Update-UnlockView -Window $Window; return }
+    $acc = Get-UnlockAccount -Window $Window
+    $mfa = $acc -and -not $acc['NoMfa']
+    $ok = $false
+    $codeResult = ''
+    try {
+        if ($st.Phase -eq 'Code') { $codeResult = Test-MfaCodeFor -Account $acc -Code $st.Pin; $ok = ($codeResult -eq 'Ok') }
+        elseif ($mfa) { $ok = Test-MfaAccountPin -Account $acc -Pin $st.Pin }
+        else { $ok = Test-UnlockPin $st.Pin }
+    }
+    catch {
+        # Klucza nie da się odczytać (DPAPI: inny komputer albo konto Windows) - bez liczenia próby
         $st.Pin = ''
+        Update-UnlockView -Window $Window
+        $msg.Text = 'Nie można odczytać danych MFA tego konta na tym komputerze (usuń plik MFA, aby wrócić do samego PIN-u).'
+        return
+    }
+    if ($codeResult -eq 'Used') {
+        # Kod poprawny, ale z okna 30 s już użytego (np. ponowna blokada zaraz po odblokowaniu) - bez liczenia próby
+        $st.Pin = ''
+        Update-UnlockView -Window $Window
+        $msg.Text = 'Ten kod został już użyty – poczekaj, aż aplikacja pokaże następny (do 30 s).'
+        return
+    }
+    if ($ok -and $st.Phase -eq 'Pin' -and $mfa) {
+        # PIN poprawny - teraz kod z aplikacji
+        $msg.Text = ''
+        Set-UnlockPhase -Window $Window -Phase 'Code'
+        return
+    }
+    if ($ok) {
+        $st.Pin = ''
+        $deny = @()
+        if ($mfa -and -not $acc.Primary) {
+            # Blokady dostępu konta dodatkowego; bez nich nie odblokowujemy (nie pełny dostęp przez błąd odczytu)
+            try { $deny = @((Get-MfaAccountSecret -Account $acc).Deny) }
+            catch {
+                Set-UnlockPhase -Window $Window -Phase 'Pin'
+                $msg.Text = 'Nie można odczytać danych MFA tego konta na tym komputerze (usuń plik MFA, aby wrócić do samego PIN-u).'
+                return
+            }
+        }
+        $user = if ($mfa) { [string]$acc.Name } else { '' }
+        $id = if (-not $mfa -or $acc.Primary) { '#primary' } else { [string]$acc.Id }
+        # Inne konto niż przed blokadą: okna poprzedniego konta zamyka Lock-DomainOps (nie wracają na ekran)
+        $st.Switched = ($st.Mode -eq 'Lock' -and $id -ne [string]$script:UnlockState.AccountId)
+        $script:UnlockState.User = $user
+        $script:UnlockState.AccountId = $id
+        Set-AccessAccount -Name $user -Deny $deny
         # Odblokowanie od razu (zanim okno się zamknie): wstrzymane okna mogą się pokazać
-        if ($st.Mode -eq 'Lock') { Restore-AfterLock }
+        if ($st.Mode -eq 'Lock' -and -not $st.Switched) { Restore-AfterLock }
         Close-Dialog -Window $Window -Ok $true
         return
     }
@@ -3758,7 +3877,7 @@ function Add-UnlockKey {
         $t.Start()
         return
     }
-    $msg.Text = 'Nieprawidłowy PIN. Pozostało prób: {0}' -f $left
+    $msg.Text = '{0} Pozostało prób: {1}' -f $(if ($st.Phase -eq 'Code') { 'Nieprawidłowy kod z aplikacji.' } else { 'Nieprawidłowy PIN.' }), $left
 }
 
 function Update-UnlockCooldown {
@@ -3773,10 +3892,9 @@ function Update-UnlockCooldown {
     }
     $st.Locked = $false
     $st.Attempts = 0
-    $st.Error = $false
     $msg.Text = ''
     $Window.FindName('lockPad').IsEnabled = $true
-    Update-UnlockView -Window $Window
+    Set-UnlockPhase -Window $Window -Phase 'Pin'
     return $false
 }
 
@@ -3860,17 +3978,26 @@ function Lock-DomainOps {
             if ($c -is [System.Windows.UIElement] -and $c.Visibility -eq 'Visible') { $c.Visibility = 'Hidden'; $c }
         })
     $w = New-UnlockWindow -Lock
+    $closed = 0
     try { [void](Invoke-Dialog -Window $w) }
     finally {
         if ($w.Tag.ExitTimer) { $w.Tag.ExitTimer.Stop() }
-        if (-not $script:UnlockState.Emergency) { Restore-AfterLock }
+        if (-not $script:UnlockState.Emergency) {
+            if ($w.Tag['Switched']) { $closed = Close-LockedWindows }
+            # Nawigacja według uprawnień konta, które odblokowało - zanim zawartość okna wróci na ekran
+            try { Update-AccessView } catch { Write-Log "Błąd uprawnień po odblokowaniu: $($_.Exception.Message)" 'ERROR' -Module '' }
+            Restore-AfterLock
+        }
     }
     if ($script:UnlockState.Emergency) {
         Close-DomainOpsEmergency
         return
     }
     $n = [int]$w.Tag.Failed
-    Write-Log ('Program odblokowany{0}.' -f $(if ($n) { " (nieudane próby: $n)" } else { '' })) $(if ($n) { 'WARN' } else { 'INFO' }) -Module ''
+    $who = if ($script:UnlockState.User) { " – konto: $($script:UnlockState.User), MFA" } else { '' }
+    if ($w.Tag['Switched']) { $who += $(if ($closed) { " (zmiana konta – zamknięte okna poprzedniego konta: $closed)" } else { ' (zmiana konta)' }) }
+    if ($script:Access.Deny.Count) { $who += '; ' + (Get-AccessDenyText -Deny @($script:Access.Deny)) }
+    Write-Log ('Program odblokowany{0}{1}.' -f $who, $(if ($n) { " (nieudane próby: $n)" } else { '' })) $(if ($n) { 'WARN' } else { 'INFO' }) -Module ''
 }
 
 function Close-DomainOpsEmergency {
@@ -3943,6 +4070,744 @@ function Start-IdleLock {
         $st.Timer = $t
     }
     $st.Timer.Start()
+}
+#endregion
+
+#region MFA przy odblokowaniu (kod z aplikacji uwierzytelniającej, TOTP)
+# Drugi składnik odblokowania programu: kod z aplikacji (Microsoft / Google Authenticator i podobne; TOTP wg RFC 6238:
+# HMAC-SHA1, 30 s, 6 cyfr). Klucze generuje program na tym komputerze i zapisuje w pliku $script:App.MfaFile
+# zaszyfrowane DPAPI - odczyta je tylko to konto Windows na tym komputerze, więc każda instancja ma własne konta.
+# Konto podstawowe: PIN ze skryptu + kod; kolejne konta: własna nazwa, własny PIN (PBKDF2) i własny klucz.
+# Usunięcie pliku wyłącza MFA na tym komputerze (zostaje sam PIN ze skryptu) - tak odzyskuje się dostęp po utracie
+# telefonu; kto może usunąć ten plik albo zmienić skrypt, obejdzie blokadę (patrz README, Bezpieczeństwo).
+$script:MfaIssuer = 'Domain Ops'
+$script:MfaDigits = 6
+$script:MfaPeriod = 30
+$script:Base32Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+$script:MfaPinIterations = 100000
+
+function ConvertTo-Base32 {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $sb = New-Object System.Text.StringBuilder
+    $buffer = 0
+    $bits = 0
+    foreach ($b in $Bytes) {
+        $buffer = (($buffer -shl 8) -bor $b) -band 0xFFFF
+        $bits += 8
+        while ($bits -ge 5) {
+            $bits -= 5
+            [void]$sb.Append($script:Base32Alphabet[($buffer -shr $bits) -band 31])
+        }
+    }
+    if ($bits -gt 0) { [void]$sb.Append($script:Base32Alphabet[($buffer -shl (5 - $bits)) -band 31]) }
+    return $sb.ToString()
+}
+
+function ConvertFrom-Base32 {
+    # Spacje, myślniki i '=' są pomijane, wielkość liter bez znaczenia; niedozwolony znak - wyjątek
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $clean = ($Text -replace '[\s\-=]', '').ToUpperInvariant()
+    $out = New-Object System.Collections.Generic.List[byte]
+    $buffer = 0
+    $bits = 0
+    foreach ($ch in $clean.ToCharArray()) {
+        $v = $script:Base32Alphabet.IndexOf($ch)
+        if ($v -lt 0) { throw "Niedozwolony znak w kluczu: $ch" }
+        $buffer = (($buffer -shl 5) -bor $v) -band 0xFFFF
+        $bits += 5
+        if ($bits -ge 8) {
+            $bits -= 8
+            $out.Add([byte](($buffer -shr $bits) -band 0xFF))
+        }
+    }
+    return , $out.ToArray()
+}
+
+function Get-TotpStep {
+    param([datetime]$Time = [datetime]::UtcNow)
+    $unix = ([DateTimeOffset]$Time.ToUniversalTime()).ToUnixTimeSeconds()
+    return [long][Math]::Floor($unix / $script:MfaPeriod)
+}
+
+function Get-TotpCode {
+    # Kod dla kroku czasu (RFC 4226: HMAC-SHA1 licznika big-endian, dynamiczne obcięcie)
+    param([Parameter(Mandatory)][byte[]]$Secret, [Parameter(Mandatory)][long]$Step, [int]$Digits = $script:MfaDigits)
+    $counter = [BitConverter]::GetBytes([long]$Step)
+    if ([BitConverter]::IsLittleEndian) { [array]::Reverse($counter) }
+    $hmac = New-Object System.Security.Cryptography.HMACSHA1 (, $Secret)
+    try { $hash = $hmac.ComputeHash($counter) } finally { $hmac.Dispose() }
+    $offset = $hash[$hash.Length - 1] -band 0x0F
+    $bin = (([int]($hash[$offset] -band 0x7F)) -shl 24) -bor (([int]$hash[$offset + 1]) -shl 16) -bor (([int]$hash[$offset + 2]) -shl 8) -bor ([int]$hash[$offset + 3])
+    $mod = [long][Math]::Pow(10, $Digits)
+    return ([long]$bin % $mod).ToString().PadLeft($Digits, '0')
+}
+
+function Test-TotpCode {
+    <#
+        Krok czasu, dla którego kod jest poprawny (bieżący ±1, czyli tolerancja 30 s zegara), -1 (zły kod) albo -2 (kod
+        z kroku nie późniejszego niż -LastStep - już użyty; ten sam kod nie odblokuje drugi raz).
+    #>
+    param([Parameter(Mandatory)][byte[]]$Secret, [AllowEmptyString()][string]$Code, [long]$LastStep = -1, [datetime]$Time = [datetime]::UtcNow)
+    $c = ([string]$Code) -replace '\s', ''
+    if ($c -notmatch "^\d{$($script:MfaDigits)}$") { return -1 }
+    $now = Get-TotpStep -Time $Time
+    $used = $false
+    foreach ($s in @($now, ($now - 1), ($now + 1))) {
+        $expected = Get-TotpCode -Secret $Secret -Step $s
+        # Porównanie w stałym czasie
+        $diff = 0
+        for ($i = 0; $i -lt $expected.Length; $i++) { $diff = $diff -bor ([int][char]$expected[$i] -bxor [int][char]$c[$i]) }
+        if ($diff -ne 0) { continue }
+        if ($s -le $LastStep) { $used = $true; continue }
+        return $s
+    }
+    return $(if ($used) { -2 } else { -1 })
+}
+
+function New-MfaSecret {
+    # 160 bitów z generatora kryptograficznego (zalecana długość dla HMAC-SHA1)
+    $bytes = New-Object byte[] 20
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return , $bytes
+}
+
+function Format-MfaKey([string]$Base32) {
+    # Klucz do wpisania ręcznie: grupy po 4 znaki
+    return ((@([regex]::Matches($Base32, '.{1,4}') | ForEach-Object { $_.Value })) -join ' ')
+}
+
+function Get-MfaUri {
+    param([Parameter(Mandatory)][string]$Account, [Parameter(Mandatory)][string]$Base32)
+    $label = [uri]::EscapeDataString("$($script:MfaIssuer):$Account")
+    return ('otpauth://totp/{0}?secret={1}&issuer={2}&algorithm=SHA1&digits={3}&period={4}' -f $label, $Base32, [uri]::EscapeDataString($script:MfaIssuer), $script:MfaDigits, $script:MfaPeriod)
+}
+
+function Protect-MfaData([string]$Text) {
+    # DPAPI bieżącego użytkownika (jak hasło SMTP raportów): odczyta tylko to konto na tym komputerze
+    $ss = New-Object System.Security.SecureString
+    foreach ($ch in $Text.ToCharArray()) { $ss.AppendChar($ch) }
+    $ss.MakeReadOnly()
+    try { return (ConvertFrom-SecureString -SecureString $ss) } finally { $ss.Dispose() }
+}
+
+function Unprotect-MfaData([string]$Blob) {
+    $ss = ConvertTo-SecureString -String $Blob
+    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss)
+    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $ss.Dispose() }
+}
+
+function Get-MfaPinHash {
+    param([Parameter(Mandatory)][string]$Pin, [Parameter(Mandatory)][byte[]]$Salt)
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($Pin, $Salt, $script:MfaPinIterations)
+    try { return [Convert]::ToBase64String($kdf.GetBytes(32)) } finally { $kdf.Dispose() }
+}
+
+function Read-MfaStore {
+    # Konta MFA tej instancji: @{ Accounts = @(@{ Id; Name; Primary; Data; LastStep; Created; LastUsed }) }
+    $empty = @{ Accounts = @() }
+    $path = [string]$script:App.MfaFile
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $empty }
+    $raw = [System.IO.File]::ReadAllText($path)
+    if (-not $raw.Trim()) { return $empty }
+    $obj = ConvertFrom-Json -InputObject $raw
+    $accounts = foreach ($a in @($obj.Accounts)) {
+        if ($null -eq $a) { continue }
+        @{ Id = [string]$a.Id; Name = [string]$a.Name; Primary = [bool]$a.Primary; Data = [string]$a.Data; LastStep = [long]$a.LastStep; Created = [string]$a.Created; LastUsed = [string]$a.LastUsed }
+    }
+    return @{ Accounts = @($accounts) }
+}
+
+function Save-MfaStore {
+    param([Parameter(Mandatory)][hashtable]$Store)
+    $path = [string]$script:App.MfaFile
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $doc = [ordered]@{ Version = 1; Note = 'Konta MFA programu Domain Ops na tym komputerze. Klucze zaszyfrowane DPAPI (tylko to konto Windows). Usunięcie pliku wyłącza MFA.'; Accounts = @($Store.Accounts | ForEach-Object { [ordered]@{ Id = $_.Id; Name = $_.Name; Primary = $_.Primary; Data = $_.Data; LastStep = $_.LastStep; Created = $_.Created; LastUsed = $_.LastUsed } }) }
+    $tmp = $path + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $doc -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
+}
+
+function Get-MfaAccountSecret {
+    # Klucz konta (bajty), dane PIN-u i blokady dostępu (Deny) z części zaszyfrowanej; wyjątek, gdy DPAPI nie odczyta
+    # (inny komputer / konto)
+    param([Parameter(Mandatory)][hashtable]$Account)
+    $d = ConvertFrom-Json -InputObject (Unprotect-MfaData $Account.Data)
+    $deny = @()
+    if ($d.PSObject.Properties['Deny']) { $deny = @($d.Deny | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
+    return @{ Secret = (ConvertFrom-Base32 ([string]$d.Secret)); Base32 = [string]$d.Secret; PinSalt = [string]$d.PinSalt; PinHash = [string]$d.PinHash; Deny = $deny }
+}
+
+function Set-MfaAccountData {
+    # Część poufna konta (klucz, PIN, blokady dostępu) zaszyfrowana DPAPI
+    param([Parameter(Mandatory)][hashtable]$Account, [Parameter(Mandatory)][string]$Base32, [string]$PinSalt = '', [string]$PinHash = '', [string[]]$Deny = @())
+    $Account.Data = Protect-MfaData (ConvertTo-Json -InputObject ([ordered]@{ Secret = $Base32; PinSalt = $PinSalt; PinHash = $PinHash; Deny = @($Deny | Where-Object { $_ }) }) -Compress)
+}
+
+function New-MfaAccount {
+    # Konto do zapisu: klucz Base32, opcjonalnie PIN (konta dodatkowe), część poufna zaszyfrowana DPAPI
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Base32, [switch]$Primary, [string]$Pin = '', [long]$LastStep = -1, [string[]]$Deny = @())
+    $salt = ''
+    $hash = ''
+    if ($Pin) {
+        $s = New-Object byte[] 16
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($s) } finally { $rng.Dispose() }
+        $salt = [Convert]::ToBase64String($s)
+        $hash = Get-MfaPinHash -Pin $Pin -Salt $s
+    }
+    $a = @{ Id = [guid]::NewGuid().ToString('N'); Name = $Name; Primary = [bool]$Primary; Data = ''; LastStep = $LastStep; Created = (Get-Date).ToString('yyyy-MM-dd HH:mm'); LastUsed = '' }
+    Set-MfaAccountData -Account $a -Base32 $Base32 -PinSalt $salt -PinHash $hash -Deny $Deny
+    return $a
+}
+
+function Test-MfaAccountPin {
+    # PIN konta: podstawowe - PIN ze skryptu; dodatkowe - PBKDF2 z części zaszyfrowanej
+    param([Parameter(Mandatory)][hashtable]$Account, [string]$Pin)
+    if (-not $Pin) { return $false }
+    if ($Account.Primary) { return (Test-UnlockPin $Pin) }
+    $s = Get-MfaAccountSecret -Account $Account
+    if (-not $s.PinHash) { return $false }
+    return ((Get-MfaPinHash -Pin $Pin -Salt ([Convert]::FromBase64String($s.PinSalt))) -eq $s.PinHash)
+}
+function Get-MfaUnlockAccounts {
+    # Konta do ekranu blokady (podstawowe pierwsze, potem ostatnio używane); pusta lista = MFA wyłączone (sam PIN).
+    # Plik nieczytelny: MFA wyłączone z ostrzeżeniem w dzienniku (tak samo jak po usunięciu pliku).
+    $store = $null
+    try { $store = Read-MfaStore }
+    catch {
+        Write-Log ('Nie odczytano pliku MFA ({0}): {1} – odblokowanie samym PIN-em.' -f $script:App.MfaFile, $_.Exception.Message) 'WARN' -Module ''
+        return @()
+    }
+    $list = @($store.Accounts)
+    if (-not $list.Count) { return @() }
+    $primary = @($list | Where-Object { $_.Primary })
+    $others = @($list | Where-Object { -not $_.Primary } | Sort-Object -Property @{ Expression = { [string]$_.LastUsed }; Descending = $true }, Name)
+    if (-not $primary.Count) { $primary = @(@{ Id = ''; Name = 'Konto podstawowe'; Primary = $true; Data = ''; LastStep = -1; Created = ''; LastUsed = ''; NoMfa = $true }) }
+    return @($primary + $others)
+}
+
+function Save-MfaUse {
+    # Po poprawnym kodzie: krok czasu (ten kod nie zadziała drugi raz) i data użycia - zapis od razu
+    param([Parameter(Mandatory)][hashtable]$Account, [long]$Step)
+    $Account.LastStep = [Math]::Max([long]$Account.LastStep, $Step)
+    $Account.LastUsed = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    try {
+        $store = Read-MfaStore
+        foreach ($a in @($store.Accounts)) {
+            if ($a.Id -eq $Account.Id) { $a.LastStep = [Math]::Max([long]$a.LastStep, $Step); $a.LastUsed = $Account.LastUsed }
+        }
+        Save-MfaStore -Store $store
+    }
+    catch { Write-Log "Nie zapisano użycia kodu MFA: $($_.Exception.Message)" 'WARN' -Module '' }
+}
+
+function Test-MfaCodeFor {
+    # Kod z aplikacji dla konta: 'Ok' (poprawny, krok zapisany), 'Used' (ten kod już użyto - trzeba poczekać na następny)
+    # albo 'Invalid'
+    param([Parameter(Mandatory)][hashtable]$Account, [string]$Code)
+    $secret = (Get-MfaAccountSecret -Account $Account).Secret
+    $step = Test-TotpCode -Secret $secret -Code $Code -LastStep ([long]$Account.LastStep)
+    if ($step -eq -2) { return 'Used' }
+    if ($step -lt 0) { return 'Invalid' }
+    Save-MfaUse -Account $Account -Step $step
+    return 'Ok'
+}
+
+function Read-MfaConfirmation {
+    # Potwierdzenie zmiany kodem z aplikacji danego konta; $true = poprawny
+    param([Parameter(Mandatory)][hashtable]$Account, [string]$Action = 'zmianę')
+    $code = Show-InputDialog -Title 'Potwierdź kodem z aplikacji' -Prompt ("Konto «{0}»: wpisz aktualny kod z aplikacji uwierzytelniającej, aby potwierdzić {1}." -f $Account.Name, $Action) -Icon 'E8D7' -Validate {
+        param($t)
+        if (([string]$t).Trim() -notmatch '^\d{6}$') { return 'Kod ma 6 cyfr.' }
+        return ''
+    }
+    if ($null -eq $code) { return $false }
+    try {
+        $res = Test-MfaCodeFor -Account $Account -Code $code.Trim()
+        if ($res -eq 'Ok') { return $true }
+        if ($res -eq 'Used') { Show-Warning 'Ten kod został już użyty – poczekaj, aż aplikacja pokaże następny (do 30 s), i spróbuj ponownie.' }
+        else { Show-Warning 'Nieprawidłowy kod. Sprawdź, czy zegar telefonu i komputera wskazuje ten sam czas.' }
+    }
+    catch { Show-Error 'Nie można odczytać danych MFA tego konta na tym komputerze.' $_ }
+    return $false
+}
+
+$script:MfaEnrollXaml = @'
+<StackPanel>
+  <TextBlock Text="Nazwa konta (na ekranie blokady i w aplikacji)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+  <TextBox x:Name="enName"/>
+  <Grid x:Name="enPinPanel" Margin="0,12,0,0">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="14"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock x:Name="enPinLabel" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+      <PasswordBox x:Name="enPin"/>
+    </StackPanel>
+    <StackPanel Grid.Column="2">
+      <TextBlock Text="Powtórz PIN" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+      <PasswordBox x:Name="enPin2"/>
+    </StackPanel>
+  </Grid>
+  <Border Style="{StaticResource Card}" Padding="14,12" Margin="0,14,0,0">
+    <StackPanel>
+      <TextBlock TextWrapping="Wrap" Foreground="#C9D0DC"
+                 Text="1. W aplikacji uwierzytelniającej (Microsoft Authenticator, Google Authenticator i podobne) dodaj konto, wybierz wpisanie klucza ręcznie i konto oparte na czasie:"/>
+      <TextBox x:Name="enKey" IsReadOnly="True" FontFamily="Consolas" FontSize="17" Margin="0,10,0,0" HorizontalContentAlignment="Center"/>
+      <TextBlock x:Name="enLabel" Foreground="#8791A5" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
+      <WrapPanel x:Name="enButtons" Margin="0,8,0,0"/>
+    </StackPanel>
+  </Border>
+  <TextBlock Text="2. Wpisz 6-cyfrowy kod, który pokazuje aplikacja" Foreground="#8791A5" FontSize="12" Margin="0,14,0,5"/>
+  <TextBox x:Name="enCode" MaxLength="6" Width="150" HorizontalAlignment="Left" FontSize="16"/>
+  <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,12,0,0"
+             Text="Klucz jest pokazywany tylko teraz. Program zapisuje go zaszyfrowanego (DPAPI) w pliku na tym komputerze – odczyta go tylko to konto Windows. Utrata telefonu: usunięcie pliku MFA przywraca odblokowanie samym PIN-em."/>
+</StackPanel>
+'@
+
+function Show-MfaEnroll {
+    <#
+        Włączenie MFA: -Primary - konto podstawowe (PIN ze skryptu), bez parametrów - nowe konto dodatkowe (nazwa i własny
+        PIN), -Account - nowy klucz istniejącego konta (nazwa i PIN bez zmian). Klucz generowany tutaj, zapis dopiero po
+        poprawnym kodzie z aplikacji. Zwraca $true po zapisaniu.
+    #>
+    param([switch]$Primary, [hashtable]$Account = $null)
+    $title = if ($Account) { "Nowy klucz MFA – $($Account.Name)" } elseif ($Primary) { 'MFA dla konta podstawowego' } else { 'Nowe konto z MFA' }
+    $w = New-Dialog -Title $title -Subtitle 'Odblokowanie programu będzie wymagać PIN-u i kodu z aplikacji w telefonie.' -Body $script:MfaEnrollXaml -Icon 'E8D7' -OkText 'Zapisz' -Width 560 -Validate {
+        param($w)
+        $t = $w.Tag
+        $name = $w.FindName('enName').Text.Trim()
+        if (-not $name) { Show-Warning 'Podaj nazwę konta.'; return $false }
+        if ($name.Length -gt 40) { Show-Warning 'Nazwa konta może mieć najwyżej 40 znaków.'; return $false }
+        $store = $null
+        try { $store = Read-MfaStore } catch { Show-Error 'Nie można odczytać pliku MFA.' $_; return $false }
+        if (@($store.Accounts | Where-Object { $_.Name -ieq $name -and $_.Id -ne $t.EditId }).Count) { Show-Warning "Konto «$name» już istnieje."; return $false }
+        if ($t.NeedPin) {
+            $pin = $w.FindName('enPin').Password
+            if ($pin -notmatch "^\d{$($script:UnlockPinLength)}$") { Show-Warning ("PIN ma mieć {0} cyfr." -f $script:UnlockPinLength); return $false }
+            if ($pin -ne $w.FindName('enPin2').Password) { Show-Warning 'Wpisane PIN-y się różnią.'; return $false }
+        }
+        $step = Test-TotpCode -Secret $t.Secret -Code $w.FindName('enCode').Text.Trim()
+        if ($step -lt 0) { Show-Warning 'Kod się nie zgadza. Sprawdź, czy klucz został wpisany bez błędów i czy zegar telefonu i komputera wskazuje ten sam czas.'; return $false }
+        try {
+            $b32 = ConvertTo-Base32 $t.Secret
+            if ($t.EditId) {
+                $old = @($store.Accounts | Where-Object { $_.Id -eq $t.EditId })[0]
+                # Nowy klucz; PIN konta dodatkowego (sól i skrót) i jego blokady dostępu bez zmian
+                $prev = Get-MfaAccountSecret -Account $old
+                Set-MfaAccountData -Account $old -Base32 $b32 -PinSalt $prev.PinSalt -PinHash $prev.PinHash -Deny $prev.Deny
+                $old.Name = $name; $old.LastStep = $step
+            }
+            else {
+                $pinText = if ($t.NeedPin) { $w.FindName('enPin').Password } else { '' }
+                $store.Accounts = @($store.Accounts) + @(New-MfaAccount -Name $name -Base32 $b32 -Primary:([bool]$t.Primary) -Pin $pinText -LastStep $step)
+            }
+            Save-MfaStore -Store $store
+        }
+        catch { Show-Error 'Nie zapisano konta MFA.' $_; return $false }
+        return $true
+    }
+    $secret = New-MfaSecret
+    $b32 = ConvertTo-Base32 $secret
+    $w.Tag.Secret = $secret
+    $w.Tag.Primary = [bool]$Primary
+    $w.Tag.EditId = $(if ($Account) { [string]$Account.Id } else { '' })
+    $w.Tag.NeedPin = (-not $Primary -and -not $Account)
+    $nameBox = $w.FindName('enName')
+    $nameBox.Text = $(if ($Account) { [string]$Account.Name } elseif ($Primary) { 'Konto podstawowe' } else { '' })
+    if (-not $w.Tag.NeedPin) { $w.FindName('enPinPanel').Visibility = 'Collapsed' }
+    $w.FindName('enPinLabel').Text = 'PIN tego konta ({0} cyfr)' -f $script:UnlockPinLength
+    $w.FindName('enKey').Text = Format-MfaKey $b32
+    $w.FindName('enLabel').Text = 'Wystawca: {0} • konto: nazwa powyżej • 6 cyfr co 30 s (SHA1)' -f $script:MfaIssuer
+    $buttons = $w.FindName('enButtons')
+    $copyKey = New-PlainButton -Text 'Kopiuj klucz' -Icon 'E8C8' -ToolTip 'Schowek wyczyści się sam po minucie'
+    $copyKey.Margin = '0,0,8,0'
+    $copyKey.add_Click({ param($s, $e) $win = [System.Windows.Window]::GetWindow($s); Set-ClipboardSecret -Text (ConvertTo-Base32 $win.Tag.Secret); Show-Toast 'Skopiowano klucz – schowek wyczyści się po minucie.' 'ok' })
+    $copyUri = New-PlainButton -Text 'Kopiuj link otpauth://' -Icon 'E71B' -ToolTip 'Link do aplikacji, które przyjmują go wklejony (np. menedżery haseł)'
+    $copyUri.add_Click({
+            param($s, $e)
+            $win = [System.Windows.Window]::GetWindow($s)
+            $n = $win.FindName('enName').Text.Trim()
+            Set-ClipboardSecret -Text (Get-MfaUri -Account $(if ($n) { $n } else { 'konto' }) -Base32 (ConvertTo-Base32 $win.Tag.Secret))
+            Show-Toast 'Skopiowano link – schowek wyczyści się po minucie.' 'ok'
+        })
+    foreach ($b in $copyKey, $copyUri) { [void]$buttons.Children.Add($b) }
+    $w.add_ContentRendered({ param($s, $e) $b = $s.FindName('enName'); [void]$b.Focus(); $b.SelectAll() })
+    $ok = Invoke-Dialog $w
+    if ($ok) { Write-Log ('MFA: {0} konto «{1}».' -f $(if ($Account) { 'nowy klucz dla' } else { 'dodano' }), $nameBox.Text.Trim()) 'OK' -Module '' }
+    return $ok
+}
+
+$script:MfaManagerXaml = @'
+<StackPanel>
+  <TextBlock x:Name="mfInfo" TextWrapping="Wrap" Foreground="#C9D0DC"/>
+  <Border Style="{StaticResource Card}" Padding="4" Margin="0,12,0,0">
+    <ListBox x:Name="mfList" Height="170" Background="Transparent" BorderThickness="0"/>
+  </Border>
+  <WrapPanel x:Name="mfButtons" Margin="0,12,0,0"/>
+  <TextBlock x:Name="mfFile" Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,10,0,0"/>
+</StackPanel>
+'@
+
+function Show-MfaManager {
+    # Konta MFA tej instancji: włączenie dla konta podstawowego, konta dodatkowe, nowy klucz, usunięcie
+    $w = New-Dialog -Title 'MFA – kody z aplikacji' -Subtitle 'Drugi składnik odblokowania programu na tym komputerze.' -Body $script:MfaManagerXaml -Icon 'E8D7' -OkText 'Zamknij' -NoCancel -Width 600
+    $buttons = $w.FindName('mfButtons')
+    foreach ($def in @(
+            @{ Key = 'Primary'; Text = 'Włącz MFA dla konta podstawowego'; Icon = 'E8D7' },
+            @{ Key = 'Add'; Text = 'Dodaj konto…'; Icon = 'E8FA' },
+            @{ Key = 'Rekey'; Text = 'Nowy klucz…'; Icon = 'E72C' },
+            @{ Key = 'Access'; Text = 'Uprawnienia…'; Icon = 'E72E' },
+            @{ Key = 'Remove'; Text = 'Usuń…'; Icon = 'E74D' })) {
+        $b = New-PlainButton -Text $def.Text -Icon $def.Icon -Danger:($def.Key -eq 'Remove')
+        $b.Tag = $def.Key
+        $b.Margin = '0,0,8,6'
+        $b.Name = 'mf' + $def.Key
+        try { $w.RegisterName($b.Name, $b) } catch { }
+        $b.add_Click($script:MfaManagerEvents.Click)
+        [void]$buttons.Children.Add($b)
+    }
+    $w.FindName('mfList').add_SelectionChanged({ param($s, $e) Update-MfaManagerButtons -Window ([System.Windows.Window]::GetWindow($s)) })
+    $w.FindName('mfFile').Text = 'Plik: ' + $script:App.MfaFile
+    Update-MfaManager -Window $w
+    [void](Invoke-Dialog $w)
+}
+
+function Update-MfaManager {
+    param([Parameter(Mandatory)]$Window)
+    $list = $Window.FindName('mfList')
+    $list.Items.Clear()
+    $store = $null
+    try { $store = Read-MfaStore } catch { $store = @{ Accounts = @() }; $Window.FindName('mfInfo').Text = 'Nie odczytano pliku MFA: ' + $_.Exception.Message }
+    $Window.Tag.Accounts = @($store.Accounts | Sort-Object -Property @{ Expression = { -not $_.Primary } }, Name)
+    foreach ($a in $Window.Tag.Accounts) {
+        $access = if ($a.Primary) { 'pełny dostęp' } else { Get-AccessSummary -Account $a }
+        [void]$list.Items.Add(('{0}  –  {1}  •  {2}  •  dodano {3}{4}' -f $a.Name, $(if ($a.Primary) { 'konto podstawowe (PIN ze skryptu)' } else { 'konto dodatkowe (własny PIN)' }), $access, $a.Created, $(if ($a.LastUsed) { "  •  ostatnio $($a.LastUsed)" } else { '' })))
+    }
+    $hasPrimary = @($Window.Tag.Accounts | Where-Object { $_.Primary }).Count -gt 0
+    $Window.FindName('mfInfo').Text = if (-not $script:UnlockPinHash) { 'Blokada PIN-em jest wyłączona w skrypcie (pusty skrót PIN-u) – MFA nie zadziała bez PIN-u.' }
+    elseif ($hasPrimary) { 'MFA włączone: odblokowanie wymaga PIN-u konta i kodu z aplikacji. Konta dodatkowe mają własny PIN i własny klucz – na ekranie blokady wybiera się konto. Dodanie konta, nowy klucz, uprawnienia i usunięcie zatwierdza się kodem z aplikacji konta podstawowego.' }
+    else { 'MFA wyłączone – program odblokowuje sam PIN. Najpierw włącz MFA dla konta podstawowego, potem możesz dodać kolejne konta.' }
+    Update-MfaManagerButtons -Window $Window
+}
+
+function Update-MfaManagerButtons {
+    param([Parameter(Mandatory)]$Window)
+    $accounts = @($Window.Tag.Accounts)
+    $hasPrimary = @($accounts | Where-Object { $_.Primary }).Count -gt 0
+    $sel = $Window.FindName('mfList').SelectedIndex
+    $Window.FindName('mfPrimary').Visibility = if ($hasPrimary) { 'Collapsed' } else { 'Visible' }
+    $Window.FindName('mfPrimary').IsEnabled = [bool]$script:UnlockPinHash
+    $Window.FindName('mfAdd').IsEnabled = $hasPrimary
+    $Window.FindName('mfRekey').IsEnabled = ($sel -ge 0)
+    $Window.FindName('mfAccess').IsEnabled = ($sel -ge 0 -and $sel -lt $accounts.Count -and -not $accounts[$sel].Primary)
+    $Window.FindName('mfRemove').IsEnabled = ($sel -ge 0)
+}
+
+function Get-MfaApprover {
+    # Konto, którego kod zatwierdza zmiany kont MFA: podstawowe - kto ma tylko odblokowany program, nie dopisze sobie
+    # własnego konta; bez konta podstawowego (plik zmieniony ręcznie) samo zmieniane konto
+    param([object[]]$Accounts, [hashtable]$Account = $null)
+    $p = @($Accounts | Where-Object { $_ -and $_.Primary })
+    if ($p.Count) { return $p[0] }
+    return $Account
+}
+
+function Remove-MfaAccountInteractive {
+    # Usunięcie konta (podstawowego tylko jako ostatniego) po potwierdzeniu kodem konta podstawowego; bez kont plik jest
+    # usuwany (MFA wyłączone)
+    param([Parameter(Mandatory)][hashtable]$Account, [Parameter(Mandatory)][hashtable]$Approver, [int]$Count)
+    if ($Account.Primary -and $Count -gt 1) { Show-Warning 'Najpierw usuń konta dodatkowe – działają tylko razem z MFA konta podstawowego.'; return }
+    $action = if ($Account.Primary) { 'wyłączenie MFA' } else { "usunięcie konta «$($Account.Name)»" }
+    if (-not (Read-MfaConfirmation -Account $Approver -Action $action)) { return }
+    $text = if ($Account.Primary) { 'Wyłączyć MFA? Program będzie odblokowywany samym PIN-em, a klucz zostanie usunięty z tego komputera (wpis w aplikacji możesz usunąć ręcznie).' } else { "Usunąć konto «$($Account.Name)»? Nie odblokuje już programu (wpis w aplikacji możesz usunąć ręcznie)." }
+    if (-not (Confirm-Action -Title 'MFA' -Text $text -ConfirmText 'Usuń' -Danger)) { return }
+    $store = Read-MfaStore
+    $store.Accounts = @($store.Accounts | Where-Object { $_.Id -ne $Account.Id })
+    if ($store.Accounts.Count) { Save-MfaStore -Store $store } else { Remove-Item -LiteralPath $script:App.MfaFile -Force -ErrorAction SilentlyContinue }
+    Write-Log ('MFA: usunięto konto «{0}».' -f $Account.Name) 'WARN' -Module ''
+}
+
+$script:MfaManagerEvents = @{
+    Click = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        try {
+            $accounts = @($w.Tag.Accounts)
+            $sel = $w.FindName('mfList').SelectedIndex
+            $acc = if ($sel -ge 0 -and $sel -lt $accounts.Count) { $accounts[$sel] } else { $null }
+            $op = [string]$s.Tag
+            $approver = Get-MfaApprover -Accounts $accounts -Account $acc
+            if ($op -eq 'Primary') { [void](Show-MfaEnroll -Primary) }
+            elseif ($op -eq 'Add') { if ($approver -and (Read-MfaConfirmation -Account $approver -Action 'dodanie nowego konta')) { [void](Show-MfaEnroll) } }
+            elseif ($op -eq 'Rekey' -and $acc) {
+                $action = if ($acc.Id -eq $approver.Id) { 'wygenerowanie nowego klucza' } else { "wygenerowanie nowego klucza dla konta «$($acc.Name)»" }
+                if (Read-MfaConfirmation -Account $approver -Action $action) { [void](Show-MfaEnroll -Account $acc) }
+            }
+            elseif ($op -eq 'Access' -and $acc -and -not $acc.Primary) {
+                if (Read-MfaConfirmation -Account $approver -Action "zmianę uprawnień konta «$($acc.Name)»") { [void](Show-MfaAccessEditor -Account $acc) }
+            }
+            elseif ($op -eq 'Remove' -and $acc) { Remove-MfaAccountInteractive -Account $acc -Approver $approver -Count $accounts.Count }
+        }
+        catch { Show-Error 'Operacja MFA nie powiodła się.' $_ }
+        Update-MfaManager -Window $w
+    }
+}
+#endregion
+
+#region Uprawnienia kont MFA (dostęp do przestrzeni roboczych i modułów)
+# Konto dodatkowe MFA może mieć zablokowane przestrzenie robocze, pojedyncze moduły i Ustawienia programu. Blokady są
+# w zaszyfrowanej (DPAPI) części konta w pliku MFA; zmienia je konto podstawowe (zatwierdzenie jego kodem z aplikacji).
+# Klucze blokad: 'ws:<przestrzeń>', 'mod:<moduł>', 'app:Settings'. Konto podstawowe i program bez MFA - pełny dostęp.
+# To ograniczenie interfejsu programu: uprawnienia w AD i na komputerach wynikają z konta Windows, na którym działa.
+$script:Access = @{ Account = ''; Deny = New-Object 'System.Collections.Generic.HashSet[string]' }
+
+function Set-AccessAccount {
+    # Uprawnienia konta, które odblokowało program (bez listy blokad - pełny dostęp)
+    param([string]$Name = '', [string[]]$Deny = @())
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($d in @($Deny)) { if ($d) { [void]$set.Add([string]$d) } }
+    $script:Access.Account = $Name
+    $script:Access.Deny = $set
+}
+
+function Test-ModuleAllowed([string]$Key) {
+    $deny = $script:Access.Deny
+    if ($deny.Count -eq 0) { return $true }
+    if ($deny.Contains("mod:$Key")) { return $false }
+    $d = Get-ModuleDefinition $Key
+    return -not ($d -and $deny.Contains("ws:$($d.Workspace)"))
+}
+
+function Test-WorkspaceAllowed([string]$Key) {
+    # Przestrzeń niezablokowana i z co najmniej jednym dostępnym modułem
+    $deny = $script:Access.Deny
+    if ($deny.Count -eq 0) { return $true }
+    if ($deny.Contains("ws:$Key")) { return $false }
+    foreach ($d in $script:UI.ModuleDefs) { if ($d.Workspace -eq $Key -and -not $deny.Contains("mod:$($d.Key)")) { return $true } }
+    return $false
+}
+
+function Test-AppAllowed([string]$Key) { return -not $script:Access.Deny.Contains("app:$Key") }
+
+function Show-AccessDenied([string]$What) {
+    Write-Log ('Brak dostępu (konto «{0}»): {1}.' -f $script:Access.Account, $What) 'WARN' -Module ''
+    Show-Toast ('Konto «{0}» nie ma dostępu: {1}.' -f $script:Access.Account, $What) 'warn' 5
+}
+
+function Get-AccessDenyText {
+    # Opis blokad dla listy kont i dziennika
+    param([string[]]$Deny = @())
+    $list = @($Deny | Where-Object { $_ })
+    $parts = New-Object System.Collections.Generic.List[string]
+    $ws = @(foreach ($k in $list) {
+            if ($k -like 'ws:*') { $key = $k.Substring(3); if ($script:UI.Workspaces.Contains($key)) { $script:UI.Workspaces[$key].Title } else { $key } }
+        })
+    if ($ws.Count) { $parts.Add('bez przestrzeni: ' + ($ws -join ', ')) }
+    $mods = @(foreach ($k in $list) {
+            if ($k -like 'mod:*') { $d = Get-ModuleDefinition $k.Substring(4); if ($d -and $list -notcontains "ws:$($d.Workspace)") { $d.Title } }
+        })
+    if ($mods.Count) { $parts.Add($(if ($mods.Count -le 3) { 'bez modułów: ' + ($mods -join ', ') } else { "zablokowane moduły: $($mods.Count)" })) }
+    if ($list -contains 'app:Settings') { $parts.Add('bez Ustawień') }
+    if (-not $parts.Count) { return 'pełny dostęp' }
+    return ($parts -join '; ')
+}
+
+function Get-AccessSummary {
+    param([Parameter(Mandatory)][hashtable]$Account)
+    try { return (Get-AccessDenyText -Deny (Get-MfaAccountSecret -Account $Account).Deny) }
+    catch { return 'uprawnienia: nie odczytano' }
+}
+
+function Update-NavAccess {
+    # Nawigacja według uprawnień: ukryte zablokowane przestrzenie, moduły i kategorie bez dostępnych modułów
+    foreach ($ws in $script:UI.Workspaces.Values) {
+        if ($ws.Tab) { $ws.Tab.Visibility = if (Test-WorkspaceAllowed $ws.Key) { 'Visible' } else { 'Collapsed' } }
+        if (-not $ws.NavHost) { continue }
+        $header = $null
+        $any = $false
+        foreach ($child in @($ws.NavHost.Children)) {
+            if ($child -is [System.Windows.Controls.TextBlock]) {
+                if ($header) { $header.Visibility = if ($any) { 'Visible' } else { 'Collapsed' } }
+                $header = $child
+                $any = $false
+                continue
+            }
+            $ok = Test-ModuleAllowed ([string]$child.Tag)
+            $child.Visibility = if ($ok) { 'Visible' } else { 'Collapsed' }
+            if ($ok) { $any = $true }
+        }
+        if ($header) { $header.Visibility = if ($any) { 'Visible' } else { 'Collapsed' } }
+    }
+    $btn = $script:UI.Controls['btnSettings']
+    if ($btn) { $btn.Visibility = if (Test-AppAllowed 'Settings') { 'Visible' } else { 'Collapsed' } }
+}
+
+function Update-AccessView {
+    # Po zmianie konta: nawigacja i - gdy otwarty moduł jest teraz niedostępny - pierwszy dostępny
+    if (-not $script:UI.Window) { return }
+    Update-NavAccess
+    $active = $script:UI.ActiveModule
+    if ($script:UI.ActiveWorkspace -and (-not (Test-WorkspaceAllowed $script:UI.ActiveWorkspace) -or ($active -and -not (Test-ModuleAllowed $active.Key)))) {
+        Show-Workspace -Key $script:UI.ActiveWorkspace
+    }
+}
+
+function Close-LockedWindows {
+    # Inne konto odblokowało program: okna poprzedniego konta ukryte na czas blokady (formularze, potwierdzenia, raporty)
+    # są zamykane - jak «Anuluj»; zwraca liczbę zamkniętych okien
+    $n = 0
+    foreach ($c in @($script:UnlockState.Hidden)) {
+        try {
+            $win = [System.Windows.Window]::GetWindow($c)
+            if ($win) { $win.Close(); $n++ }
+        }
+        catch { }
+    }
+    $script:UnlockState.Hidden = @()
+    return $n
+}
+
+$script:AccessEditorXaml = @'
+<StackPanel>
+  <TextBlock x:Name="acInfo" TextWrapping="Wrap" Foreground="#C9D0DC"
+             Text="Odznacz przestrzenie robocze albo pojedyncze moduły, do których to konto nie ma mieć dostępu. Zablokowane pozycje znikają z nawigacji po odblokowaniu programu tym kontem."/>
+  <WrapPanel x:Name="acButtons" Margin="0,10,0,0"/>
+  <Border Style="{StaticResource Card}" Padding="6" Margin="0,10,0,0">
+    <TreeView x:Name="acTree" Height="340" BorderThickness="0" Background="Transparent"/>
+  </Border>
+  <TextBlock x:Name="acSummary" Foreground="#8791A5" FontSize="12" TextWrapping="Wrap" Margin="0,10,0,0"/>
+  <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"
+             Text="To ograniczenie w programie. Uprawnienia w AD i na komputerach wynikają z konta Windows, na którym działa program – do rozdzielenia uprawnień między osoby używaj osobnych kont Windows."/>
+</StackPanel>
+'@
+
+function Get-AccessEditorDeny {
+    # Blokady z drzewa edytora (+ blokady pozycji, których teraz nie ma, np. modułu własnego spoza folderu)
+    param([Parameter(Mandatory)]$Window)
+    $t = $Window.Tag
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($b in $t.Boxes) { if ($b.IsChecked -ne $true) { $out.Add([string]$b.Tag) } }
+    foreach ($k in $t.Unknown) { if (-not $out.Contains($k)) { $out.Add($k) } }
+    return $out.ToArray()
+}
+
+function Update-AccessEditor {
+    param([Parameter(Mandatory)]$Window)
+    foreach ($p in $Window.Tag.Workspaces) {
+        foreach ($b in $p.Modules) { $b.IsEnabled = ($p.Box.IsChecked -eq $true) }
+    }
+    $Window.FindName('acSummary').Text = 'Po zapisaniu: ' + (Get-AccessDenyText -Deny @(Get-AccessEditorDeny -Window $Window))
+}
+
+$script:AccessEditorEvents = @{
+    Changed = { param($s, $e) Update-AccessEditor -Window ([System.Windows.Window]::GetWindow($s)) }
+    All     = {
+        param($s, $e)
+        $w = [System.Windows.Window]::GetWindow($s)
+        foreach ($b in $w.Tag.Boxes) { $b.IsChecked = $true }
+        $w.Tag.Unknown = @()
+        Update-AccessEditor -Window $w
+    }
+}
+
+function New-AccessCheckBox {
+    param([string]$Key, [string]$Text, [string]$Icon = '', [bool]$Allowed, [switch]$Bold)
+    $cb = New-Object System.Windows.Controls.CheckBox
+    $cb.Content = New-IconContent -Text $Text -Icon $Icon
+    $cb.Tag = $Key
+    $cb.IsChecked = $Allowed
+    $cb.Margin = '0,2,0,2'
+    if ($Bold) { $cb.FontWeight = 'SemiBold' }
+    $cb.add_Click($script:AccessEditorEvents.Changed)
+    return $cb
+}
+
+function Show-MfaAccessEditor {
+    # Uprawnienia konta dodatkowego: drzewo przestrzeni i modułów + Ustawienia programu; $true po zapisaniu
+    param([Parameter(Mandatory)][hashtable]$Account)
+    $data = Get-MfaAccountSecret -Account $Account
+    $deny = @($data.Deny)
+    $w = New-Dialog -Title "Uprawnienia – $($Account.Name)" -Subtitle 'Do czego to konto ma dostęp po odblokowaniu programu.' -Body $script:AccessEditorXaml -Icon 'E72E' -OkText 'Zapisz' -Width 600 -Validate {
+        param($w)
+        $newDeny = @(Get-AccessEditorDeny -Window $w)
+        $any = $false
+        foreach ($p in $w.Tag.Workspaces) {
+            if ($p.Box.IsChecked -eq $true -and @($p.Modules | Where-Object { $_.IsChecked -eq $true }).Count) { $any = $true; break }
+        }
+        if (-not $any) { Show-Warning 'Konto musi mieć dostęp do co najmniej jednego modułu.'; return $false }
+        try {
+            $store = Read-MfaStore
+            $acc = @($store.Accounts | Where-Object { $_.Id -eq $w.Tag.AccountId })[0]
+            if (-not $acc) { Show-Warning 'Tego konta nie ma już w pliku MFA.'; return $false }
+            $cur = Get-MfaAccountSecret -Account $acc
+            Set-MfaAccountData -Account $acc -Base32 $cur.Base32 -PinSalt $cur.PinSalt -PinHash $cur.PinHash -Deny $newDeny
+            Save-MfaStore -Store $store
+            $w.Tag.Saved = $newDeny
+        }
+        catch { Show-Error 'Nie zapisano uprawnień.' $_; return $false }
+        return $true
+    }
+    $w.Tag.AccountId = [string]$Account.Id
+    $w.Tag.Boxes = New-Object System.Collections.ArrayList
+    $w.Tag.Workspaces = New-Object System.Collections.ArrayList
+    $known = New-Object 'System.Collections.Generic.HashSet[string]'
+    $tree = $w.FindName('acTree')
+    foreach ($ws in $script:UI.Workspaces.Values) {
+        $wsBox = New-AccessCheckBox -Key "ws:$($ws.Key)" -Text $ws.Title -Icon $ws.Icon -Allowed ($deny -notcontains "ws:$($ws.Key)") -Bold
+        [void]$known.Add([string]$wsBox.Tag)
+        [void]$w.Tag.Boxes.Add($wsBox)
+        $node = New-Object System.Windows.Controls.TreeViewItem
+        $node.Header = $wsBox
+        $mods = New-Object System.Collections.ArrayList
+        foreach ($d in @($script:UI.ModuleDefs | Where-Object { $_.Workspace -eq $ws.Key })) {
+            $mb = New-AccessCheckBox -Key "mod:$($d.Key)" -Text $d.Title -Allowed ($deny -notcontains "mod:$($d.Key)")
+            [void]$known.Add([string]$mb.Tag)
+            [void]$w.Tag.Boxes.Add($mb)
+            [void]$mods.Add($mb)
+            $child = New-Object System.Windows.Controls.TreeViewItem
+            $child.Header = $mb
+            [void]$node.Items.Add($child)
+            if ($deny -contains "mod:$($d.Key)") { $node.IsExpanded = $true }
+        }
+        [void]$w.Tag.Workspaces.Add(@{ Box = $wsBox; Modules = @($mods); Node = $node })
+        [void]$tree.Items.Add($node)
+    }
+    $appNode = New-Object System.Windows.Controls.TreeViewItem
+    $appHeader = New-Object System.Windows.Controls.TextBlock
+    $appHeader.Text = 'Program'
+    $appHeader.FontWeight = 'SemiBold'
+    $appHeader.Foreground = Get-Brush '#C9D0DC'
+    $appNode.Header = $appHeader
+    $appNode.IsExpanded = $true
+    $setBox = New-AccessCheckBox -Key 'app:Settings' -Text 'Ustawienia programu (w tym zarządzanie MFA)' -Icon 'E713' -Allowed ($deny -notcontains 'app:Settings')
+    [void]$known.Add('app:Settings')
+    [void]$w.Tag.Boxes.Add($setBox)
+    $setItem = New-Object System.Windows.Controls.TreeViewItem
+    $setItem.Header = $setBox
+    [void]$appNode.Items.Add($setItem)
+    [void]$tree.Items.Add($appNode)
+    $w.Tag.Unknown = @($deny | Where-Object { -not $known.Contains($_) })
+    $all = New-PlainButton -Text 'Pełny dostęp' -Icon 'E73E' -ToolTip 'Zaznacza wszystkie przestrzenie, moduły i Ustawienia'
+    $all.Name = 'acAll'
+    try { $w.RegisterName($all.Name, $all) } catch { }
+    $all.add_Click($script:AccessEditorEvents.All)
+    [void]$w.FindName('acButtons').Children.Add($all)
+    Update-AccessEditor -Window $w
+    if (-not (Invoke-Dialog $w)) { return $false }
+    $saved = @($w.Tag.Saved)
+    Write-Log ('MFA: uprawnienia konta «{0}»: {1}.' -f $Account.Name, (Get-AccessDenyText -Deny $saved)) 'OK' -Module ''
+    if ($script:UnlockState.AccountId -eq [string]$Account.Id) {
+        # Zmienione uprawnienia konta, które teraz pracuje - od razu
+        Set-AccessAccount -Name $script:UnlockState.User -Deny $saved
+        Update-AccessView
+    }
+    return $true
 }
 #endregion
 
@@ -6620,6 +7485,15 @@ function Show-Module {
     param([string]$Key)
     $definition = Get-ModuleDefinition $Key
     if (-not $definition) { return }
+    if (-not (Test-ModuleAllowed $Key)) {
+        # Moduł zablokowany dla konta MFA (Uprawnienia…) - wyjątek przerywa też akcje, które po otwarciu modułu
+        # wypełniają jego pola albo uruchamiają jego operacje
+        $text = 'Konto «{0}» nie ma dostępu do modułu «{1}».' -f $script:Access.Account, $definition.Title
+        Write-Log $text 'WARN' -Module ''
+        $ex = New-Object System.UnauthorizedAccessException($text)
+        $ex.Data['DomainOpsAccess'] = $true
+        throw $ex
+    }
     if ($script:UI.ActiveWorkspace -ne $definition.Workspace) { Show-Workspace -Key $definition.Workspace -ModuleKey $Key; return }
     $m = $script:UI.Modules[$Key]
     if (-not $m) { $m = Invoke-WithWaitCursor { Initialize-Module -Definition $definition } }
@@ -6636,6 +7510,17 @@ function Show-Module {
 function Show-Workspace {
     param([string]$Key, [string]$ModuleKey = '')
     if (-not $script:UI.Workspaces.Contains($Key)) { $Key = @($script:UI.Workspaces.Keys)[0] }
+    if (-not (Test-WorkspaceAllowed $Key)) {
+        # Przestrzeń zablokowana dla konta MFA (np. zapamiętana z poprzedniej sesji): pierwsza dostępna
+        $Key = @($script:UI.Workspaces.Keys | Where-Object { Test-WorkspaceAllowed $_ })[0]
+        $ModuleKey = ''
+        if (-not $Key) {
+            if ($script:UI.ActiveModule) { $script:UI.ActiveModule.Root.Visibility = 'Collapsed'; $script:UI.ActiveModule = $null }
+            foreach ($other in $script:UI.Workspaces.Values) { if ($other.NavHost) { $other.NavHost.Visibility = 'Collapsed' } }
+            $script:UI.ActiveWorkspace = ''
+            return
+        }
+    }
     $ws = $script:UI.Workspaces[$Key]
     $script:UI.ActiveWorkspace = $Key
     $script:Settings.LastWorkspace = $Key
@@ -6651,9 +7536,9 @@ function Show-Workspace {
     $c.txtSubtitle.Text = $ws.Description
     if (-not $ModuleKey) { $ModuleKey = [string]$script:Settings.LastModules[$Key] }
     $def = Get-ModuleDefinition $ModuleKey
-    if (-not $def -or $def.Workspace -ne $Key) {
+    if (-not $def -or $def.Workspace -ne $Key -or -not (Test-ModuleAllowed $def.Key)) {
         $def = $null
-        foreach ($d in $script:UI.ModuleDefs) { if ($d.Workspace -eq $Key) { $def = $d; break } }
+        foreach ($d in $script:UI.ModuleDefs) { if ($d.Workspace -eq $Key -and (Test-ModuleAllowed $d.Key)) { $def = $d; break } }
     }
     if ($def) { Show-Module -Key $def.Key }
     elseif ($script:UI.ActiveModule) { $script:UI.ActiveModule.Root.Visibility = 'Collapsed'; $script:UI.ActiveModule = $null }
@@ -7942,7 +8827,10 @@ $script:ShellEvents = @{
             elseif ($mods -eq $ctrl -and [int]$key -ge [int][System.Windows.Input.Key]::D1 -and [int]$key -le [int][System.Windows.Input.Key]::D9) {
                 $index = [int]$key - [int][System.Windows.Input.Key]::D1
                 $keys = @($script:UI.Workspaces.Keys)
-                if ($index -lt $keys.Count) { Show-Workspace -Key $keys[$index] }
+                if ($index -lt $keys.Count) {
+                    if (Test-WorkspaceAllowed $keys[$index]) { Show-Workspace -Key $keys[$index] }
+                    else { Show-AccessDenied ('przestrzeń «{0}»' -f $script:UI.Workspaces[$keys[$index]].Title) }
+                }
                 $e.Handled = $true
             }
         }
@@ -8116,6 +9004,7 @@ function Initialize-Navigation {
     foreach ($d in $script:UI.ModuleDefs) {
         if (-not $script:UI.Workspaces.Contains($d.Workspace)) { Write-Log "Moduł «$($d.Title)» wskazuje nieistniejącą przestrzeń roboczą «$($d.Workspace)»." 'WARN' -Module '' }
     }
+    Update-NavAccess
 }
 
 function New-NavItem {
@@ -31029,6 +31918,10 @@ function Start-DomainOps {
     # PIN przed zbudowaniem okna głównego (bez poprawnego PIN-u program się kończy)
     if (-not (Unlock-DomainOps)) { return }
     $w = Initialize-MainWindow
+    if ($script:UnlockState.User) {
+        $limits = if ($script:Access.Deny.Count) { '; ' + (Get-AccessDenyText -Deny @($script:Access.Deny)) } else { '' }
+        Write-Log ("Odblokowano program – konto: {0} (PIN i kod z aplikacji){1}." -f $script:UnlockState.User, $limits) 'OK' -Module ''
+    }
     try {
         Start-IdleLock
         [void]$w.ShowDialog()
