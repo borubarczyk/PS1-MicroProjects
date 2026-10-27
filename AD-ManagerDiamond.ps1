@@ -1641,14 +1641,20 @@ function Add-ParamSection {
     $caption.Text = $Title
     $caption.FontWeight = 'SemiBold'
     $caption.Foreground = Get-Brush '#C9D1DE'
+    foreach ($e in @($chevron, $caption)) { [void]$sp.Children.Add($e) }
+    $b.Content = $sp
+    # Podsumowanie obok przycisku (nie w nim): zmiana tekstu nie zmienia rozmiaru przycisku
     $summary = New-Object System.Windows.Controls.TextBlock
-    $summary.Margin = '12,0,0,0'
+    $summary.Margin = '6,0,0,0'
     $summary.FontSize = 12
+    $summary.VerticalAlignment = 'Center'
     $summary.Foreground = Get-Brush '#7B8496'
     $summary.TextTrimming = 'CharacterEllipsis'
-    $summary.MaxWidth = 760
-    foreach ($e in @($chevron, $caption, $summary)) { [void]$sp.Children.Add($e) }
-    $b.Content = $sp
+    $header = New-Object System.Windows.Controls.DockPanel
+    $header.LastChildFill = $true
+    [System.Windows.Controls.DockPanel]::SetDock($b, 'Left')
+    [void]$header.Children.Add($b)
+    [void]$header.Children.Add($summary)
     $section = @{ Button = $b; Chevron = $chevron; Summary = $summary; Rows = @(); Open = $open; Remember = $Remember; Start = 0 }
     $script:ParamSections[$b] = $section
     Register-ControlHandler -Control $b -EventName 'Click' -Module $Module -Action {
@@ -1658,7 +1664,7 @@ function Add-ParamSection {
         if ($sec.Remember) { Set-ModuleSetting -Module $m -Name $sec.Remember -Value $sec.Open }
         Update-ParamSection -Section $sec
     }
-    [void](Add-TopControl -Module $Module -Control $b)
+    [void](Add-TopControl -Module $Module -Control $header)
     $section.Start = $Module.ParamsStack.Children.Count
     return $section
 }
