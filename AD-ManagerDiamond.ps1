@@ -3602,8 +3602,9 @@ $script:UnlockTitle = 'Domain Ops – odblokowanie'
 $script:LockTitle = 'Domain Ops – zablokowany'
 # Stan blokady w trakcie pracy (Invoke-Dialog wstrzymuje inne okna, dopóki program jest zablokowany).
 # Emergency: zamknięcie programu z ekranu blokady bez PIN-u; Hidden: okna, których zawartość ukryto na czas blokady.
-# User: nazwa konta MFA, które odblokowało program ('' - sam PIN); AccountId: '#primary' (PIN ze skryptu) albo Id konta
-$script:UnlockState = @{ Locked = $false; Emergency = $false; Hidden = @(); User = ''; AccountId = '#primary' }
+# User: nazwa konta MFA, które odblokowało program ('' - sam PIN); AccountId: '#primary' (PIN ze skryptu) albo Id konta;
+# Since: czas odblokowania (operator na górnym pasku)
+$script:UnlockState = @{ Locked = $false; Emergency = $false; Hidden = @(); User = ''; AccountId = '#primary'; Since = $null }
 # Blokada po bezczynności (ustawienie LockIdleMinutes, 0 = wyłączona): Last - ostatnia aktywność w oknach programu (UTC)
 $script:IdleLock = @{ Timer = $null; Last = [datetime]::UtcNow; Pos = $null }
 
@@ -3840,6 +3841,7 @@ function Add-UnlockKey {
         $st.Switched = ($st.Mode -eq 'Lock' -and $id -ne [string]$script:UnlockState.AccountId)
         $script:UnlockState.User = $user
         $script:UnlockState.AccountId = $id
+        $script:UnlockState.Since = Get-Date
         Set-AccessAccount -Name $user -Deny $deny
         # Odblokowanie od razu (zanim okno się zamknie): wstrzymane okna mogą się pokazać
         if ($st.Mode -eq 'Lock' -and -not $st.Switched) { Restore-AfterLock }
@@ -3973,6 +3975,8 @@ function Lock-DomainOps {
     Clear-ClipboardSecret
     Write-Log $(if ($IdleMinutes) { "Program zablokowany po $IdleMinutes min bez aktywności." } else { 'Program zablokowany.' }) -Module ''
     if ($main.Content) { $main.Content.Visibility = 'Hidden' }
+    # Pasek zadań: bez nazwy operatora na czas blokady (po odblokowaniu tytuł ustawia Update-OperatorView)
+    $main.Title = 'Domain Ops – zablokowany'
     $script:UnlockState.Hidden = @(foreach ($ow in @($main.OwnedWindows)) {
             $c = $ow.Content
             if ($c -is [System.Windows.UIElement] -and $c.Visibility -eq 'Visible') { $c.Visibility = 'Hidden'; $c }
@@ -4566,21 +4570,33 @@ function Set-MfaAccountData {
     $Account.Data = Protect-MfaData (ConvertTo-Json -InputObject ([ordered]@{ Secret = $Base32; PinSalt = $PinSalt; PinHash = $PinHash; Deny = @($Deny | Where-Object { $_ }) }) -Compress)
 }
 
+function New-MfaPinData([string]$Pin) {
+    # PIN konta dodatkowego do zapisu: losowa sól (16 bajtów) i skrót PBKDF2
+    $s = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($s) } finally { $rng.Dispose() }
+    return @{ Salt = [Convert]::ToBase64String($s); Hash = (Get-MfaPinHash -Pin $Pin -Salt $s) }
+}
+
 function New-MfaAccount {
     # Konto do zapisu: klucz Base32, opcjonalnie PIN (konta dodatkowe), część poufna zaszyfrowana DPAPI
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Base32, [switch]$Primary, [string]$Pin = '', [long]$LastStep = -1, [string[]]$Deny = @())
-    $salt = ''
-    $hash = ''
-    if ($Pin) {
-        $s = New-Object byte[] 16
-        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-        try { $rng.GetBytes($s) } finally { $rng.Dispose() }
-        $salt = [Convert]::ToBase64String($s)
-        $hash = Get-MfaPinHash -Pin $Pin -Salt $s
-    }
+    $pd = if ($Pin) { New-MfaPinData -Pin $Pin } else { @{ Salt = ''; Hash = '' } }
     $a = @{ Id = [guid]::NewGuid().ToString('N'); Name = $Name; Primary = [bool]$Primary; Data = ''; LastStep = $LastStep; Created = (Get-Date).ToString('yyyy-MM-dd HH:mm'); LastUsed = '' }
-    Set-MfaAccountData -Account $a -Base32 $Base32 -PinSalt $salt -PinHash $hash -Deny $Deny
+    Set-MfaAccountData -Account $a -Base32 $Base32 -PinSalt $pd.Salt -PinHash $pd.Hash -Deny $Deny
     return $a
+}
+
+function Set-MfaAccountPin {
+    # Nowy PIN konta dodatkowego (nowa sól i skrót); klucz i blokady dostępu w części zaszyfrowanej bez zmian
+    param([Parameter(Mandatory)][string]$AccountId, [Parameter(Mandatory)][string]$Pin)
+    $store = Read-MfaStore
+    $acc = $store.Accounts | Where-Object { $_.Id -eq $AccountId } | Select-Object -First 1
+    if (-not $acc -or $acc.Primary) { throw 'Nie znaleziono konta dodatkowego w pliku MFA.' }
+    $prev = Get-MfaAccountSecret -Account $acc
+    $pd = New-MfaPinData -Pin $Pin
+    Set-MfaAccountData -Account $acc -Base32 $prev.Base32 -PinSalt $pd.Salt -PinHash $pd.Hash -Deny $prev.Deny
+    Save-MfaStore -Store $store
 }
 
 function Test-MfaAccountPin {
@@ -4807,6 +4823,58 @@ function Update-MfaEnrollQr {
     }
 }
 
+function Test-MfaPrimarySession {
+    # Program odblokowany kontem podstawowym (PIN ze skryptu) - tylko wtedy można ustawić PIN innego konta
+    return ([string]$script:UnlockState.AccountId -eq '#primary')
+}
+
+$script:MfaPinResetXaml = @'
+<StackPanel>
+  <TextBlock x:Name="prInfo" TextWrapping="Wrap" Foreground="#C9D0DC"/>
+  <Grid Margin="0,12,0,0">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="14"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock x:Name="prPinLabel" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+      <PasswordBox x:Name="prPin"/>
+    </StackPanel>
+    <StackPanel Grid.Column="2">
+      <TextBlock Text="Powtórz PIN" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+      <PasswordBox x:Name="prPin2"/>
+    </StackPanel>
+  </Grid>
+  <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,12,0,0"
+             Text="Klucz w aplikacji, uprawnienia i historia konta się nie zmieniają – poprzedni PIN przestaje działać od razu. Przekaż nowy PIN użytkownikowi osobiście."/>
+</StackPanel>
+'@
+
+function Show-MfaPinReset {
+    <#
+        Nowy PIN konta dodatkowego (np. użytkownik go zapomniał). Wywoływane tylko w sesji konta podstawowego, po
+        potwierdzeniu kodem z aplikacji konta podstawowego. Zwraca $true po zapisaniu.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Account)
+    $w = New-Dialog -Title "Reset PIN-u – $($Account.Name)" -Subtitle 'Nowy PIN konta dodatkowego, ustawiany przez konto podstawowe.' -Body $script:MfaPinResetXaml -Icon 'E785' -OkText 'Zapisz PIN' -Width 480 -Validate {
+        param($w)
+        $pin = $w.FindName('prPin').Password
+        if ($pin -notmatch "^\d{$($script:UnlockPinLength)}$") { Show-Warning ("PIN ma mieć {0} cyfr." -f $script:UnlockPinLength); return $false }
+        if ($pin -ne $w.FindName('prPin2').Password) { Show-Warning 'Wpisane PIN-y się różnią.'; return $false }
+        try { Set-MfaAccountPin -AccountId $w.Tag.AccountId -Pin $pin }
+        catch { Show-Error 'Nie zapisano nowego PIN-u.' $_; return $false }
+        return $true
+    }
+    $w.Tag.AccountId = [string]$Account.Id
+    $w.FindName('prInfo').Text = "Konto «$($Account.Name)» będzie odblokowywać program nowym PIN-em i kodem z tej samej aplikacji co dotąd."
+    $w.FindName('prPinLabel').Text = 'Nowy PIN ({0} cyfr)' -f $script:UnlockPinLength
+    $w.add_ContentRendered({ param($s, $e) [void]$s.FindName('prPin').Focus() })
+    $ok = Invoke-Dialog $w
+    if ($ok) { Write-Log ('MFA: konto podstawowe zresetowało PIN konta «{0}».' -f $Account.Name) 'WARN' -Module '' }
+    return $ok
+}
+
 $script:MfaManagerXaml = @'
 <StackPanel>
   <TextBlock x:Name="mfInfo" TextWrapping="Wrap" Foreground="#C9D0DC"/>
@@ -4826,6 +4894,7 @@ function Show-MfaManager {
             @{ Key = 'Primary'; Text = 'Włącz MFA dla konta podstawowego'; Icon = 'E8D7' },
             @{ Key = 'Add'; Text = 'Dodaj konto…'; Icon = 'E8FA' },
             @{ Key = 'Rekey'; Text = 'Nowy klucz…'; Icon = 'E72C' },
+            @{ Key = 'ResetPin'; Text = 'Resetuj PIN…'; Icon = 'E785' },
             @{ Key = 'Access'; Text = 'Uprawnienia…'; Icon = 'E72E' },
             @{ Key = 'Remove'; Text = 'Usuń…'; Icon = 'E74D' })) {
         $b = New-PlainButton -Text $def.Text -Icon $def.Icon -Danger:($def.Key -eq 'Remove')
@@ -4834,6 +4903,8 @@ function Show-MfaManager {
         $b.Name = 'mf' + $def.Key
         try { $w.RegisterName($b.Name, $b) } catch { }
         $b.add_Click($script:MfaManagerEvents.Click)
+        # Wyłączony przycisk też pokazuje podpowiedź (dlaczego jest niedostępny)
+        [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($b, $true)
         [void]$buttons.Children.Add($b)
     }
     $w.FindName('mfList').add_SelectionChanged({ param($s, $e) Update-MfaManagerButtons -Window ([System.Windows.Window]::GetWindow($s)) })
@@ -4855,7 +4926,7 @@ function Update-MfaManager {
     }
     $hasPrimary = @($Window.Tag.Accounts | Where-Object { $_.Primary }).Count -gt 0
     $Window.FindName('mfInfo').Text = if (-not $script:UnlockPinHash) { 'Blokada PIN-em jest wyłączona w skrypcie (pusty skrót PIN-u) – MFA nie zadziała bez PIN-u.' }
-    elseif ($hasPrimary) { 'MFA włączone: odblokowanie wymaga PIN-u konta i kodu z aplikacji. Konta dodatkowe mają własny PIN i własny klucz – na ekranie blokady wybiera się konto. Dodanie konta, nowy klucz, uprawnienia i usunięcie zatwierdza się kodem z aplikacji konta podstawowego.' }
+    elseif ($hasPrimary) { 'MFA włączone: odblokowanie wymaga PIN-u konta i kodu z aplikacji. Konta dodatkowe mają własny PIN i własny klucz – na ekranie blokady wybiera się konto. Dodanie konta, nowy klucz, uprawnienia i usunięcie zatwierdza się kodem z aplikacji konta podstawowego. Reset PIN-u konta dodatkowego (gdy użytkownik go zapomni) jest dostępny tylko dla konta podstawowego – po odblokowaniu programu jego PIN-em.' }
     else { 'MFA wyłączone – program odblokowuje sam PIN. Najpierw włącz MFA dla konta podstawowego, potem możesz dodać kolejne konta.' }
     Update-MfaManagerButtons -Window $Window
 }
@@ -4869,7 +4940,13 @@ function Update-MfaManagerButtons {
     $Window.FindName('mfPrimary').IsEnabled = [bool]$script:UnlockPinHash
     $Window.FindName('mfAdd').IsEnabled = $hasPrimary
     $Window.FindName('mfRekey').IsEnabled = ($sel -ge 0)
-    $Window.FindName('mfAccess').IsEnabled = ($sel -ge 0 -and $sel -lt $accounts.Count -and -not $accounts[$sel].Primary)
+    $other = ($sel -ge 0 -and $sel -lt $accounts.Count -and -not $accounts[$sel].Primary)
+    $Window.FindName('mfAccess').IsEnabled = $other
+    $reset = $Window.FindName('mfResetPin')
+    $reset.IsEnabled = ($other -and (Test-MfaPrimarySession))
+    $reset.ToolTip = if (-not (Test-MfaPrimarySession)) { 'Tylko konto podstawowe: zablokuj program i odblokuj go PIN-em konta podstawowego' }
+    elseif ($other) { 'Nowy PIN wybranego konta (np. gdy użytkownik go zapomniał); zatwierdzasz kodem konta podstawowego' }
+    else { 'Wybierz konto dodatkowe – PIN konta podstawowego jest zapisany w skrypcie' }
     $Window.FindName('mfRemove').IsEnabled = ($sel -ge 0)
 }
 
@@ -4912,6 +4989,10 @@ $script:MfaManagerEvents = @{
             elseif ($op -eq 'Rekey' -and $acc) {
                 $action = if ($acc.Id -eq $approver.Id) { 'wygenerowanie nowego klucza' } else { "wygenerowanie nowego klucza dla konta «$($acc.Name)»" }
                 if (Read-MfaConfirmation -Account $approver -Action $action) { [void](Show-MfaEnroll -Account $acc) }
+            }
+            elseif ($op -eq 'ResetPin' -and $acc -and -not $acc.Primary) {
+                if (-not (Test-MfaPrimarySession)) { Show-Warning 'PIN innego konta może zresetować tylko konto podstawowe. Zablokuj program i odblokuj go PIN-em konta podstawowego.' }
+                elseif (Read-MfaConfirmation -Account $approver -Action "reset PIN-u konta «$($acc.Name)»") { [void](Show-MfaPinReset -Account $acc) }
             }
             elseif ($op -eq 'Access' -and $acc -and -not $acc.Primary) {
                 if (Read-MfaConfirmation -Account $approver -Action "zmianę uprawnień konta «$($acc.Name)»") { [void](Show-MfaAccessEditor -Account $acc) }
@@ -5012,9 +5093,34 @@ function Update-NavAccess {
     if ($btn) { $btn.Visibility = if (Test-AppAllowed 'Settings') { 'Visible' } else { 'Collapsed' } }
 }
 
+function Update-OperatorView {
+    # Operator - konto, które odblokowało program: na górnym pasku (przed kłódką) i w tytule okna; bez blokady PIN-em brak
+    $c = $script:UI.Controls
+    $w = $script:UI.Window
+    if (-not $w -or -not $c['operatorChip']) { return }
+    if (-not $script:UnlockPinHash) {
+        $c.operatorChip.Visibility = 'Collapsed'
+        $w.Title = 'Domain Ops'
+        return
+    }
+    $mfa = [bool]$script:UnlockState.User
+    $name = if ($mfa) { [string]$script:UnlockState.User } else { 'Konto podstawowe' }
+    $primary = ([string]$script:UnlockState.AccountId -eq '#primary')
+    $limits = Get-AccessDenyText -Deny @($script:Access.Deny)
+    $limited = $script:Access.Deny.Count -gt 0
+    $c.txtOperator.Text = $name
+    $c.txtOperatorMode.Text = if (-not $mfa) { 'operator • sam PIN' } elseif ($primary) { 'operator • konto podstawowe' } elseif ($limited) { 'operator • ograniczony dostęp' } else { 'operator • konto dodatkowe' }
+    $c.txtOperatorMode.Foreground = Get-Brush $(if ($limited) { '#FFC46B' } else { '#7B8496' })
+    $since = if ($script:UnlockState.Since) { ' (od {0:HH:mm})' -f $script:UnlockState.Since } else { '' }
+    $c.operatorChip.ToolTip = ("Operator programu: {0}{1} – {2}{3}.`nZmiana operatora: zablokuj program (Ctrl+Shift+L) i odblokuj go PIN-em i kodem innego konta." -f $name, $since, $(if (-not $mfa) { 'odblokowano PIN-em, bez MFA' } elseif ($primary) { 'konto podstawowe, MFA' } else { 'konto dodatkowe, MFA' }), $(if ($primary) { '' } else { "; $limits" }))
+    $c.operatorChip.Visibility = 'Visible'
+    $w.Title = "Domain Ops – operator: $name"
+}
+
 function Update-AccessView {
-    # Po zmianie konta: nawigacja i - gdy otwarty moduł jest teraz niedostępny - pierwszy dostępny
+    # Po zmianie konta: operator, nawigacja i - gdy otwarty moduł jest teraz niedostępny - pierwszy dostępny
     if (-not $script:UI.Window) { return }
+    Update-OperatorView
     Update-NavAccess
     $active = $script:UI.ActiveModule
     if ($script:UI.ActiveWorkspace -and (-not (Test-WorkspaceAllowed $script:UI.ActiveWorkspace) -or ($active -and -not (Test-ModuleAllowed $active.Key)))) {
@@ -9013,6 +9119,16 @@ $script:MainXaml = @'
               <TextBlock Style="{StaticResource Glyph}" Text="&#xE70D;" FontSize="10" Foreground="#7B8496" Margin="10,0,0,0"/>
             </StackPanel>
           </Button>
+          <Border x:Name="operatorChip" Background="#161B22" BorderBrush="#242B36" BorderThickness="1" CornerRadius="8" Padding="9,4,11,4"
+                  Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Style="{StaticResource Glyph}" Text="&#xE8D7;" FontSize="13" Foreground="#8CB0FF" VerticalAlignment="Center" Margin="0,0,8,0"/>
+              <StackPanel VerticalAlignment="Center">
+                <TextBlock x:Name="txtOperator" Foreground="#E4E8EF" FontSize="12.5" MaxWidth="180" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="txtOperatorMode" Foreground="#7B8496" FontSize="11"/>
+              </StackPanel>
+            </StackPanel>
+          </Border>
           <Button x:Name="btnLock" Style="{StaticResource GhostButton}" ToolTip="Zablokuj program – odblokowanie PIN-em (Ctrl+Shift+L)" Margin="4,0,0,0" Padding="10,7">
             <TextBlock Style="{StaticResource Glyph}" Text="&#xE72E;" FontSize="15"/>
           </Button>
@@ -9133,7 +9249,7 @@ function New-MainWindow {
     $w = New-UiElement $script:MainXaml
     $script:UI.Window = $w
     $c = $script:UI.Controls
-    foreach ($n in 'txtVersion', 'txtDomain', 'wsSwitcher', 'txtSubtitle', 'btnCred', 'txtCredUser', 'txtCredMode', 'btnLock', 'btnSettings',
+    foreach ($n in 'txtVersion', 'txtDomain', 'wsSwitcher', 'txtSubtitle', 'btnCred', 'txtCredUser', 'txtCredMode', 'operatorChip', 'txtOperator', 'txtOperatorMode', 'btnLock', 'btnSettings',
         'targetColumn', 'targetHost', 'navHost', 'contentHost', 'toastHost', 'logRow', 'logSplitter', 'logPanel', 'logList',
         'btnLogCopy', 'btnLogFile', 'btnLogClear', 'btnLogHide', 'statusDot', 'txtStatus', 'prgStatus', 'btnCancelOps', 'btnLogToggle',
         'logBadge', 'logBadgeText') {
@@ -9187,6 +9303,7 @@ function New-MainWindow {
     $w.add_SizeChanged({ param($s, $e) try { Update-HeaderLayout } catch { } })
 
     Update-CredentialLabel
+    Update-OperatorView
     Update-StatusBar
     return $w
 }
@@ -9268,6 +9385,7 @@ function Update-HeaderLayout {
         }
     }
     $script:UI.Controls.txtSubtitle.Visibility = if ($w.ActualWidth -lt 1440) { 'Collapsed' } else { 'Visible' }
+    $script:UI.Controls.txtOperatorMode.Visibility = if ($compact) { 'Collapsed' } else { 'Visible' }
 }
 
 function Set-LogVisible {
