@@ -15150,9 +15150,14 @@ function Get-DoOneDriveAccounts {
                 if ($path -and $path.StartsWith($folder.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $kfm += $pair[1] }
             }
         }
+        # Synchronizowane biblioteki SharePoint i skróty: nazwy wartości w Tenants\<dzierżawa> i ścieżki w ScopeIdToMountPointPathCache
+        $libs = New-Object System.Collections.Generic.List[string]
+        foreach ($t in @(Get-ChildItem -LiteralPath "$($a.PSPath)\Tenants" -ErrorAction SilentlyContinue)) { foreach ($n in $t.GetValueNames()) { if ($n) { $libs.Add([string]$n) } } }
+        try { $mk = Get-Item -LiteralPath "$($a.PSPath)\ScopeIdToMountPointPathCache" -ErrorAction Stop; foreach ($n in $mk.GetValueNames()) { $libs.Add([string]$mk.GetValue($n)) } } catch { }
+        $libs = @($libs | Where-Object { $_ -and (-not $folder -or $_.TrimEnd('\') -ne $folder.TrimEnd('\')) } | Sort-Object -Unique)
         [pscustomobject]@{
             Email = $email; Folder = $folder; Kind = $(if ($a.PSChildName -eq 'Personal') { 'OneDrive (prywatny)' } else { 'OneDrive dla Firm' })
-            Tenant = [string](Get-DoProp $v 'DisplayName'); Kfm = $kfm
+            Tenant = [string](Get-DoProp $v 'DisplayName'); Kfm = $kfm; Key = $a.PSChildName; Libraries = $libs
         }
     }
 }
@@ -15185,6 +15190,32 @@ function Test-DoAddinMatch {
     param([string]$Text, [string[]]$Tokens)
     foreach ($t in @($Tokens | Where-Object { $_ -and $_.Length -ge 3 })) { if ($Text.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
     return $false
+}
+
+function Get-DoFolderSize {
+    # Łączny rozmiar plików w folderach (bez wyjątków przy braku dostępu); -Exclude - wzorce nazw pomijanych plików
+    param([string[]]$Paths, [string[]]$Exclude = @())
+    $sum = 0.0
+    foreach ($p in $Paths) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p -PathType Container)) { continue }
+        foreach ($f in @(Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+            $skip = $false
+            foreach ($x in $Exclude) { if ($f.Name -like $x) { $skip = $true; break } }
+            if (-not $skip) { $sum += $f.Length }
+        }
+    }
+    return $sum
+}
+
+function Get-DoAppCachePaths {
+    # Foldery pamięci podręcznej aplikacji w profilu: Teams klasyczny i nowy, Outlook (RoamCache)
+    param([string]$ProfilePath, [ValidateSet('TeamsClassic', 'TeamsNew', 'Outlook')][string]$App)
+    if ($App -eq 'TeamsClassic') {
+        $base = Join-Path $ProfilePath 'AppData\Roaming\Microsoft\Teams'
+        return @('Cache', 'Code Cache', 'GPUCache', 'blob_storage', 'databases', 'IndexedDB', 'Local Storage', 'tmp', 'Service Worker\CacheStorage' | ForEach-Object { Join-Path $base $_ })
+    }
+    if ($App -eq 'TeamsNew') { return @(Join-Path $ProfilePath 'AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams') }
+    return @(Join-Path $ProfilePath 'AppData\Local\Microsoft\Outlook\RoamCache')
 }
 
 function Find-DoFiles {
@@ -15507,17 +15538,160 @@ $script:M365AddinActionScript = {
     }
 }
 
+# Teams, OneDrive i Outlook u użytkowników (tylko dane lokalne komputera - bez łączenia z usługami w chmurze):
+# konto OneDrive, foldery znane, biblioteki SharePoint, czy działa, ostatni stan z SyncDiagnostics.log, zasady grupy;
+# Teams nowy / klasyczny i Outlook - czy działają (proces użytkownika) i rozmiar pamięci podręcznej
+$script:M365AppsScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $polKey = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' -ErrorAction SilentlyContinue
+    $pol = New-Object System.Collections.Generic.List[string]
+    $kfmPolicy = [bool](Get-DoProp $polKey 'KFMSilentOptIn')
+    if ($kfmPolicy) { $pol.Add('foldery znane do OneDrive (KFM)') }
+    if ([string](Get-DoProp $polKey 'KFMBlockOptOut') -eq '1') { $pol.Add('blokada cofnięcia KFM') }
+    if ([string](Get-DoProp $polKey 'SilentAccountConfig') -eq '1') { $pol.Add('ciche logowanie') }
+    if ([string](Get-DoProp $polKey 'FilesOnDemandEnabled') -eq '1') { $pol.Add('pliki na żądanie') }
+    # Właściciel procesu (-IncludeUserName) wymaga uprawnień administratora - bez nich stan «działa» zostaje pusty
+    $procs = @()
+    try { $procs = @(Get-Process -Name 'OneDrive', 'ms-teams', 'Teams', 'OUTLOOK' -IncludeUserName -ErrorAction SilentlyContinue) } catch { }
+    $profiles = @(Get-DoProfiles -UserFilter $P.UserFilter)
+    foreach ($pr in $profiles) {
+        $run = { param([string[]]$Names) @($procs | Where-Object { $Names -contains $_.ProcessName -and [string]$_.UserName -ieq $pr.User }).Count -gt 0 }
+        $st = @{ Read = $false; Od = @() }
+        $err = ''
+        try {
+            Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
+                param($Root, $Source)
+                $st.Read = $true
+                $st.Od = @(Get-DoOneDriveAccounts -Root $Root -ProfilePath $pr.Path | Where-Object { $_.Kind -eq 'OneDrive dla Firm' })
+            }
+        }
+        catch { $err = $_.Exception.Message }
+        $od = @($st.Od) | Select-Object -First 1
+        $notes = New-Object System.Collections.Generic.List[string]
+        if ($err) { $notes.Add('rejestr: ' + $err) }
+        $odRun = & $run @('OneDrive')
+        $sync = ''
+        if ($od) {
+            $log = Join-Path $pr.Path ("AppData\Local\Microsoft\OneDrive\logs\{0}\SyncDiagnostics.log" -f $od.Key)
+            if (Test-Path -LiteralPath $log) {
+                $li = Get-Item -LiteralPath $log
+                $vals = @{}
+                foreach ($line in @(Get-Content -LiteralPath $log -TotalCount 400 -ErrorAction SilentlyContinue)) {
+                    if ($line -match '^\s*(FilesToUpload|FilesToDownload)\s*[:=]\s*(\d+)') { $vals[$Matches[1]] = [int]$Matches[2] }
+                }
+                $sync = 'stan z {0:yyyy-MM-dd HH:mm}' -f $li.LastWriteTime
+                if ($vals.Count) { $sync += ('; do wysłania {0}, do pobrania {1}' -f $(if ($vals.ContainsKey('FilesToUpload')) { $vals.FilesToUpload } else { '?' }), $(if ($vals.ContainsKey('FilesToDownload')) { $vals.FilesToDownload } else { '?' })) }
+                $age = ([datetime]::Now - $li.LastWriteTime).TotalDays
+                if ($pr.Loaded -and $age -ge 7) { $notes.Add(('OneDrive nie zapisał stanu od {0} dni' -f [int]$age)) }
+            }
+            if ($pr.Loaded -and -not $odRun) { $notes.Add('OneDrive nie działa u zalogowanego użytkownika') }
+            if ($kfmPolicy -and @($od.Kfm).Count -lt 2) { $notes.Add('zasada KFM, ale Pulpit lub Dokumenty poza OneDrive') }
+        }
+        elseif ($st.Read -and $pr.Loaded) { $notes.Add('brak konta OneDrive dla Firm') }
+        $teamsClassic = Test-Path -LiteralPath (Join-Path $pr.Path 'AppData\Roaming\Microsoft\Teams')
+        $teamsNew = Test-Path -LiteralPath (Join-Path $pr.Path 'AppData\Local\Packages\MSTeams_8wekyb3d8bbwe')
+        $teamsMb = [Math]::Round((Get-DoFolderSize -Paths (@(Get-DoAppCachePaths -ProfilePath $pr.Path -App TeamsClassic) + @(Get-DoAppCachePaths -ProfilePath $pr.Path -App TeamsNew))) / 1MB, 1)
+        $outlookMb = [Math]::Round((Get-DoFolderSize -Paths @(Get-DoAppCachePaths -ProfilePath $pr.Path -App Outlook) -Exclude @('Stream_Autocomplete*')) / 1MB, 1)
+        $libs = @(if ($od) { $od.Libraries })
+        [pscustomobject][ordered]@{
+            'Użytkownik' = $pr.User
+            'OneDrive' = $(if ($od) { $od.Email } elseif (-not $st.Read) { '(nie odczytano – niezalogowany)' } else { '' })
+            'Dzierżawa' = $(if ($od) { $od.Tenant } else { '' })
+            'Foldery w OneDrive' = $(if ($od) { (@($od.Kfm) -join ', ') } else { '' })
+            'Biblioteki SharePoint' = $(if ($libs.Count) { '{0}: {1}' -f $libs.Count, ((@($libs | Select-Object -First 3 | ForEach-Object { Split-Path -Leaf $_ })) -join ', ') + $(if ($libs.Count -gt 3) { ' …' } else { '' }) } else { '' })
+            'OneDrive działa' = $(if ($pr.Loaded) { $odRun } else { $null })
+            'Synchronizacja' = $sync
+            'Teams' = $(if ($teamsNew -and $teamsClassic) { 'nowy i klasyczny' } elseif ($teamsNew) { 'nowy' } elseif ($teamsClassic) { 'klasyczny' } else { '' })
+            'Teams działa' = $(if ($pr.Loaded) { & $run @('ms-teams', 'Teams') } else { $null })
+            'Pamięć Teams (MB)' = $teamsMb
+            'Outlook działa' = $(if ($pr.Loaded) { & $run @('OUTLOOK') } else { $null })
+            'Pamięć Outlooka (MB)' = $outlookMb
+            'Zasady OneDrive' = ($pol -join ', ')
+            'Uwagi' = ($notes -join '; ')
+            'Zalogowany' = $pr.Loaded
+            '__sid' = $pr.Sid; '__profile' = $pr.Path; '__user' = $pr.User; '__od' = $(if ($od) { $od.Key } else { '' })
+            '__tone' = $(if ($notes.Count) { 'warn' } else { '' })
+        }
+    }
+}
+
+# Czyszczenie pamięci Teams / Outlooka (najpierw zamknięcie aplikacji użytkownika) albo reset OneDrive (OneDrive.exe /reset
+# w sesji użytkownika przez jednorazowe zadanie harmonogramu, potem ponowne uruchomienie OneDrive)
+$script:M365AppActionScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $clear = {
+        param([string[]]$Paths, [string[]]$Keep)
+        $freed = 0.0; $removed = 0; $locked = 0
+        foreach ($p in $Paths) {
+            if (-not (Test-Path -LiteralPath $p -PathType Container)) { continue }
+            foreach ($f in @(Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+                $skip = $false
+                foreach ($k in $Keep) { if ($f.Name -like $k) { $skip = $true; break } }
+                if ($skip) { continue }
+                try { $len = $f.Length; Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $freed += $len; $removed++ } catch { $locked++ }
+            }
+            Get-ChildItem -LiteralPath $p -Recurse -Force -Directory -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending |
+                ForEach-Object { if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } }
+        }
+        return @{ Freed = $freed; Removed = $removed; Locked = $locked }
+    }
+    $stopApp = {
+        param([string[]]$Names, [string]$User)
+        $ps = @()
+        try { $ps = @(Get-Process -Name $Names -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { [string]$_.UserName -ieq $User }) } catch { }
+        foreach ($x in $ps) { try { Stop-Process -Id $x.Id -Force -ErrorAction Stop } catch { } }
+        if ($ps.Count) { Start-Sleep -Seconds 2 }
+        return $ps.Count
+    }
+    foreach ($it in @($P.Items)) {
+        try {
+            if ($P.Op -eq 'OneDriveReset') {
+                if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$($it.Sid)")) { throw 'użytkownik nie jest zalogowany – reset OneDrive działa w jego sesji' }
+                $cands = @(Join-Path $it.Profile 'AppData\Local\Microsoft\OneDrive\OneDrive.exe')
+                foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) { if ($pf) { $cands += (Join-Path $pf 'Microsoft OneDrive\OneDrive.exe') } }
+                $exe = $cands | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+                if (-not $exe) { throw 'nie znaleziono OneDrive.exe (profil użytkownika ani Program Files)' }
+                $principal = New-ScheduledTaskPrincipal -UserId $it.User -LogonType Interactive -RunLevel Limited
+                foreach ($arg in '/reset', '/background') {
+                    $task = 'DomainOps-OneDrive-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+                    Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $exe -Argument $arg) -Principal $principal -Force | Out-Null
+                    try { Start-ScheduledTask -TaskName $task; Start-Sleep -Seconds $(if ($arg -eq '/reset') { 10 } else { 2 }) }
+                    finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+                }
+                [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = 'reset OneDrive'; 'Wynik' = 'OK'; 'Uwagi' = 'OneDrive zresetowany i uruchomiony ponownie – ponowna synchronizacja bibliotek może potrwać; pliki zostają' }
+                continue
+            }
+            if ($P.Op -eq 'Teams') {
+                $closed = & $stopApp @('ms-teams', 'Teams') $it.User
+                $r = & $clear (@(Get-DoAppCachePaths -ProfilePath $it.Profile -App TeamsClassic) + @(Get-DoAppCachePaths -ProfilePath $it.Profile -App TeamsNew)) @()
+                $what = 'pamięć Teams'
+            }
+            else {
+                $closed = & $stopApp @('OUTLOOK') $it.User
+                $r = & $clear @(Get-DoAppCachePaths -ProfilePath $it.Profile -App Outlook) @('Stream_Autocomplete*')
+                $what = 'pamięć Outlooka (RoamCache)'
+            }
+            $note = @($(if ($closed) { "zamknięto procesy: $closed" }), $(if ($r.Locked) { "w użyciu (pominięte): $($r.Locked)" }), 'użytkownik uruchamia aplikację ponownie') | Where-Object { $_ }
+            [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = $what; 'Wynik' = ('OK – usunięto {0} plików, {1:N1} MB' -f $r.Removed, ($r.Freed / 1MB)); 'Uwagi' = ($note -join '; ') }
+        }
+        catch { [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = $P.Op; 'Wynik' = 'Błąd – ' + $_.Exception.Message } }
+    }
+}
+
 $script:M365Views = @(
     @{ Name = 'Office i Microsoft 365'; Op = 'Office i stan urządzenia'; Script = $script:M365DeviceScript; Hint = 'Office Click-to-Run (wersja, kanał, produkty, licencja współdzielona), dołączenie do Entra ID (dsregcmd) i zapis w Intune.' }
     @{ Name = 'Konta i skrzynki'; Op = 'Konta i skrzynki użytkowników'; Script = $script:M365AccountsScript; Hint = 'Konta Office i OneDrive, profile Outlooka (konta, pliki PST i OST) oraz skrzynki współdzielone i archiwa z automapowania (pamięć Autodiscover Outlooka). Skrzynki otwierane ręcznie przez «Otwórz skrzynkę» nie są zapisywane w profilu.' }
     @{ Name = 'Pliki PST'; Op = 'Wyszukiwanie plików PST'; Script = $script:M365PstScript; Hint = 'Pliki PST (opcjonalnie OST) w profilach użytkowników albo na wszystkich dyskach lokalnych, z informacją, czy są otwarte w profilu Outlooka. Zaznaczone pliki skopiujesz na udział z menu wiersza.' }
     @{ Name = 'Dodatki Outlooka'; Op = 'Dodatki Outlooka'; Script = $script:M365AddinsScript; Hint = 'Dodatki COM Outlooka u każdego użytkownika: czy się wczytują, czy wyłączył je Outlook (np. za wolne albo po awarii), lista «nie wyłączaj» i zasady grupy. Włączenie albo wyłączenie dodatku – menu wiersza (zalogowani, działa po ponownym uruchomieniu Outlooka).' }
+    @{ Name = 'Teams, OneDrive, Outlook'; Op = 'Teams, OneDrive i Outlook użytkowników'; Script = $script:M365AppsScript; Hint = 'Dla każdego użytkownika: konto OneDrive, foldery znane i biblioteki SharePoint w OneDrive, czy OneDrive działa, ostatni zapis stanu synchronizacji, zasady grupy; Teams (nowy, klasyczny) i Outlook – czy działają i ile zajmuje ich pamięć podręczna. Czyszczenie pamięci i reset OneDrive – menu wiersza. Tylko dane z komputera, bez łączenia z usługami w chmurze.' }
 )
 
 function Update-M365Options {
     param([hashtable]$Module)
     $v = Get-SegmentIndex $Module.ViewSel
-    $Module.UserFilter.IsEnabled = ($v -eq 1 -or $v -eq 3)
+    $Module.UserFilter.IsEnabled = ($v -in 1, 3, 4)
     $Module.Offline.IsEnabled = ($v -ne 0)
     $Module.Scope.IsEnabled = ($v -eq 2)
     $Module.Ost.IsEnabled = ($v -eq 2)
@@ -15556,7 +15730,7 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'M365' -Titl
             foreach ($r in $rows) { $v = Get-ObjectValue $r 'Rozmiar (MB)'; if ($v -is [double] -or $v -is [int] -or $v -is [decimal]) { $mb += [double]$v } elseif ([string]$v) { $mb += [double]([string]$v -replace ',', '.') } }
             Set-StatTile -Module $m -Key 'items' -Value ([string]$rows.Count)
             Set-StatTile -Module $m -Key 'users' -Value $(if ((Get-SegmentIndex $m.ViewSel) -eq 0) { '—' } else { [string]$users })
-            Set-StatTile -Module $m -Key 'size' -Value $(if ((Get-SegmentIndex $m.ViewSel) -in 0, 3) { '—' } else { ('{0:N1}' -f ($mb / 1024)) })
+            Set-StatTile -Module $m -Key 'size' -Value $(if ((Get-SegmentIndex $m.ViewSel) -in 0, 3, 4) { '—' } else { ('{0:N1}' -f ($mb / 1024)) })
         }
     }
     $m.Actions.OpenFolder = {
@@ -15667,6 +15841,25 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'M365' -Titl
         Start-HostOperation -Module $m -Name $(if ($Op -eq 'Enable') { 'Włączanie dodatków Outlooka' } else { 'Wyłączanie dodatków Outlooka' }) -Targets @($byHost.Keys) -PerTarget $per -Output Log -ScriptBlock $script:M365AddinActionScript `
             -OnComplete { param($m) if ((Get-SegmentIndex $m.ViewSel) -eq 3) { Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } } }
     }
+    $m.Actions.UserApp = {
+        # Czyszczenie pamięci Teams / Outlooka albo reset OneDrive u użytkowników z zaznaczonych wierszy (widok «Teams, OneDrive, Outlook»)
+        param($m, $Rows, [string]$Op)
+        $byHost = Get-SelectedRowsByHost -Module $m -Columns @('__sid', '__profile', '__user') -Rows $Rows
+        if ($byHost.Count -eq 0) { Show-Warning 'Zaznacz użytkowników w widoku «Teams, OneDrive, Outlook».'; return }
+        $items = Get-HostItemList -ByHost $byHost -Format { param($i) [string]$i['__user'] }
+        $text = @{
+            Teams         = 'Wyczyścić pamięć podręczną Teams (nowego i klasycznego) u wybranych użytkowników? Teams zostanie zamknięty – użytkownik uruchomi go ponownie; konto, czaty i pliki zostają (pobiorą się ponownie).'
+            Outlook       = 'Wyczyścić pamięć podręczną Outlooka (RoamCache) u wybranych użytkowników? Outlook zostanie zamknięty – niezapisane wiadomości przepadną. Autouzupełnianie adresów zostaje.'
+            OneDriveReset = 'Zresetować OneDrive u wybranych (zalogowanych) użytkowników? OneDrive odłączy i ponownie zsynchronizuje biblioteki – pliki zostają, ale pełna synchronizacja może potrwać. Reset i ponowne uruchomienie OneDrive są wykonywane w sesji użytkownika (jednorazowe zadanie harmonogramu).'
+        }[$Op]
+        if (-not (Confirm-Action -Text $text -Items $items -ConfirmText $(if ($Op -eq 'OneDriveReset') { 'Zresetuj' } else { 'Wyczyść' }) -Danger)) { return }
+        $per = @{}
+        foreach ($h in $byHost.Keys) { $per[$h] = @{ Helpers = $script:M365Helpers; Op = $Op; Items = @($byHost[$h] | ForEach-Object { @{ Sid = [string]$_['__sid']; Profile = [string]$_['__profile']; User = [string]$_['__user'] } }) } }
+        $m.Data.ActionHosts = @($byHost.Keys)
+        $name = @{ Teams = 'Czyszczenie pamięci Teams'; Outlook = 'Czyszczenie pamięci Outlooka'; OneDriveReset = 'Reset OneDrive' }[$Op]
+        Start-HostOperation -Module $m -Name $name -Targets @($byHost.Keys) -PerTarget $per -Output Log -ScriptBlock $script:M365AppActionScript `
+            -OnComplete { param($m) if ((Get-SegmentIndex $m.ViewSel) -eq 4) { Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } } }
+    }
     $m.PillColumns = @('Stan')
     $row = Add-ToolbarRow -Module $m -Title 'Widok'
     $m.ViewSel = Add-Segmented -Parent $row -Items @($script:M365Views | ForEach-Object { $_.Name }) -Module $m -OnChange { param($m) Update-M365Options -Module $m }
@@ -15686,6 +15879,9 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'M365' -Titl
     Add-RowAction -Module $m -Text 'Kopiuj pliki PST na udział…' -Icon 'E8C8' -Action { param($m, $rows) & $m.Actions.CopyPst $m $rows }
     Add-RowAction -Module $m -Text 'Dodatek: włącz na stałe…' -Icon 'E73E' -Separator -Action { param($m, $rows) & $m.Actions.Addin $m $rows 'Enable' }
     Add-RowAction -Module $m -Text 'Dodatek: wyłącz u użytkownika…' -Icon 'E711' -Danger -Action { param($m, $rows) & $m.Actions.Addin $m $rows 'Disable' }
+    Add-RowAction -Module $m -Text 'Wyczyść pamięć Teams…' -Icon 'E74D' -Separator -Danger -Action { param($m, $rows) & $m.Actions.UserApp $m $rows 'Teams' }
+    Add-RowAction -Module $m -Text 'Wyczyść pamięć Outlooka…' -Icon 'E74D' -Danger -Action { param($m, $rows) & $m.Actions.UserApp $m $rows 'Outlook' }
+    Add-RowAction -Module $m -Text 'Zresetuj OneDrive…' -Icon 'E72C' -Danger -Action { param($m, $rows) & $m.Actions.UserApp $m $rows 'OneDriveReset' }
 }
 #endregion
 
