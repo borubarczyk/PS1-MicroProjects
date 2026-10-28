@@ -4409,6 +4409,7 @@ $script:MfaDigits = 6
 $script:MfaPeriod = 30
 $script:Base32Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
 $script:MfaPinIterations = 100000
+$script:FocusPasswordBoxes = $true
 
 function ConvertTo-Base32 {
     param([Parameter(Mandatory)][byte[]]$Bytes)
@@ -4869,7 +4870,8 @@ function Show-MfaPinReset {
     $w.Tag.AccountId = [string]$Account.Id
     $w.FindName('prInfo').Text = "Konto «$($Account.Name)» będzie odblokowywać program nowym PIN-em i kodem z tej samej aplikacji co dotąd."
     $w.FindName('prPinLabel').Text = 'Nowy PIN ({0} cyfr)' -f $script:UnlockPinLength
-    $w.add_ContentRendered({ param($s, $e) [void]$s.FindName('prPin').Focus() })
+    # Kursor od razu w polu PIN-u (testy pod Wine wyłączają: tam skupienie na polu hasła zamyka proces)
+    if ($script:FocusPasswordBoxes) { $w.add_ContentRendered({ param($s, $e) [void]$s.FindName('prPin').Focus() }) }
     $ok = Invoke-Dialog $w
     if ($ok) { Write-Log ('MFA: konto podstawowe zresetowało PIN konta «{0}».' -f $Account.Name) 'WARN' -Module '' }
     return $ok
@@ -7292,29 +7294,30 @@ function Get-ReportTail {
 # przez Invoke-Command (blok dostaje jeden parametr: hashtablę $P). Tryb 'Local' wykonuje blok lokalnie
 # z parametrami ($Target, $P, $Ctx) - np. polecenia AD, kopiowanie plików albo połączenie obu podejść.
 # Wyniki odbiera timer w wątku okna, więc wszystkie aktualizacje interfejsu są bezpieczne.
-# $Stream: wyniki na bieżąco (Start-HostOperation -OnItem) - każdy obiekt od razu w opakowaniu z polem __item,
-# na końcu wynik bez danych (błędy); bez tego dane zbierane i zwracane razem z wynikiem.
+# $Stream: kolejka wyników na bieżąco (Start-HostOperation -OnItem) - każdy obiekt od razu trafia do kolejki
+# (odbiera ją timer okna), a wynik zadania (błędy) zwracany jest bez danych; bez kolejki dane zbierane do wyniku.
 $script:WorkerScript = @'
 param($Target, $Mode, $ScriptText, $P, $Ctx, $Stream)
 $ProgressPreference = 'SilentlyContinue'
 $result = @{ Target = $Target; Ok = $true; Data = @(); Errors = @() }
 try {
     $sb = [scriptblock]::Create($ScriptText)
-    if ($Stream) {
+    # Pusta kolekcja w warunku daje fałsz - stąd porównanie z $null
+    if ($null -ne $Stream) {
         $streamed = 0
         if ($Mode -eq 'Remote') {
             $icErrors = $null
             $ic = @{ ComputerName = $Target; ScriptBlock = $sb; ArgumentList = @(, $P); ErrorAction = 'SilentlyContinue'; ErrorVariable = 'icErrors' }
             if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
             if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
-            Invoke-Command @ic | ForEach-Object { if ($null -ne $_) { $streamed++; [pscustomobject]@{ __item = $_ } } }
+            Invoke-Command @ic | ForEach-Object { if ($null -ne $_) { $streamed++; $Stream.Enqueue($_) } }
             if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { $_.Exception.Message }) }
         }
         else {
             $errs = New-Object System.Collections.ArrayList
             & $sb $Target $P $Ctx 2>&1 | ForEach-Object {
                 if ($_ -is [System.Management.Automation.ErrorRecord]) { [void]$errs.Add($_.Exception.Message) }
-                elseif ($null -ne $_) { $streamed++; [pscustomobject]@{ __item = $_ } }
+                elseif ($null -ne $_) { $streamed++; $Stream.Enqueue($_) }
             }
             $result.Errors = @($errs)
         }
@@ -7515,19 +7518,11 @@ function Start-HostOperation {
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.RunspacePool = $runspacePool
         [void]$ps.AddScript($script:WorkerScript)
-        [void]$ps.AddArgument($t).AddArgument($mode).AddArgument($scriptText).AddArgument($p).AddArgument($ctx).AddArgument([bool]$OnItem)
-        if ($OnItem) {
-            # Wyniki na bieżąco: odbiera je Update-Operations (Receive-StreamItems) z kolekcji wyjściowej
-            $in = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
-            $in.Complete()
-            $out = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
-            $handle = $ps.BeginInvoke($in, $out)
-            [void]$op.Items.Add(@{ Target = $t; PS = $ps; Handle = $handle; Finished = $false; Stream = $true; Out = $out; Final = $null })
-        }
-        else {
-            $handle = $ps.BeginInvoke()
-            [void]$op.Items.Add(@{ Target = $t; PS = $ps; Handle = $handle; Finished = $false })
-        }
+        # Wyniki na bieżąco (-OnItem): kolejka bez blokad, z której obiekty odbiera Update-Operations (Receive-StreamItems)
+        $queue = if ($OnItem) { New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]' } else { $null }
+        [void]$ps.AddArgument($t).AddArgument($mode).AddArgument($scriptText).AddArgument($p).AddArgument($ctx).AddArgument($queue)
+        $handle = $ps.BeginInvoke()
+        [void]$op.Items.Add(@{ Target = $t; PS = $ps; Handle = $handle; Finished = $false; Queue = $queue })
     }
 
     [void]$script:Engine.Operations.Add($op)
@@ -7630,18 +7625,15 @@ function Update-Operations {
                     Complete-OperationItem -Operation $op -Result ([pscustomobject]@{ Target = $item.Target; Ok = $false; Data = @(); Errors = @($msg) })
                     continue
                 }
-                # Kolekcja wyjściowa bywa pusta (fałsz w warunku) - o trybie decyduje znacznik Stream
-                if (-not $item.Finished -and $item['Stream']) { Receive-StreamItems -Operation $op -Item $item }
+                if (-not $item.Finished -and $null -ne $item['Queue']) { Receive-StreamItems -Operation $op -Item $item }
                 if ($item.Finished -or -not $item.Handle.IsCompleted) { continue }
                 $item.Finished = $true
                 $changed = $true
                 $r = $null
                 try {
                     $output = $item.PS.EndInvoke($item.Handle)
-                    if ($item['Stream']) {
-                        Receive-StreamItems -Operation $op -Item $item
-                        $output = @($item.Final | Where-Object { $_ })
-                    }
+                    # Reszta wyników na bieżąco przed wynikiem zadania (OnResult widzi już wszystkie obiekty)
+                    if ($null -ne $item['Queue']) { Receive-StreamItems -Operation $op -Item $item -All }
                     if ($output -and $output.Count -gt 0) { $r = $output[0] }
                     if (-not $r) {
                         # Zadanie zatrzymane, zanim ruszyło (czekało w kolejce puli), nie zwraca nic
@@ -7685,19 +7677,21 @@ function Update-Operations {
 }
 
 function Receive-StreamItems {
-    # Obiekty operacji z -OnItem, które przyszły od ostatniego taktu timera; ostatni obiekt bez __item to wynik zadania
-    param([hashtable]$Operation, [hashtable]$Item)
-    $batch = $Item.Out.ReadAll()
-    if (-not $batch -or $batch.Count -eq 0) { return }
+    # Obiekty operacji z -OnItem, które przyszły od ostatniego taktu timera (najwyżej 500 na takt - okno nie zamarza;
+    # -All: wszystkie, po zakończeniu zadania)
+    param([hashtable]$Operation, [hashtable]$Item, [switch]$All)
+    $queue = $Item.Queue
+    if ($queue.IsEmpty) { return }
     $m = $Operation.Module
     $previous = $script:LogContext
     $script:LogContext = $m.Title
     try {
-        foreach ($o in $batch) {
-            if ($null -eq $o) { continue }
-            if (-not $o.PSObject.Properties['__item']) { $Item.Final = $o; continue }
-            if ($Operation.Cancelled) { continue }
-            try { $null = & $Operation.OnItem $m $Item.Target $o.__item }
+        $o = $null
+        $n = 0
+        while (($All -or $n -lt 500) -and $queue.TryDequeue([ref]$o)) {
+            $n++
+            if ($null -eq $o -or $Operation.Cancelled) { continue }
+            try { $null = & $Operation.OnItem $m $Item.Target $o }
             catch {
                 if (-not $Item['ItemError']) {
                     $Item.ItemError = $true
@@ -9452,7 +9446,7 @@ function Update-HeaderLayout {
     $script:UI.Controls.txtSubtitle.Visibility = if ($w.ActualWidth -lt 1440) { 'Collapsed' } else { 'Visible' }
     # Nazwa operatora przy kłódce tylko przy szerokim oknie (zawsze w tytule okna i w podpowiedzi kłódki)
     $op = $script:UI.Controls.txtOperator
-    $op.Visibility = if ($w.ActualWidth -ge 1440 -and $op.Text) { 'Visible' } else { 'Collapsed' }
+    $op.Visibility = if ($w.ActualWidth -ge 1600 -and $op.Text) { 'Visible' } else { 'Collapsed' }
 }
 
 function Set-LogVisible {
@@ -17637,13 +17631,15 @@ $script:LoadTileXaml = @'
 
 function Add-LoadTile {
     # Kafelek z wartością i wykresem ostatnich próbek (jak w Menedżerze zadań)
-    param([hashtable]$Module, [string]$Key, [string]$Label, [string]$Icon)
+    param([hashtable]$Module, [string]$Key, [string]$Label, [string]$Icon, [string]$ToolTip = '')
     $tile = New-UiElement $script:LoadTileXaml
     $tile.Style = Get-ThemeResource 'Card'
     $tile.Padding = '14,10'
     $tile.FindName('icon').Text = Get-Glyph $Icon
     $tile.FindName('value').Text = '–'
     $tile.FindName('label').Text = $Label
+    # Stała podpowiedź: zmieniana co próbkę migotałaby pod kursorem (a pod Wine zapętlała okno)
+    if ($ToolTip) { $tile.ToolTip = $ToolTip }
     $Module.Stats[$Key] = $tile
     [void]$Module.StatsGrid.Children.Add($tile)
     $Module.StatsGrid.Columns = $Module.StatsGrid.Children.Count
@@ -17651,12 +17647,10 @@ function Add-LoadTile {
 }
 
 function Set-LoadTile {
-    param([hashtable]$Module, [string]$Key, [string]$Value, [string]$Label, [string]$Tone = '', [object[]]$Series = @(), [double]$Max = 100, [string]$ToolTip = '')
+    param([hashtable]$Module, [string]$Key, [string]$Value, [string]$Label, [string]$Tone = '', [object[]]$Series = @(), [double]$Max = 100)
     Set-StatTile -Module $Module -Key $Key -Value $Value -Tone $Tone -Label $Label
     $tile = $Module.Stats[$Key]
     if (-not $tile) { return }
-    # Pełny opis w podpowiedzi - kafelki bywają wąskie
-    $tile.ToolTip = $(if ($ToolTip) { $ToolTip } else { "$Value – $Label" })
     $canvas = $tile.FindName('spark')
     $line = $tile.FindName('line')
     $line.Stroke = Get-Brush $(if ($Tone -eq 'crit') { '#FF7A86' } elseif ($Tone -eq 'warn') { '#FFC46B' } else { '#8CB0FF' })
@@ -17676,8 +17670,9 @@ function Set-LoadTile {
     $line.Points = $points
 }
 
+# Stała wysokość i wiersze bez zawijania: zmienna wysokość panelu przy każdej próbce przesuwała kafelki i tabelę
 $script:LoadWhyXaml = @'
-<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Margin="0,4,0,6">
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Margin="0,4,0,6" Height="168" ClipToBounds="True">
   <Grid.ColumnDefinitions>
     <ColumnDefinition Width="*"/>
     <ColumnDefinition Width="18"/>
@@ -17698,21 +17693,31 @@ $script:LoadWhyXaml = @'
 '@
 
 function Set-LoadLines {
-    # Wiersze z kolorową kropką (ocena) w panelu «Co się dzieje»
+    # Wiersze z kolorową kropką (ocena) w panelu «Co się dzieje»: jedna linia na wpis (pełny tekst - widok «Podsumowanie»
+    # i kopia), istniejące wiersze zmieniane w miejscu bez tworzenia elementów co próbkę
     param($Panel, [object[]]$Lines)
-    $Panel.Children.Clear()
-    foreach ($l in $Lines) {
-        $tb = New-Object System.Windows.Controls.TextBlock
-        $tb.TextWrapping = 'Wrap'
-        $tb.FontSize = 12.5
-        $tb.Margin = '0,0,0,4'
-        $tb.Foreground = Get-Brush '#C9D0DC'
-        $dot = New-Object System.Windows.Documents.Run '● '
-        $dot.Foreground = Get-Brush $(switch ([string]$l.Tone) { 'crit' { '#FF7A86' } 'warn' { '#FFC46B' } 'ok' { '#5EE3AE' } default { '#8CB0FF' } })
-        [void]$tb.Inlines.Add($dot)
+    $kids = $Panel.Children
+    while ($kids.Count -gt $Lines.Count) { $kids.RemoveAt($kids.Count - 1) }
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $l = $Lines[$i]
         $text = if ($l['Item']) { '{0}: {1}' -f $l.Item, $l.Text } else { [string]$l.Text }
-        [void]$tb.Inlines.Add((New-Object System.Windows.Documents.Run $text))
-        [void]$Panel.Children.Add($tb)
+        $color = switch ([string]$l.Tone) { 'crit' { '#FF7A86' } 'warn' { '#FFC46B' } 'ok' { '#5EE3AE' } default { '#8CB0FF' } }
+        if ($i -lt $kids.Count) { $tb = $kids[$i] }
+        else {
+            $tb = New-Object System.Windows.Controls.TextBlock
+            $tb.TextTrimming = 'CharacterEllipsis'
+            $tb.FontSize = 12.5
+            $tb.Margin = '0,0,0,4'
+            $tb.Foreground = Get-Brush '#C9D0DC'
+            [void]$tb.Inlines.Add((New-Object System.Windows.Documents.Run '● '))
+            [void]$tb.Inlines.Add((New-Object System.Windows.Documents.Run ''))
+            [void]$kids.Add($tb)
+        }
+        if ([string]$tb.Tag -eq "$color|$text") { continue }
+        $tb.Tag = "$color|$text"
+        $runs = @($tb.Inlines)
+        $runs[0].Foreground = Get-Brush $color
+        $runs[1].Text = $text
     }
 }
 
@@ -17801,7 +17806,10 @@ function Get-LoadRows {
             })
     }
     if ($View -eq 3) { return @($st.Ticks | Select-Object -Last 500 | ForEach-Object { ConvertTo-LoadTickRow $_ }) }
-    return @(Get-LoadSummary -State $st | ForEach-Object { [ordered]@{ 'Pozycja' = $_.Item; 'Wartość' = $_.Text; '__key' = $_.Item; '__flag' = $(if ($_.Tone -in 'warn', 'crit') { $_.Tone } else { '' }) } })
+    # Podsumowanie okna, a pod nim «co się dzieje teraz» (w panelu skrócone do jednej linii)
+    $i = 0
+    $now = @(Get-LoadFindings -State $st | ForEach-Object { $i++; @{ Item = "Teraz #$i"; Text = $_.Text; Tone = $_.Tone } })
+    return @(@(Get-LoadSummary -State $st) + $now | ForEach-Object { [ordered]@{ 'Pozycja' = $_.Item; 'Wartość' = $_.Text; '__key' = $_.Item; '__flag' = $(if ($_.Tone -in 'warn', 'crit') { $_.Tone } else { '' }) } })
 }
 
 function ConvertTo-LoadTickRow($Entry) {
@@ -17895,13 +17903,13 @@ function Update-LoadUi {
     if ($last) {
         $cpu = $last.Cpu
         $cpuText = if ($null -ne $cpu) { (Format-LoadNumber ([double]$cpu)) + '%' } else { '–' }
-        Set-LoadTile -Module $m -Key 'cpu' -Value $cpuText -Label ('Procesor • kolejka {0}' -f $(if ($null -ne $last.Queue) { $last.Queue } else { '–' })) -ToolTip ('Procesor {0} ({1} rdzeni), w jądrze {2}%, kolejka {3}; wykres – ostatnie {4} próbek' -f $cpuText, $cores, $(if ($null -ne $last.Kernel) { Format-LoadNumber ([double]$last.Kernel) } else { '–' }), $(if ($null -ne $last.Queue) { $last.Queue } else { '–' }), $ticks.Count) -Tone $(if ($null -ne $cpu -and $cpu -ge 85) { 'crit' } elseif ($null -ne $cpu -and $cpu -ge 60) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.Cpu })
+        Set-LoadTile -Module $m -Key 'cpu' -Value $cpuText -Label ('Procesor • kolejka {0}' -f $(if ($null -ne $last.Queue) { $last.Queue } else { '–' })) -Tone $(if ($null -ne $cpu -and $cpu -ge 85) { 'crit' } elseif ($null -ne $cpu -and $cpu -ge 60) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.Cpu })
         $used = $last.UsedPct
-        Set-LoadTile -Module $m -Key 'mem' -Value $(if ($null -ne $used) { (Format-LoadNumber ([double]$used)) + '%' } else { '–' }) -Label ('Pamięć • wolne {0} MB' -f (Format-LoadNumber ([double]$last.AvailMB))) -ToolTip ('Pamięć zajęta {0}%: wolne {1} MB z {2} MB, commit {3}%, {4} stron/s z dysku' -f $(if ($null -ne $used) { Format-LoadNumber ([double]$used) } else { '–' }), (Format-LoadNumber ([double]$last.AvailMB)), (Format-LoadNumber $memMB), $(if ($null -ne $last.CommitPct) { Format-LoadNumber ([double]$last.CommitPct) } else { '–' }), (Format-LoadNumber ([double]$last.HardPs))) -Tone $(if ($null -ne $last.AvailMB -and $memMB -gt 0 -and ([double]$last.AvailMB -lt 500 -or [double]$last.AvailMB -lt 0.05 * $memMB)) { 'crit' } elseif ($null -ne $used -and $used -ge 85) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.UsedPct })
+        Set-LoadTile -Module $m -Key 'mem' -Value $(if ($null -ne $used) { (Format-LoadNumber ([double]$used)) + '%' } else { '–' }) -Label ('Pamięć • wolne {0} MB' -f (Format-LoadNumber ([double]$last.AvailMB))) -Tone $(if ($null -ne $last.AvailMB -and $memMB -gt 0 -and ([double]$last.AvailMB -lt 500 -or [double]$last.AvailMB -lt 0.05 * $memMB)) { 'crit' } elseif ($null -ne $used -and $used -ge 85) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.UsedPct })
         $lat = $last.DiskLat
-        Set-LoadTile -Module $m -Key 'disk' -Value $(if ($null -ne $lat) { (Format-LoadNumber ([double]$lat) 1) + ' ms' } else { '–' }) -Label $(if ($last.DiskLatName) { 'Dysk {0} • {1}%' -f $last.DiskLatName, (Format-LoadNumber ([double]$last.DiskBusy)) } else { 'Dyski • bez operacji' }) -ToolTip $(if ($last.DiskLatName) { 'Najwolniejszy dysk {0}: {1} ms na operację; najbardziej zajęty {2}: {3}% czasu' -f $last.DiskLatName, (Format-LoadNumber ([double]$lat) 1), $last.DiskBusyName, (Format-LoadNumber ([double]$last.DiskBusy)) } else { '' }) -Tone $(if ($null -ne $lat -and $lat -ge 50) { 'crit' } elseif ($null -ne $lat -and $lat -ge 20) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.DiskLat }) -Max 20
+        Set-LoadTile -Module $m -Key 'disk' -Value $(if ($null -ne $lat) { (Format-LoadNumber ([double]$lat) 1) + ' ms' } else { '–' }) -Label $(if ($last.DiskLatName) { 'Dysk {0} • {1}%' -f $last.DiskLatName, (Format-LoadNumber ([double]$last.DiskBusy)) } else { 'Dyski • bez operacji' }) -Tone $(if ($null -ne $lat -and $lat -ge 50) { 'crit' } elseif ($null -ne $lat -and $lat -ge 20) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.DiskLat }) -Max 20
         $netV = [double]$last.NetMbps
-        Set-LoadTile -Module $m -Key 'net' -Value ((Format-LoadNumber $netV $(if ($netV -ge 100) { 0 } else { 1 })) + ' Mb/s') -Label $(if ($null -ne $last.NetUtil) { 'Sieć • {0}% łącza' -f (Format-LoadNumber ([double]$last.NetUtil)) } else { 'Sieć' }) -ToolTip $(if ($last.NetName) { 'Ruch razem {0} Mb/s; najbardziej obciążona karta {1}: {2}% łącza' -f (Format-LoadNumber $netV 1), $last.NetName, (Format-LoadNumber ([double]$last.NetUtil)) } else { '' }) -Tone $(if ($null -ne $last.NetUtil -and $last.NetUtil -ge 80) { 'crit' } elseif ($null -ne $last.NetUtil -and $last.NetUtil -ge 60) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.NetMbps }) -Max 1
+        Set-LoadTile -Module $m -Key 'net' -Value ((Format-LoadNumber $netV $(if ($netV -ge 100) { 0 } else { 1 })) + ' Mb/s') -Label $(if ($null -ne $last.NetUtil) { 'Sieć • {0}% łącza' -f (Format-LoadNumber ([double]$last.NetUtil)) } else { 'Sieć' }) -Tone $(if ($null -ne $last.NetUtil -and $last.NetUtil -ge 80) { 'crit' } elseif ($null -ne $last.NetUtil -and $last.NetUtil -ge 60) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.NetMbps }) -Max 1
     }
     $minutes = [double]$st.Params.Minutes
     $state = if ($st.Running) { 'trwa' } elseif ($st.Error) { 'błąd' } else { 'zakończony' }
@@ -17997,10 +18005,10 @@ function Initialize-LoadModule {
     Add-TopControl -Module $m -Control $why | Out-Null
     $row2 = Add-ToolbarRow -Module $m -Title 'Widok'
     $m.ViewSwitch = Add-Segmented -Parent $row2 -Items $script:LoadViews -Module $m -OnChange { param($m) Show-LoadView -Module $m }
-    Add-LoadTile -Module $m -Key 'cpu' -Label 'Procesor' -Icon 'E9D9'
-    Add-LoadTile -Module $m -Key 'mem' -Label 'Pamięć' -Icon 'E9D2'
-    Add-LoadTile -Module $m -Key 'disk' -Label 'Dyski' -Icon 'EDA2'
-    Add-LoadTile -Module $m -Key 'net' -Label 'Sieć' -Icon 'E968'
+    Add-LoadTile -Module $m -Key 'cpu' -Label 'Procesor' -Icon 'E9D9' -ToolTip 'Obciążenie procesora w ostatniej próbce i kolejka wątków czekających na procesor; wykres – ostatnie próbki (do 60)'
+    Add-LoadTile -Module $m -Key 'mem' -Label 'Pamięć' -Icon 'E9D2' -ToolTip 'Zajęta pamięć RAM i wolne megabajty; wykres – zajętość w ostatnich próbkach. Commit i stronicowanie – widok «Przebieg»'
+    Add-LoadTile -Module $m -Key 'disk' -Label 'Dyski' -Icon 'EDA2' -ToolTip 'Najwolniejszy wolumin (opóźnienie operacji) i jego zajętość; wykres – opóźnienie w ostatnich próbkach. Szczegóły – widok «Dyski»'
+    Add-LoadTile -Module $m -Key 'net' -Label 'Sieć' -Icon 'E968' -ToolTip 'Ruch sieciowy razem (odbiór + wysyłanie) i wykorzystanie najbardziej obciążonej karty; wykres – ostatnie próbki. Szczegóły – widok «Sieć»'
     Add-StatTile -Module $m -Key 'mon' -Label 'Czas pomiaru' -Icon 'E916' | Out-Null
     Add-RowAction -Module $m -Text 'Zakończ proces…' -Icon 'E711' -Danger -Action {
         param($m, $rows)
