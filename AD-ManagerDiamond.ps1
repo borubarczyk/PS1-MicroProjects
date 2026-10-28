@@ -15335,24 +15335,51 @@ function Get-DoGppItems {
 '@
 
 # Zmapowane dyski: HKEY_USERS\<SID>\Network\<litera> (połączenia trwałe), opcjonalnie historia Eksploratora (MountPoints2)
+# Pochodzenie: «GPO: nazwa» - ta sama litera i ścieżka w Preferencjach zasad grupy (zmienne %…% jako dowolny tekst);
+# pozostałe «ręcznie» (program sprawdza je jeszcze w skryptach logowania - $script:NetLogonScriptCheck)
 $script:NetDrivesScript = {
     param($P)
     . ([scriptblock]::Create($P.Helpers))
     $profiles = @(Get-DoProfiles -UserFilter $P.UserFilter)
     $skipped = @($profiles | Where-Object { -not $_.Loaded }).Count
+    $names = Get-DoGpoNames
     foreach ($pr in $profiles) {
+        $gpp = @(foreach ($it in @(Get-DoGppItems -Profile $pr -Kind 'Drives')) {
+                $x = $it.Props
+                if ([string]$x.GetAttribute('action') -eq 'D') { continue }
+                $guid = $it.Gpo.ToUpperInvariant()
+                @{ Letter = ([string]$x.GetAttribute('letter')).ToUpperInvariant(); Path = ([string]$x.GetAttribute('path')).TrimEnd('\'); Gpo = $(if ($names.ContainsKey($guid)) { $names[$guid] } else { $it.Gpo }) }
+            })
         try {
             Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
                 param($Root, $Source)
+                # Skrypty logowania z zasad grupy zastosowane dla użytkownika (plik i nazwa GPO) - treść sprawdza program
+                $scripts = @(foreach ($g in @(Get-ChildItem -LiteralPath "$Root\Software\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Logon" -ErrorAction SilentlyContinue)) {
+                        $gv = Get-ItemProperty -LiteralPath $g.PSPath -ErrorAction SilentlyContinue
+                        foreach ($s in @(Get-ChildItem -LiteralPath $g.PSPath -ErrorAction SilentlyContinue)) {
+                            $file = [string](Get-ItemProperty -LiteralPath $s.PSPath -ErrorAction SilentlyContinue).Script
+                            if (-not $file) { continue }
+                            if ($file -notmatch '^(\\\\|[A-Za-z]:)') { $file = ([string]$gv.FileSysPath).TrimEnd('\') + '\Scripts\Logon\' + $file }
+                            '{0}|{1}' -f $file, [string]$gv.DisplayName
+                        }
+                    })
                 foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Network" -ErrorAction SilentlyContinue)) {
                     $v = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
                     $path = [string]$v.RemotePath
                     # UserName: konto podane przy mapowaniu; własne konto użytkownika Windows zapisuje jako DWORD 0 albo pusty tekst
                     $account = if ($v.UserName -is [string]) { $v.UserName } else { '' }
+                    $letter = $k.PSChildName.ToUpperInvariant()
+                    $origin = 'ręcznie'
+                    foreach ($g in $gpp) {
+                        $pattern = [System.Management.Automation.WildcardPattern]::Escape($g.Path) -replace '%[^%]+%', '*'
+                        if ((-not $g.Letter -or $g.Letter -eq $letter) -and $path.TrimEnd('\') -like $pattern) { $origin = 'GPO: ' + $g.Gpo; break }
+                    }
                     [pscustomobject][ordered]@{
-                        'Użytkownik' = $pr.User; 'Litera' = ($k.PSChildName.ToUpperInvariant() + ':'); 'Ścieżka' = $path
+                        'Użytkownik' = $pr.User; 'Litera' = ($letter + ':'); 'Ścieżka' = $path
                         'Serwer' = $(if ($path -match '^\\\\([^\\]+)') { $Matches[1] } else { '' })
+                        'Pochodzenie' = $origin
                         'Konto połączenia' = $account; 'Trwałe' = $true; 'Zalogowany' = $pr.Loaded; 'Źródło' = $Source
+                        '__sid' = $pr.Sid; '__scripts' = ($scripts -join ';')
                     }
                 }
                 if ($P.History) {
@@ -15363,7 +15390,7 @@ $script:NetDrivesScript = {
                         $seen[$path] = $true
                         [pscustomobject][ordered]@{
                             'Użytkownik' = $pr.User; 'Litera' = ''; 'Ścieżka' = $path; 'Serwer' = $(if ($path -match '^\\\\([^\\]+)') { $Matches[1] } else { '' })
-                            'Konto połączenia' = ''; 'Trwałe' = $false; 'Zalogowany' = $pr.Loaded; 'Źródło' = 'historia Eksploratora (MountPoints2)'
+                            'Pochodzenie' = ''; 'Konto połączenia' = ''; 'Trwałe' = $false; 'Zalogowany' = $pr.Loaded; 'Źródło' = 'historia Eksploratora (MountPoints2)'
                         }
                     }
                 }
@@ -15373,6 +15400,94 @@ $script:NetDrivesScript = {
     }
     if ($skipped -and -not $P.Offline) {
         [pscustomobject][ordered]@{ 'Użytkownik' = "(niezalogowani: $skipped)"; 'Litera' = ''; 'Ścieżka' = ''; 'Zalogowany' = $false; 'Źródło' = 'pominięto'; 'Uwagi' = 'Zaznacz «Także niezalogowani», aby odczytać ich mapowania z NTUSER.DAT.' }
+    }
+}
+
+# Skrypty logowania użytkownika (AD: scriptPath w NETLOGON, oraz z zasad grupy): czy w treści jest ścieżka mapowanego dysku.
+# Po stronie programu (tryb lokalny) - sesja WinRM na komputerze docelowym nie ma dostępu do udziałów sieciowych (podwójny
+# skok uwierzytelnienia). Przybliżenie: ścieżki składane ze zmiennych w skrypcie nie zostaną rozpoznane.
+$script:NetLogonScriptCheck = {
+    param($Target, $P, $Ctx)
+    $files = [ordered]@{}
+    $name = [string]$P.User
+    $sam = @($name -split '\\')[-1]
+    $dom = if ($name -match '\\') { @($name -split '\\')[0] } else { '' }
+    if (-not $dom -or -not $P.Domain -or $dom -ieq $P.Domain) {
+        try {
+            Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false
+            $ad = @{ Identity = $sam; Properties = 'scriptPath'; ErrorAction = 'Stop' }
+            if ($Ctx.Server) { $ad.Server = $Ctx.Server }
+            if ($Ctx.Credential) { $ad.Credential = $Ctx.Credential }
+            $sp = [string](Get-ADUser @ad).scriptPath
+            if ($sp -match '^(\\\\|[A-Za-z]:)') { $files[$sp] = 'AD' }
+            elseif ($sp -and $P.Netlogon) { $files[(Join-Path $P.Netlogon $sp)] = 'AD' }
+        }
+        catch { }
+    }
+    foreach ($s in @($P.Scripts | Select-Object -Unique)) { $files[([string]$s).Split('|')[0]] = 'GPO' }
+    foreach ($f in @($files.Keys)) {
+        $text = $null
+        try { if ((Get-Item -LiteralPath $f -ErrorAction Stop).Length -le 2MB) { $text = [System.IO.File]::ReadAllText($f) } } catch { }
+        if (-not $text) { continue }
+        foreach ($path in @($P.Paths | Select-Object -Unique)) {
+            $needle = ([string]$path).TrimEnd('\')
+            if ($needle -and $text.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { [pscustomobject]@{ Path = $path; Script = (Split-Path -Leaf $f) } }
+        }
+    }
+}
+
+# Odłączenie dysków zmapowanych ręcznie: wpis trwały usuwany z profilu (zalogowani - ich gałąź rejestru, pozostali - NTUSER.DAT
+# na chwilę), a zalogowanym dysk odłączany od razu: net use /delete w ich sesji przez jednorazowe zadanie Harmonogramu
+$script:NetUnmapScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $profiles = @{}
+    foreach ($pr in @(Get-DoProfiles)) { $profiles[$pr.Sid] = $pr }
+    foreach ($it in @($P.Items)) {
+        $letter = ([string]$it.Letter).TrimEnd(':').ToUpperInvariant()
+        $res = [ordered]@{ 'Użytkownik' = $it.User; 'Dysk' = ('{0}: {1}' -f $letter, $it.Path); 'Wynik' = '' }
+        $pr = $profiles[[string]$it.Sid]
+        if (-not $pr) { $res.Wynik = 'Błąd – profil użytkownika nie istnieje na tym komputerze'; [pscustomobject]$res; continue }
+        $state = @{ Removed = $false; Other = '' }
+        try {
+            Use-DoUserHive -Profile $pr -LoadOffline $true -Action {
+                param($Root, $Source)
+                $key = "$Root\Network\$letter"
+                if (-not (Test-Path -LiteralPath $key)) { return }
+                $cur = [string](Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue).RemotePath
+                # Litera wskazuje już inny udział (zmiana po odczycie listy) - nie ruszamy
+                if ($it.Path -and $cur -and $cur -ne $it.Path) { $state.Other = $cur; return }
+                Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop
+                $state.Removed = $true
+            }
+        }
+        catch { $res.Wynik = 'Błąd – ' + $_.Exception.Message; [pscustomobject]$res; continue }
+        if ($state.Other) { $res.Wynik = 'Pominięto – litera {0}: wskazuje teraz {1}' -f $letter, $state.Other; [pscustomobject]$res; continue }
+        $parts = @($(if ($state.Removed) { 'usunięto z profilu (nie wróci przy logowaniu)' } else { 'w profilu nie było trwałego wpisu' }))
+        if ($pr.Loaded) {
+            $task = 'DomainOps-Unmap-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+            try {
+                $principal = New-ScheduledTaskPrincipal -UserId $it.User -LogonType Interactive -RunLevel Limited
+                Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\net.exe') -Argument ('use {0}: /delete /y' -f $letter)) -Principal $principal -Force | Out-Null
+                Start-ScheduledTask -TaskName $task
+                # Wynik net use: 0 - odłączono, 2 - nie było połączenia; 267009/267011 - zadanie jeszcze trwa / nie ruszyło
+                $code = $null
+                for ($i = 0; $i -lt 30; $i++) {
+                    Start-Sleep -Milliseconds 500
+                    $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+                    $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
+                    if ($t -and [string]$t.State -ne 'Running' -and $info -and [int64]$info.LastTaskResult -notin 267009, 267011) { $code = [int64]$info.LastTaskResult; break }
+                }
+                if ($code -eq 0) { $parts += 'odłączono w sesji użytkownika' }
+                elseif ($code -eq 2) { $parts += 'w sesji nie był połączony' }
+                elseif ($null -eq $code) { $parts += 'sesja nie odpowiedziała – dysk zniknie po wylogowaniu' }
+                else { $parts += 'net use w sesji: kod {0}' -f $code }
+            }
+            catch { $parts += 'nie odłączono w sesji: ' + $_.Exception.Message }
+            finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+        }
+        $res.Wynik = 'OK – ' + ($parts -join '; ')
+        [pscustomobject]$res
     }
 }
 
@@ -15479,7 +15594,7 @@ $script:NetSmbSessionsScript = {
 }
 
 $script:NetResViews = @(
-    @{ Name = 'Dyski zmapowane'; Op = 'Zmapowane dyski użytkowników'; Script = $script:NetDrivesScript; Hint = 'Zalogowani: rejestr ich sesji (połączenia trwałe). Mapowania nietrwałe (np. net use bez /persistent) widzi tylko sesja użytkownika.' }
+    @{ Name = 'Dyski zmapowane'; Op = 'Zmapowane dyski użytkowników'; Script = $script:NetDrivesScript; Hint = 'Zalogowani: rejestr ich sesji (połączenia trwałe). Mapowania nietrwałe (np. net use bez /persistent) widzi tylko sesja użytkownika. «Pochodzenie»: GPO, skrypt logowania albo ręcznie – ręczne można odłączyć (prawy przycisk myszy).' }
     @{ Name = 'Dyski z GPO'; Op = 'Dyski z zasad grupy'; Script = $script:NetGpoDrivesScript; Hint = 'Dyski z Preferencji zasad grupy zastosowane na komputerze (historia GPP), z nazwą GPO. Mapowania ze skryptów logowania nie są tu widoczne.' }
     @{ Name = 'Drukarki sieciowe'; Op = 'Drukarki sieciowe użytkowników'; Script = $script:NetPrintersScript; Hint = 'Połączenia drukarek z rejestru użytkowników oraz drukarki z Preferencji zasad grupy; «Domyślna» – drukarka domyślna użytkownika.' }
     @{ Name = 'Podłączeni do komputera (SMB)'; Op = 'Sesje SMB'; Script = $script:NetSmbSessionsScript; Hint = 'Klienci podłączeni do udziałów tego komputera. Zamknięcie sesji lub otwartego pliku – prawy przycisk myszy na wierszu.' }
@@ -15515,7 +15630,54 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'NetResource
             Set-StatTile -Module $m -Key 'items' -Value ([string]$rows.Count)
             Set-StatTile -Module $m -Key 'users' -Value ([string]$users)
             Set-StatTile -Module $m -Key 'servers' -Value $(if ((Get-SegmentIndex $m.ViewSel) -eq 3) { '—' } else { [string]$servers })
+            if ((Get-SegmentIndex $m.ViewSel) -eq 0) { & $m.Actions.CheckScripts $m }
         }
+    }
+    $m.Actions.CheckScripts = {
+        # Dyski «ręcznie»: czy mapuje je skrypt logowania (w tle, po stronie programu - NETLOGON i SYSVOL)
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Pochodzenie') -eq 'ręcznie' -and [string](Get-ObjectValue $_ 'Ścieżka') })
+        if (-not $rows.Count) { return }
+        $per = @{}
+        foreach ($r in $rows) {
+            $u = [string](Get-ObjectValue $r 'Użytkownik')
+            if (-not $per.ContainsKey($u)) { $per[$u] = @{ User = $u; Scripts = @(); Paths = @(); Domain = [string]$env:USERDOMAIN; Netlogon = $(if ($env:USERDNSDOMAIN) { "\\$($env:USERDNSDOMAIN)\NETLOGON" } else { '' }) } }
+            $per[$u].Scripts += @(([string](Get-ObjectValue $r '__scripts')).Split(';') | Where-Object { $_ })
+            $per[$u].Paths += [string](Get-ObjectValue $r 'Ścieżka')
+        }
+        Start-HostOperation -Module $m -Name 'Skrypty logowania' -Targets @($per.Keys) -PerTarget $per -Local -Background -Quiet -Output None -ScriptBlock $script:NetLogonScriptCheck -OnResult {
+            param($m, $r)
+            foreach ($o in @($r.Data)) {
+                foreach ($row in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Użytkownik') -eq $r.Target -and [string](Get-ObjectValue $_ 'Ścieżka') -eq [string]$o.Path -and [string](Get-ObjectValue $_ 'Pochodzenie') -eq 'ręcznie' })) {
+                    Set-ResultValue -Module $m -Row $row -Column 'Pochodzenie' -Value ('skrypt logowania: {0}' -f $o.Script)
+                }
+            }
+        }
+    }
+    $m.Actions.Unmap = {
+        # Odłączenie dysków zmapowanych ręcznie; z GPO i ze skryptów logowania pomijane - wróciłyby przy logowaniu
+        param($m, $Rows)
+        if ((Get-SegmentIndex $m.ViewSel) -ne 0) { Show-Warning 'Odłączanie dotyczy widoku «Dyski zmapowane».'; return }
+        $all = @($Rows | Where-Object { [string](Get-RowValue $_ 'Litera') -match '^[A-Za-z]:$' -and [string](Get-RowValue $_ '__sid') })
+        if (-not $all.Count) { Show-Warning 'Zaznacz zmapowane dyski (z literą) w widoku «Dyski zmapowane».'; return }
+        $fmt = { param($r) '{0}: {1} – {2} {3}' -f (Get-RowValue $r 'Komputer'), (Get-RowValue $r 'Użytkownik'), (Get-RowValue $r 'Litera'), (Get-RowValue $r 'Ścieżka') }
+        $manual = @($all | Where-Object { [string](Get-RowValue $_ 'Pochodzenie') -eq 'ręcznie' })
+        $skip = @($all | Where-Object { [string](Get-RowValue $_ 'Pochodzenie') -ne 'ręcznie' } | ForEach-Object { '{0} ({1})' -f (& $fmt $_), (Get-RowValue $_ 'Pochodzenie') })
+        if (-not $manual.Count) { Show-Warning ("Zaznaczone dyski mapuje GPO albo skrypt logowania – po odłączeniu wróciłyby przy następnym logowaniu; zmień je w zasadach grupy lub w skrypcie:`n" + ($skip -join "`n")); return }
+        $text = 'Odłączyć wybrane dyski sieciowe? Mapowanie zostanie usunięte z profilu użytkownika (nie wróci przy logowaniu), a zalogowanym dysk zniknie od razu (net use /delete w ich sesji). Pliki otwarte z tych dysków zostaną zamknięte.'
+        if ($skip.Count) { $text += "`n`nPominięte – mapuje je GPO lub skrypt logowania (wróciłyby przy logowaniu): " + ($skip -join '; ') }
+        $chosen = @(Confirm-Action -Text $text -Items @($manual | ForEach-Object { & $fmt $_ }) -ConfirmText 'Odłącz' -Danger -Select -ReturnIndex)
+        if (-not $chosen.Count) { return }
+        $per = @{}
+        foreach ($i in $chosen) {
+            $r = $manual[$i]
+            $h = [string](Get-RowValue $r 'Komputer')
+            if (-not $per.ContainsKey($h)) { $per[$h] = @{ Helpers = $script:NetResHelpers; Items = @() } }
+            $per[$h].Items += @{ Sid = [string](Get-RowValue $r '__sid'); User = [string](Get-RowValue $r 'Użytkownik'); Letter = [string](Get-RowValue $r 'Litera'); Path = [string](Get-RowValue $r 'Ścieżka') }
+        }
+        $m.Data.ActionHosts = @($per.Keys)
+        Start-HostOperation -Module $m -Name 'Odłączanie dysków sieciowych' -Targets @($per.Keys) -PerTarget $per -Output Log -ScriptBlock $script:NetUnmapScript `
+            -OnComplete { param($m) Invoke-WithTargets -Kind Computer -Names @($m.Data.ActionHosts) -Refresh -Action { & $m.Actions.List $m } }
     }
     $m.Actions.Close = {
         # Zamknięcie sesji SMB albo otwartych plików na komputerze (użytkownik straci niezapisane zmiany w tych plikach)
@@ -15560,6 +15722,7 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'NetResource
         if (-not $paths.Count) { Show-Warning 'Zaznaczone wiersze nie mają ścieżki sieciowej bez zmiennych (np. %LogonUser%).'; return }
         foreach ($path in @($paths | Select-Object -First 5)) { try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $path) } catch { Show-Error "Nie można otworzyć $path." $_ } }
     }
+    Add-RowAction -Module $m -Text 'Odłącz dysk sieciowy…' -Icon 'E8CE' -Danger -Separator -Action { param($m, $rows) & $m.Actions.Unmap $m $rows }
     Add-RowAction -Module $m -Text 'Zamknij sesję SMB…' -Icon 'E711' -Danger -Separator -Action { param($m, $rows) & $m.Actions.Close $m $rows 'Session' }
     Add-RowAction -Module $m -Text 'Zamknij otwarty plik…' -Icon 'E711' -Danger -Action { param($m, $rows) & $m.Actions.Close $m $rows 'File' }
 }
