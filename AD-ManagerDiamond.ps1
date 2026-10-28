@@ -122,6 +122,12 @@ $script:Settings = [ordered]@{
     InactiveDays     = 90
     # Blokada programu (PIN) po tylu minutach bez aktywności w jego oknach; 0 = wyłączona
     LockIdleMinutes  = 10
+    # Nadawca w tytule wiadomości do zalogowanych użytkowników
+    MessageSender    = 'Administrator'
+    # Pomoc zdalna Windows (msra /offerRA) w menu - wymaga konfiguracji w domenie, domyślnie ukryta
+    RemoteAssist     = $false
+    # Tryb diagnostyczny: kolejne kroki wybranych operacji w dzienniku (i w pliku dziennika)
+    DebugLog         = $false
     LastWorkspace    = 'Remote'
     LastModules      = @{}
     WindowWidth      = 1560
@@ -482,8 +488,10 @@ function Import-Settings {
     try { $s.GroupFilter = [Math]::Min(4, [Math]::Max(0, [int]$s.GroupFilter)) } catch { $s.GroupFilter = 0 }
     try { $s.LogHeight = [Math]::Min(600, [Math]::Max(90, [int]$s.LogHeight)) } catch { $s.LogHeight = 190 }
     try { $s.WindowWidth = [Math]::Max(1100, [int]$s.WindowWidth); $s.WindowHeight = [Math]::Max(680, [int]$s.WindowHeight) } catch { }
-    foreach ($b in 'OnlyEnabled', 'WindowMaximized', 'LogVisible', 'DetailVisible', 'ProfilesImported') { $s[$b] = [bool]$s[$b] }
-    foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace', 'GroupSearchBase', 'DisabledBaseOU', 'AadSyncServer', 'ReportJobsDir') { $s[$t] = [string]$s[$t] }
+    foreach ($b in 'OnlyEnabled', 'WindowMaximized', 'LogVisible', 'DetailVisible', 'ProfilesImported', 'RemoteAssist', 'DebugLog') { $s[$b] = [bool]$s[$b] }
+    foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace', 'GroupSearchBase', 'DisabledBaseOU', 'AadSyncServer', 'ReportJobsDir', 'MessageSender') { $s[$t] = [string]$s[$t] }
+    $s.MessageSender = $s.MessageSender.Trim()
+    if (-not $s.MessageSender -or $s.MessageSender.Length -gt 60) { $s.MessageSender = 'Administrator' }
     foreach ($l in 'ExceptionUsers', 'ProtectedGroups', 'NtfsHiddenIdentities') { $s[$l] = @($s[$l] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
     # ConvertTo-PlainData zwraca tablicę jako jeden obiekt - najpierw do zmiennej, dopiero potem wyliczanie
     $tpl = ConvertTo-PlainData $s.LocalGroupTemplates
@@ -2088,9 +2096,10 @@ function Add-OuField {
 $script:OuFields = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
 
 function Add-RowAction {
-    # Pozycja menu kontekstowego tabeli wyników; akcja dostaje ($m, $rows) - zaznaczone wiersze (DataRowView)
-    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][scriptblock]$Action, [string]$Icon = '', [switch]$Danger, [switch]$Separator)
-    [void]$Module.RowActions.Add(@{ Text = $Text; Action = $Action; Icon = $Icon; Danger = [bool]$Danger; Separator = [bool]$Separator })
+    # Pozycja menu kontekstowego tabeli wyników; akcja dostaje ($m, $rows) - zaznaczone wiersze (DataRowView).
+    # -Visible: warunek sprawdzany przy każdym otwarciu menu (np. funkcja włączana w ustawieniach)
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][scriptblock]$Action, [string]$Icon = '', [switch]$Danger, [switch]$Separator, [scriptblock]$Visible)
+    [void]$Module.RowActions.Add(@{ Text = $Text; Action = $Action; Icon = $Icon; Danger = [bool]$Danger; Separator = [bool]$Separator; Visible = $Visible })
 }
 #endregion
 
@@ -3292,53 +3301,80 @@ function Show-SettingsDialog {
     if (-not (Test-AppAllowed 'Settings')) { Show-AccessDenied 'Ustawienia programu'; return $false }
     $body = @'
 <StackPanel>
-  <TextBlock Text="Kontroler domeny" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
-  <TextBox x:Name="stDc" Tag="puste = wybór automatyczny"/>
-  <Grid Margin="0,14,0,0">
-    <Grid.ColumnDefinitions>
-      <ColumnDefinition Width="*"/>
-      <ColumnDefinition Width="14"/>
-      <ColumnDefinition Width="*"/>
-    </Grid.ColumnDefinitions>
-    <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="12"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="12"/>
-      <RowDefinition Height="Auto"/>
-    </Grid.RowDefinitions>
-    <StackPanel>
-      <TextBlock Text="Równoległe operacje" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
-      <TextBox x:Name="stThrottle" HorizontalContentAlignment="Right"/>
-    </StackPanel>
-    <StackPanel Grid.Column="2">
-      <TextBlock Text="Równoległe zapytania AD" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
-      <TextBox x:Name="stAdThrottle" HorizontalContentAlignment="Right"/>
-    </StackPanel>
-    <StackPanel Grid.Row="2">
-      <TextBlock Text="Limit połączenia (s)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
-      <TextBox x:Name="stTimeout" HorizontalContentAlignment="Right"/>
-    </StackPanel>
-    <StackPanel Grid.Row="2" Grid.Column="2">
-      <TextBlock Text="Nieaktywność (dni)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
-      <TextBox x:Name="stDays" HorizontalContentAlignment="Right"/>
-    </StackPanel>
-    <StackPanel Grid.Row="4">
-      <TextBlock Text="Blokada po bezczynności (min)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
-      <TextBox x:Name="stIdle" HorizontalContentAlignment="Right"/>
-    </StackPanel>
-  </Grid>
-  <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"
-             Text="Równoległe operacje na komputerach: 1–64. Zapytania AD: 1–16 – usługa ADWS na kontrolerze domeny odrzuca zbyt wiele żądań naraz («A connection to the directory … was unavailable»), więc przy takich błędach zmniejsz tę wartość (przejściowe błędy są i tak ponawiane). Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili. Blokada po bezczynności: 0–240 min (0 = wyłączona) – po tylu minutach bez klawisza, kliknięcia czy ruchu myszy w oknach programu wymaga PIN-u, jak przycisk z kłódką."/>
-  <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
-  <TextBlock Text="Zabezpieczenia" Foreground="#8791A5" FontSize="12" Margin="0,0,0,6"/>
   <Grid>
     <Grid.ColumnDefinitions>
       <ColumnDefinition Width="*"/>
-      <ColumnDefinition Width="Auto"/>
+      <ColumnDefinition Width="28"/>
+      <ColumnDefinition Width="*"/>
     </Grid.ColumnDefinitions>
-    <TextBlock x:Name="stMfaInfo" Foreground="#AEB6C4" FontSize="12.5" TextWrapping="Wrap" VerticalAlignment="Center" Margin="0,0,12,0"/>
-    <Button x:Name="stMfa" Grid.Column="1"/>
+    <StackPanel>
+      <TextBlock Text="Kontroler domeny" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+      <TextBox x:Name="stDc" Tag="puste = wybór automatyczny"/>
+      <Grid Margin="0,14,0,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="14"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="12"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="12"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <StackPanel>
+          <TextBlock Text="Równoległe operacje" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+          <TextBox x:Name="stThrottle" HorizontalContentAlignment="Right"/>
+        </StackPanel>
+        <StackPanel Grid.Column="2">
+          <TextBlock Text="Równoległe zapytania AD" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+          <TextBox x:Name="stAdThrottle" HorizontalContentAlignment="Right"/>
+        </StackPanel>
+        <StackPanel Grid.Row="2">
+          <TextBlock Text="Limit połączenia (s)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+          <TextBox x:Name="stTimeout" HorizontalContentAlignment="Right"/>
+        </StackPanel>
+        <StackPanel Grid.Row="2" Grid.Column="2">
+          <TextBlock Text="Nieaktywność (dni)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+          <TextBox x:Name="stDays" HorizontalContentAlignment="Right"/>
+        </StackPanel>
+        <StackPanel Grid.Row="4">
+          <TextBlock Text="Blokada po bezczynności (min)" Foreground="#8791A5" FontSize="12" Margin="0,0,0,5"/>
+          <TextBox x:Name="stIdle" HorizontalContentAlignment="Right"/>
+        </StackPanel>
+      </Grid>
+      <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"
+                 Text="Równoległe operacje na komputerach: 1–64. Zapytania AD: 1–16 – usługa ADWS na kontrolerze domeny odrzuca zbyt wiele żądań naraz («A connection to the directory … was unavailable»), więc przy takich błędach zmniejsz tę wartość (przejściowe błędy są i tak ponawiane). Limit połączenia WinRM: 5–300 s. Nieaktywność to domyślna wartość raportów kont i profili. Blokada po bezczynności: 0–240 min (0 = wyłączona) – po tylu minutach bez klawisza, kliknięcia czy ruchu myszy w oknach programu wymaga PIN-u, jak przycisk z kłódką."/>
+    </StackPanel>
+    <StackPanel Grid.Column="2">
+      <TextBlock Text="Zabezpieczenia" Foreground="#8791A5" FontSize="12" Margin="0,0,0,6"/>
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="stMfaInfo" Foreground="#AEB6C4" FontSize="12.5" TextWrapping="Wrap" VerticalAlignment="Center" Margin="0,0,12,0"/>
+        <Button x:Name="stMfa" Grid.Column="1"/>
+      </Grid>
+      <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
+      <TextBlock Text="Użytkownicy i diagnostyka" Foreground="#8791A5" FontSize="12" Margin="0,0,0,6"/>
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="Nadawca wiadomości" Foreground="#AEB6C4" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,12,0"/>
+        <TextBox x:Name="stSender" Grid.Column="1" Tag="np. Administrator, Dział IT" ToolTip="Tytuł okna wiadomości u użytkownika: «Wiadomość od: …» (lista komputerów, sesje RDS)"/>
+      </Grid>
+      <CheckBox x:Name="stRa" Margin="0,10,0,0">
+        <TextBlock TextWrapping="Wrap" Text="Pokazuj «Zaoferuj pomoc zdalną» (Pomoc zdalna Windows – msra)"/>
+      </CheckBox>
+      <TextBlock x:Name="stRaInfo" Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="24,3,0,0"/>
+      <CheckBox x:Name="stDebug" Margin="0,10,0,0">
+        <TextBlock TextWrapping="Wrap" Text="Tryb diagnostyczny – kolejne kroki operacji (np. podłączanie i odłączanie dysków) w dzienniku i w pliku dziennika"/>
+      </CheckBox>
+    </StackPanel>
   </Grid>
   <Border Height="1" Background="#242B36" Margin="0,16,0,12"/>
   <TextBlock Text="Pliki programu" Foreground="#8791A5" FontSize="12" Margin="0,0,0,6"/>
@@ -3352,7 +3388,7 @@ function Show-SettingsDialog {
   <TextBlock x:Name="stInfo" Foreground="#5E6779" FontSize="11.5" TextWrapping="Wrap" Margin="0,8,0,0"/>
 </StackPanel>
 '@
-    $w = New-Dialog -Title 'Ustawienia' -Subtitle 'Połączenia, wydajność i pliki programu.' -Body $body -Icon 'E713' -OkText 'Zapisz' -Width 560 -Validate {
+    $w = New-Dialog -Title 'Ustawienia' -Subtitle 'Połączenia, wydajność, użytkownicy i pliki programu.' -Body $body -Icon 'E713' -OkText 'Zapisz' -Width 920 -Validate {
         param($w)
         foreach ($pair in @(@('stThrottle', 1, 64, 'Równoległe operacje'), @('stAdThrottle', 1, 16, 'Równoległe zapytania AD'), @('stTimeout', 5, 300, 'Limit połączenia'), @('stDays', 1, 3650, 'Nieaktywność'), @('stIdle', 0, 240, 'Blokada po bezczynności'))) {
             $v = 0
@@ -3361,6 +3397,7 @@ function Show-SettingsDialog {
                 return $false
             }
         }
+        if ($w.FindName('stSender').Text.Trim().Length -gt 60) { Show-Warning 'Nadawca wiadomości: najwyżej 60 znaków.'; return $false }
         return $true
     }
     $w.FindName('stDc').Text = [string]$script:Settings.DomainController
@@ -3371,6 +3408,10 @@ function Show-SettingsDialog {
     $idle = $w.FindName('stIdle')
     $idle.Text = [string]$script:Settings.LockIdleMinutes
     if (-not $script:UnlockPinHash) { $idle.IsEnabled = $false; $idle.ToolTip = 'Blokada PIN-em jest wyłączona (pusty skrót PIN-u w skrypcie).' }
+    $w.FindName('stSender').Text = [string]$script:Settings.MessageSender
+    $w.FindName('stRa').IsChecked = [bool]$script:Settings.RemoteAssist
+    $w.FindName('stRaInfo').Text = $script:RemoteAssistShortInfo
+    $w.FindName('stDebug').IsChecked = [bool]$script:Settings.DebugLog
     # Lokalizacje plików: ścieżka do skopiowania i Eksplorator z zaznaczonym plikiem (albo otwartym folderem)
     $files = $w.FindName('stFiles')
     $locations = @(
@@ -3418,6 +3459,10 @@ function Show-SettingsDialog {
     $script:Settings.TimeoutSec = [int]$w.FindName('stTimeout').Text.Trim()
     $script:Settings.InactiveDays = [int]$w.FindName('stDays').Text.Trim()
     $script:Settings.LockIdleMinutes = [int]$w.FindName('stIdle').Text.Trim()
+    $msgFrom = $w.FindName('stSender').Text.Trim()
+    $script:Settings.MessageSender = if ($msgFrom) { $msgFrom } else { 'Administrator' }
+    $script:Settings.RemoteAssist = ($w.FindName('stRa').IsChecked -eq $true)
+    $script:Settings.DebugLog = ($w.FindName('stDebug').IsChecked -eq $true)
     Set-EngineThrottle ([int]$w.FindName('stThrottle').Text.Trim()) ([int]$w.FindName('stAdThrottle').Text.Trim())
     Export-Settings
     return $true
@@ -5664,6 +5709,7 @@ function Update-GridMenu {
     $rows = @(Get-SelectedResultRows -Module $Module)
     $hasRows = $rows.Count -gt 0
     foreach ($a in $Module.RowActions) {
+        if ($a['Visible'] -and -not (& $a['Visible'])) { continue }
         if ($a.Separator -and $menu.Items.Count -gt 0) { [void]$menu.Items.Add((New-MenuSeparator)) }
         $item = New-MenuItem -Text $a.Text -Icon $a.Icon -Module $Module -Danger:$a.Danger -Enabled ($hasRows -and -not $Module.Busy) -Action {
             param($m, $s)
@@ -7342,15 +7388,20 @@ try {
         if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { $_.Exception.Message }) }
     }
     else {
-        $raw = @(& $sb $Target $P $Ctx 2>&1)
-        $result.Data = @($raw | Where-Object { $null -ne $_ -and $_ -isnot [System.Management.Automation.ErrorRecord] })
-        $result.Errors = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.Exception.Message })
+        # Wyniki zbierane na bieżąco: błąd przerywający blok nie kasuje tego, co blok już zwrócił (OnResult je dostaje)
+        $raw = New-Object System.Collections.ArrayList
+        try { & $sb $Target $P $Ctx 2>&1 | ForEach-Object { [void]$raw.Add($_) } }
+        finally {
+            $result.Data = @($raw | Where-Object { $null -ne $_ -and $_ -isnot [System.Management.Automation.ErrorRecord] })
+            $result.Errors = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.Exception.Message })
+        }
     }
 }
 catch {
     $result.Errors = @($result.Errors) + @($_.Exception.Message)
+    $result.Terminated = $true
 }
-if ($result.Errors.Count -gt 0 -and $result.Data.Count -eq 0) { $result.Ok = $false }
+if ($result.Errors.Count -gt 0 -and ($result.Data.Count -eq 0 -or $result['Terminated'])) { $result.Ok = $false }
 [pscustomobject]$result
 '@
 
@@ -7740,7 +7791,8 @@ function Complete-OperationItem {
                 'Log' {
                     foreach ($d in $data) {
                         $text = Format-LogObject $d
-                        $level = if ($text -match 'Błąd') { 'WARN' } else { 'OK' }
+                        # Wiersze trybu diagnostycznego (Diagnostyka) jako informacja, nie wynik
+                        $level = if ($d -isnot [string] -and $d.PSObject.Properties['Diagnostyka']) { 'INFO' } elseif ($text -match 'Błąd') { 'WARN' } else { 'OK' }
                         Write-Log ("[{0}] {1}" -f $Result.Target, $text) $level
                     }
                 }
@@ -8446,17 +8498,29 @@ function New-SourceRow {
 }
 
 function Add-PanelMenu {
-    # Menu kontekstowe listy: pozycje @{ Text; Icon; Action = { param($panel, $names) } } albo '-' (separator)
+    # Menu kontekstowe listy: pozycje @{ Text; Icon; Action = { param($panel, $names) }; Visible = { warunek } } albo '-' (separator)
     param([hashtable]$Panel, [object[]]$Items)
     $menu = New-Object System.Windows.Controls.ContextMenu
     foreach ($it in $Items) {
         if ($it -is [string]) { [void]$menu.Items.Add((New-MenuSeparator)); continue }
         $mi = New-MenuItem -Text $it.Text -Icon $it.Icon -Danger:([bool]$it['Danger'])
-        $script:PanelMenuActions[$mi] = @{ Panel = $Panel; Action = $it.Action }
+        $script:PanelMenuActions[$mi] = @{ Panel = $Panel; Action = $it.Action; Visible = $it['Visible'] }
         $mi.add_Click($script:PanelMenuClick)
         [void]$menu.Items.Add($mi)
     }
+    $menu.add_Opened({ param($s, $e) Update-PanelMenu -Menu $s })
+    Update-PanelMenu -Menu $menu
     $Panel.pList.ContextMenu = $menu
+}
+
+function Update-PanelMenu {
+    # Pozycje z warunkiem Visible (np. włączane w ustawieniach) - sprawdzane przy każdym otwarciu menu
+    param($Menu)
+    foreach ($mi in @($Menu.Items)) {
+        $entry = $null
+        if (-not $script:PanelMenuActions.TryGetValue($mi, [ref]$entry) -or -not $entry.Visible) { continue }
+        $mi.Visibility = if (& $entry.Visible) { 'Visible' } else { 'Collapsed' }
+    }
 }
 $script:PanelMenuActions = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
 $script:PanelMenuClick = {
@@ -8481,13 +8545,92 @@ function Start-Tool {
     catch { Show-Error "Nie można uruchomić $FilePath." $_ }
 }
 
+# Pomoc zdalna Windows (msra /offerRA) - opis wymagań (ustawienia, brak programu, README)
+$script:RemoteAssistShortInfo = 'Wbudowana w Windows, bez licencji. Wymaga: msra.exe u operatora (Windows Server – funkcja «Pomoc zdalna»), zasady grupy «Konfiguruj oferowanie pomocy zdalnej» z listą pomocników i reguły zapory «Pomoc zdalna» na komputerach; użytkownik musi przyjąć pomoc.'
+$script:RemoteAssistInfo = @'
+Pomoc zdalna Windows (msra /offerRA) jest wbudowana w system i nie wymaga licencji. Operator oferuje pomoc, użytkownik widzi pytanie i musi ją przyjąć; potem operator widzi jego pulpit (a za zgodą użytkownika może przejąć sterowanie).
+
+Co jest potrzebne:
+• Komputer operatora: program msra.exe. W Windows 10/11 zwykle jest; w Windows Server trzeba doinstalować funkcję «Pomoc zdalna» (Install-WindowsFeature Remote-Assistance) albo uruchamiać program z komputera z Windows 10/11.
+• Komputery użytkowników (zasady grupy): Konfiguracja komputera › Szablony administracyjne › System › Pomoc zdalna › «Konfiguruj oferowanie pomocy zdalnej» – włączone, z listą pomocników (np. grupa administratorów pomocy) i wybranym poziomem (podgląd albo sterowanie).
+• Zapora na komputerach użytkowników: reguły «Pomoc zdalna» (DCOM i RA Server) w profilu domeny – np. ta sama gałąź zasad grupy albo Zapora Windows › reguły przychodzące.
+• Użytkownik musi być zalogowany i zaakceptować pomoc.
+
+Pozycję menu włącza się w Ustawieniach («Pokazuj «Zaoferuj pomoc zdalną»»).
+'@
+
+function Get-MsraPath {
+    # msra.exe z systemu; 32-bitowy PowerShell w 64-bitowym Windows widzi SysWOW64 (bez msra.exe) - wtedy przez Sysnative
+    foreach ($p in (Join-Path $env:windir 'System32\msra.exe'), (Join-Path $env:windir 'Sysnative\msra.exe')) { if (Test-Path -LiteralPath $p) { return $p } }
+    return $null
+}
+
+function Start-RemoteAssistance {
+    # Oferta pomocy zdalnej dla komputera (użytkownik musi przyjąć); bez msra.exe - opis, co doinstalować i skonfigurować
+    param([string]$Computer)
+    $exe = Get-MsraPath
+    if (-not $exe) { Show-Message -Title 'Pomoc zdalna niedostępna' -Tone 'warn' -Text ("Na tym komputerze nie ma programu Pomoc zdalna Windows (msra.exe).`n`n" + $script:RemoteAssistInfo); return }
+    Start-Tool -FilePath $exe -Arguments @('/offerRA', $Computer) -Name $Computer
+}
+
+# Okno wiadomości w sesjach użytkowników przez WTSSendMessage - własny tytuł «Wiadomość od: …» (msg.exe wpisuje w tytule
+# nazwę konta nadawcy, przez WinRM pustą). Kompilowane na komputerze docelowym (Add-Type); gdy się nie da (np. tryb
+# ograniczonego języka) - msg.exe z nadawcą w treści.
+$script:WtsMessageSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class DomainOpsWtsMsg {
+    [StructLayout(LayoutKind.Sequential)]
+    struct SessionInfo { public int SessionId; public IntPtr WinStationName; public int State; }
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSEnumerateSessions(IntPtr server, int reserved, int version, out IntPtr info, out int count);
+    [DllImport("wtsapi32.dll")]
+    static extern void WTSFreeMemory(IntPtr memory);
+    [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool WTSQuerySessionInformation(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out int bytes);
+    [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool WTSSendMessage(IntPtr server, int sessionId, string title, int titleBytes, string message, int messageBytes, int style, int timeout, out int response, bool wait);
+    static string Query(int id, int infoClass) {
+        IntPtr buffer; int bytes;
+        if (!WTSQuerySessionInformation(IntPtr.Zero, id, infoClass, out buffer, out bytes)) return "";
+        try { return Marshal.PtrToStringUni(buffer) ?? ""; } finally { WTSFreeMemory(buffer); }
+    }
+    // Sesje z zalogowanym użytkownikiem (bez sesji 0): "id|DOMENA\użytkownik"
+    public static List<string> UserSessions() {
+        var list = new List<string>();
+        IntPtr info; int count;
+        if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out info, out count)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            int size = Marshal.SizeOf(typeof(SessionInfo));
+            for (int i = 0; i < count; i++) {
+                var s = (SessionInfo)Marshal.PtrToStructure(new IntPtr(info.ToInt64() + i * size), typeof(SessionInfo));
+                if (s.SessionId == 0) continue;
+                string user = Query(s.SessionId, 5);
+                if (user.Length == 0) continue;
+                string domain = Query(s.SessionId, 7);
+                list.Add(s.SessionId + "|" + (domain.Length > 0 ? domain + "\\" + user : user));
+            }
+        }
+        finally { WTSFreeMemory(info); }
+        return list;
+    }
+    // Okno z informacją na wierzchu (bez czekania na odpowiedź); "" albo opis błędu
+    public static string Send(int sessionId, string title, string text, int timeoutSeconds) {
+        int response;
+        if (WTSSendMessage(IntPtr.Zero, sessionId, title, title.Length * 2, text, text.Length * 2, 0x40 | 0x10000 | 0x40000, timeoutSeconds, out response, false)) return "";
+        return new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message;
+    }
+}
+'@
+
 function Send-ComputerMessage {
-    # Wiadomość do wszystkich zalogowanych na komputerach (msg * przez WinRM, okno na 5 min) - bez listowania sesji
+    # Wiadomość do wszystkich zalogowanych na komputerach (okno na 5 min, tytuł «Wiadomość od: <nadawca z ustawień>»)
     param([string[]]$Names)
     $list = @($Names | Where-Object { $_ } | Select-Object -Unique)
     if (-not $list.Count) { return }
     $shown = (@($list | Select-Object -First 5) -join ', ') + $(if ($list.Count -gt 5) { " i $($list.Count - 5) więcej" } else { '' })
-    $text = Show-InputDialog -Title 'Wiadomość do zalogowanych' -Prompt "Wiadomość pojawi się na 5 minut u wszystkich zalogowanych użytkowników (konsola i pulpit zdalny): $shown." -Icon 'E715' -Validate {
+    $text = Show-InputDialog -Title 'Wiadomość do zalogowanych' -Prompt "Wiadomość pojawi się na 5 minut u wszystkich zalogowanych użytkowników (konsola i pulpit zdalny): $shown. Nadawca: $($script:Settings.MessageSender) (Ustawienia)." -Icon 'E715' -Validate {
         param($t)
         $v = ([string]$t).Trim()
         if (-not $v) { return 'Wpisz treść wiadomości.' }
@@ -8495,10 +8638,30 @@ function Send-ComputerMessage {
         return ''
     }
     if ($null -eq $text) { return }
-    Start-HostOperation -Module $script:UI.Modules['__computers'] -Name 'Wiadomość do zalogowanych' -Targets $list -Parameters @{ Message = $text.Trim() } -Output Log -ScriptBlock {
+    Start-HostOperation -Module $script:UI.Modules['__computers'] -Name 'Wiadomość do zalogowanych' -Targets $list -Parameters @{ Message = $text.Trim(); Sender = [string]$script:Settings.MessageSender; WtsSource = $script:WtsMessageSource } -Output Log -ScriptBlock {
         param($P)
-        $out = @(& msg.exe '*' '/TIME:300' ([string]$P.Message) 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
-        if ($LASTEXITCODE -eq 0) { 'Wysłano wiadomość do zalogowanych użytkowników.' }
+        $title = 'Wiadomość od: {0} ({1:dd.MM.yyyy HH:mm})' -f $P.Sender, (Get-Date)
+        $why = ''
+        if (-not ('DomainOpsWtsMsg' -as [type])) { try { Add-Type -TypeDefinition ([string]$P.WtsSource) -ErrorAction Stop } catch { $why = $_.Exception.Message } }
+        if (-not $why) {
+            try {
+                $sessions = @([DomainOpsWtsMsg]::UserSessions())
+                if (-not $sessions.Count) { 'Nikt nie jest zalogowany – wiadomości nie wysłano.'; return }
+                $ok = @(); $bad = @()
+                foreach ($s in $sessions) {
+                    $id, $user = $s.Split('|', 2)
+                    $err = [DomainOpsWtsMsg]::Send([int]$id, $title, [string]$P.Message, 300)
+                    if ($err) { $bad += '{0} ({1})' -f $user, $err } else { $ok += $user }
+                }
+                if ($ok.Count) { 'Wysłano wiadomość do: {0}.' -f ($ok -join ', ') }
+                if ($bad.Count) { 'Błąd – nie wysłano do: {0}' -f ($bad -join '; ') }
+                return
+            }
+            catch { $why = $_.Exception.Message }
+        }
+        # Bez WTSSendMessage: msg.exe - tytuł okna ustala system, nadawca w treści
+        $out = @(& msg.exe '*' '/TIME:300' ("Od: {0}`n`n{1}" -f $P.Sender, $P.Message) 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+        if ($LASTEXITCODE -eq 0) { 'Wysłano wiadomość do zalogowanych użytkowników (msg.exe, nadawca w treści; {0}).' -f $why }
         else { 'Błąd – msg.exe, kod {0}: {1}' -f $LASTEXITCODE, ($out -join ' ') }
     }
 }
@@ -8582,7 +8745,7 @@ function Initialize-ComputerPanel {
         @{ Text = 'Odznacz wybrane'; Icon = 'E739'; Action = { param($panel) Set-TargetCheck -Panel $panel -Mode UncheckSelected } }
         '-'
         @{ Text = 'Pulpit zdalny'; Icon = 'E8AF'; Action = { param($panel, $names) Start-Tool -FilePath 'mstsc.exe' -Arguments @("/v:$($names[0])") -Name $names[0] } }
-        @{ Text = 'Zaoferuj pomoc zdalną'; Icon = 'E8F2'; Action = { param($panel, $names) Start-Tool -FilePath 'msra.exe' -Arguments @('/offerRA', $names[0]) -Name $names[0] } }
+        @{ Text = 'Zaoferuj pomoc zdalną'; Icon = 'E8F2'; Visible = { [bool]$script:Settings.RemoteAssist }; Action = { param($panel, $names) Start-RemoteAssistance -Computer $names[0] } }
         @{ Text = 'Wiadomość do zalogowanych…'; Icon = 'E715'; Action = { param($panel, $names) Send-ComputerMessage -Names $names } }
         @{ Text = 'Zarządzanie komputerem'; Icon = 'E912'; Action = { param($panel, $names) Start-Tool -FilePath 'compmgmt.msc' -Arguments @("/computer:\\$($names[0])") -Name $names[0] } }
         @{ Text = 'Usługi'; Icon = 'E9F5'; Action = { param($panel, $names) Start-Tool -FilePath 'services.msc' -Arguments @("/computer:\\$($names[0])") -Name $names[0] } }
@@ -15311,21 +15474,113 @@ function Invoke-DoInUserSession {
         nie da się przetłumaczyć; logowanie interaktywne, bez podniesienia uprawnień), potem usuwane. Zwraca kod wyjścia
         programu albo $null, gdy nie skończył się w czasie (267009/267011 - zadanie jeszcze trwa / jeszcze nie ruszyło).
     #>
-    param([string]$Name, [string]$Sid, [string]$Execute, [string]$Argument, [int]$TimeoutSeconds = 15)
+    # $Trace - lista na kroki (tryb diagnostyczny): zadanie, zmiany stanu z czasem, brak wyniku
+    param([string]$Name, [string]$Sid, [string]$Execute, [string]$Argument, [int]$TimeoutSeconds = 15, [System.Collections.IList]$Trace)
     $task = 'DomainOps-{0}-{1}' -f $Name, [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $start = Get-Date
     try {
         $principal = New-ScheduledTaskPrincipal -UserId $Sid -LogonType Interactive -RunLevel Limited
         Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $Execute -Argument $Argument) -Principal $principal -Force | Out-Null
+        if ($null -ne $Trace) { [void]$Trace.Add(('zadanie {0}: {1} {2}' -f $task, $Execute, $Argument)) }
         Start-ScheduledTask -TaskName $task
+        $last = ''
         for ($i = 0; $i -lt $TimeoutSeconds * 2; $i++) {
             Start-Sleep -Milliseconds 500
             $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
             $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
+            if ($null -ne $Trace) {
+                $now = 'stan {0}, ostatni wynik {1}' -f $(if ($t) { [string]$t.State } else { '?' }), $(if ($info) { [string]$info.LastTaskResult } else { '?' })
+                if ($now -ne $last) { [void]$Trace.Add(('po {0:N1} s: {1}' -f ((Get-Date) - $start).TotalSeconds, $now)); $last = $now }
+            }
             if ($t -and [string]$t.State -ne 'Running' -and $info -and [int64]$info.LastTaskResult -notin 267009, 267011) { return [int64]$info.LastTaskResult }
         }
+        if ($null -ne $Trace) { [void]$Trace.Add(('brak wyniku po {0} s' -f $TimeoutSeconds)) }
         return $null
     }
     finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+}
+
+function Get-DoDesktopSids {
+    # SID-y właścicieli explorer.exe (użytkownicy z pulpitem); $null - nie udało się sprawdzić. Gałąź rejestru bywa załadowana
+    # także dla kont usług bez pulpitu, a zadanie «tylko gdy użytkownik jest zalogowany» by tam nie ruszyło.
+    try {
+        $found = @{}
+        foreach ($proc in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+            try { $o = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop; if ($o.Sid) { $found[[string]$o.Sid] = $true } } catch { }
+        }
+        return $found
+    }
+    catch { return $null }
+}
+
+function Invoke-DoNetDrive {
+    <#
+        Podłączenie (Map) albo odłączenie (Unmap) dysku w sesji zalogowanego użytkownika bez okna konsoli: skrypt JScript
+        (obiekt WScript.Network) uruchamiany przez wscript.exe jednorazowym zadaniem w jego sesji. Gdy Windows Script Host
+        jest wyłączony albo skrypt nie zapisał wyniku - cmd z net use (okno konsoli mignie).
+        Wynik: @{ Code (0 - OK, $null - brak odpowiedzi); NotConnected (odłączanie: dysku nie było w sesji); Message; Method }
+    #>
+    param($Profile, [ValidateSet('Map', 'Unmap')][string]$Op, [string]$Letter, [string]$Path, [System.Collections.IList]$Trace)
+    $add = { param($t) if ($null -ne $Trace) { [void]$Trace.Add($t) } }
+    # Folder roboczy w Temp profilu (użytkownik ma tam prawa); gdy go nie ma - Windows\Temp z prawem zapisu dla użytkownika
+    $base = Join-Path $Profile.Path 'AppData\Local\Temp'
+    if (-not (Test-Path -LiteralPath $base)) { $base = Join-Path $env:SystemRoot 'Temp' }
+    $dir = Join-Path $base ('DomainOps-{0}-{1}' -f $Op, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $out = Join-Path $dir 'wynik.txt'
+    $result = @{ Code = $null; NotConnected = $false; Message = ''; Method = '' }
+    try {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            $acl = Get-Acl -LiteralPath $dir
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($Profile.Sid)), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $dir -AclObject $acl
+        }
+        catch { & $add ('uprawnienia folderu roboczego: ' + $_.Exception.Message) }
+        & $add ('folder roboczy: ' + $dir)
+        $wshOff = $false
+        foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings', "Registry::HKEY_USERS\$($Profile.Sid)\Software\Microsoft\Windows Script Host\Settings") {
+            if ([string](Get-DoRegValue $k 'Enabled') -eq '0') { $wshOff = $true; & $add ('Windows Script Host wyłączony: ' + $k) }
+        }
+        if (-not $wshOff) {
+            $l = ConvertTo-Json -InputObject ($Letter + ':') -Compress
+            $call = if ($Op -eq 'Map') { 'MapNetworkDrive({0}, {1}, true)' -f $l, (ConvertTo-Json -InputObject $Path -Compress) } else { 'RemoveNetworkDrive({0}, true, true)' -f $l }
+            $js = Join-Path $dir 'dysk.js'
+            $code = @(
+                "var o = WScript.Arguments(0), c = 0, m = '';"
+                "try { new ActiveXObject('WScript.Network').$call; } catch (e) { c = e.number & 0xFFFF; if (!c) c = 1; m = e.description; }"
+                "var f = new ActiveXObject('Scripting.FileSystemObject').CreateTextFile(o, true, true); f.Write(c + '|' + m); f.Close();"
+                'WScript.Quit(c);'
+            ) -join "`r`n"
+            [System.IO.File]::WriteAllText($js, $code, [System.Text.Encoding]::Unicode)
+            & $add ('skrypt: ' + $call)
+            $result.Method = 'wscript'
+            $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "{0}" "{1}"' -f $js, $out) -TimeoutSeconds 30 -Trace $Trace
+            if (Test-Path -LiteralPath $out) {
+                $text = [System.IO.File]::ReadAllText($out)
+                & $add ('wynik skryptu: ' + $text)
+                $parts = $text.Split('|', 2)
+                $n = 0
+                if ([int]::TryParse($parts[0], [ref]$n)) { $result.Code = $n }
+                $result.Message = $(if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' })
+                # 2250 - połączenie sieciowe nie istnieje
+                $result.NotConnected = ($Op -eq 'Unmap' -and $result.Code -eq 2250)
+                return $result
+            }
+            if ($null -eq $result.Code) { return $result }
+            & $add ('skrypt nie zapisał wyniku (kod {0}) – próba przez cmd' -f $result.Code)
+        }
+        # cmd z net use (okno konsoli mignie); komunikat net use w stronie kodowej OEM
+        $arg = if ($Op -eq 'Map') { '/d /c net use {0}: "{1}" /persistent:yes >"{2}" 2>&1' -f $Letter, $Path, $out } else { '/d /c net use {0}: /delete /y >"{1}" 2>&1' -f $Letter, $out }
+        $result.Method = 'cmd'
+        $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $arg -TimeoutSeconds 30 -Trace $Trace
+        $oem = try { [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { [System.Text.Encoding]::Default }
+        try { $result.Message = (@([System.IO.File]::ReadAllLines($out, $oem) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' ') } catch { }
+        & $add ('net use: ' + $result.Message)
+        # net use: 2 - każdy błąd, także brak połączenia
+        $result.NotConnected = ($Op -eq 'Unmap' -and $result.Code -eq 2)
+        return $result
+    }
+    finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 function Get-DoGpHistoryRoots {
@@ -15481,39 +15736,54 @@ $script:NetUnmapScript = {
     . ([scriptblock]::Create($P.Helpers))
     $profiles = @{}
     foreach ($pr in @(Get-DoProfiles)) { $profiles[$pr.Sid] = $pr }
+    $desktops = Get-DoDesktopSids
     foreach ($it in @($P.Items)) {
         $letter = ([string]$it.Letter).TrimEnd(':').ToUpperInvariant()
         $res = [ordered]@{ 'Użytkownik' = $it.User; 'Dysk' = ('{0}: {1}' -f $letter, $it.Path); 'Wynik' = '' }
+        $trace = New-Object System.Collections.ArrayList
         $pr = $profiles[[string]$it.Sid]
         if (-not $pr) { $res.Wynik = 'Błąd – profil użytkownika nie istnieje na tym komputerze'; [pscustomobject]$res; continue }
-        $state = @{ Removed = $false; Other = '' }
-        try {
-            Use-DoUserHive -Profile $pr -LoadOffline $true -Action {
-                param($Root, $Source)
-                $key = "$Root\Network\$letter"
-                if (-not (Test-Path -LiteralPath $key)) { return }
-                $cur = [string](Get-DoRegValue $key 'RemotePath')
-                # Litera wskazuje już inny udział (zmiana po odczycie listy) - nie ruszamy
-                if ($it.Path -and $cur -and $cur -ne $it.Path) { $state.Other = $cur; return }
-                Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop
-                $state.Removed = $true
-            }
+        $session = ($pr.Loaded -and ($null -eq $desktops -or $desktops.ContainsKey($pr.Sid)))
+        [void]$trace.Add(('profil {0}: {1}' -f $pr.Sid, $(if ($session) { 'zalogowany, z pulpitem' } elseif ($pr.Loaded) { 'gałąź rejestru załadowana, bez pulpitu' } else { 'niezalogowany (NTUSER.DAT)' })))
+        $state = @{ Existed = $false; Other = ''; Gone = $false }
+        # Wpis trwały w profilu: sprawdzenie i (bez sesji z pulpitem) od razu usunięcie
+        $entry = {
+            param($Root, $Source, [bool]$Remove)
+            $key = "$Root\Network\$letter"
+            if (-not (Test-Path -LiteralPath $key)) { [void]$trace.Add(('wpis Network\{0} ({1}): brak' -f $letter, $Source)); $state.Gone = $true; return }
+            $cur = [string](Get-DoRegValue $key 'RemotePath')
+            [void]$trace.Add(('wpis Network\{0} ({1}): {2}' -f $letter, $Source, $cur))
+            # Litera wskazuje już inny udział (zmiana po odczycie listy) - nie ruszamy
+            if ($it.Path -and $cur -and $cur -ne $it.Path) { $state.Other = $cur; return }
+            $state.Existed = $true
+            if (-not $Remove) { return }
+            Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop
+            $state.Gone = -not (Test-Path -LiteralPath $key)
+            [void]$trace.Add(('wpis usunięty: {0}' -f $state.Gone))
         }
+        try { Use-DoUserHive -Profile $pr -LoadOffline $true -Action { param($Root, $Source) & $entry $Root $Source (-not $session) } }
         catch { $res.Wynik = 'Błąd – ' + $_.Exception.Message; [pscustomobject]$res; continue }
-        if ($state.Other) { $res.Wynik = 'Pominięto – litera {0}: wskazuje teraz {1}' -f $letter, $state.Other; [pscustomobject]$res; continue }
-        $parts = @($(if ($state.Removed) { 'usunięto z profilu (nie wróci przy logowaniu)' } else { 'w profilu nie było trwałego wpisu' }))
-        if ($pr.Loaded) {
-            try {
-                # Wynik net use: 0 - odłączono, 2 - nie było połączenia
-                $code = Invoke-DoInUserSession -Name 'Unmap' -Sid $it.Sid -Execute (Join-Path $env:SystemRoot 'System32\net.exe') -Argument ('use {0}: /delete /y' -f $letter)
-                if ($code -eq 0) { $parts += 'odłączono w sesji użytkownika' }
-                elseif ($code -eq 2) { $parts += 'w sesji nie był połączony' }
-                elseif ($null -eq $code) { $parts += 'sesja nie odpowiedziała – dysk zniknie po wylogowaniu' }
-                else { $parts += 'net use w sesji: kod {0}' -f $code }
+        if ($state.Other) { $res.Wynik = 'Pominięto – litera {0}: wskazuje teraz {1}' -f $letter, $state.Other }
+        else {
+            $sessionPart = ''
+            if ($session) {
+                # Najpierw odłączenie w sesji (WScript.Network usuwa też wpis z profilu), potem usunięcie wpisu, jeśli został
+                try {
+                    $r = Invoke-DoNetDrive -Profile $pr -Op Unmap -Letter $letter -Trace $trace
+                    $sessionPart = if ($r.Code -eq 0) { 'odłączono w sesji użytkownika' }
+                    elseif ($r.NotConnected) { 'w sesji nie był połączony' }
+                    elseif ($null -eq $r.Code) { 'sesja nie odpowiedziała – dysk zniknie po wylogowaniu' }
+                    else { 'w sesji nie odłączono: {0}' -f $(if ($r.Message) { '{0} (kod {1})' -f $r.Message, $r.Code } else { 'kod {0}' -f $r.Code }) }
+                }
+                catch { $sessionPart = 'w sesji nie odłączono: ' + $_.Exception.Message }
+                try { Use-DoUserHive -Profile $pr -LoadOffline $false -Action { param($Root, $Source) & $entry $Root $Source $true } }
+                catch { [void]$trace.Add('usuwanie wpisu: ' + $_.Exception.Message) }
             }
-            catch { $parts += 'nie odłączono w sesji: ' + $_.Exception.Message }
+            elseif ($pr.Loaded) { $sessionPart = 'brak sesji z pulpitem' }
+            $profilePart = if (-not $state.Existed) { 'w profilu nie było trwałego wpisu' } elseif ($state.Gone) { 'usunięto z profilu (nie wróci przy logowaniu)' } else { 'Błąd – wpis w profilu został' }
+            $res.Wynik = $(if ($profilePart -like 'Błąd*') { '' } else { 'OK – ' }) + (@($profilePart, $sessionPart | Where-Object { $_ }) -join '; ')
         }
-        $res.Wynik = 'OK – ' + ($parts -join '; ')
+        if ($P.Debug) { foreach ($t in $trace) { [pscustomobject]@{ 'Diagnostyka' = '{0} {1}: – {2}' -f $pr.User, $letter, $t } } }
         [pscustomobject]$res
     }
 }
@@ -15527,17 +15797,8 @@ $script:NetMapScript = {
     . ([scriptblock]::Create($P.Helpers))
     $path = ([string]$P.Path).TrimEnd('\')
     $profiles = @(Get-DoProfiles)
-    # Sesje interaktywne: właściciele explorer.exe (gałąź rejestru bywa załadowana także dla kont usług bez pulpitu,
-    # a zadanie «tylko gdy użytkownik jest zalogowany» by tam nie ruszyło); $null - nie udało się sprawdzić
-    $interactive = $null
-    try {
-        $found = @{}
-        foreach ($proc in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
-            try { $o = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop; if ($o.Sid) { $found[[string]$o.Sid] = $true } } catch { }
-        }
-        $interactive = $found
-    }
-    catch { }
+    # Użytkownicy z pulpitem (właściciele explorer.exe); $null - nie udało się sprawdzić
+    $interactive = Get-DoDesktopSids
     # Login: pełna nazwa DOMENA\login albo sam login (wtedy dowolna domena)
     $want = [string]$P.UserName
     $wantLeaf = @($want -split '\\')[-1]
@@ -15556,12 +15817,13 @@ $script:NetMapScript = {
     try { $local = @(Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop | Where-Object { [int]$_.DriveType -ne 4 } | ForEach-Object { ([string]$_.DeviceID).Substring(0, 1).ToUpperInvariant() }) }
     catch { $local = @([System.IO.DriveInfo]::GetDrives() | Where-Object { [string]$_.DriveType -ne 'Network' } | ForEach-Object { $_.Name.Substring(0, 1).ToUpperInvariant() }) }
     $names = Get-DoGpoNames
-    $oem = try { [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { [System.Text.Encoding]::Default }
     $mpName = $path.Replace('\', '#')
     foreach ($pr in $list) {
         $res = [ordered]@{ 'Użytkownik' = $pr.User; 'Dysk' = $path; 'Wynik' = '' }
         if (-not $pr.Loaded -and -not $P.Offline) { $res.Wynik = 'Pominięto – użytkownik niezalogowany (opcja «Niezalogowanym zapisz w profilu»)'; [pscustomobject]$res; continue }
         $session = ($pr.Loaded -and ($null -eq $interactive -or $interactive.ContainsKey($pr.Sid)))
+        $trace = New-Object System.Collections.ArrayList
+        [void]$trace.Add(('profil {0}: {1}; dyski lokalne: {2}' -f $pr.Sid, $(if ($session) { 'zalogowany, z pulpitem' } elseif ($pr.Loaded) { 'gałąź rejestru załadowana, bez pulpitu' } else { 'niezalogowany (NTUSER.DAT)' }), ($local -join ', ')))
         # Litery z Preferencji zasad grupy (bez usuwania i «pierwszej wolnej»)
         $gpp = @(foreach ($it in @(Get-DoGppItems -Profile $pr -Kind 'Drives')) {
                 $x = $it.Props
@@ -15570,12 +15832,14 @@ $script:NetMapScript = {
                 @{ Letter = ([string]$x.GetAttribute('letter')).ToUpperInvariant(); Path = [string]$x.GetAttribute('path'); Gpo = $(if ($names.ContainsKey($guid)) { $names[$guid] } else { $it.Gpo }) }
             })
         $st = @{ Letter = ''; Skip = ''; Saved = $false; Read = $false }
+        $emit = { if ($P.Debug) { foreach ($t in $trace) { [pscustomobject]@{ 'Diagnostyka' = '{0} {1}: – {2}' -f $pr.User, $path, $t } } }; [pscustomobject]$res }
         try {
             Use-DoUserHive -Profile $pr -LoadOffline $true -Action {
                 param($Root, $Source)
                 $st.Read = $true
                 $net = @{}
                 foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Network" -ErrorAction SilentlyContinue)) { $net[$k.PSChildName.ToUpperInvariant()] = ([string](Get-DoRegValue $k 'RemotePath')).TrimEnd('\') }
+                [void]$trace.Add(('zmapowane w profilu: {0}; litery z GPO: {1}' -f (@($net.Keys | Sort-Object | ForEach-Object { '{0}: {1}' -f $_, $net[$_] }) -join ', '), (@($gpp | ForEach-Object { $_.Letter }) -join ', ')))
                 $same = @($net.Keys | Where-Object { $net[$_] -eq $path } | Sort-Object)
                 if ($same.Count) { $st.Skip = 'udział jest już podłączony jako {0}:' -f $same[0]; return }
                 $l = ([string]$P.Letter).ToUpperInvariant()
@@ -15591,6 +15855,7 @@ $script:NetMapScript = {
                     if (-not $l) { $st.Skip = 'brak wolnej litery (D:–Z:)'; return }
                 }
                 $st.Letter = $l
+                [void]$trace.Add('litera: ' + $l)
                 if ($session) { return }
                 # Bez sesji (niezalogowany albo gałąź załadowana bez pulpitu): wpis trwały jak po net use /persistent:yes (konto użytkownika, sieć Microsoft Windows)
                 $key = "$Root\Network\$l"
@@ -15609,28 +15874,15 @@ $script:NetMapScript = {
                 $st.Saved = $true
             }
         }
-        catch { $res.Wynik = 'Błąd – ' + $_.Exception.Message; [pscustomobject]$res; continue }
-        if (-not $st.Read) { $res.Wynik = 'Błąd – w profilu nie ma pliku NTUSER.DAT'; [pscustomobject]$res; continue }
-        if ($st.Skip) { $res.Wynik = 'Pominięto – ' + $st.Skip; [pscustomobject]$res; continue }
+        catch { $res.Wynik = 'Błąd – ' + $_.Exception.Message; & $emit; continue }
+        if (-not $st.Read) { $res.Wynik = 'Błąd – w profilu nie ma pliku NTUSER.DAT'; & $emit; continue }
+        if ($st.Skip) { $res.Wynik = 'Pominięto – ' + $st.Skip; & $emit; continue }
         $res.Dysk = '{0}: {1}' -f $st.Letter, $path
-        if ($st.Saved) { $res.Wynik = 'OK – zapisano w profilu ({0}dysk pojawi się przy następnym logowaniu)' -f $(if ($pr.Loaded) { 'brak sesji z pulpitem – ' } else { '' }); [pscustomobject]$res; continue }
-        # Zalogowany: net use w jego sesji; komunikat net use przez plik (strona kodowa OEM) - sam kod wyjścia nie mówi, co poszło źle
-        $out = Join-Path $env:SystemRoot ('Temp\DomainOps-Map-{0}.txt' -f [guid]::NewGuid().ToString('N').Substring(0, 12))
+        if ($st.Saved) { $res.Wynik = 'OK – zapisano w profilu ({0}dysk pojawi się przy następnym logowaniu)' -f $(if ($pr.Loaded) { 'brak sesji z pulpitem – ' } else { '' }); & $emit; continue }
+        # Zalogowany z pulpitem: podłączenie w jego sesji (bez okna konsoli; komunikat błędu z WScript.Network albo net use)
         try {
-            # Plik z prawem zapisu dla użytkownika; bez tego cmd w jego sesji nie przekierowałby wyjścia i net use by nie ruszył -
-            # gdy uprawnień nie da się nadać, plik jest usuwany i tworzy go sam cmd (Użytkownicy mogą tworzyć pliki w Windows\Temp)
-            try {
-                [System.IO.File]::WriteAllText($out, '')
-                $acl = Get-Acl -LiteralPath $out
-                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($pr.Sid)), 'Modify', 'Allow')))
-                Set-Acl -LiteralPath $out -AclObject $acl
-            }
-            catch { Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue }
-            $arg = '/d /c net use {0}: "{1}" /persistent:yes >"{2}" 2>&1' -f $st.Letter, $path, $out
-            $code = Invoke-DoInUserSession -Name 'Map' -Sid $pr.Sid -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $arg -TimeoutSeconds 30
-            $msg = ''
-            try { $msg = (@([System.IO.File]::ReadAllLines($out, $oem) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' ') } catch { }
-            if ($code -eq 0) {
+            $r = Invoke-DoNetDrive -Profile $pr -Op Map -Letter $st.Letter -Path $path -Trace $trace
+            if ($r.Code -eq 0) {
                 $res.Wynik = 'OK – podłączono w sesji użytkownika (wraca przy logowaniu)'
                 if ($P.Label) {
                     $mp = "Registry::HKEY_USERS\$($pr.Sid)\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\$mpName"
@@ -15638,12 +15890,11 @@ $script:NetMapScript = {
                     catch { $res.Wynik += '; etykiety nie ustawiono: ' + $_.Exception.Message }
                 }
             }
-            elseif ($null -eq $code) { $res.Wynik = 'Nieznany – sesja nie odpowiedziała w 30 s; sprawdź za chwilę w widoku «Dyski zmapowane»' }
-            else { $res.Wynik = 'Błąd – net use: ' + $(if ($msg) { $msg } else { 'kod {0}' -f $code }) }
+            elseif ($null -eq $r.Code) { $res.Wynik = 'Nieznany – sesja nie odpowiedziała w 30 s; sprawdź za chwilę w widoku «Dyski zmapowane»' }
+            else { $res.Wynik = 'Błąd – ' + $(if ($r.Message) { '{0} (kod {1})' -f $r.Message, $r.Code } else { 'kod {0}' -f $r.Code }) }
         }
         catch { $res.Wynik = 'Błąd – ' + $_.Exception.Message }
-        finally { Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue }
-        [pscustomobject]$res
+        & $emit
     }
 }
 
@@ -15926,7 +16177,7 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'NetResource
         foreach ($i in $chosen) {
             $r = $manual[$i]
             $h = [string](Get-RowValue $r 'Komputer')
-            if (-not $per.ContainsKey($h)) { $per[$h] = @{ Helpers = $script:NetResHelpers; Items = @() } }
+            if (-not $per.ContainsKey($h)) { $per[$h] = @{ Helpers = $script:NetResHelpers; Debug = [bool]$script:Settings.DebugLog; Items = @() } }
             $per[$h].Items += @{ Sid = [string](Get-RowValue $r '__sid'); User = [string](Get-RowValue $r 'Użytkownik'); Letter = [string](Get-RowValue $r 'Litera'); Path = [string](Get-RowValue $r 'Ścieżka') }
         }
         $m.Data.ActionHosts = @($per.Keys)
@@ -15955,7 +16206,7 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'NetResource
         $paths = @(@($Rows) | Where-Object { $_ } | ForEach-Object { ([string](Get-RowValue $_ 'Ścieżka')).TrimEnd('\') } | Where-Object { $_ -match $script:NetMapPathPattern } | Select-Object -Unique)
         $d = Show-NetMapDialog -Users @($users.Values) -Computers $computers -Taken $taken -Path $(if ($paths.Count -eq 1) { $paths[0] } else { '' })
         if (-not $d) { return }
-        $base = @{ Helpers = $script:NetResHelpers; Path = $d.Path; Letter = $d.Letter; Label = $d.Label; Mode = $d.Mode; UserName = $d.UserName; Offline = $d.Offline; Sids = @() }
+        $base = @{ Helpers = $script:NetResHelpers; Debug = [bool]$script:Settings.DebugLog; Path = $d.Path; Letter = $d.Letter; Label = $d.Label; Mode = $d.Mode; UserName = $d.UserName; Offline = $d.Offline; Sids = @() }
         $per = @{}
         if ($d.Mode -eq 'Selected') {
             foreach ($u in $users.Values) {
@@ -30987,6 +31238,9 @@ $script:DomainHealthScript = {
         if ($cmd) { return ('{0}: {1}' -f $cmd, $e.Exception.Message) }
         return [string]$e.Exception.Message
     }
+    # Całość w try: nieprzechwycony błąd (np. «index» modułu AD przy metadanych usuniętego kontrolera) przerwałby blok
+    # i silnik zgubiłby wszystkie dotychczasowe wiersze - zamiast tego wiersz z poleceniem, które zawiodło
+    try {
     # Dane domeny: Get-ADDomain, a gdy zgłosi błąd (metadane usuniętego kontrolera) - wprost z katalogu
     try { $domain = Get-AdDomainInfo -AdParams $ad }
     catch { Out-Row 'Domena' 'AD' 'Błąd' 'nie odczytano danych domeny (ani przez Get-ADDomain, ani wprost z katalogu)' (Get-ErrText $_); return }
@@ -31045,7 +31299,7 @@ $script:DomainHealthScript = {
     if ($dcs.Count -eq 1) { Out-Row 'Kontrolery' ([string]$domain.DNSRoot) 'Ostrzeżenie' 'tylko jeden kontroler domeny' 'awaria serwera zatrzymuje logowanie i całą domenę – dodaj drugi kontroler' }
 
     # Role FSMO
-    $hosts = @($dcs | ForEach-Object { ([string]$_.HostName).ToLowerInvariant() })
+    $hosts = @($dcs | ForEach-Object { try { ([string]$_.HostName).ToLowerInvariant() } catch { } } | Where-Object { $_ })
     try {
     $roleList = [ordered]@{ 'Emulator PDC' = $domain.PDCEmulator; 'Wzorzec RID' = $domain.RIDMaster; 'Wzorzec infrastruktury' = $domain.InfrastructureMaster }
     if ($forest) { $roleList['Wzorzec schematu'] = $forest.SchemaMaster; $roleList['Wzorzec nazw domen'] = $forest.DomainNamingMaster }
@@ -31062,6 +31316,7 @@ $script:DomainHealthScript = {
     # Porty (z tego komputera)
     if ($P.Ports) {
         foreach ($dc in $dcs) {
+            try {
             if (-not [string]$dc.HostName) { continue }
             $ports = [ordered]@{ 53 = 'DNS'; 88 = 'Kerberos'; 389 = 'LDAP'; 445 = 'SMB'; 9389 = 'ADWS' }
             if ($dc.IsGlobalCatalog) { $ports[3268] = 'GC' }
@@ -31073,6 +31328,8 @@ $script:DomainHealthScript = {
                 finally { $tcp.Dispose() }
             }
             Out-Row 'Łączność' ([string]$dc.Name) $(if ($closed.Count -eq 0) { 'OK' } elseif ($closed.Count -eq $ports.Count) { 'Błąd' } else { 'Ostrzeżenie' }) $(if ($closed.Count -eq 0) { 'wszystkie porty odpowiadają' } else { 'nie odpowiada: ' + ($closed -join ', ') }) (($ports.Values) -join ', ')
+            }
+            catch { Out-Row 'Łączność' ([string]$dc.Name) 'Info' 'nie sprawdzono portów' (Get-ErrText $_) }
         }
     }
 
@@ -31128,7 +31385,16 @@ $script:DomainHealthScript = {
     }
     catch { Out-Row 'DNS' ([string]$domain.DNSRoot) 'Info' 'nie sprawdzono rekordów SRV' (Get-ErrText $_) }
 
-    Out-Row 'Domena' 'Poziom funkcjonalny' 'Info' ('domena: {0}, las: {1}' -f $domain.DomainMode, $(if ($forest) { $forest.ForestMode } else { '?' }))
+    try { Out-Row 'Domena' 'Poziom funkcjonalny' 'Info' ('domena: {0}, las: {1}' -f $domain.DomainMode, $(if ($forest) { $forest.ForestMode } else { '?' })) }
+    catch { Out-Row 'Domena' 'Poziom funkcjonalny' 'Info' 'nie odczytano' (Get-ErrText $_) }
+    }
+    catch {
+        $where = ''
+        try { $where = ([string]$_.InvocationInfo.Line).Trim() } catch { }
+        if ($where.Length -gt 200) { $where = $where.Substring(0, 200) + '…' }
+        $stack = if ($P.Debug) { ' | stos: ' + (([string]$_.ScriptStackTrace) -replace '\s*\r?\n\s*', ' ← ') } else { '' }
+        Out-Row 'Domena' 'Przegląd' 'Błąd' 'przegląd przerwany – kolejne sprawdzenia pominięte' ('{0}{1}{2}' -f (Get-ErrText $_), $(if ($where) { " | polecenie: $where" } else { '' }), $stack)
+    }
 }
 
 # Część na każdym kontrolerze (WinRM). $P: EventHours
@@ -31198,7 +31464,8 @@ function Add-DomainHealthAdResult {
     # Wynik części AD ($script:DomainHealthScript): domena, kontrolery, kopie zapasowe i wiersze ocen
     param([hashtable]$Health, $Result)
     $h = $Health
-    if (-not $Result.Ok) { [void]$h.Rows.Add([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Domena'; 'Obiekt' = 'AD'; 'Wynik' = 'nie odczytano danych domeny'; 'Szczegóły' = ((@($Result.Errors)) -join ' ') }); return }
+    # Przegląd przerwany: wiersze zebrane przed błędem zostają, do tego wiersz błędu
+    if (-not $Result.Ok) { [void]$h.Rows.Add([pscustomobject]@{ 'Ocena' = 'Błąd'; 'Obszar' = 'Domena'; 'Obiekt' = 'AD'; 'Wynik' = $(if (@($Result.Data).Count) { 'przegląd przerwany – kolejne sprawdzenia pominięte' } else { 'nie odczytano danych domeny' }); 'Szczegóły' = ((@($Result.Errors)) -join ' ') }) }
     foreach ($d in @($Result.Data)) {
         switch ([string](Get-ObjectValue $d '__rec')) {
             'domain' { $h.Domain = [string]$d.Name; $h.Pdc = [string]$d.Pdc }
@@ -31207,6 +31474,9 @@ function Add-DomainHealthAdResult {
             'row' { [void]$h.Rows.Add($d) }
         }
     }
+    # Błędy poleceń, które nie przerwały przeglądu (np. ostrzeżenia modułu AD)
+    $errs = @(@($Result.Errors) | Where-Object { $_ })
+    if ($errs.Count -and $Result.Ok) { [void]$h.Rows.Add([pscustomobject]@{ 'Ocena' = 'Info'; 'Obszar' = 'Domena'; 'Obiekt' = 'AD'; 'Wynik' = 'komunikaty błędów podczas przeglądu'; 'Szczegóły' = ($errs -join ' | ') }) }
 }
 
 function Get-DcHealthResultRows {
@@ -31301,7 +31571,7 @@ Register-Module -Workspace 'Domain' -Category 'Stan domeny' -Key 'DomainHealth' 
     $m.Actions.Run = {
         param($m)
         if (-not (Test-AdAvailable)) { return }
-        $params = @{ Ports = (Test-Checked $m.Ports); ReplWarnHours = (Get-Num $m.ReplWarn); ReplCritHours = (Get-Num $m.ReplCrit); BackupWarnDays = (Get-Num $m.BackupWarn); BackupCritDays = (Get-Num $m.BackupCrit); UnsupportedOs = $script:UnsupportedOsPattern }
+        $params = @{ Ports = (Test-Checked $m.Ports); ReplWarnHours = (Get-Num $m.ReplWarn); ReplCritHours = (Get-Num $m.ReplCrit); BackupWarnDays = (Get-Num $m.BackupWarn); BackupCritDays = (Get-Num $m.BackupCrit); UnsupportedOs = $script:UnsupportedOsPattern; Debug = [bool]$script:Settings.DebugLog }
         $m.Data.Health = New-DomainHealthData -Params $params -Remote (Test-Checked $m.Remote) -EventHours (Get-Num $m.EventHours)
         Reset-ResultTable -Module $m
         Start-AdOperation -Module $m -Name 'Stan domeny' -Targets @('AD') -Output None -Parameters $params -ScriptBlock $script:DomainHealthScript -OnResult {
@@ -34012,10 +34282,23 @@ $script:RdsActionScript = {
     $names = @{ 'Logoff' = 'wylogowanie'; 'Disconnect' = 'rozłączenie'; 'Reset' = 'reset (rwinsta)'; 'Message' = 'wiadomość' }
     $exe = @{ 'Logoff' = 'logoff.exe'; 'Disconnect' = 'tsdiscon.exe'; 'Reset' = 'rwinsta.exe'; 'Message' = 'msg.exe' }[[string]$P.Op]
     $users = @($P.Users)
+    # Wiadomość: WTSSendMessage z tytułem «Wiadomość od: <nadawca>»; bez kompilacji (np. tryb ograniczonego języka) - msg.exe
+    $wts = $false
+    if ($P.Op -eq 'Message') {
+        $title = 'Wiadomość od: {0} ({1:dd.MM.yyyy HH:mm})' -f $P.Sender, (Get-Date)
+        $wts = [bool]('DomainOpsWtsMsg' -as [type])
+        if (-not $wts) { try { Add-Type -TypeDefinition ([string]$P.WtsSource) -ErrorAction Stop; $wts = $true } catch { } }
+    }
     $i = 0
     foreach ($id in @($P.Ids)) {
+        if ($wts) {
+            $err = try { [DomainOpsWtsMsg]::Send([int]$id, $title, [string]$P.Message, 300) } catch { $_.Exception.Message }
+            [pscustomobject]@{ 'Sesja' = [int]$id; 'Użytkownik' = $(if ($i -lt $users.Count) { [string]$users[$i] } else { '' }); 'Operacja' = $names['Message']; 'Wynik' = $(if ($err) { 'Błąd – ' + $err } else { 'OK' }) }
+            $i++
+            continue
+        }
         $cmdArgs = @([string]$id)
-        if ($P.Op -eq 'Message') { $cmdArgs += '/TIME:300'; $cmdArgs += [string]$P.Message }
+        if ($P.Op -eq 'Message') { $cmdArgs += '/TIME:300'; $cmdArgs += ("Od: {0}`n`n{1}" -f $P.Sender, $P.Message) }
         $out = @(& $exe @cmdArgs 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
         $code = $LASTEXITCODE
         [pscustomobject]@{
@@ -34142,7 +34425,7 @@ function Invoke-RdsSessionAction {
         }
     }
     $per = @{}
-    foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $Op; Message = $message; Ids = @($byHost[$h] | ForEach-Object { $_.Id }); Users = @($byHost[$h] | ForEach-Object { $_.User }) } }
+    foreach ($h in $byHost.Keys) { $per[$h] = @{ Op = $Op; Message = $message; Sender = [string]$script:Settings.MessageSender; WtsSource = $script:WtsMessageSource; Ids = @($byHost[$h] | ForEach-Object { $_.Id }); Users = @($byHost[$h] | ForEach-Object { $_.User }) } }
     $m.Data.ActionHosts = @($byHost.Keys)
     $onComplete = $null
     if ($Op -ne 'Message') {
@@ -34228,12 +34511,12 @@ function Add-RdsSessionRowActions {
         Start-Tool -FilePath 'mstsc.exe' -Arguments @(('/v:{0}' -f (Get-ObjectValue $r 'Komputer')), ('/shadow:{0}' -f (Get-ObjectValue $r 'ID')), '/control') -Name ([string](Get-ObjectValue $r 'Komputer'))
     }
     Add-RowAction -Module $Module -Text 'Procesy w sesji' -Icon 'E9D9' -Action { param($m, $rows) Show-RdsSessionProcesses -Module $m -Rows $rows }
-    Add-RowAction -Module $Module -Text 'Zaoferuj pomoc zdalną' -Icon 'E8F2' -Action {
-        # Pomoc zdalna Windows: msra pokazuje sesje komputera do wyboru, użytkownik musi zaakceptować
+    Add-RowAction -Module $Module -Text 'Zaoferuj pomoc zdalną' -Icon 'E8F2' -Visible { [bool]$script:Settings.RemoteAssist } -Action {
+        # Pomoc zdalna Windows: msra pokazuje sesje komputera do wyboru, użytkownik musi zaakceptować (włączana w ustawieniach)
         param($m, $rows)
         $r = Get-RdsSessionRows $rows | Select-Object -First 1
         if (-not $r) { return }
-        Start-Tool -FilePath 'msra.exe' -Arguments @('/offerRA', [string](Get-ObjectValue $r 'Komputer')) -Name ([string](Get-ObjectValue $r 'Komputer'))
+        Start-RemoteAssistance -Computer ([string](Get-ObjectValue $r 'Komputer'))
     }
     Add-RowAction -Module $Module -Text 'Rozłącz' -Icon 'E8CD' -Separator -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Disconnect -Rows $rows }
     Add-RowAction -Module $Module -Text 'Wyloguj' -Icon 'E7E8' -Danger -Action { param($m, $rows) Invoke-RdsSessionAction -Module $m -Op Logoff -Rows $rows }
