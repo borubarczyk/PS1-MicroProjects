@@ -15252,13 +15252,27 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
 # zasad grupy z historii GPP (profil użytkownika, ProgramData), a nazwy GPO z zapisanego stanu zasad grupy. Kod pomocniczy jako tekst
 # ($P.Helpers), bo blok wykonuje się na komputerze docelowym.
 $script:NetResHelpers = @'
+function Get-DoRegValue {
+    <#
+        Jedna wartość z rejestru (RegistryKey.GetValue); $Key - klucz z Get-Item/Get-ChildItem albo ścieżka; brak -> $null.
+        Nie Get-ItemProperty: czyta wszystkie wartości klucza i przerywa się (mimo -ErrorAction) na nietypowej, np. ExecTime
+        skryptów zasad grupy (REG_QWORD o długości 16 bajtów) - «Specified cast is not valid».
+    #>
+    param($Key, [string]$Name)
+    try {
+        $k = if ($Key -is [Microsoft.Win32.RegistryKey]) { $Key } else { Get-Item -LiteralPath $Key -ErrorAction Stop }
+        return $k.GetValue($Name)
+    }
+    catch { return $null }
+}
+
 function Get-DoProfiles {
     # Profile kont użytkowników (S-1-5-21-…): SID, folder, nazwa konta, czy gałąź rejestru jest załadowana (zalogowany)
     param([string]$UserFilter = '')
     foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue)) {
         $sid = $k.PSChildName
         if ($sid -notmatch '^S-1-5-21-') { continue }
-        $path = [string](Get-ItemProperty -LiteralPath $k.PSPath -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
+        $path = [string](Get-DoRegValue $k 'ProfileImagePath')
         $path = [Environment]::ExpandEnvironmentVariables($path)
         $name = ''
         try { $name = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value } catch { $name = Split-Path -Leaf $path }
@@ -15303,8 +15317,8 @@ function Get-DoGpoNames {
     $map = @{}
     foreach ($list in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State' -ErrorAction SilentlyContinue)) {
         foreach ($g in @(Get-ChildItem -LiteralPath (Join-Path $list.PSPath 'GPO-List') -ErrorAction SilentlyContinue)) {
-            $v = Get-ItemProperty -LiteralPath $g.PSPath -ErrorAction SilentlyContinue
-            if ($v -and $v.GPOName -and $v.DisplayName) { $map[([string]$v.GPOName).ToUpperInvariant()] = [string]$v.DisplayName }
+            $id = [string](Get-DoRegValue $g 'GPOName'); $dn = [string](Get-DoRegValue $g 'DisplayName')
+            if ($id -and $dn) { $map[$id.ToUpperInvariant()] = $dn }
         }
     }
     return $map
@@ -15356,19 +15370,18 @@ $script:NetDrivesScript = {
                 param($Root, $Source)
                 # Skrypty logowania z zasad grupy zastosowane dla użytkownika (plik i nazwa GPO) - treść sprawdza program
                 $scripts = @(foreach ($g in @(Get-ChildItem -LiteralPath "$Root\Software\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Logon" -ErrorAction SilentlyContinue)) {
-                        $gv = Get-ItemProperty -LiteralPath $g.PSPath -ErrorAction SilentlyContinue
                         foreach ($s in @(Get-ChildItem -LiteralPath $g.PSPath -ErrorAction SilentlyContinue)) {
-                            $file = [string](Get-ItemProperty -LiteralPath $s.PSPath -ErrorAction SilentlyContinue).Script
+                            $file = [string](Get-DoRegValue $s 'Script')
                             if (-not $file) { continue }
-                            if ($file -notmatch '^(\\\\|[A-Za-z]:)') { $file = ([string]$gv.FileSysPath).TrimEnd('\') + '\Scripts\Logon\' + $file }
-                            '{0}|{1}' -f $file, [string]$gv.DisplayName
+                            if ($file -notmatch '^(\\\\|[A-Za-z]:)') { $file = ([string](Get-DoRegValue $g 'FileSysPath')).TrimEnd('\') + '\Scripts\Logon\' + $file }
+                            '{0}|{1}' -f $file, [string](Get-DoRegValue $g 'DisplayName')
                         }
                     })
                 foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Network" -ErrorAction SilentlyContinue)) {
-                    $v = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
-                    $path = [string]$v.RemotePath
+                    $path = [string](Get-DoRegValue $k 'RemotePath')
                     # UserName: konto podane przy mapowaniu; własne konto użytkownika Windows zapisuje jako DWORD 0 albo pusty tekst
-                    $account = if ($v.UserName -is [string]) { $v.UserName } else { '' }
+                    $user = Get-DoRegValue $k 'UserName'
+                    $account = if ($user -is [string]) { $user } else { '' }
                     $letter = $k.PSChildName.ToUpperInvariant()
                     $origin = 'ręcznie'
                     foreach ($g in $gpp) {
@@ -15455,7 +15468,7 @@ $script:NetUnmapScript = {
                 param($Root, $Source)
                 $key = "$Root\Network\$letter"
                 if (-not (Test-Path -LiteralPath $key)) { return }
-                $cur = [string](Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue).RemotePath
+                $cur = [string](Get-DoRegValue $key 'RemotePath')
                 # Litera wskazuje już inny udział (zmiana po odczycie listy) - nie ruszamy
                 if ($it.Path -and $cur -and $cur -ne $it.Path) { $state.Other = $cur; return }
                 Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop
@@ -15534,7 +15547,7 @@ $script:NetPrintersScript = {
         try {
             Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
                 param($Root, $Source)
-                $device = [string](Get-ItemProperty -LiteralPath "$Root\Software\Microsoft\Windows NT\CurrentVersion\Windows" -Name Device -ErrorAction SilentlyContinue).Device
+                $device = [string](Get-DoRegValue "$Root\Software\Microsoft\Windows NT\CurrentVersion\Windows" 'Device')
                 $default = ($device -split ',')[0]
                 foreach ($k in @(Get-ChildItem -LiteralPath "$Root\Printers\Connections" -ErrorAction SilentlyContinue)) {
                     $parts = @($k.PSChildName -split ',' | Where-Object { $_ })
