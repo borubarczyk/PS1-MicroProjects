@@ -130,6 +130,8 @@ $script:Settings = [ordered]@{
     DebugLog         = $false
     LastWorkspace    = 'Remote'
     LastModules      = @{}
+    # Zwinięte kategorie nawigacji modułów: 'przestrzeń|kategoria'
+    NavCollapsed     = @()
     WindowWidth      = 1560
     WindowHeight     = 940
     WindowMaximized  = $false
@@ -354,6 +356,54 @@ function Format-Bytes {
     return '{0:N0} B' -f $Bytes
 }
 
+# Rozmiar w tabeli wyników: bajty pokazywane w czytelnej jednostce (KB / MB / GB / TB), a sortowane według liczby bajtów.
+# Typ kompilowany przy pierwszym użyciu (kolumny SizeColumns modułu); gdy się nie da - liczba MB jak dawniej.
+$script:ByteSizeSource = @'
+using System;
+using System.Globalization;
+namespace DomainOps {
+    public struct ByteSize : IComparable, IFormattable {
+        public readonly double Bytes;
+        public ByteSize(double bytes) { Bytes = bytes; }
+        public int CompareTo(object other) {
+            if (other is ByteSize) return Bytes.CompareTo(((ByteSize)other).Bytes);
+            if (other == null || other is DBNull) return 1;
+            try { return Bytes.CompareTo(Convert.ToDouble(other, CultureInfo.InvariantCulture)); } catch { return 1; }
+        }
+        public override string ToString() {
+            double b = Math.Abs(Bytes);
+            if (b >= 1099511627776.0) return (Bytes / 1099511627776.0).ToString("N2") + " TB";
+            if (b >= 1073741824.0) return (Bytes / 1073741824.0).ToString("N2") + " GB";
+            if (b >= 1048576.0) return (Bytes / 1048576.0).ToString("N1") + " MB";
+            if (b >= 1024.0) return (Bytes / 1024.0).ToString("N0") + " KB";
+            return Bytes.ToString("N0") + " B";
+        }
+        public string ToString(string format, IFormatProvider provider) { return ToString(); }
+    }
+}
+'@
+$script:ByteSizeReady = $false
+
+function ConvertTo-ByteSize {
+    # Liczba bajtów -> DomainOps.ByteSize; bez skompilowanego typu - MB z jednym miejscem po przecinku
+    param($Bytes)
+    if ($null -eq $Bytes -or $Bytes -is [System.DBNull]) { return $Bytes }
+    if (-not $script:ByteSizeReady) {
+        $script:ByteSizeReady = $true
+        if (-not ('DomainOps.ByteSize' -as [type])) { try { Add-Type -TypeDefinition $script:ByteSizeSource -ErrorAction Stop } catch { } }
+    }
+    if ('DomainOps.ByteSize' -as [type]) { return (New-Object DomainOps.ByteSize ([double]$Bytes)) }
+    return [Math]::Round([double]$Bytes / 1MB, 1)
+}
+
+function Get-ByteCount {
+    # Liczba bajtów z wartości komórki (ByteSize albo liczba MB - zapas bez skompilowanego typu)
+    param($Value)
+    if ($null -eq $Value -or $Value -is [System.DBNull] -or [string]$Value -eq '') { return 0.0 }
+    if ($Value.GetType().FullName -eq 'DomainOps.ByteSize') { return [double]$Value.Bytes }
+    return [double]$Value * 1MB
+}
+
 function Split-ListText {
     # "a, b; c" -> @('a','b','c')
     param([string]$Text)
@@ -492,7 +542,7 @@ function Import-Settings {
     foreach ($t in 'SearchBase', 'NameFilter', 'UserSearchBase', 'DomainController', 'LastWorkspace', 'GroupSearchBase', 'DisabledBaseOU', 'AadSyncServer', 'ReportJobsDir', 'MessageSender') { $s[$t] = [string]$s[$t] }
     $s.MessageSender = $s.MessageSender.Trim()
     if (-not $s.MessageSender -or $s.MessageSender.Length -gt 60) { $s.MessageSender = 'Administrator' }
-    foreach ($l in 'ExceptionUsers', 'ProtectedGroups', 'NtfsHiddenIdentities') { $s[$l] = @($s[$l] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
+    foreach ($l in 'ExceptionUsers', 'ProtectedGroups', 'NtfsHiddenIdentities', 'NavCollapsed') { $s[$l] = @($s[$l] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
     # ConvertTo-PlainData zwraca tablicę jako jeden obiekt - najpierw do zmiennej, dopiero potem wyliczanie
     $tpl = ConvertTo-PlainData $s.LocalGroupTemplates
     $s.LocalGroupTemplates = @(foreach ($t in @($tpl)) { if ($t -is [hashtable] -and [string]$t['Name']) { ConvertTo-LocalGroupTemplate $t } })
@@ -5117,21 +5167,25 @@ function Get-AccessSummary {
 }
 
 function Update-NavAccess {
-    # Nawigacja według uprawnień: ukryte zablokowane przestrzenie, moduły i kategorie bez dostępnych modułów
+    # Nawigacja według uprawnień i zwiniętych kategorii: ukryte zablokowane przestrzenie i moduły, kategorie bez dostępnych
+    # modułów oraz moduły zwiniętych kategorii (nagłówek zostaje, ze strzałką ▸)
     foreach ($ws in $script:UI.Workspaces.Values) {
         if ($ws.Tab) { $ws.Tab.Visibility = if (Test-WorkspaceAllowed $ws.Key) { 'Visible' } else { 'Collapsed' } }
         if (-not $ws.NavHost) { continue }
         $header = $null
         $any = $false
+        $collapsed = $false
         foreach ($child in @($ws.NavHost.Children)) {
-            if ($child -is [System.Windows.Controls.TextBlock]) {
+            if ($child.Tag -is [hashtable] -and $child.Tag['NavHeader']) {
                 if ($header) { $header.Visibility = if ($any) { 'Visible' } else { 'Collapsed' } }
                 $header = $child
                 $any = $false
+                $collapsed = Test-NavCollapsed -Workspace $ws.Key -Category ([string]$child.Tag.Category)
+                $child.Tag.Chevron.Text = Get-Glyph $(if ($collapsed) { 'E76C' } else { 'E70D' })
                 continue
             }
             $ok = Test-ModuleAllowed ([string]$child.Tag)
-            $child.Visibility = if ($ok) { 'Visible' } else { 'Collapsed' }
+            $child.Visibility = if ($ok -and -not $collapsed) { 'Visible' } else { 'Collapsed' }
             if ($ok) { $any = $true }
         }
         if ($header) { $header.Visibility = if ($any) { 'Visible' } else { 'Collapsed' } }
@@ -6032,6 +6086,9 @@ function Add-ResultRows {
                     if ($Computer -and $p.Name -eq $TargetColumn) { continue }
                     $values[$p.Name] = ConvertTo-CellValue $p.Value
                 }
+            }
+            foreach ($name in @($Module.SizeColumns)) {
+                if ($values.Contains($name) -and $values[$name] -is [System.ValueType] -and $values[$name] -isnot [bool]) { $values[$name] = ConvertTo-ByteSize $values[$name] }
             }
             foreach ($name in @($values.Keys)) {
                 if (-not $table.Columns.Contains($name)) { [void]$table.Columns.Add($name, [object]) }
@@ -8019,6 +8076,8 @@ function New-ModuleContext {
         DetailsFormatter = $null
         SecretColumns  = @()
         PillColumns    = @()
+        # Kolumny z liczbą bajtów: w tabeli w czytelnej jednostce (ConvertTo-ByteSize), sortowanie według bajtów
+        SizeColumns    = @()
         GoodWhenNo     = @()
         HiddenColumns  = @()
         # Kolumny ukryte przez użytkownika (wybór kolumn, «Ukryj kolumnę») - zostają ukryte po odświeżeniu wyników
@@ -8100,6 +8159,8 @@ function Show-Module {
     $script:Settings.LastModules[$definition.Workspace] = $Key
     $ws = $script:UI.Workspaces[$definition.Workspace]
     $nav = $ws.NavItems[$Key]
+    # Moduł z zwiniętej kategorii (np. otwarty z menu wiersza) - kategoria się rozwija, żeby było widać, gdzie jesteśmy
+    if ($nav -and (Test-NavCollapsed -Workspace $definition.Workspace -Category ([string]$definition.Category))) { Set-NavCategoryCollapsed -Workspace $definition.Workspace -Category ([string]$definition.Category) -Collapsed $false }
     if ($nav -and $nav.IsChecked -ne $true) { $nav.IsChecked = $true }
 }
 
@@ -9728,10 +9789,7 @@ function Initialize-Navigation {
         foreach ($order in @($ws['Categories'])) { if ($order -and @($defs | Where-Object { $_.Category -eq $order }).Count -gt 0) { [void]$categories.Add($order) } }
         foreach ($d in $defs) { if (-not $categories.Contains($d.Category)) { [void]$categories.Add($d.Category) } }
         foreach ($cat in $categories) {
-            $header = New-Object System.Windows.Controls.TextBlock
-            $header.Style = Get-ThemeResource 'NavHeader'
-            $header.Text = $cat.ToUpperInvariant()
-            [void]$panel.Children.Add($header)
+            [void]$panel.Children.Add((New-NavHeader -Workspace $ws.Key -Category $cat))
             foreach ($d in @($defs | Where-Object { $_.Category -eq $cat })) {
                 $item = New-NavItem -Definition $d -Workspace $ws.Key
                 $ws.NavItems[$d.Key] = $item
@@ -9742,6 +9800,73 @@ function Initialize-Navigation {
     foreach ($d in $script:UI.ModuleDefs) {
         if (-not $script:UI.Workspaces.Contains($d.Workspace)) { Write-Log "Moduł «$($d.Title)» wskazuje nieistniejącą przestrzeń roboczą «$($d.Workspace)»." 'WARN' -Module '' }
     }
+    Update-NavAccess
+}
+
+function New-NavHeader {
+    # Nagłówek kategorii: kliknięcie zwija i rozwija jej moduły (stan zapamiętany w ustawieniach), prawy przycisk -
+    # zwinięcie albo rozwinięcie wszystkich kategorii przestrzeni
+    param([string]$Workspace, [string]$Category)
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Tag = @{ NavHeader = $true; Workspace = $Workspace; Category = $Category }
+    # Przezroczyste tło - kliknięcie działa na całej szerokości nagłówka
+    $grid.Background = [System.Windows.Media.Brushes]::Transparent
+    $grid.Cursor = [System.Windows.Input.Cursors]::Hand
+    $grid.ToolTip = 'Kliknij, aby zwinąć lub rozwinąć kategorię (prawy przycisk – wszystkie)'
+    foreach ($w in @('*', 'Auto')) {
+        $cd = New-Object System.Windows.Controls.ColumnDefinition
+        $cd.Width = if ($w -eq '*') { New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star) } else { [System.Windows.GridLength]::Auto }
+        [void]$grid.ColumnDefinitions.Add($cd)
+    }
+    $text = New-Object System.Windows.Controls.TextBlock
+    $text.Style = Get-ThemeResource 'NavHeader'
+    $text.Text = $Category.ToUpperInvariant()
+    [void]$grid.Children.Add($text)
+    $chev = New-GlyphBlock -Code 'E70D' -Size 9 -Color '#5E6779'
+    $chev.Margin = '0,14,10,5'
+    $chev.VerticalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetColumn($chev, 1)
+    [void]$grid.Children.Add($chev)
+    $grid.Tag.Chevron = $chev
+    $grid.add_MouseLeftButtonUp({
+            param($s, $e)
+            $t = $s.Tag
+            Set-NavCategoryCollapsed -Workspace $t.Workspace -Category $t.Category -Collapsed (-not (Test-NavCollapsed -Workspace $t.Workspace -Category $t.Category))
+            $e.Handled = $true
+        })
+    $menu = New-Object System.Windows.Controls.ContextMenu
+    foreach ($it in @(@{ Text = 'Zwiń wszystkie kategorie'; Icon = 'E70E'; Collapse = $true }, @{ Text = 'Rozwiń wszystkie kategorie'; Icon = 'E70D'; Collapse = $false })) {
+        $mi = New-MenuItem -Text $it.Text -Icon $it.Icon
+        $mi.Tag = @{ Workspace = $Workspace; Collapse = $it.Collapse }
+        $mi.add_Click({ param($s, $e) Set-NavAllCollapsed -Workspace ([string]$s.Tag.Workspace) -Collapsed ([bool]$s.Tag.Collapse) })
+        [void]$menu.Items.Add($mi)
+    }
+    $grid.ContextMenu = $menu
+    return $grid
+}
+
+function Test-NavCollapsed {
+    param([string]$Workspace, [string]$Category)
+    return (@($script:Settings.NavCollapsed) -contains "$Workspace|$Category")
+}
+
+function Set-NavCategoryCollapsed {
+    # Zwinięcie / rozwinięcie kategorii nawigacji; widoczność modułów liczy Update-NavAccess (razem z uprawnieniami)
+    param([string]$Workspace, [string]$Category, [bool]$Collapsed)
+    $key = "$Workspace|$Category"
+    $list = @(@($script:Settings.NavCollapsed) | Where-Object { $_ -and $_ -ne $key })
+    if ($Collapsed) { $list += $key }
+    $script:Settings.NavCollapsed = $list
+    Update-NavAccess
+}
+
+function Set-NavAllCollapsed {
+    param([string]$Workspace, [bool]$Collapsed)
+    $ws = $script:UI.Workspaces[$Workspace]
+    $cats = @(foreach ($child in @($ws.NavHost.Children)) { if ($child.Tag -is [hashtable] -and $child.Tag['NavHeader']) { [string]$child.Tag.Category } })
+    $list = @(@($script:Settings.NavCollapsed) | Where-Object { $_ -and $_ -notlike "$Workspace|*" })
+    if ($Collapsed) { $list += @($cats | ForEach-Object { "$Workspace|$_" }) }
+    $script:Settings.NavCollapsed = $list
     Update-NavAccess
 }
 
@@ -12020,15 +12145,39 @@ param(`$P)
 `$r = & { $($script:RemoteExecScript.ToString()) } `$P
 `$lines = @(`$r.'Wynik' -split "``r?``n" | ForEach-Object { `$_.Trim() } | Where-Object { `$_ })
 `$ok = (`$r.'Kod wyjścia' -eq 0)
+# Zasady wskazane w komunikatach (GUID niezależnie od języka systemu) i ich nazwy z zapisanego stanu zasad grupy
+# na komputerze (zasady już tu stosowane); pozostałe nazwy uzupełnia program z AD
+`$guids = @([regex]::Matches((`$lines -join ' '), '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') | ForEach-Object { `$_.Value.ToUpperInvariant() } | Select-Object -Unique)
+`$names = @{}
+if (`$guids.Count) {
+    foreach (`$list in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State' -ErrorAction SilentlyContinue)) {
+        foreach (`$g in @(Get-ChildItem -LiteralPath (Join-Path `$list.PSPath 'GPO-List') -ErrorAction SilentlyContinue)) {
+            `$id = [string]`$g.GetValue('GPOName'); `$dn = [string]`$g.GetValue('DisplayName')
+            if (`$id -and `$dn) { `$names[`$id.ToUpperInvariant()] = `$dn }
+        }
+    }
+}
 [pscustomobject]@{
-    'Wynik'       = `$(if (`$ok) { 'OK' } elseif (`$null -eq `$r.'Kod wyjścia') { `$r.'Stan' } else { 'Błąd – kod ' + `$r.'Kod wyjścia' })
-    'Kod wyjścia' = `$r.'Kod wyjścia'
-    'Czas (s)'    = `$r.'Czas (s)'
-    'Komunikaty'  = (`$lines -join ' | ')
-    '__tone'      = `$(if (`$ok) { 'ok' } else { 'crit' })
+    'Wynik'            = `$(if (`$ok) { 'OK' } elseif (`$null -eq `$r.'Kod wyjścia') { `$r.'Stan' } else { 'Błąd – kod ' + `$r.'Kod wyjścia' })
+    'Kod wyjścia'      = `$r.'Kod wyjścia'
+    'Czas (s)'         = `$r.'Czas (s)'
+    'Problem z zasadą' = (`$guids -join ', ')
+    'Nazwa zasady'     = (@(`$guids | ForEach-Object { if (`$names.ContainsKey(`$_)) { `$names[`$_] } else { '?' } }) -join ', ')
+    'Komunikaty'       = (`$lines -join ' | ')
+    '__tone'           = `$(if (`$ok) { 'ok' } else { 'crit' })
 }
 "@)
-        Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters $params -ScriptBlock $sb
+        Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters $params -ScriptBlock $sb -OnResult {
+            # Nazwy zasad, których komputer nie zna (np. nowa zasada, która od razu zawodzi) - z AD
+            param($m, $r)
+            foreach ($row in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Komputer') -eq $r.Target -and [string](Get-ObjectValue $_ 'Nazwa zasady') -match '\?' })) {
+                $guids = @(([string](Get-ObjectValue $row 'Problem z zasadą')).Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                $known = @(([string](Get-ObjectValue $row 'Nazwa zasady')).Split(',') | ForEach-Object { $_.Trim() })
+                $ad = Resolve-GpoNames -Guids $guids
+                $text = @(for ($i = 0; $i -lt $guids.Count; $i++) { if ($i -lt $known.Count -and $known[$i] -and $known[$i] -ne '?') { $known[$i] } elseif ($ad.ContainsKey($guids[$i])) { $ad[$guids[$i]] } else { '? (brak w AD)' } }) -join ', '
+                Set-ResultValue -Module $m -Row $row -Column 'Nazwa zasady' -Value $text
+            }
+        }
     }
     Add-RowAction -Module $m -Text 'Uruchom gpupdate na tych komputerach' -Icon 'E895' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Run }
 }
@@ -12377,15 +12526,16 @@ $script:DiskCleanupScript = {
             }
             finally { if ($stopped) { Start-Service -Name $c.Service -ErrorAction SilentlyContinue } }
         }
-        $row = [ordered]@{ 'Kategoria' = $c.Name; 'Rozmiar (MB)' = [Math]::Round($all / 1MB, 1); 'Do usunięcia (MB)' = [Math]::Round($cand / 1MB, 1); 'Do usunięcia (pliki)' = $candCount }
-        if (-not $P.Preview) { $row['Usunięto (MB)'] = [Math]::Round($freed / 1MB, 1); $row['Usunięto'] = $removed; $row['Nie usunięto (w użyciu)'] = $failed }
+        # Rozmiary w bajtach - program pokazuje je w czytelnej jednostce (kolumny SizeColumns modułu)
+        $row = [ordered]@{ 'Kategoria' = $c.Name; 'Rozmiar' = [double]$all; 'Do usunięcia' = [double]$cand; 'Do usunięcia (pliki)' = $candCount }
+        if (-not $P.Preview) { $row['Usunięto'] = [double]$freed; $row['Usunięto (pliki)'] = $removed; $row['Nie usunięto (w użyciu)'] = $failed }
         $row['Uwagi'] = $(if ($note) { $note } elseif (-not $c.Age) { 'w całości' } else { "starsze niż $([int]$P.OlderThanDays) dni" })
         [pscustomobject]$row
     }
     $after = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)).FreeSpace
-    $sum = [ordered]@{ 'Kategoria' = "(dysk systemowy $env:SystemDrive)"; 'Do usunięcia (MB)' = [Math]::Round($totalCand / 1MB, 1) }
-    if (-not $P.Preview) { $sum['Odzyskano (GB)'] = [Math]::Round(($after - $before) / 1GB, 2) }
-    $sum['Wolne (GB)'] = [Math]::Round($after / 1GB, 1)
+    $sum = [ordered]@{ 'Kategoria' = "(dysk systemowy $env:SystemDrive)"; 'Do usunięcia' = [double]$totalCand }
+    if (-not $P.Preview) { $sum['Odzyskano'] = [double]($after - $before) }
+    $sum['Wolne'] = [double]$after
     [pscustomobject]$sum
 }
 
@@ -12393,6 +12543,7 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
     -Description 'Zajętość dysków lokalnych oraz czyszczenie: pliki tymczasowe, Kosz, raporty błędów, pamięć optymalizacji dostarczania, zrzuty pamięci i pobrane aktualizacje – z podglądem, ile miejsca się zwolni, i raportem odzyskanego miejsca.' -Build {
     param($m)
     $m.PillColumns = @('Stan')
+    $m.SizeColumns = @('Rozmiar', 'Do usunięcia', 'Usunięto', 'Odzyskano', 'Wolne')
     $row = Add-ToolbarRow -Module $m -Title 'Zajętość'
     Add-Button -Parent $row -Text 'Pokaż dyski' -Icon 'EDA2' -Module $m -Primary -OnClick {
         param($m)
@@ -12428,13 +12579,12 @@ Register-Module -Workspace 'Remote' -Category 'System' -Key 'Disks' -Title 'Dysk
         $m.Data.CleanPreview = [bool]$Preview
         Start-HostOperation -Module $m -Name $(if ($Preview) { 'Podgląd czyszczenia dysków' } else { 'Czyszczenie dysków' }) -Targets $targets -Parameters $params -ScriptBlock $script:DiskCleanupScript -OnComplete {
             param($m)
-            $mb = 0.0
+            $bytes = 0.0
             foreach ($r in @(Get-ResultRowsAll -Module $m)) {
                 if ([string](Get-ObjectValue $r 'Kategoria') -like '(*') { continue }
-                $v = [string](Get-ObjectValue $r $(if ($m.Data.CleanPreview) { 'Do usunięcia (MB)' } else { 'Usunięto (MB)' }))
-                if ($v) { $mb += [double]($v -replace ',', '.') }
+                $bytes += Get-ByteCount (Get-ObjectValue $r $(if ($m.Data.CleanPreview) { 'Do usunięcia' } else { 'Usunięto' }))
             }
-            Show-Toast ('{0}: {1:N2} GB' -f $(if ($m.Data.CleanPreview) { 'Do zwolnienia' } else { 'Zwolniono' }), ($mb / 1024)) 'ok' 6
+            Show-Toast ('{0}: {1}' -f $(if ($m.Data.CleanPreview) { 'Do zwolnienia' } else { 'Zwolniono' }), (Format-Bytes $bytes)) 'ok' 6
         }
     }
     Add-Button -Parent $row3 -Text 'Podgląd' -Icon 'E7B3' -Module $m -ToolTip 'Ile miejsca zwolni czyszczenie wybranych kategorii (nic nie jest usuwane)' -OnClick { param($m) & $m.Actions.Cleanup $m -Preview } | Out-Null
@@ -13787,6 +13937,186 @@ function Hide-EventIds {
     }
     Update-EventTiles -Module $Module
     Show-Toast ("Ukryto wierszy: {0}. ID {1} będą pomijane przy kolejnych pobraniach i śledzeniu (pole «ID»)." -f $drop.Count, ($ids -join ', ')) 'info'
+}
+#endregion
+
+#region Zarządzanie zdalne: rejestr - odczyt i eksport kluczy (.reg), np. przed reinstalacją programu
+# Klucze HKLM, HKU i HKCR (HKCU przez WinRM to gałąź konta, którym się łączymy - dla użytkownika HKU\<SID>).
+# Eksport: reg export na komputerze, treść wraca do programu i trafia do pliku <komputer>.reg (format regedit, do importu).
+$script:RegistryPresets = [ordered]@{
+    # ClientID, ustawienia i hasła (zaszyfrowane) - 64-bitowa instalacja i 32-bitowa (WOW6432Node)
+    'TeamViewer' = @('HKLM\SOFTWARE\TeamViewer', 'HKLM\SOFTWARE\WOW6432Node\TeamViewer')
+}
+
+function ConvertTo-RegistryKeyList {
+    <#
+        Tekst z kluczami (jeden w wierszu) -> @{ Keys = @('HKLM\...'); Errors = @(opisy) }. Przyjmuje skróty i pełne nazwy
+        gałęzi, ścieżki skopiowane z paska adresu regedit («Komputer\HKEY_LOCAL_MACHINE\...») i z PowerShell (Registry::, HKLM:).
+    #>
+    param([string]$Text)
+    $roots = @{ 'HKLM' = 'HKLM'; 'HKEY_LOCAL_MACHINE' = 'HKLM'; 'HKU' = 'HKU'; 'HKEY_USERS' = 'HKU'; 'HKCR' = 'HKCR'; 'HKEY_CLASSES_ROOT' = 'HKCR'; 'HKCC' = 'HKCC'; 'HKEY_CURRENT_CONFIG' = 'HKCC' }
+    $keys = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+    foreach ($line in @(([string]$Text) -split '\r?\n')) {
+        $k = $line.Trim().Trim('"').Trim().TrimEnd('\')
+        if (-not $k -or $k.StartsWith('#')) { continue }
+        $k = $k -replace '^Microsoft\.PowerShell\.Core\\Registry::', '' -replace '^Registry::', '' -replace '^(Computer|Komputer)\\', ''
+        $k = $k -replace '^(HK[A-Z_]+):\\?', '$1\'
+        $root = ($k -split '\\', 2)[0].ToUpperInvariant()
+        if ($root -in 'HKCU', 'HKEY_CURRENT_USER') { [void]$errors.Add("$line – HKCU przez WinRM to gałąź konta połączenia; dla użytkownika użyj HKU\<SID>"); continue }
+        if (-not $roots.ContainsKey($root)) { [void]$errors.Add("$line – nieznana gałąź (HKLM, HKU, HKCR)"); continue }
+        $rest = if ($k.Contains('\')) { ($k -split '\\', 2)[1].Trim('\') } else { '' }
+        $norm = $roots[$root] + $(if ($rest) { '\' + $rest } else { '' })
+        if ($rest -and -not ($keys -contains $norm)) { [void]$keys.Add($norm) }
+        elseif (-not $rest) { [void]$errors.Add("$line – podaj klucz, nie całą gałąź") }
+    }
+    return @{ Keys = @($keys); Errors = @($errors) }
+}
+
+# Odczyt wartości kluczy (z podkluczami do limitu) i opcjonalnie eksport reg export. $P: Keys, Recurse, Export, MaxValues
+$script:RegistryReadScript = {
+    param($P)
+    $hives = @{ 'HKLM' = 'HKEY_LOCAL_MACHINE'; 'HKU' = 'HKEY_USERS'; 'HKCR' = 'HKEY_CLASSES_ROOT'; 'HKCC' = 'HKEY_CURRENT_CONFIG' }
+    $format = {
+        param($Kind, $Data)
+        if ($null -eq $Data) { return '' }
+        switch ([string]$Kind) {
+            # Bez znaku jak w regedit (wartość z ustawionym najwyższym bitem .NET zwraca jako ujemną)
+            'DWord' { $u = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$Data), 0); return ('{0} (0x{0:X8})' -f $u) }
+            'QWord' { if ($Data -isnot [byte[]]) { $u = [BitConverter]::ToUInt64([BitConverter]::GetBytes([int64]$Data), 0); return ('{0} (0x{0:X16})' -f $u) } }
+            'MultiString' { return (@($Data) -join ' | ') }
+        }
+        if ($Data -is [byte[]]) {
+            $hex = (@($Data | Select-Object -First 64 | ForEach-Object { $_.ToString('X2') })) -join ' '
+            return $(if ($Data.Length -gt 64) { '{0} … ({1} bajtów)' -f $hex, $Data.Length } else { $hex })
+        }
+        return [string]$Data
+    }
+    $count = 0
+    foreach ($key in @($P.Keys)) {
+        $root, $rest = ([string]$key).Split('\', 2)
+        $ps = 'Registry::{0}\{1}' -f $hives[$root], $rest
+        if (-not (Test-Path -LiteralPath $ps)) { [pscustomobject][ordered]@{ '__rec' = 'row'; 'Klucz' = $key; 'Nazwa' = ''; 'Typ' = ''; 'Dane' = ''; 'Uwagi' = 'brak klucza na tym komputerze' }; continue }
+        if ($P.Export) {
+            # reg export: plik UTF-16 z nagłówkiem regedit; stderr reg.exe to w Windows PowerShell rekordy błędów - stąd Continue
+            $tmp = Join-Path $env:SystemRoot ('Temp\DomainOps-reg-{0}.reg' -f [guid]::NewGuid().ToString('N').Substring(0, 12))
+            $eap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            $out = @(& reg.exe export $key $tmp /y 2>&1 | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $eap
+            if ($code -eq 0 -and (Test-Path -LiteralPath $tmp)) { [pscustomobject]@{ '__rec' = 'export'; 'Key' = $key; 'Text' = [System.IO.File]::ReadAllText($tmp) } }
+            else { [pscustomobject][ordered]@{ '__rec' = 'row'; 'Klucz' = $key; 'Nazwa' = ''; 'Typ' = ''; 'Dane' = ''; 'Uwagi' = 'Błąd eksportu (reg export, kod {0}): {1}' -f $code, ($out -join ' ') } }
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+        $queue = New-Object System.Collections.Queue
+        $queue.Enqueue(@{ Path = $ps; Show = $key })
+        while ($queue.Count) {
+            $cur = $queue.Dequeue()
+            $item = $null
+            try { $item = Get-Item -LiteralPath $cur.Path -ErrorAction Stop } catch { [pscustomobject][ordered]@{ '__rec' = 'row'; 'Klucz' = $cur.Show; 'Nazwa' = ''; 'Typ' = ''; 'Dane' = ''; 'Uwagi' = 'Błąd odczytu: ' + $_.Exception.Message }; continue }
+            $names = @($item.GetValueNames() | Sort-Object)
+            if (-not $names.Count) { [pscustomobject][ordered]@{ '__rec' = 'row'; 'Klucz' = $cur.Show; 'Nazwa' = ''; 'Typ' = ''; 'Dane' = ''; 'Uwagi' = 'klucz bez wartości' } }
+            foreach ($n in $names) {
+                if ($count -ge $P.MaxValues) { break }
+                $count++
+                # Pojedyncze wartości przez RegistryKey - Get-ItemProperty przerywa się na nietypowych (np. 16-bajtowy REG_QWORD)
+                # Zwykłe przypisanie w try - przypisanie całego try rozwinęłoby tablicę bajtów w luźne liczby
+                $kind = 'Unknown'; $data = $null
+                try { $kind = [string]$item.GetValueKind($n) } catch { }
+                try { $data = $item.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } catch { }
+                $type = @{ 'String' = 'REG_SZ'; 'ExpandString' = 'REG_EXPAND_SZ'; 'DWord' = 'REG_DWORD'; 'QWord' = 'REG_QWORD'; 'MultiString' = 'REG_MULTI_SZ'; 'Binary' = 'REG_BINARY'; 'None' = 'REG_NONE' }[$kind]
+                [pscustomobject][ordered]@{ '__rec' = 'row'; 'Klucz' = $cur.Show; 'Nazwa' = $(if ($n) { $n } else { '(domyślna)' }); 'Typ' = $(if ($type) { $type } else { $kind }); 'Dane' = (& $format $kind $data); 'Uwagi' = '' }
+            }
+            if ($count -ge $P.MaxValues) { [pscustomobject][ordered]@{ '__rec' = 'row'; 'Klucz' = $cur.Show; 'Nazwa' = ''; 'Typ' = ''; 'Dane' = ''; 'Uwagi' = ('pokazano pierwsze {0} wartości – resztę zawiera eksport .reg' -f $P.MaxValues) }; break }
+            if ($P.Recurse) { foreach ($sub in @($item.GetSubKeyNames() | Sort-Object)) { $queue.Enqueue(@{ Path = ('{0}\{1}' -f $cur.Path, $sub); Show = ('{0}\{1}' -f $cur.Show, $sub) }) } }
+        }
+    }
+}
+
+function Save-RegistryExport {
+    # Eksporty kluczy z jednego komputera -> jeden plik <komputer>.reg (nagłówek regedit raz, UTF-16 jak z reg export)
+    param([string]$Folder, [string]$Computer, [object[]]$Exports)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("Windows Registry Editor Version 5.00`r`n")
+    foreach ($e in $Exports) {
+        $body = ([string]$e.Text) -replace '^\uFEFF', '' -replace '^\s*Windows Registry Editor Version 5\.00\s*', ''
+        [void]$sb.Append("`r`n; " + [string]$e.Key + "`r`n" + $body.TrimEnd() + "`r`n")
+    }
+    $name = ($Computer -replace '[\\/:*?"<>|]', '_') + '.reg'
+    if (-not (Test-Path -LiteralPath $Folder)) { New-Item -ItemType Directory -Path $Folder -Force | Out-Null }
+    $file = Join-Path $Folder $name
+    [System.IO.File]::WriteAllText($file, $sb.ToString(), [System.Text.Encoding]::Unicode)
+    return $file
+}
+
+Register-Module -Workspace 'Remote' -Category 'System' -Key 'RegistryExport' -Title 'Rejestr – odczyt i eksport' -Icon 'E74C' -Badge 'nowe' `
+    -Description 'Wartości wybranych kluczy rejestru z wielu komputerów naraz (z podkluczami) i eksport do plików .reg – po jednym na komputer, w formacie regedit do późniejszego importu. Np. przed reinstalacją programu (szablon TeamViewer: ClientID, ustawienia).' -Build {
+    param($m)
+    $m.Keys = Add-StretchTextBox -Module $m -Title 'Klucze' -Multiline -Height 80 -Placeholder 'Jeden klucz w wierszu, np. HKLM\SOFTWARE\TeamViewer (także skopiowany z paska adresu regedit)' -Text ([string](Get-ModuleSetting -Module $m -Name 'Keys' -Default ''))
+    Register-ControlHandler -Control $m.Keys -EventName 'TextChanged' -Module $m -Action { param($m, $s) Set-ModuleSetting -Module $m -Name 'Keys' -Value $s.Text }
+    $row = Add-ToolbarRow -Module $m -Title 'Szablony'
+    foreach ($name in $script:RegistryPresets.Keys) {
+        $b = Add-Button -Parent $row -Text $name -Icon 'E8A5' -Module $m -ToolTip ('Wstaw klucze: ' + ($script:RegistryPresets[$name] -join ', ')) -OnClick {
+            param($m, $s)
+            $preset = $script:RegistryPresets[[string]$s.Tag]
+            $have = @(([string]$m.Keys.Text) -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $m.Keys.Text = (@($have) + @($preset | Where-Object { $have -notcontains $_ })) -join "`r`n"
+        }
+        $b.Tag = $name
+    }
+    $row2 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.Recurse = Add-CheckBox -Parent $row2 -Text 'Z podkluczami' -Checked $true -ToolTip 'Wartości także z podkluczy (eksport .reg zawsze obejmuje podklucze)'
+    Add-Label -Parent $row2 -Text 'Najwyżej wartości' | Out-Null
+    $m.Max = Add-Numeric -Parent $row2 -Value 2000 -Minimum 100 -Maximum 50000 -Width 80
+    $m.Actions.Run = {
+        param($m, [bool]$Export)
+        $parsed = ConvertTo-RegistryKeyList -Text $m.Keys.Text
+        if ($parsed.Errors.Count) { Show-Warning ("Popraw klucze:`n" + ($parsed.Errors -join "`n")); return }
+        if (-not $parsed.Keys.Count) { Show-Warning 'Wpisz klucze rejestru (jeden w wierszu) albo wybierz szablon.'; return }
+        $targets = @(Get-TargetComputers)
+        if (-not $targets) { return }
+        $m.Data.Export = $Export
+        $m.Data.ExportFolder = $(if ($Export) { Join-Path ([string]$m.Folder.Text.Trim()) ('{0:yyyyMMdd_HHmmss}' -f (Get-Date)) } else { '' })
+        $m.Data.Files = New-Object System.Collections.ArrayList
+        if ($Export) { Set-ModuleSetting -Module $m -Name 'Folder' -Value $m.Folder.Text.Trim() }
+        # Wiersze dodaje OnResult (-Output None) - tabela czyszczona tu, jak przy zwykłym odczycie do tabeli
+        Reset-ResultTable -Module $m
+        Start-HostOperation -Module $m -Name $(if ($Export) { 'Eksport kluczy rejestru' } else { 'Odczyt rejestru' }) -Targets $targets -Output None -ScriptBlock $script:RegistryReadScript `
+            -Parameters @{ Keys = $parsed.Keys; Recurse = (Test-Checked $m.Recurse); Export = $Export; MaxValues = (Get-Num $m.Max) } -OnResult {
+            param($m, $r)
+            if (-not $r.Ok) { Add-ResultRows -Module $m -Computer $r.Target -Objects @([pscustomobject][ordered]@{ 'Klucz' = ''; 'Uwagi' = 'Błąd: ' + ((@($r.Errors)) -join ' ') }); return }
+            $rows = @($r.Data | Where-Object { [string](Get-ObjectValue $_ '__rec') -eq 'row' })
+            if ($rows.Count) { Add-ResultRows -Module $m -Computer $r.Target -Objects $rows }
+            $exports = @($r.Data | Where-Object { [string](Get-ObjectValue $_ '__rec') -eq 'export' })
+            if ($m.Data.Export -and $exports.Count) {
+                try {
+                    $file = Save-RegistryExport -Folder $m.Data.ExportFolder -Computer $r.Target -Exports $exports
+                    [void]$m.Data.Files.Add($file)
+                    Write-Log ('[{0}] zapisano {1} (kluczy: {2})' -f $r.Target, $file, $exports.Count) 'OK'
+                }
+                catch { Write-Log ('[{0}] nie zapisano pliku .reg: {1}' -f $r.Target, $_.Exception.Message) 'ERROR' }
+            }
+        } -OnComplete {
+            param($m)
+            if ($m.Data.Export) {
+                $n = $m.Data.Files.Count
+                Show-Toast $(if ($n) { "Zapisano plików .reg: $n – $($m.Data.ExportFolder)" } else { 'Nie zapisano żadnego pliku .reg (brak kluczy albo błędy – szczegóły w tabeli)' }) $(if ($n) { 'ok' } else { 'warn' }) 6
+            }
+        }
+    }
+    $row3 = Add-ToolbarRow -Module $m -Title 'Akcje'
+    Add-Button -Parent $row3 -Text 'Pokaż wartości' -Icon 'E72C' -Module $m -Primary -OnClick { param($m) & $m.Actions.Run $m $false } | Out-Null
+    Add-Button -Parent $row3 -Text 'Eksportuj do .reg' -Icon 'EDE1' -Module $m -ToolTip 'reg export na każdym komputerze; pliki <komputer>.reg w nowym folderze z datą' -OnClick { param($m) & $m.Actions.Run $m $true } | Out-Null
+    Add-Label -Parent $row3 -Text 'do folderu' | Out-Null
+    $m.Folder = Add-TextBox -Parent $row3 -Width 360 -Text ([string](Get-ModuleSetting -Module $m -Name 'Folder' -Default (Join-Path $script:App.DataDir 'Rejestr')))
+    Add-Button -Parent $row3 -Text '' -Icon 'E838' -Module $m -AlwaysEnabled -ToolTip 'Wybierz folder' -OnClick { param($m) $p = Select-FolderPath -Selected $m.Folder.Text.Trim(); if ($p) { $m.Folder.Text = $p } } | Out-Null
+    Add-Button -Parent $row3 -Text 'Otwórz folder' -Icon 'E8DA' -Module $m -AlwaysEnabled -ToolTip 'Ostatni eksport (albo folder eksportów) w Eksploratorze' -OnClick {
+        param($m)
+        $f = if ($m.Data['ExportFolder'] -and (Test-Path -LiteralPath $m.Data.ExportFolder)) { $m.Data.ExportFolder } else { $m.Folder.Text.Trim() }
+        Show-InExplorer -Path $f
+    } | Out-Null
+    Add-Label -Parent (Add-ToolbarRow -Module $m -Title ' ') -Text 'Przywrócenie: plik .reg uruchomiony na komputerze (albo reg import). HKCU przez WinRM to gałąź konta połączenia – dla użytkownika HKU\<SID> (np. z modułu Profile).' -Hint | Out-Null
 }
 #endregion
 
@@ -20385,6 +20715,34 @@ $script:AdPrelude = $script:AdPrelude.Replace('%PROXIES%', (& {
 
 # Systemy bez wsparcia producenta (stan na 2026 r.): Windows 10 poza LTSC, Windows 7/8.x, Server 2003-2012 R2
 $script:UnsupportedOsPattern = 'Windows (XP|Vista|7|8|8\.1)( |$)|Windows 10 (?!.*LTSC)|Windows Server (2003|2008|2012)'
+
+$script:GpoNameCache = @{}
+
+function Resolve-GpoNames {
+    <#
+        GUID zasad grupy ({…}) -> nazwa wyświetlana z AD (obiekty groupPolicyContainer); wynik: hashtabla GUID -> nazwa
+        (tylko znalezione). Pamięć podręczna na czas pracy programu; bez modułu AD albo przy błędzie zapytania - pusta.
+    #>
+    param([string[]]$Guids)
+    $want = @($Guids | ForEach-Object { ([string]$_).Trim().ToUpperInvariant() } | Where-Object { $_ -match '^\{[0-9A-F-]{36}\}$' -and -not $script:GpoNameCache.ContainsKey($_) } | Select-Object -Unique)
+    if ($want.Count -and (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        try {
+            Import-AdModule
+            $ad = Get-AdSplat
+            $filter = '(&(objectClass=groupPolicyContainer)(|' + ((@($want | ForEach-Object { "(name=$_)" })) -join '') + '))'
+            foreach ($g in @(Get-ADObject -LDAPFilter $filter -Properties displayName @ad)) { $script:GpoNameCache[([string]$g.Name).ToUpperInvariant()] = [string]$g.displayName }
+            # Brak w AD (np. usunięta zasada) też zapamiętany - bez ponownych zapytań
+            foreach ($w in $want) { if (-not $script:GpoNameCache.ContainsKey($w)) { $script:GpoNameCache[$w] = '' } }
+        }
+        catch { }
+    }
+    $map = @{}
+    foreach ($g in @($Guids)) {
+        $k = ([string]$g).Trim().ToUpperInvariant()
+        if ($script:GpoNameCache.ContainsKey($k) -and $script:GpoNameCache[$k]) { $map[$k] = $script:GpoNameCache[$k] }
+    }
+    return $map
+}
 
 function Get-FriendlyAdError {
     # Typowe komunikaty błędów AD (po angielsku) -> wskazówka po polsku; nieznane bez zmian
