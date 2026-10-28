@@ -15348,7 +15348,8 @@ $script:NetDrivesScript = {
                 $x = $it.Props
                 if ([string]$x.GetAttribute('action') -eq 'D') { continue }
                 $guid = $it.Gpo.ToUpperInvariant()
-                @{ Letter = ([string]$x.GetAttribute('letter')).ToUpperInvariant(); Path = ([string]$x.GetAttribute('path')).TrimEnd('\'); Gpo = $(if ($names.ContainsKey($guid)) { $names[$guid] } else { $it.Gpo }) }
+                # useLetter=0: pierwsza wolna litera - pasuje każda
+                @{ Letter = $(if ([string]$x.GetAttribute('useLetter') -eq '0') { '' } else { ([string]$x.GetAttribute('letter')).ToUpperInvariant() }); Path = ([string]$x.GetAttribute('path')).TrimEnd('\'); Gpo = $(if ($names.ContainsKey($guid)) { $names[$guid] } else { $it.Gpo }) }
             })
         try {
             Use-DoUserHive -Profile $pr -LoadOffline $P.Offline -Action {
@@ -15467,7 +15468,8 @@ $script:NetUnmapScript = {
         if ($pr.Loaded) {
             $task = 'DomainOps-Unmap-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
             try {
-                $principal = New-ScheduledTaskPrincipal -UserId $it.User -LogonType Interactive -RunLevel Limited
+                # SID zamiast nazwy - działa także, gdy nazwy konta nie da się przetłumaczyć
+                $principal = New-ScheduledTaskPrincipal -UserId $it.Sid -LogonType Interactive -RunLevel Limited
                 Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\net.exe') -Argument ('use {0}: /delete /y' -f $letter)) -Principal $principal -Force | Out-Null
                 Start-ScheduledTask -TaskName $task
                 # Wynik net use: 0 - odłączono, 2 - nie było połączenia; 267009/267011 - zadanie jeszcze trwa / nie ruszyło
