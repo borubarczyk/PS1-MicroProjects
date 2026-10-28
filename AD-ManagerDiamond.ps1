@@ -5094,27 +5094,29 @@ function Update-NavAccess {
 }
 
 function Update-OperatorView {
-    # Operator - konto, które odblokowało program: na górnym pasku (przed kłódką) i w tytule okna; bez blokady PIN-em brak
+    # Operator - konto, które odblokowało program: nazwa przy kłódce na górnym pasku (szczegóły w podpowiedzi) i w tytule
+    # okna; bez blokady PIN-em (kłódka ukryta) tytuł bez operatora
     $c = $script:UI.Controls
     $w = $script:UI.Window
-    if (-not $w -or -not $c['operatorChip']) { return }
+    if (-not $w -or -not $c['txtOperator']) { return }
     if (-not $script:UnlockPinHash) {
-        $c.operatorChip.Visibility = 'Collapsed'
+        $c.txtOperator.Text = ''
         $w.Title = 'Domain Ops'
         return
     }
     $mfa = [bool]$script:UnlockState.User
     $name = if ($mfa) { [string]$script:UnlockState.User } else { 'Konto podstawowe' }
     $primary = ([string]$script:UnlockState.AccountId -eq '#primary')
-    $limits = Get-AccessDenyText -Deny @($script:Access.Deny)
     $limited = $script:Access.Deny.Count -gt 0
+    $kind = if (-not $mfa) { 'sam PIN, bez MFA' } elseif ($primary) { 'konto podstawowe, MFA' } else { 'konto dodatkowe, MFA' }
+    $since = if ($script:UnlockState.Since) { ', od {0:HH:mm}' -f $script:UnlockState.Since } else { '' }
+    $limits = if ($primary) { 'pełny dostęp' } else { Get-AccessDenyText -Deny @($script:Access.Deny) }
     $c.txtOperator.Text = $name
-    $c.txtOperatorMode.Text = if (-not $mfa) { 'operator • sam PIN' } elseif ($primary) { 'operator • konto podstawowe' } elseif ($limited) { 'operator • ograniczony dostęp' } else { 'operator • konto dodatkowe' }
-    $c.txtOperatorMode.Foreground = Get-Brush $(if ($limited) { '#FFC46B' } else { '#7B8496' })
-    $since = if ($script:UnlockState.Since) { ' (od {0:HH:mm})' -f $script:UnlockState.Since } else { '' }
-    $c.operatorChip.ToolTip = ("Operator programu: {0}{1} – {2}{3}.`nZmiana operatora: zablokuj program (Ctrl+Shift+L) i odblokuj go PIN-em i kodem innego konta." -f $name, $since, $(if (-not $mfa) { 'odblokowano PIN-em, bez MFA' } elseif ($primary) { 'konto podstawowe, MFA' } else { 'konto dodatkowe, MFA' }), $(if ($primary) { '' } else { "; $limits" }))
-    $c.operatorChip.Visibility = 'Visible'
+    # Ograniczony dostęp - nazwa na pomarańczowo
+    $c.txtOperator.Foreground = Get-Brush $(if ($limited) { '#FFC46B' } else { '#E4E8EF' })
+    $c.btnLock.ToolTip = ("Operator: {0} ({1}{2}) – {3}.`nKliknij, aby zablokować program (Ctrl+Shift+L); zmiana operatora: odblokuj go PIN-em i kodem innego konta." -f $name, $kind, $since, $limits)
     $w.Title = "Domain Ops – operator: $name"
+    try { Update-HeaderLayout } catch { }
 }
 
 function Update-AccessView {
@@ -7290,12 +7292,37 @@ function Get-ReportTail {
 # przez Invoke-Command (blok dostaje jeden parametr: hashtablę $P). Tryb 'Local' wykonuje blok lokalnie
 # z parametrami ($Target, $P, $Ctx) - np. polecenia AD, kopiowanie plików albo połączenie obu podejść.
 # Wyniki odbiera timer w wątku okna, więc wszystkie aktualizacje interfejsu są bezpieczne.
+# $Stream: wyniki na bieżąco (Start-HostOperation -OnItem) - każdy obiekt od razu w opakowaniu z polem __item,
+# na końcu wynik bez danych (błędy); bez tego dane zbierane i zwracane razem z wynikiem.
 $script:WorkerScript = @'
-param($Target, $Mode, $ScriptText, $P, $Ctx)
+param($Target, $Mode, $ScriptText, $P, $Ctx, $Stream)
 $ProgressPreference = 'SilentlyContinue'
 $result = @{ Target = $Target; Ok = $true; Data = @(); Errors = @() }
 try {
     $sb = [scriptblock]::Create($ScriptText)
+    if ($Stream) {
+        $streamed = 0
+        if ($Mode -eq 'Remote') {
+            $icErrors = $null
+            $ic = @{ ComputerName = $Target; ScriptBlock = $sb; ArgumentList = @(, $P); ErrorAction = 'SilentlyContinue'; ErrorVariable = 'icErrors' }
+            if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
+            if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
+            Invoke-Command @ic | ForEach-Object { if ($null -ne $_) { $streamed++; [pscustomobject]@{ __item = $_ } } }
+            if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { $_.Exception.Message }) }
+        }
+        else {
+            $errs = New-Object System.Collections.ArrayList
+            & $sb $Target $P $Ctx 2>&1 | ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) { [void]$errs.Add($_.Exception.Message) }
+                elseif ($null -ne $_) { $streamed++; [pscustomobject]@{ __item = $_ } }
+            }
+            $result.Errors = @($errs)
+        }
+        if ($result.Errors.Count -gt 0 -and $streamed -eq 0) { $result.Ok = $false }
+        $result.Streamed = $streamed
+        [pscustomobject]$result
+        return
+    }
     if ($Mode -eq 'Remote') {
         $icErrors = $null
         $ic = @{
@@ -7401,6 +7428,8 @@ function Start-HostOperation {
                        np. śledzenie nowych zdarzeń - błędy obsługuje -OnResult)
         -Background  : pomocnicze wczytanie w tle (np. lista OU w panelu) - nie blokuje modułu i nie czeka na inne
                        jego operacje; zwykle razem z -Output None i -Quiet
+        -OnItem { param($m, $target, $obj) } - wyniki na bieżąco: każdy obiekt zwrócony przez blok trafia tu od razu
+                       (w wątku okna), a nie po zakończeniu - np. pomiar trwający wiele minut; zwykle z -Output None
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Module,
@@ -7418,7 +7447,8 @@ function Start-HostOperation {
         [ValidateSet('Default', 'AD')][string]$Pool = 'Default',
         [switch]$ReplaceRows,
         [switch]$Quiet,
-        [switch]$Background
+        [switch]$Background,
+        [scriptblock]$OnItem
     )
     if ($Module.Busy -and -not $Background) {
         Show-Warning "Poprzednia operacja w module «$($Module.Title)» jeszcze trwa. Poczekaj na jej zakończenie lub przerwij ją na pasku stanu."
@@ -7463,6 +7493,7 @@ function Start-HostOperation {
         TargetColumn = $TargetColumn
         OnResult     = $OnResult
         OnComplete   = $OnComplete
+        OnItem       = $OnItem
         Items        = New-Object System.Collections.ArrayList
         Total        = $items.Count
         Done         = 0
@@ -7484,9 +7515,19 @@ function Start-HostOperation {
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.RunspacePool = $runspacePool
         [void]$ps.AddScript($script:WorkerScript)
-        [void]$ps.AddArgument($t).AddArgument($mode).AddArgument($scriptText).AddArgument($p).AddArgument($ctx)
-        $handle = $ps.BeginInvoke()
-        [void]$op.Items.Add(@{ Target = $t; PS = $ps; Handle = $handle; Finished = $false })
+        [void]$ps.AddArgument($t).AddArgument($mode).AddArgument($scriptText).AddArgument($p).AddArgument($ctx).AddArgument([bool]$OnItem)
+        if ($OnItem) {
+            # Wyniki na bieżąco: odbiera je Update-Operations (Receive-StreamItems) z kolekcji wyjściowej
+            $in = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
+            $in.Complete()
+            $out = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
+            $handle = $ps.BeginInvoke($in, $out)
+            [void]$op.Items.Add(@{ Target = $t; PS = $ps; Handle = $handle; Finished = $false; Stream = $true; Out = $out; Final = $null })
+        }
+        else {
+            $handle = $ps.BeginInvoke()
+            [void]$op.Items.Add(@{ Target = $t; PS = $ps; Handle = $handle; Finished = $false })
+        }
     }
 
     [void]$script:Engine.Operations.Add($op)
@@ -7589,12 +7630,18 @@ function Update-Operations {
                     Complete-OperationItem -Operation $op -Result ([pscustomobject]@{ Target = $item.Target; Ok = $false; Data = @(); Errors = @($msg) })
                     continue
                 }
+                # Kolekcja wyjściowa bywa pusta (fałsz w warunku) - o trybie decyduje znacznik Stream
+                if (-not $item.Finished -and $item['Stream']) { Receive-StreamItems -Operation $op -Item $item }
                 if ($item.Finished -or -not $item.Handle.IsCompleted) { continue }
                 $item.Finished = $true
                 $changed = $true
                 $r = $null
                 try {
                     $output = $item.PS.EndInvoke($item.Handle)
+                    if ($item['Stream']) {
+                        Receive-StreamItems -Operation $op -Item $item
+                        $output = @($item.Final | Where-Object { $_ })
+                    }
                     if ($output -and $output.Count -gt 0) { $r = $output[0] }
                     if (-not $r) {
                         # Zadanie zatrzymane, zanim ruszyło (czekało w kolejce puli), nie zwraca nic
@@ -7635,6 +7682,31 @@ function Update-Operations {
         $script:Engine.Deferred.RemoveAt(0)
         Invoke-UiAction -Module $next.Module -Action $next.Action
     }
+}
+
+function Receive-StreamItems {
+    # Obiekty operacji z -OnItem, które przyszły od ostatniego taktu timera; ostatni obiekt bez __item to wynik zadania
+    param([hashtable]$Operation, [hashtable]$Item)
+    $batch = $Item.Out.ReadAll()
+    if (-not $batch -or $batch.Count -eq 0) { return }
+    $m = $Operation.Module
+    $previous = $script:LogContext
+    $script:LogContext = $m.Title
+    try {
+        foreach ($o in $batch) {
+            if ($null -eq $o) { continue }
+            if (-not $o.PSObject.Properties['__item']) { $Item.Final = $o; continue }
+            if ($Operation.Cancelled) { continue }
+            try { $null = & $Operation.OnItem $m $Item.Target $o.__item }
+            catch {
+                if (-not $Item['ItemError']) {
+                    $Item.ItemError = $true
+                    Write-Log ("[{0}] błąd obsługi wyniku na bieżąco: {1}" -f $Item.Target, $_.Exception.Message) 'ERROR'
+                }
+            }
+        }
+    }
+    finally { $script:LogContext = $previous }
 }
 
 function Invoke-Deferred {
@@ -9119,18 +9191,11 @@ $script:MainXaml = @'
               <TextBlock Style="{StaticResource Glyph}" Text="&#xE70D;" FontSize="10" Foreground="#7B8496" Margin="10,0,0,0"/>
             </StackPanel>
           </Button>
-          <Border x:Name="operatorChip" Background="#161B22" BorderBrush="#242B36" BorderThickness="1" CornerRadius="8" Padding="9,4,11,4"
-                  Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed">
-            <StackPanel Orientation="Horizontal">
-              <TextBlock Style="{StaticResource Glyph}" Text="&#xE8D7;" FontSize="13" Foreground="#8CB0FF" VerticalAlignment="Center" Margin="0,0,8,0"/>
-              <StackPanel VerticalAlignment="Center">
-                <TextBlock x:Name="txtOperator" Foreground="#E4E8EF" FontSize="12.5" MaxWidth="180" TextTrimming="CharacterEllipsis"/>
-                <TextBlock x:Name="txtOperatorMode" Foreground="#7B8496" FontSize="11"/>
-              </StackPanel>
-            </StackPanel>
-          </Border>
           <Button x:Name="btnLock" Style="{StaticResource GhostButton}" ToolTip="Zablokuj program – odblokowanie PIN-em (Ctrl+Shift+L)" Margin="4,0,0,0" Padding="10,7">
-            <TextBlock Style="{StaticResource Glyph}" Text="&#xE72E;" FontSize="15"/>
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Style="{StaticResource Glyph}" Text="&#xE72E;" FontSize="15" VerticalAlignment="Center"/>
+              <TextBlock x:Name="txtOperator" FontSize="12.5" Margin="8,0,2,0" MaxWidth="140" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Visibility="Collapsed"/>
+            </StackPanel>
           </Button>
           <Button x:Name="btnSettings" Style="{StaticResource GhostButton}" ToolTip="Ustawienia" Margin="4,0,0,0" Padding="10,7">
             <TextBlock Style="{StaticResource Glyph}" Text="&#xE713;" FontSize="15"/>
@@ -9249,7 +9314,7 @@ function New-MainWindow {
     $w = New-UiElement $script:MainXaml
     $script:UI.Window = $w
     $c = $script:UI.Controls
-    foreach ($n in 'txtVersion', 'txtDomain', 'wsSwitcher', 'txtSubtitle', 'btnCred', 'txtCredUser', 'txtCredMode', 'operatorChip', 'txtOperator', 'txtOperatorMode', 'btnLock', 'btnSettings',
+    foreach ($n in 'txtVersion', 'txtDomain', 'wsSwitcher', 'txtSubtitle', 'btnCred', 'txtCredUser', 'txtCredMode', 'txtOperator', 'btnLock', 'btnSettings',
         'targetColumn', 'targetHost', 'navHost', 'contentHost', 'toastHost', 'logRow', 'logSplitter', 'logPanel', 'logList',
         'btnLogCopy', 'btnLogFile', 'btnLogClear', 'btnLogHide', 'statusDot', 'txtStatus', 'prgStatus', 'btnCancelOps', 'btnLogToggle',
         'logBadge', 'logBadgeText') {
@@ -9385,7 +9450,9 @@ function Update-HeaderLayout {
         }
     }
     $script:UI.Controls.txtSubtitle.Visibility = if ($w.ActualWidth -lt 1440) { 'Collapsed' } else { 'Visible' }
-    $script:UI.Controls.txtOperatorMode.Visibility = if ($compact) { 'Collapsed' } else { 'Visible' }
+    # Nazwa operatora przy kłódce tylko przy szerokim oknie (zawsze w tytule okna i w podpowiedzi kłódki)
+    $op = $script:UI.Controls.txtOperator
+    $op.Visibility = if ($w.ActualWidth -ge 1440 -and $op.Text) { 'Visible' } else { 'Collapsed' }
 }
 
 function Set-LogVisible {
@@ -17039,6 +17106,927 @@ function Initialize-PerfModule {
         }
     }
     $m.EmptyHint = 'Zaznacz komputery i kliknij «Zmierz». Pomiar trwa tyle, ile ustawiono (domyślnie 10 s); zaznacz «Monitoruj», aby obserwować serwer na bieżąco.'
+}
+#endregion
+
+#region Zarządzanie zdalne: monitor obciążenia na żywo (podobnie jak Monitor zasobów)
+# Jedno połączenie WinRM na cały pomiar: na serwerze pętla co N sekund odczytuje surowe liczniki wydajności
+# (Win32_PerfRawData_* - te same co Monitor zasobów i perfmon, nazwy niezależne od języka systemu) i wysyła różnice
+# od poprzedniego odczytu (delty): czas CPU i bajty I/O każdego procesu, zajętość i opóźnienia dysków, ruch kart sieciowych.
+# Program sumuje je od startu - stąd «w tym oknie proces X zużył Y czasu CPU (Z% obciążenia), przeczytał N GB».
+# Wyniki przychodzą na bieżąco (Start-HostOperation -OnItem) jako płaskie obiekty z polem __kind (zagnieżdżone obiekty
+# zdalne PowerShell zamienia w tekst): proc, disk, nic, conn - dane jednej próbki, tick - koniec próbki.
+# Koszt po stronie serwera: jedna sesja PowerShell i odczyt liczników co N s - widoczny w tabeli jako proces monitora.
+# Sieć w podziale na procesy: tylko liczba połączeń TCP (bajty na proces wymagałyby śledzenia jądra - ETW).
+$script:LoadMonitorScript = {
+    param($P)
+    $ErrorActionPreference = 'Stop'
+    $interval = [Math]::Max(1, [Math]::Min(60, [int]$P.Interval))
+    $end = (Get-Date).AddMinutes([Math]::Max(0.05, [double]$P.Minutes))
+    $missing = @{}
+    function Get-Raw([string]$Class, [string]$Filter = '') {
+        try {
+            if ($Filter) { return @(Get-CimInstance -ClassName $Class -Filter $Filter -ErrorAction Stop) }
+            return @(Get-CimInstance -ClassName $Class -ErrorAction Stop)
+        }
+        catch { $missing[$Class] = $_.Exception.Message; return @() }
+    }
+    function Get-Delta($a, $b, [string]$Prop) {
+        if ($null -eq $a -or $null -eq $b) { return 0.0 }
+        $d = [double]$b.$Prop - [double]$a.$Prop
+        # Liczniki 32-bitowe się przekręcają; spadek licznika 64-bitowego (nowy obiekt pod tą samą nazwą) - zero
+        if ($d -lt 0 -and [double]$a.$Prop -lt 4294967296) { $d += 4294967296 }
+        return [Math]::Max(0.0, $d)
+    }
+    function Get-Rate($a, $b, [string]$Prop) {
+        # PERF_COUNTER_COUNTER / BULK_COUNT: na sekundę
+        if ($null -eq $a -or $null -eq $b -or [double]$b.Frequency_PerfTime -le 0) { return 0.0 }
+        $dt = (Get-Delta $a $b 'Timestamp_PerfTime') / [double]$b.Frequency_PerfTime
+        if ($dt -le 0) { return 0.0 }
+        return (Get-Delta $a $b $Prop) / $dt
+    }
+    function Get-Pct100ns($a, $b, [string]$Prop) {
+        if ($null -eq $a -or $null -eq $b) { return 0.0 }
+        $dt = Get-Delta $a $b 'Timestamp_Sys100NS'
+        if ($dt -le 0) { return 0.0 }
+        return 100.0 * (Get-Delta $a $b $Prop) / $dt
+    }
+    function Get-AvgTimer($a, $b, [string]$Prop) {
+        # PERF_AVERAGE_TIMER: sekundy na operację
+        if ($null -eq $a -or $null -eq $b -or [double]$b.Frequency_PerfTime -le 0) { return 0.0 }
+        $base = Get-Delta $a $b ($Prop + '_Base')
+        if ($base -le 0) { return 0.0 }
+        return ((Get-Delta $a $b $Prop) / [double]$b.Frequency_PerfTime) / $base
+    }
+    function Get-PctBase($a, $b, [string]$Prop) {
+        if ($null -eq $a -or $null -eq $b) { return $null }
+        $base = Get-Delta $a $b ($Prop + '_Base')
+        if ($base -le 0) { return $null }
+        return 100.0 * (Get-Delta $a $b $Prop) / $base
+    }
+    function Get-Clamp([double]$v) { return [Math]::Min(100.0, [Math]::Max(0.0, $v)) }
+    function Get-ByName($list, [string]$Name) { foreach ($x in $list) { if ([string]$x.Name -eq $Name) { return $x } }; return $null }
+    function Get-Sample {
+        @{
+            Time = Get-Date
+            Cpu  = @(Get-Raw 'Win32_PerfRawData_PerfOS_Processor' "Name='_Total'") | Select-Object -First 1
+            Sys  = @(Get-Raw 'Win32_PerfRawData_PerfOS_System') | Select-Object -First 1
+            Mem  = @(Get-Raw 'Win32_PerfRawData_PerfOS_Memory') | Select-Object -First 1
+            Disk = @(Get-Raw 'Win32_PerfRawData_PerfDisk_LogicalDisk' | Where-Object { $_.Name -ne '_Total' })
+            Nic  = @(Get-Raw 'Win32_PerfRawData_Tcpip_NetworkInterface' | Where-Object { $_.Name -notmatch 'isatap|teredo|6to4|loopback|pseudo' })
+            Proc = @(Get-Raw 'Win32_PerfRawData_PerfProc_Process' | Where-Object { $_.Name -ne '_Total' -and $_.Name -ne 'Idle' -and [int]$_.IDProcess -ne 0 })
+        }
+    }
+
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    [pscustomobject]@{ __kind = 'info'; Cores = [Math]::Max(1, [int]$cs.NumberOfLogicalProcessors); MemoryMB = [Math]::Round([double]$os.TotalVisibleMemorySize / 1KB); Os = [string]$os.Caption; MonitorPid = $PID; Interval = $interval; Until = $end }
+    $known = @{}
+    $services = @{}
+    $svcAt = [datetime]::MinValue
+    $connAt = [datetime]::MinValue
+    $prev = Get-Sample
+    while ((Get-Date) -lt $end) {
+        $wait = [int]($interval * 1000 - ((Get-Date) - $prev.Time).TotalMilliseconds)
+        if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+        $cur = Get-Sample
+        $dt = ($cur.Time - $prev.Time).TotalSeconds
+
+        # --- procesy: czas CPU i bajty I/O od poprzedniej próbki (proces nowy - od startu); nazwy bez #n (zmieniają się)
+        $before = @{}
+        foreach ($x in $prev.Proc) { $before[('{0}|{1}' -f $x.IDProcess, ([string]$x.Name -replace '#\d+$', ''))] = $x }
+        $all = foreach ($x in $cur.Proc) {
+            $name = [string]$x.Name -replace '#\d+$', ''
+            $a = $before[('{0}|{1}' -f $x.IDProcess, $name)]
+            if ($a) { $cpuS = (Get-Delta $a $x 'PercentProcessorTime') / 1e7; $rd = Get-Delta $a $x 'IOReadBytesPersec'; $wr = Get-Delta $a $x 'IOWriteBytesPersec' }
+            else { $cpuS = [double]$x.PercentProcessorTime / 1e7; $rd = [double]$x.IOReadBytesPersec; $wr = [double]$x.IOWriteBytesPersec }
+            [pscustomobject]@{ __kind = 'proc'; Id = [int]$x.IDProcess; Name = $name; CpuS = $cpuS; ReadB = $rd; WriteB = $wr; PrivMB = [Math]::Round([double]$x.WorkingSetPrivate / 1MB, 1); CommitMB = [Math]::Round([double]$x.PrivateBytes / 1MB, 1); Handles = [int]$x.HandleCount; Threads = [int]$x.ThreadCount }
+        }
+        $all = @($all)
+        # Wysyłane tylko aktywne procesy, największe w pamięci i sam monitor (reszta w tej próbce bez zmian)
+        $send = @{}
+        foreach ($x in $all) { if ($x.CpuS -gt 0.0005 -or $x.ReadB -gt 0 -or $x.WriteB -gt 0 -or $x.Id -eq $PID) { $send[$x.Id] = $x } }
+        foreach ($x in @($all | Sort-Object PrivMB -Descending | Select-Object -First 15)) { $send[$x.Id] = $x }
+        # Opis nowych procesów (usługi, użytkownik, polecenie) - raz na proces
+        $new = @($send.Values | Where-Object { -not $known.ContainsKey(('{0}|{1}' -f $_.Id, $_.Name)) })
+        if ($new.Count) {
+            if (((Get-Date) - $svcAt).TotalSeconds -ge 60) {
+                $services = @{}
+                try {
+                    foreach ($s in @(Get-CimInstance -ClassName Win32_Service -Filter "State='Running'" -ErrorAction Stop)) {
+                        $k = [int]$s.ProcessId
+                        if (-not $services.ContainsKey($k)) { $services[$k] = New-Object System.Collections.ArrayList }
+                        [void]$services[$k].Add([string]$s.Name)
+                    }
+                }
+                catch { }
+                $svcAt = Get-Date
+            }
+            $ids = @($new | ForEach-Object { $_.Id })
+            $wmi = @{}
+            for ($i = 0; $i -lt $ids.Count; $i += 40) {
+                $filter = (@($ids[$i..([Math]::Min($i + 39, $ids.Count - 1))] | ForEach-Object { "ProcessId=$_" }) -join ' OR ')
+                try { foreach ($w in @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop)) { $wmi[[int]$w.ProcessId] = $w } } catch { }
+            }
+            $users = @{}
+            try { foreach ($gp in @(Get-Process -Id $ids -IncludeUserName -ErrorAction SilentlyContinue)) { $users[[int]$gp.Id] = [string]$gp.UserName } } catch { }
+            foreach ($x in $new) {
+                $known[('{0}|{1}' -f $x.Id, $x.Name)] = $true
+                $cmd = if ($wmi.ContainsKey($x.Id)) { [string]$wmi[$x.Id].CommandLine } else { '' }
+                [pscustomobject]@{
+                    __kind   = 'procinfo'
+                    Id       = $x.Id
+                    Name     = $x.Name
+                    User     = $(if ($users.ContainsKey($x.Id)) { $users[$x.Id] } else { '' })
+                    Services = $(if ($services.ContainsKey($x.Id)) { (@($services[$x.Id]) -join ', ') } else { '' })
+                    Command  = $(if ($cmd.Length -gt 300) { $cmd.Substring(0, 300) + '…' } else { $cmd })
+                }
+            }
+        }
+        $send.Values
+
+        # --- połączenia TCP procesów (co 30 s - przy tysiącach połączeń odczyt trwa dłużej)
+        $connSent = $false
+        if (((Get-Date) - $connAt).TotalSeconds -ge 30) {
+            $connAt = Get-Date
+            try {
+                $c = @{}
+                foreach ($t in @(Get-NetTCPConnection -State Established -ErrorAction Stop)) { $k = [int]$t.OwningProcess; $c[$k] = 1 + $(if ($c.ContainsKey($k)) { $c[$k] } else { 0 }) }
+                foreach ($k in $c.Keys) { [pscustomobject]@{ __kind = 'conn'; Id = $k; Count = $c[$k] } }
+                $connSent = $true
+            }
+            catch { }
+        }
+
+        # --- dyski (woluminy) i karty sieciowe
+        foreach ($d1 in $cur.Disk) {
+            $d0 = Get-ByName $prev.Disk $d1.Name
+            if (-not $d0) { continue }
+            $idle = Get-PctBase $d0 $d1 'PercentIdleTime'
+            [pscustomobject]@{
+                __kind    = 'disk'
+                Name      = [string]$d1.Name
+                Busy      = $(if ($null -ne $idle) { [Math]::Round((Get-Clamp (100 - $idle)), 1) } else { $null })
+                ReadMBps  = [Math]::Round((Get-Rate $d0 $d1 'DiskReadBytesPersec') / 1MB, 3)
+                WriteMBps = [Math]::Round((Get-Rate $d0 $d1 'DiskWriteBytesPersec') / 1MB, 3)
+                Iops      = [Math]::Round((Get-Rate $d0 $d1 'DiskTransfersPersec'), 1)
+                LatMs     = [Math]::Round(1000 * (Get-AvgTimer $d0 $d1 'AvgDisksecPerTransfer'), 1)
+                Queue     = [double]$d1.CurrentDiskQueueLength
+                FreePct   = $(if ([double]$d1.PercentFreeSpace_Base -gt 0) { [Math]::Round(100.0 * [double]$d1.PercentFreeSpace / [double]$d1.PercentFreeSpace_Base, 1) } else { $null })
+            }
+        }
+        foreach ($n1 in $cur.Nic) {
+            $n0 = Get-ByName $prev.Nic $n1.Name
+            if (-not $n0) { continue }
+            $bw = [double]$n1.CurrentBandwidth
+            $total = Get-Rate $n0 $n1 'BytesTotalPersec'
+            if ($bw -le 0 -and $total -le 0) { continue }
+            [pscustomobject]@{
+                __kind    = 'nic'
+                Name      = [string]$n1.Name
+                SpeedMbps = [Math]::Round($bw / 1e6)
+                RxMbps    = [Math]::Round(8 * (Get-Rate $n0 $n1 'BytesReceivedPersec') / 1e6, 3)
+                TxMbps    = [Math]::Round(8 * (Get-Rate $n0 $n1 'BytesSentPersec') / 1e6, 3)
+                Util      = $(if ($bw -gt 0) { [Math]::Round((Get-Clamp (100.0 * 8 * $total / $bw)), 1) } else { $null })
+            }
+        }
+
+        # --- koniec próbki: procesor, pamięć, lista działających procesów (wykrycie zakończonych)
+        $mem = $cur.Mem
+        [pscustomobject]@{
+            __kind    = 'tick'
+            Time      = $cur.Time
+            Seconds   = [Math]::Round($dt, 3)
+            Cpu       = $(if ($cur.Cpu) { [Math]::Round((Get-Clamp (100 - (Get-Pct100ns $prev.Cpu $cur.Cpu 'PercentProcessorTime'))), 1) } else { $null })
+            Kernel    = $(if ($cur.Cpu) { [Math]::Round((Get-Clamp (Get-Pct100ns $prev.Cpu $cur.Cpu 'PercentPrivilegedTime')), 1) } else { $null })
+            Queue     = $(if ($cur.Sys) { [int]$cur.Sys.ProcessorQueueLength } else { $null })
+            AvailMB   = $(if ($mem) { [double]$mem.AvailableMBytes } else { $null })
+            CommitPct = $(if ($mem -and [double]$mem.CommitLimit -gt 0) { [Math]::Round(100.0 * [double]$mem.CommittedBytes / [double]$mem.CommitLimit, 1) } else { $null })
+            HardPs    = [Math]::Round((Get-Rate $prev.Mem $cur.Mem 'PageReadsPersec'), 1)
+            Alive     = (@($all | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Name }) -join ';')
+            Conns     = $connSent
+            Missing   = (@($missing.Keys) -join ', ')
+        }
+        $prev = $cur
+    }
+    [pscustomobject]@{ __kind = 'end' }
+}
+
+$script:LoadViews = @('Procesy', 'Dyski', 'Sieć', 'Przebieg', 'Podsumowanie')
+$script:LoadPl = [System.Globalization.CultureInfo]::GetCultureInfo('pl-PL')
+
+function Format-LoadNumber([double]$Value, [int]$Decimals = 0) { return $Value.ToString(('N' + $Decimals), $script:LoadPl) }
+
+function Format-LoadBytes([double]$Bytes) {
+    if ($Bytes -ge 1TB) { return (Format-LoadNumber ($Bytes / 1TB) 2) + ' TB' }
+    if ($Bytes -ge 1GB) { return (Format-LoadNumber ($Bytes / 1GB) 2) + ' GB' }
+    if ($Bytes -ge 1MB) { return (Format-LoadNumber ($Bytes / 1MB) 1) + ' MB' }
+    return (Format-LoadNumber ($Bytes / 1KB)) + ' KB'
+}
+
+function Format-LoadDuration([double]$Seconds) {
+    # Czas CPU / czas trwania po polsku: 12,4 s · 7 min 12 s · 1 h 05 min
+    if ($Seconds -lt 60) { return (Format-LoadNumber $Seconds 1) + ' s' }
+    $t = [TimeSpan]::FromSeconds([Math]::Round($Seconds))
+    if ($t.TotalHours -ge 1) { return '{0} h {1:00} min' -f [int][Math]::Floor($t.TotalHours), $t.Minutes }
+    return '{0} min {1} s' -f [int][Math]::Floor($t.TotalMinutes), $t.Seconds
+}
+
+function New-LoadState {
+    param([string]$Target, [hashtable]$Params)
+    return @{
+        Target = $Target; Params = $Params; Started = Get-Date; Running = $true; Info = $null; Error = ''; Stopped = $false
+        Seq = 0; Seconds = 0.0; CpuBusySec = 0.0; Ticks = New-Object System.Collections.ArrayList
+        Proc = @{}; ProcInfo = @{}; Disk = [ordered]@{}; Nic = [ordered]@{}; Conns = @{}
+        Pending = @{ Proc = (New-Object System.Collections.ArrayList); Disk = (New-Object System.Collections.ArrayList); Nic = (New-Object System.Collections.ArrayList); Conn = (New-Object System.Collections.ArrayList) }
+        Peak = @{ Cpu = $null; AvailMin = $null; Lat = $null; Net = $null }
+    }
+}
+
+function Receive-LoadItem {
+    # Obiekt z serwera (wywołanie na bieżąco z silnika): dane próbki zbierane do końca próbki (tick)
+    param([hashtable]$Module, $Object)
+    $st = $Module.Data['Load']
+    if (-not $st -or $null -eq $Object) { return }
+    $kind = [string]$Object.__kind
+    if ($kind -eq 'proc') { [void]$st.Pending.Proc.Add($Object) }
+    elseif ($kind -eq 'disk') { [void]$st.Pending.Disk.Add($Object) }
+    elseif ($kind -eq 'nic') { [void]$st.Pending.Nic.Add($Object) }
+    elseif ($kind -eq 'conn') { [void]$st.Pending.Conn.Add($Object) }
+    elseif ($kind -eq 'procinfo') { $st.ProcInfo[('{0}|{1}' -f $Object.Id, $Object.Name)] = $Object }
+    elseif ($kind -eq 'info') {
+        # Odstęp próbek faktycznie użyty na komputerze (po ograniczeniu zakresu)
+        $st.Info = $Object
+        $st.Params.Interval = [int]$Object.Interval
+        Update-LoadUi -Module $Module
+    }
+    elseif ($kind -eq 'tick') { Add-LoadTick -Module $Module -Tick $Object }
+    elseif ($kind -eq 'end') { $st.Running = $false }
+}
+
+function Add-LoadTick {
+    # Koniec próbki: delty dopisywane do sum od startu, przebieg, wartości szczytowe; potem odświeżenie widoku
+    param([hashtable]$Module, $Tick)
+    $st = $Module.Data.Load
+    $cores = if ($st.Info) { [Math]::Max(1, [int]$st.Info.Cores) } else { 1 }
+    $dt = [Math]::Max(0.001, [double]$Tick.Seconds)
+    $time = [datetime]$Tick.Time
+    $st.Seq++
+    $st.Seconds += $dt
+    if ($null -ne $Tick.Cpu) { $st.CpuBusySec += [double]$Tick.Cpu / 100.0 * $dt * $cores }
+
+    $topCpu = $null
+    $topIo = $null
+    foreach ($p in $st.Pending.Proc) {
+        $key = '{0}|{1}' -f $p.Id, $p.Name
+        $e = $st.Proc[$key]
+        if (-not $e) {
+            $e = @{ Key = $key; Id = [int]$p.Id; Name = [string]$p.Name; CpuS = 0.0; CpuNow = 0.0; CpuMax = 0.0; ReadB = 0.0; WriteB = 0.0; IoNow = 0.0; PrivMB = 0.0; PrivMax = 0.0; CommitMB = 0.0; Handles = 0; Threads = 0; Exited = ''; Seen = 0 }
+            $st.Proc[$key] = $e
+        }
+        $e.CpuS += [double]$p.CpuS
+        $e.CpuNow = 100.0 * [double]$p.CpuS / ($dt * $cores)
+        $e.CpuMax = [Math]::Max($e.CpuMax, $e.CpuNow)
+        $e.ReadB += [double]$p.ReadB
+        $e.WriteB += [double]$p.WriteB
+        $e.IoNow = ([double]$p.ReadB + [double]$p.WriteB) / $dt / 1MB
+        $e.PrivMB = [double]$p.PrivMB
+        $e.PrivMax = [Math]::Max($e.PrivMax, $e.PrivMB)
+        $e.CommitMB = [double]$p.CommitMB
+        $e.Handles = [int]$p.Handles
+        $e.Threads = [int]$p.Threads
+        $e.Seen = $st.Seq
+        if ([int]$p.Id -ne [int]$(if ($st.Info) { $st.Info.MonitorPid } else { -1 })) {
+            if (-not $topCpu -or $e.CpuNow -gt $topCpu.CpuNow) { $topCpu = $e }
+            if (-not $topIo -or $e.IoNow -gt $topIo.IoNow) { $topIo = $e }
+        }
+    }
+    # Procesy bez aktywności w tej próbce: teraz zero; procesy, których już nie ma - zakończone
+    $alive = @{}
+    foreach ($k in ([string]$Tick.Alive).Split(';')) { if ($k) { $alive[$k] = $true } }
+    foreach ($e in $st.Proc.Values) {
+        if ($e.Seen -ne $st.Seq) { $e.CpuNow = 0.0; $e.IoNow = 0.0 }
+        if (-not $e.Exited -and $alive.Count -and -not $alive.ContainsKey($e.Key)) { $e.Exited = $time.ToString('HH:mm:ss') }
+    }
+    if ($Tick.Conns) {
+        $st.Conns = @{}
+        foreach ($c in $st.Pending.Conn) { $st.Conns[[int]$c.Id] = [int]$c.Count }
+    }
+
+    $diskBusy = $null; $diskLat = $null
+    foreach ($d in $st.Pending.Disk) {
+        $name = [string]$d.Name
+        $e = $st.Disk[$name]
+        if (-not $e) { $e = @{ Name = $name; ReadB = 0.0; WriteB = 0.0; BusySec = 0.0; LatMax = 0.0; LatMaxAt = ''; LatWeighted = 0.0; Ops = 0.0 }; $st.Disk[$name] = $e }
+        $e.Now = $d
+        $e.ReadB += [double]$d.ReadMBps * 1MB * $dt
+        $e.WriteB += [double]$d.WriteMBps * 1MB * $dt
+        if ($null -ne $d.Busy) { $e.BusySec += [double]$d.Busy / 100.0 * $dt }
+        $ops = [double]$d.Iops * $dt
+        $e.Ops += $ops
+        $e.LatWeighted += [double]$d.LatMs * $ops
+        # Opóźnienie liczy się, gdy dysk coś robi (pojedyncza operacja na bezczynnym dysku bywa myląca)
+        if ([double]$d.Iops -ge 1 -and [double]$d.LatMs -gt $e.LatMax) { $e.LatMax = [double]$d.LatMs; $e.LatMaxAt = $time.ToString('HH:mm:ss') }
+        if ($null -ne $d.Busy -and (-not $diskBusy -or [double]$d.Busy -gt [double]$diskBusy.Busy)) { $diskBusy = $d }
+        if ([double]$d.Iops -ge 1 -and (-not $diskLat -or [double]$d.LatMs -gt [double]$diskLat.LatMs)) { $diskLat = $d }
+    }
+    $netRx = 0.0; $netTx = 0.0; $netTop = $null
+    foreach ($n in $st.Pending.Nic) {
+        $name = [string]$n.Name
+        $e = $st.Nic[$name]
+        if (-not $e) { $e = @{ Name = $name; RxB = 0.0; TxB = 0.0; UtilMax = 0.0; UtilMaxAt = '' }; $st.Nic[$name] = $e }
+        $e.Now = $n
+        $e.RxB += [double]$n.RxMbps * 1e6 / 8 * $dt
+        $e.TxB += [double]$n.TxMbps * 1e6 / 8 * $dt
+        if ($null -ne $n.Util -and [double]$n.Util -gt $e.UtilMax) { $e.UtilMax = [double]$n.Util; $e.UtilMaxAt = $time.ToString('HH:mm:ss') }
+        $netRx += [double]$n.RxMbps
+        $netTx += [double]$n.TxMbps
+        if ($null -ne $n.Util -and (-not $netTop -or [double]$n.Util -gt [double]$netTop.Util)) { $netTop = $n }
+    }
+
+    $memMB = if ($st.Info) { [double]$st.Info.MemoryMB } else { 0 }
+    $entry = [ordered]@{
+        Seq = $st.Seq; Time = $time; Cpu = $Tick.Cpu; Kernel = $Tick.Kernel; Queue = $Tick.Queue; AvailMB = $Tick.AvailMB
+        UsedPct = $(if ($memMB -gt 0 -and $null -ne $Tick.AvailMB) { [Math]::Round(100.0 * ($memMB - [double]$Tick.AvailMB) / $memMB, 1) } else { $null })
+        CommitPct = $Tick.CommitPct; HardPs = $Tick.HardPs
+        DiskBusy = $(if ($diskBusy) { [double]$diskBusy.Busy } else { $null }); DiskBusyName = $(if ($diskBusy) { [string]$diskBusy.Name } else { '' })
+        DiskLat = $(if ($diskLat) { [double]$diskLat.LatMs } else { $null }); DiskLatName = $(if ($diskLat) { [string]$diskLat.Name } else { '' })
+        NetMbps = [Math]::Round($netRx + $netTx, 2); NetUtil = $(if ($netTop) { [double]$netTop.Util } else { $null }); NetName = $(if ($netTop) { [string]$netTop.Name } else { '' })
+        TopCpu = $(if ($topCpu -and $topCpu.CpuNow -gt 0) { '{0} ({1}%)' -f $topCpu.Name, (Format-LoadNumber $topCpu.CpuNow 1) } else { '' })
+        TopIo = $(if ($topIo -and $topIo.IoNow -gt 0.01) { '{0} ({1} MB/s)' -f $topIo.Name, (Format-LoadNumber $topIo.IoNow 1) } else { '' })
+        Missing = [string]$Tick.Missing
+    }
+    [void]$st.Ticks.Add($entry)
+    $pk = $st.Peak
+    if ($null -ne $entry.Cpu -and (-not $pk.Cpu -or [double]$entry.Cpu -gt [double]$pk.Cpu.Cpu)) { $pk.Cpu = $entry }
+    if ($null -ne $entry.AvailMB -and (-not $pk.AvailMin -or [double]$entry.AvailMB -lt [double]$pk.AvailMin.AvailMB)) { $pk.AvailMin = $entry }
+    if ($null -ne $entry.DiskLat -and (-not $pk.Lat -or [double]$entry.DiskLat -gt [double]$pk.Lat.DiskLat)) { $pk.Lat = $entry }
+    if ($null -ne $entry.NetUtil -and (-not $pk.Net -or [double]$entry.NetUtil -gt [double]$pk.Net.NetUtil)) { $pk.Net = $entry }
+    foreach ($k in @($st.Pending.Keys)) { $st.Pending[$k].Clear() }
+    Update-LoadUi -Module $Module -NewTick $entry
+}
+
+function Get-LoadAverage {
+    # Średnia wartości z ostatnich próbek (ok. 15 s) - pojedyncza próbka bywa skokiem
+    param([hashtable]$State, [string]$Field, [int]$Count = 3)
+    $vals = @($State.Ticks | Select-Object -Last $Count | ForEach-Object { $_[$Field] } | Where-Object { $null -ne $_ })
+    if (-not $vals.Count) { return $null }
+    return ($vals | Measure-Object -Average).Average
+}
+
+function Get-LoadTopProcesses {
+    # Procesy z czołówki według pola (bez procesu monitora)
+    param([hashtable]$State, [string]$By, [int]$Count = 3)
+    $mon = if ($State.Info) { [int]$State.Info.MonitorPid } else { -1 }
+    $list = @($State.Proc.Values | Where-Object { $_.Id -ne $mon })
+    $sorted = if ($By -eq 'Io') { @($list | Sort-Object { $_.ReadB + $_.WriteB } -Descending) } elseif ($By -eq 'IoNow') { @($list | Sort-Object { $_.IoNow } -Descending) } else { @($list | Sort-Object { $_[$By] } -Descending) }
+    return @($sorted | Select-Object -First $Count)
+}
+
+function Get-LoadFindings {
+    # «Co się dzieje teraz»: wąskie gardła z ostatnich próbek i procesy, które je powodują
+    param([hashtable]$State)
+    $out = New-Object System.Collections.ArrayList
+    if (-not $State.Ticks.Count) { return @() }
+    $cores = if ($State.Info) { [Math]::Max(1, [int]$State.Info.Cores) } else { 1 }
+    $memMB = if ($State.Info) { [double]$State.Info.MemoryMB } else { 0 }
+    $n = [Math]::Min(3, $State.Ticks.Count)
+    $span = Format-LoadDuration ([double]$n * [double]$State.Params.Interval)
+    $cpu = Get-LoadAverage $State 'Cpu'
+    $who = { param($by) (@(Get-LoadTopProcesses -State $State -By $by -Count 2 | Where-Object { $_[$by] -gt 0 } | ForEach-Object { if ($by -eq 'IoNow') { '{0} {1} MB/s' -f $_.Name, (Format-LoadNumber $_.IoNow 1) } elseif ($by -eq 'PrivMB') { '{0} {1} MB' -f $_.Name, (Format-LoadNumber $_.PrivMB) } else { '{0} {1}%' -f $_.Name, (Format-LoadNumber $_.CpuNow 1) } })) -join ', ' }
+    if ($null -ne $cpu -and $cpu -ge 60) {
+        $text = 'Procesor {0}% (średnio z {1})' -f (Format-LoadNumber $cpu), $span
+        $top = & $who 'CpuNow'
+        if ($top) { $text += ' – najwięcej: ' + $top }
+        [void]$out.Add(@{ Tone = $(if ($cpu -ge 85) { 'crit' } else { 'warn' }); Text = $text })
+    }
+    $kernel = Get-LoadAverage $State 'Kernel'
+    if ($null -ne $kernel -and $kernel -ge 30) { [void]$out.Add(@{ Tone = 'warn'; Text = ('Dużo czasu procesora w jądrze: {0}% – sterowniki, antywirus, intensywne I/O lub ruch sieciowy' -f (Format-LoadNumber $kernel)) }) }
+    $queue = Get-LoadAverage $State 'Queue'
+    if ($null -ne $queue -and $queue -gt 2 * $cores) { [void]$out.Add(@{ Tone = 'warn'; Text = ('Kolejka procesora {0} przy {1} rdzeniach – wątki czekają na procesor' -f (Format-LoadNumber $queue 1), $cores) }) }
+    $avail = Get-LoadAverage $State 'AvailMB'
+    if ($null -ne $avail -and $memMB -gt 0 -and ($avail -lt 500 -or $avail -lt 0.05 * $memMB)) {
+        $text = 'Mało wolnej pamięci: {0} MB z {1} MB' -f (Format-LoadNumber $avail), (Format-LoadNumber $memMB)
+        $top = & $who 'PrivMB'
+        if ($top) { $text += ' – największe: ' + $top }
+        [void]$out.Add(@{ Tone = 'crit'; Text = $text })
+    }
+    $hard = Get-LoadAverage $State 'HardPs'
+    if ($null -ne $hard -and $hard -ge 100) { [void]$out.Add(@{ Tone = 'warn'; Text = ('Stronicowanie: {0} stron/s czytanych z dysku – za mało pamięci RAM dla obecnego obciążenia' -f (Format-LoadNumber $hard)) }) }
+    $commit = Get-LoadAverage $State 'CommitPct' 1
+    if ($null -ne $commit -and $commit -ge 90) { [void]$out.Add(@{ Tone = 'crit'; Text = ('Pamięć zadeklarowana (commit) {0}% limitu – grozi brakiem pamięci wirtualnej' -f (Format-LoadNumber $commit)) }) }
+    foreach ($d in $State.Disk.Values) {
+        $now = $d['Now']
+        if (-not $now -or [double]$now.Iops -lt 5) { continue }
+        $lat = [double]$now.LatMs
+        if ($lat -ge 20) {
+            $text = 'Dysk {0} {1} ms na operację, zajęty {2}%, kolejka {3}' -f (Get-LoadDiskName $d.Name), (Format-LoadNumber $lat 1), (Format-LoadNumber ([double]$now.Busy)), (Format-LoadNumber ([double]$now.Queue))
+            $top = & $who 'IoNow'
+            if ($top) { $text += ' – najwięcej I/O: ' + $top }
+            [void]$out.Add(@{ Tone = $(if ($lat -ge 50) { 'crit' } else { 'warn' }); Text = $text })
+        }
+    }
+    foreach ($d in $State.Disk.Values) {
+        $now = $d['Now']
+        if ($now -and $null -ne $now.FreePct -and [double]$now.FreePct -lt 10) { [void]$out.Add(@{ Tone = 'warn'; Text = ('Dysk {0} wolne tylko {1}% miejsca' -f (Get-LoadDiskName $d.Name), (Format-LoadNumber ([double]$now.FreePct) 1)) }) }
+    }
+    foreach ($nc in $State.Nic.Values) {
+        $now = $nc['Now']
+        if (-not $now -or $null -eq $now.Util -or [double]$now.Util -lt 60) { continue }
+        $text = 'Karta {0}: {1}% łącza (odbiór {2} Mb/s, wysyłanie {3} Mb/s)' -f $nc.Name, (Format-LoadNumber ([double]$now.Util)), (Format-LoadNumber ([double]$now.RxMbps) 1), (Format-LoadNumber ([double]$now.TxMbps) 1)
+        $conn = @($State.Proc.Values | Where-Object { $State.Conns.ContainsKey($_.Id) } | Sort-Object { $State.Conns[$_.Id] } -Descending | Select-Object -First 3 | ForEach-Object { '{0} ({1} poł.)' -f $_.Name, $State.Conns[$_.Id] })
+        if ($conn.Count) { $text += ' – najwięcej połączeń: ' + ($conn -join ', ') }
+        [void]$out.Add(@{ Tone = $(if ([double]$now.Util -ge 80) { 'crit' } else { 'warn' }); Text = $text })
+    }
+    if (-not $out.Count) {
+        $last = $State.Ticks[$State.Ticks.Count - 1]
+        $parts = @()
+        if ($null -ne $cpu) { $parts += 'procesor {0}%' -f (Format-LoadNumber $cpu) }
+        if ($null -ne $last.AvailMB) { $parts += 'wolna pamięć {0} MB' -f (Format-LoadNumber ([double]$last.AvailMB)) }
+        if ($null -ne $last.DiskLat) { $parts += 'dyski do {0} ms' -f (Format-LoadNumber ([double]$last.DiskLat) 1) }
+        if ($null -ne $last.NetUtil) { $parts += 'sieć {0}% łącza' -f (Format-LoadNumber ([double]$last.NetUtil)) }
+        [void]$out.Add(@{ Tone = 'ok'; Text = ('Bez oznak przeciążenia: ' + ($parts -join ', ')) })
+    }
+    # Najpierw krytyczne, potem ostrzeżenia (kolejność wykrycia w ramach oceny)
+    return @(@($out | Where-Object { $_.Tone -eq 'crit' }) + @($out | Where-Object { $_.Tone -ne 'crit' }) | Select-Object -First 7)
+}
+
+function Get-LoadDiskName([string]$Name) {
+    # «D:» albo «HarddiskVolume3:» - nazwa woluminu z dwukropkiem do zdań typu «Dysk D: 60 ms»
+    if ($Name.EndsWith(':')) { return $Name }
+    return $Name + ':'
+}
+
+function Get-LoadSummary {
+    # «Od startu pomiaru»: co się działo w całym oknie - kto zużył najwięcej CPU, I/O i pamięci; wiersze @{ Item; Text; Tone }
+    param([hashtable]$State)
+    $out = New-Object System.Collections.ArrayList
+    if (-not $State.Ticks.Count) { return @() }
+    $first = $State.Ticks[0]
+    $last = $State.Ticks[$State.Ticks.Count - 1]
+    $cores = if ($State.Info) { [Math]::Max(1, [int]$State.Info.Cores) } else { 1 }
+    $from = ([datetime]$first.Time).AddSeconds(-[double]$State.Params.Interval)
+    [void]$out.Add(@{ Item = 'Okno pomiaru'; Text = ('{0:HH:mm:ss} – {1:HH:mm:ss} ({2}, próbek: {3}, co {4} s)' -f $from, [datetime]$last.Time, (Format-LoadDuration $State.Seconds), $State.Ticks.Count, $State.Params.Interval); Tone = 'info' })
+    $cpus = @($State.Ticks | ForEach-Object { $_.Cpu } | Where-Object { $null -ne $_ })
+    if ($cpus.Count) {
+        $avg = ($cpus | Measure-Object -Average).Average
+        $pk = $State.Peak.Cpu
+        [void]$out.Add(@{ Item = 'Procesor'; Text = ('średnio {0}%, szczyt {1}% o {2:HH:mm:ss}; łącznie {3} czasu procesora ({4} rdzeni)' -f (Format-LoadNumber $avg), (Format-LoadNumber ([double]$pk.Cpu)), [datetime]$pk.Time, (Format-LoadDuration $State.CpuBusySec), $cores); Tone = $(if ($avg -ge 85) { 'crit' } elseif ($avg -ge 60) { 'warn' } else { 'ok' }) })
+    }
+    $i = 0
+    foreach ($p in @(Get-LoadTopProcesses -State $State -By 'CpuS' -Count 5 | Where-Object { $_.CpuS -gt 0 })) {
+        $i++
+        $share = if ($State.CpuBusySec -gt 0) { 100.0 * $p.CpuS / $State.CpuBusySec } else { 0 }
+        $of = 100.0 * $p.CpuS / ([Math]::Max(0.001, $State.Seconds) * $cores)
+        [void]$out.Add(@{ Item = ('Najwięcej CPU #{0}' -f $i); Text = ('{0} (PID {1}): {2} czasu procesora = {3}% obciążenia w oknie, średnio {4}% mocy komputera, szczyt {5}%' -f $p.Name, $p.Id, (Format-LoadDuration $p.CpuS), (Format-LoadNumber $share), (Format-LoadNumber $of 1), (Format-LoadNumber $p.CpuMax)); Tone = $(if ($i -eq 1 -and $of -ge 50) { 'warn' } else { 'info' }) })
+    }
+    $i = 0
+    foreach ($p in @(Get-LoadTopProcesses -State $State -By 'Io' -Count 3 | Where-Object { $_.ReadB + $_.WriteB -gt 1MB })) {
+        $i++
+        [void]$out.Add(@{ Item = ('Najwięcej I/O #{0}' -f $i); Text = ('{0} (PID {1}): odczyt {2}, zapis {3} (pliki, sieć i urządzenia razem)' -f $p.Name, $p.Id, (Format-LoadBytes $p.ReadB), (Format-LoadBytes $p.WriteB)); Tone = 'info' })
+    }
+    $big = @(Get-LoadTopProcesses -State $State -By 'PrivMax' -Count 3)
+    $memText = @()
+    if ($State.Peak.AvailMin) { $memText += 'najmniej wolnej {0} MB o {1:HH:mm:ss}' -f (Format-LoadNumber ([double]$State.Peak.AvailMin.AvailMB)), [datetime]$State.Peak.AvailMin.Time }
+    if ($big.Count) { $memText += 'największe: ' + ((@($big | ForEach-Object { '{0} {1} MB' -f $_.Name, (Format-LoadNumber $_.PrivMax) })) -join ', ') }
+    if ($memText.Count) { [void]$out.Add(@{ Item = 'Pamięć'; Text = ($memText -join '; '); Tone = 'info' }) }
+    $diskText = @(foreach ($d in $State.Disk.Values) {
+            if ($d.Ops -le 0 -and $d.ReadB + $d.WriteB -le 0) { continue }
+            $avgLat = if ($d.Ops -gt 0) { $d.LatWeighted / $d.Ops } else { 0 }
+            '{0} odczyt {1}, zapis {2}, średnio {3} ms{4}' -f $d.Name, (Format-LoadBytes $d.ReadB), (Format-LoadBytes $d.WriteB), (Format-LoadNumber $avgLat 1), $(if ($d.LatMax -gt 0) { ', maks. {0} ms o {1}' -f (Format-LoadNumber $d.LatMax 1), $d.LatMaxAt } else { '' })
+        })
+    if ($diskText.Count) { [void]$out.Add(@{ Item = 'Dyski'; Text = ($diskText -join '; '); Tone = $(if ($State.Peak.Lat -and [double]$State.Peak.Lat.DiskLat -ge 50) { 'warn' } else { 'info' }) }) }
+    $netText = @(foreach ($nc in $State.Nic.Values) {
+            if ($nc.RxB + $nc.TxB -le 0) { continue }
+            '{0} odebrano {1}, wysłano {2}, maks. {3}% łącza{4}' -f $nc.Name, (Format-LoadBytes $nc.RxB), (Format-LoadBytes $nc.TxB), (Format-LoadNumber $nc.UtilMax), $(if ($nc.UtilMaxAt) { ' o ' + $nc.UtilMaxAt } else { '' })
+        })
+    if ($netText.Count) { [void]$out.Add(@{ Item = 'Sieć'; Text = ($netText -join '; '); Tone = 'info' }) }
+    $mon = if ($State.Info) { @($State.Proc.Values | Where-Object { $_.Id -eq [int]$State.Info.MonitorPid }) | Select-Object -First 1 } else { $null }
+    if ($mon) { [void]$out.Add(@{ Item = 'Koszt monitora'; Text = ('{0} (PID {1}): średnio {2}% procesora, {3} MB pamięci – odczyt liczników wykonuje też usługa WMI (WmiPrvSE)' -f $mon.Name, $mon.Id, (Format-LoadNumber (100.0 * $mon.CpuS / ([Math]::Max(0.001, $State.Seconds) * $cores)) 2), (Format-LoadNumber $mon.PrivMB)); Tone = 'info' }) }
+    return @($out)
+}
+
+function Get-LoadSummaryText {
+    param([hashtable]$State)
+    $lines = @("Monitor obciążenia – $($State.Target)")
+    $lines += @(Get-LoadSummary -State $State | ForEach-Object { '{0}: {1}' -f $_.Item, $_.Text })
+    $lines += ''
+    $lines += 'Ostatnie próbki:'
+    $lines += @(Get-LoadFindings -State $State | ForEach-Object { '- ' + $_.Text })
+    return ($lines -join "`r`n")
+}
+
+$script:LoadTileXaml = @'
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Padding="14,10" Margin="0,0,10,0">
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <Border Width="34" Height="34" CornerRadius="8" Background="#1B2333" Margin="0,0,12,0" VerticalAlignment="Center">
+      <TextBlock Name="icon" Style="{StaticResource Glyph}" FontSize="15" Foreground="#8CB0FF" HorizontalAlignment="Center"/>
+    </Border>
+    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+      <TextBlock Name="value" FontSize="20" FontWeight="SemiBold" Foreground="White" TextTrimming="CharacterEllipsis"/>
+      <TextBlock Name="label" FontSize="11.5" Foreground="#8791A5" TextTrimming="CharacterEllipsis"/>
+    </StackPanel>
+    <Canvas Name="spark" Grid.Row="1" Grid.ColumnSpan="2" Height="26" Margin="0,8,0,0" ClipToBounds="True">
+      <Polyline Name="line" Stroke="#8CB0FF" StrokeThickness="1.5" StrokeLineJoin="Round"/>
+    </Canvas>
+  </Grid>
+</Border>
+'@
+
+function Add-LoadTile {
+    # Kafelek z wartością i wykresem ostatnich próbek (jak w Menedżerze zadań)
+    param([hashtable]$Module, [string]$Key, [string]$Label, [string]$Icon)
+    $tile = New-UiElement $script:LoadTileXaml
+    $tile.Style = Get-ThemeResource 'Card'
+    $tile.Padding = '14,10'
+    $tile.FindName('icon').Text = Get-Glyph $Icon
+    $tile.FindName('value').Text = '–'
+    $tile.FindName('label').Text = $Label
+    $Module.Stats[$Key] = $tile
+    [void]$Module.StatsGrid.Children.Add($tile)
+    $Module.StatsGrid.Columns = $Module.StatsGrid.Children.Count
+    $Module.StatsGrid.Visibility = 'Visible'
+}
+
+function Set-LoadTile {
+    param([hashtable]$Module, [string]$Key, [string]$Value, [string]$Label, [string]$Tone = '', [object[]]$Series = @(), [double]$Max = 100, [string]$ToolTip = '')
+    Set-StatTile -Module $Module -Key $Key -Value $Value -Tone $Tone -Label $Label
+    $tile = $Module.Stats[$Key]
+    if (-not $tile) { return }
+    # Pełny opis w podpowiedzi - kafelki bywają wąskie
+    $tile.ToolTip = $(if ($ToolTip) { $ToolTip } else { "$Value – $Label" })
+    $canvas = $tile.FindName('spark')
+    $line = $tile.FindName('line')
+    $line.Stroke = Get-Brush $(if ($Tone -eq 'crit') { '#FF7A86' } elseif ($Tone -eq 'warn') { '#FFC46B' } else { '#8CB0FF' })
+    $vals = @($Series | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ })
+    $points = New-Object System.Windows.Media.PointCollection
+    if ($vals.Count -ge 2) {
+        $w = if ($canvas.ActualWidth -gt 0) { $canvas.ActualWidth } else { 160 }
+        $h = 26.0
+        $top = [Math]::Max($Max, ($vals | Measure-Object -Maximum).Maximum)
+        if ($top -le 0) { $top = 1 }
+        for ($i = 0; $i -lt $vals.Count; $i++) {
+            $x = $w * $i / ($vals.Count - 1)
+            $y = $h - 1 - ($h - 2) * [Math]::Min(1.0, $vals[$i] / $top)
+            $points.Add((New-Object System.Windows.Point($x, $y)))
+        }
+    }
+    $line.Points = $points
+}
+
+$script:LoadWhyXaml = @'
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Margin="0,4,0,6">
+  <Grid.ColumnDefinitions>
+    <ColumnDefinition Width="*"/>
+    <ColumnDefinition Width="18"/>
+    <ColumnDefinition Width="*"/>
+  </Grid.ColumnDefinitions>
+  <StackPanel>
+    <TextBlock Text="Co się dzieje teraz" FontWeight="SemiBold" Foreground="#E4E8EF"/>
+    <StackPanel Name="now" Margin="0,6,0,0"/>
+  </StackPanel>
+  <StackPanel Grid.Column="2">
+    <DockPanel LastChildFill="True">
+      <StackPanel Name="actions" DockPanel.Dock="Right" Orientation="Horizontal"/>
+      <TextBlock Text="Od startu pomiaru" FontWeight="SemiBold" Foreground="#E4E8EF" VerticalAlignment="Center"/>
+    </DockPanel>
+    <StackPanel Name="total" Margin="0,6,0,0"/>
+  </StackPanel>
+</Grid>
+'@
+
+function Set-LoadLines {
+    # Wiersze z kolorową kropką (ocena) w panelu «Co się dzieje»
+    param($Panel, [object[]]$Lines)
+    $Panel.Children.Clear()
+    foreach ($l in $Lines) {
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.TextWrapping = 'Wrap'
+        $tb.FontSize = 12.5
+        $tb.Margin = '0,0,0,4'
+        $tb.Foreground = Get-Brush '#C9D0DC'
+        $dot = New-Object System.Windows.Documents.Run '● '
+        $dot.Foreground = Get-Brush $(switch ([string]$l.Tone) { 'crit' { '#FF7A86' } 'warn' { '#FFC46B' } 'ok' { '#5EE3AE' } default { '#8CB0FF' } })
+        [void]$tb.Inlines.Add($dot)
+        $text = if ($l['Item']) { '{0}: {1}' -f $l.Item, $l.Text } else { [string]$l.Text }
+        [void]$tb.Inlines.Add((New-Object System.Windows.Documents.Run $text))
+        [void]$Panel.Children.Add($tb)
+    }
+}
+
+function Get-LoadRows {
+    # Wiersze bieżącego widoku (słowniki z kluczem __key - aktualizowane w miejscu)
+    param([hashtable]$Module, [int]$View)
+    $st = $Module.Data['Load']
+    if (-not $st) { return @() }
+    $cores = if ($st.Info) { [Math]::Max(1, [int]$st.Info.Cores) } else { 1 }
+    $secs = [Math]::Max(0.001, $st.Seconds)
+    if ($View -eq 0) {
+        $mon = if ($st.Info) { [int]$st.Info.MonitorPid } else { -1 }
+        $limit = [Math]::Max(5, (Get-Num $Module.LoadTop))
+        # Czołówka CPU w oknie, do tego największe I/O i pamięć oraz procesy aktywne teraz
+        $pick = [ordered]@{}
+        foreach ($e in @($st.Proc.Values | Sort-Object { $_.CpuS } -Descending | Select-Object -First $limit)) { $pick[$e.Key] = $e }
+        foreach ($e in @($st.Proc.Values | Sort-Object { $_.ReadB + $_.WriteB } -Descending | Select-Object -First 5)) { $pick[$e.Key] = $e }
+        foreach ($e in @($st.Proc.Values | Sort-Object { $_.PrivMB } -Descending | Select-Object -First 5)) { $pick[$e.Key] = $e }
+        foreach ($e in @($st.Proc.Values | Sort-Object { $_.CpuNow } -Descending | Select-Object -First 5)) { $pick[$e.Key] = $e }
+        return @(foreach ($e in $pick.Values) {
+                $info = $st.ProcInfo[$e.Key]
+                [ordered]@{
+                    'Proces'               = $(if ($e.Id -eq $mon) { "$($e.Name) (monitor)" } else { $e.Name })
+                    'PID'                  = $e.Id
+                    'CPU teraz (%)'        = [Math]::Round($e.CpuNow, 1)
+                    'CPU śr. (%)'          = [Math]::Round(100.0 * $e.CpuS / ($secs * $cores), 1)
+                    'CPU maks. (%)'        = [Math]::Round($e.CpuMax, 1)
+                    'Czas CPU (s)'         = [Math]::Round($e.CpuS, 1)
+                    'Udział w CPU (%)'     = $(if ($st.CpuBusySec -gt 0) { [Math]::Round(100.0 * $e.CpuS / $st.CpuBusySec, 1) } else { 0 })
+                    'Odczyt I/O (MB)'      = [Math]::Round($e.ReadB / 1MB, 1)
+                    'Zapis I/O (MB)'       = [Math]::Round($e.WriteB / 1MB, 1)
+                    'I/O teraz (MB/s)'     = [Math]::Round($e.IoNow, 2)
+                    'Pamięć (MB)'          = [Math]::Round($e.PrivMB)
+                    'Pamięć maks. (MB)'    = [Math]::Round($e.PrivMax)
+                    'Połączenia TCP'       = $(if ($st.Conns.ContainsKey($e.Id)) { $st.Conns[$e.Id] } else { 0 })
+                    'Wątki'                = $e.Threads
+                    'Uchwyty'              = $e.Handles
+                    'Usługi'               = $(if ($info) { [string]$info.Services } else { '' })
+                    'Użytkownik'           = $(if ($info) { [string]$info.User } else { '' })
+                    'Stan'                 = $(if ($e.Exited) { "zakończony $($e.Exited)" } else { 'działa' })
+                    'Polecenie'            = $(if ($info) { [string]$info.Command } else { '' })
+                    '__key'                = $e.Key
+                    '__flag'               = $(if ($e.CpuNow -ge 50) { 'warn' } else { '' })
+                }
+            })
+    }
+    if ($View -eq 1) {
+        return @(foreach ($d in $st.Disk.Values) {
+                $now = $d['Now']
+                [ordered]@{
+                    'Wolumin'               = $d.Name
+                    'Zajętość teraz (%)'    = $(if ($now) { $now.Busy } else { $null })
+                    'Zajętość śr. (%)'      = [Math]::Round(100.0 * $d.BusySec / $secs, 1)
+                    'Opóźnienie teraz (ms)' = $(if ($now) { $now.LatMs } else { $null })
+                    'Opóźnienie śr. (ms)'   = $(if ($d.Ops -gt 0) { [Math]::Round($d.LatWeighted / $d.Ops, 1) } else { 0 })
+                    'Opóźnienie maks. (ms)' = [Math]::Round($d.LatMax, 1)
+                    'Maks. o'               = $d.LatMaxAt
+                    'Kolejka'               = $(if ($now) { $now.Queue } else { $null })
+                    'IOPS'                  = $(if ($now) { $now.Iops } else { $null })
+                    'Odczyt (MB/s)'         = $(if ($now) { $now.ReadMBps } else { $null })
+                    'Zapis (MB/s)'          = $(if ($now) { $now.WriteMBps } else { $null })
+                    'Odczytano (MB)'        = [Math]::Round($d.ReadB / 1MB, 1)
+                    'Zapisano (MB)'         = [Math]::Round($d.WriteB / 1MB, 1)
+                    'Wolne (%)'             = $(if ($now) { $now.FreePct } else { $null })
+                    '__key'                 = $d.Name
+                    '__flag'                = $(if ($now -and [double]$now.Iops -ge 5 -and [double]$now.LatMs -ge 50) { 'crit' } elseif ($now -and [double]$now.Iops -ge 5 -and [double]$now.LatMs -ge 20) { 'warn' } else { '' })
+                }
+            })
+    }
+    if ($View -eq 2) {
+        return @(foreach ($nc in $st.Nic.Values) {
+                $now = $nc['Now']
+                [ordered]@{
+                    'Karta'                   = $nc.Name
+                    'Prędkość (Mb/s)'         = $(if ($now) { $now.SpeedMbps } else { $null })
+                    'Odbiór teraz (Mb/s)'     = $(if ($now) { $now.RxMbps } else { $null })
+                    'Wysyłanie teraz (Mb/s)'  = $(if ($now) { $now.TxMbps } else { $null })
+                    'Wykorzystanie teraz (%)' = $(if ($now) { $now.Util } else { $null })
+                    'Wykorzystanie maks. (%)' = [Math]::Round($nc.UtilMax, 1)
+                    'Maks. o'                 = $nc.UtilMaxAt
+                    'Odebrano (MB)'           = [Math]::Round($nc.RxB / 1MB, 1)
+                    'Wysłano (MB)'            = [Math]::Round($nc.TxB / 1MB, 1)
+                    '__key'                   = $nc.Name
+                    '__flag'                  = $(if ($now -and $null -ne $now.Util -and [double]$now.Util -ge 80) { 'warn' } else { '' })
+                }
+            })
+    }
+    if ($View -eq 3) { return @($st.Ticks | Select-Object -Last 500 | ForEach-Object { ConvertTo-LoadTickRow $_ }) }
+    return @(Get-LoadSummary -State $st | ForEach-Object { [ordered]@{ 'Pozycja' = $_.Item; 'Wartość' = $_.Text; '__key' = $_.Item; '__flag' = $(if ($_.Tone -in 'warn', 'crit') { $_.Tone } else { '' }) } })
+}
+
+function ConvertTo-LoadTickRow($Entry) {
+    return [ordered]@{
+        'Czas'                    = ([datetime]$Entry.Time).ToString('HH:mm:ss')
+        'CPU (%)'                 = $Entry.Cpu
+        'Jądro (%)'               = $Entry.Kernel
+        'Kolejka CPU'             = $Entry.Queue
+        'Wolna pamięć (MB)'       = $Entry.AvailMB
+        'Pamięć zajęta (%)'       = $Entry.UsedPct
+        'Commit (%)'              = $Entry.CommitPct
+        'Strony z dysku (/s)'     = $Entry.HardPs
+        'Dysk zajętość maks. (%)' = $Entry.DiskBusy
+        'Opóźnienie maks. (ms)'   = $Entry.DiskLat
+        'Najwolniejszy dysk'      = $Entry.DiskLatName
+        'Sieć (Mb/s)'             = $Entry.NetMbps
+        'Najwięcej CPU'           = $Entry.TopCpu
+        'Najwięcej I/O'           = $Entry.TopIo
+        '__key'                   = [string]$Entry.Seq
+        '__seq'                   = [int]$Entry.Seq
+        '__flag'                  = $(if ($null -ne $Entry.Cpu -and [double]$Entry.Cpu -ge 85) { 'warn' } else { '' })
+    }
+}
+
+function Sync-LoadRows {
+    # Wiersze aktualizowane w miejscu (klucz __key): sortowanie, zaznaczenie i przewinięcie tabeli zostają
+    param([hashtable]$Module, [object[]]$Rows)
+    $table = $Module.Table
+    if (-not $table) { return }
+    $index = @{}
+    if ($table.Columns.Contains('__key')) { foreach ($r in @($table.Rows)) { $index[[string]$r['__key']] = $r } }
+    $new = New-Object System.Collections.ArrayList
+    $keep = @{}
+    $Module.Loading = $true
+    $table.BeginLoadData()
+    try {
+        foreach ($o in $Rows) {
+            $k = [string]$o['__key']
+            $keep[$k] = $true
+            $row = $index[$k]
+            if (-not $row) { [void]$new.Add($o); continue }
+            $changed = $false
+            foreach ($name in @($o.Keys)) {
+                if (-not $table.Columns.Contains($name)) { [void]$table.Columns.Add($name, [object]); Add-GridColumn -Module $Module -Name $name }
+                $v = ConvertTo-CellValue $o[$name]
+                if (-not [object]::Equals($row[$name], $v)) { $row[$name] = $v; $changed = $true }
+            }
+            if ($changed) { Update-RowSearch -Module $Module -Row $row }
+        }
+        foreach ($k in @($index.Keys)) { if (-not $keep.ContainsKey($k)) { $table.Rows.Remove($index[$k]) } }
+    }
+    finally {
+        $table.EndLoadData()
+        $Module.Loading = $false
+    }
+    if ($new.Count) { Add-ResultRows -Module $Module -Objects @($new) }
+    Update-ResultCount -Module $Module
+}
+
+function Show-LoadView {
+    # Przełączenie widoku: nowa tabela z zapamiętanych danych (bez ponownego pomiaru)
+    param([hashtable]$Module)
+    $m = $Module
+    $view = [Math]::Max(0, (Get-SegmentIndex $m.ViewSwitch))
+    $m.Data.LoadView = $view
+    Reset-ResultTable -Module $m
+    Sync-LoadRows -Module $m -Rows @(Get-LoadRows -Module $m -View $view)
+    # Domyślna kolejność (kolumna musi już istnieć); kliknięcie nagłówka ją zmienia
+    $sort = @(@('Czas CPU (s)', 'DESC'), @('Wolumin', 'ASC'), @('Karta', 'ASC'), @('__seq', 'DESC'), @('', ''))[$view]
+    if ($sort[0] -and $m.Table.Columns.Contains($sort[0])) { $m.View.Sort = '[{0}] {1}' -f $sort[0], $sort[1] }
+    $m.ResultHint = @(
+        'Procesy: teraz – ostatnia próbka; śr., maks. i sumy – od startu pomiaru. CPU w % mocy całego komputera; udział – część całego zużycia procesora w oknie. I/O: pliki, sieć i urządzenia razem.'
+        'Woluminy: zajętość, opóźnienie operacji (powyżej 20 ms – wolno, 50 ms – bardzo wolno), kolejka i przepustowość; sumy od startu pomiaru'
+        'Karty sieciowe: ruch teraz, szczyt wykorzystania łącza i dane przesłane od startu pomiaru'
+        'Przebieg: jedna próbka w wierszu (najnowsze na górze) – kiedy rosło obciążenie i który proces wtedy prowadził'
+        'Podsumowanie okna pomiaru: kto zużył najwięcej procesora, I/O i pamięci, szczyty z godziną'
+    )[$view]
+    if ($m.View_['resultHint']) { $m.View_['resultHint'].Text = $m.ResultHint }
+}
+
+function Update-LoadUi {
+    # Kafelki, «co się dzieje» i tabela bieżącego widoku po każdej próbce
+    param([hashtable]$Module, $NewTick = $null)
+    $m = $Module
+    $st = $m.Data['Load']
+    if (-not $st) { return }
+    $ticks = @($st.Ticks | Select-Object -Last 60)
+    $last = if ($ticks.Count) { $ticks[$ticks.Count - 1] } else { $null }
+    $cores = if ($st.Info) { [int]$st.Info.Cores } else { 0 }
+    $memMB = if ($st.Info) { [double]$st.Info.MemoryMB } else { 0 }
+    if ($last) {
+        $cpu = $last.Cpu
+        $cpuText = if ($null -ne $cpu) { (Format-LoadNumber ([double]$cpu)) + '%' } else { '–' }
+        Set-LoadTile -Module $m -Key 'cpu' -Value $cpuText -Label ('Procesor • kolejka {0}' -f $(if ($null -ne $last.Queue) { $last.Queue } else { '–' })) -ToolTip ('Procesor {0} ({1} rdzeni), w jądrze {2}%, kolejka {3}; wykres – ostatnie {4} próbek' -f $cpuText, $cores, $(if ($null -ne $last.Kernel) { Format-LoadNumber ([double]$last.Kernel) } else { '–' }), $(if ($null -ne $last.Queue) { $last.Queue } else { '–' }), $ticks.Count) -Tone $(if ($null -ne $cpu -and $cpu -ge 85) { 'crit' } elseif ($null -ne $cpu -and $cpu -ge 60) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.Cpu })
+        $used = $last.UsedPct
+        Set-LoadTile -Module $m -Key 'mem' -Value $(if ($null -ne $used) { (Format-LoadNumber ([double]$used)) + '%' } else { '–' }) -Label ('Pamięć • wolne {0} MB' -f (Format-LoadNumber ([double]$last.AvailMB))) -ToolTip ('Pamięć zajęta {0}%: wolne {1} MB z {2} MB, commit {3}%, {4} stron/s z dysku' -f $(if ($null -ne $used) { Format-LoadNumber ([double]$used) } else { '–' }), (Format-LoadNumber ([double]$last.AvailMB)), (Format-LoadNumber $memMB), $(if ($null -ne $last.CommitPct) { Format-LoadNumber ([double]$last.CommitPct) } else { '–' }), (Format-LoadNumber ([double]$last.HardPs))) -Tone $(if ($null -ne $last.AvailMB -and $memMB -gt 0 -and ([double]$last.AvailMB -lt 500 -or [double]$last.AvailMB -lt 0.05 * $memMB)) { 'crit' } elseif ($null -ne $used -and $used -ge 85) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.UsedPct })
+        $lat = $last.DiskLat
+        Set-LoadTile -Module $m -Key 'disk' -Value $(if ($null -ne $lat) { (Format-LoadNumber ([double]$lat) 1) + ' ms' } else { '–' }) -Label $(if ($last.DiskLatName) { 'Dysk {0} • {1}%' -f $last.DiskLatName, (Format-LoadNumber ([double]$last.DiskBusy)) } else { 'Dyski • bez operacji' }) -ToolTip $(if ($last.DiskLatName) { 'Najwolniejszy dysk {0}: {1} ms na operację; najbardziej zajęty {2}: {3}% czasu' -f $last.DiskLatName, (Format-LoadNumber ([double]$lat) 1), $last.DiskBusyName, (Format-LoadNumber ([double]$last.DiskBusy)) } else { '' }) -Tone $(if ($null -ne $lat -and $lat -ge 50) { 'crit' } elseif ($null -ne $lat -and $lat -ge 20) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.DiskLat }) -Max 20
+        $netV = [double]$last.NetMbps
+        Set-LoadTile -Module $m -Key 'net' -Value ((Format-LoadNumber $netV $(if ($netV -ge 100) { 0 } else { 1 })) + ' Mb/s') -Label $(if ($null -ne $last.NetUtil) { 'Sieć • {0}% łącza' -f (Format-LoadNumber ([double]$last.NetUtil)) } else { 'Sieć' }) -ToolTip $(if ($last.NetName) { 'Ruch razem {0} Mb/s; najbardziej obciążona karta {1}: {2}% łącza' -f (Format-LoadNumber $netV 1), $last.NetName, (Format-LoadNumber ([double]$last.NetUtil)) } else { '' }) -Tone $(if ($null -ne $last.NetUtil -and $last.NetUtil -ge 80) { 'crit' } elseif ($null -ne $last.NetUtil -and $last.NetUtil -ge 60) { 'warn' } else { '' }) -Series @($ticks | ForEach-Object { $_.NetMbps }) -Max 1
+    }
+    $minutes = [double]$st.Params.Minutes
+    $state = if ($st.Running) { 'trwa' } elseif ($st.Error) { 'błąd' } else { 'zakończony' }
+    Set-StatTile -Module $m -Key 'mon' -Value (Format-LoadDuration $st.Seconds) -Label ('{0} • {1} • do {2} min' -f $st.Target, $state, $minutes) -Tone $(if ($st.Error) { 'crit' } elseif ($st.Running) { 'info' } else { '' })
+    $why = $m.Data['LoadWhy']
+    if ($why) {
+        Set-LoadLines -Panel $why.FindName('now') -Lines @(if ($st.Error) { @{ Tone = 'crit'; Text = $st.Error } } else { Get-LoadFindings -State $st })
+        # W panelu najważniejsze pozycje; pełna lista w widoku «Podsumowanie» i w kopii
+        Set-LoadLines -Panel $why.FindName('total') -Lines @(Get-LoadSummary -State $st | Where-Object { $_.Item -notmatch '#[3-9]$' -and $_.Item -notmatch 'I/O #[2-9]$' -and $_.Item -ne 'Koszt monitora' } | Select-Object -First 8)
+    }
+    if ($m.View_['busyText'] -and $st.Running) { $m.View_['busyText'].Text = 'Monitor: {0} • {1} / {2} min • próbek: {3}' -f $st.Target, (Format-LoadDuration $st.Seconds), $minutes, $st.Ticks.Count }
+    $view = [int]$m.Data['LoadView']
+    if ($view -eq 3 -and $NewTick) {
+        # Przebieg: tylko nowa próbka (cała tabela co kilka sekund byłaby zbędnym kosztem)
+        Add-ResultRows -Module $m -Objects @(ConvertTo-LoadTickRow $NewTick)
+        $rows = @($m.Table.Rows)
+        if ($rows.Count -gt 500) { $m.Table.Rows.Remove($rows[0]) }
+        if (-not $m.View.Sort) { try { $m.View.Sort = '[__seq] DESC' } catch { } }
+    }
+    elseif ($view -ne 3 -or -not $m.Table.Rows.Count) {
+        Sync-LoadRows -Module $m -Rows @(Get-LoadRows -Module $m -View $view)
+        if (-not $m.View.Sort -and $view -eq 0 -and $m.Table.Columns.Contains('Czas CPU (s)')) { try { $m.View.Sort = '[Czas CPU (s)] DESC' } catch { } }
+    }
+}
+
+function Start-LoadMonitor {
+    param([hashtable]$Module)
+    $m = $Module
+    $targets = @(Get-TargetComputers)
+    if (-not $targets) { return }
+    $target = $targets[0]
+    if ($targets.Count -gt 1) { Show-Toast ('Monitor obserwuje jeden komputer naraz – wybrano {0} (pierwszy zaznaczony).' -f $target) 'info' }
+    $params = @{ Interval = (Get-Num $m.LoadInterval); Minutes = (Get-Num $m.LoadMinutes) }
+    $m.Data.Load = New-LoadState -Target $target -Params $params
+    Reset-StatTiles -Module $m
+    Show-LoadView -Module $m
+    Update-LoadUi -Module $m
+    Write-Log ('Monitor obciążenia: {0} – start (próbka co {1} s, najdłużej {2} min).' -f $target, $params.Interval, $params.Minutes) -Module $m.Title
+    Start-HostOperation -Module $m -Name 'Monitor obciążenia' -Targets @($target) -Output None -Quiet -Parameters $params -ScriptBlock $script:LoadMonitorScript -OnItem {
+        param($m, $target, $obj)
+        Receive-LoadItem -Module $m -Object $obj
+    } -OnResult {
+        param($m, $r)
+        Complete-LoadMonitor -Module $m -Result $r
+    }
+}
+
+function Complete-LoadMonitor {
+    # Koniec pomiaru (czas minął, «Przerwij» albo błąd połączenia): podsumowanie w dzienniku
+    param([hashtable]$Module, $Result)
+    $m = $Module
+    $st = $m.Data['Load']
+    if (-not $st) { return }
+    $st.Running = $false
+    $cancelled = @($Result.Errors | Where-Object { [string]$_ -like 'Anulowano*' -or [string]$_ -like 'Przerwano*' }).Count -gt 0
+    if (-not $Result.Ok -and -not $cancelled -and -not $st.Ticks.Count) {
+        $st.Error = 'Monitor nie wystartował: ' + ((@($Result.Errors | Select-Object -Unique)) -join ' | ')
+        Write-Log ('[{0}] {1}' -f $st.Target, $st.Error) 'ERROR'
+    }
+    elseif ($st.Ticks.Count) {
+        $how = if ($cancelled) { 'zatrzymany' } elseif (-not $Result.Ok) { 'przerwany (błąd połączenia)' } else { 'zakończony' }
+        $top = @(Get-LoadSummary -State $st | Where-Object { $_.Item -in 'Okno pomiaru', 'Procesor', 'Najwięcej CPU #1', 'Najwięcej I/O #1' } | ForEach-Object { '{0}: {1}' -f $_.Item, $_.Text })
+        Write-Log ('Monitor obciążenia [{0}] {1}. {2}' -f $st.Target, $how, ($top -join '; ')) $(if ($Result.Ok -or $cancelled) { 'OK' } else { 'WARN' })
+        if (-not $Result.Ok -and -not $cancelled) { $st.Error = 'Połączenie przerwane: ' + ((@($Result.Errors | Select-Object -Unique)) -join ' | ') }
+    }
+    Update-LoadUi -Module $m
+}
+
+function Initialize-LoadModule {
+    param([hashtable]$Module)
+    $m = $Module
+    $m.Data.Load = $null
+    $m.Data.LoadView = 0
+    $row = Add-ToolbarRow -Module $m -Title 'Pomiar'
+    Add-Label -Parent $row -Text 'Próbka co (s)' | Out-Null
+    $m.LoadInterval = Add-Numeric -Parent $row -Value 5 -Minimum 2 -Maximum 60 -Width 50
+    Add-Label -Parent $row -Text 'Najdłużej (min)' | Out-Null
+    $m.LoadMinutes = Add-Numeric -Parent $row -Value 15 -Minimum 1 -Maximum 240 -Width 55
+    Add-Label -Parent $row -Text 'Procesy w tabeli' | Out-Null
+    $m.LoadTop = Add-Numeric -Parent $row -Value 30 -Minimum 5 -Maximum 200 -Width 50
+    Add-Button -Parent $row -Text 'Start' -Icon 'E768' -Module $m -Primary -ToolTip 'Obserwuje pierwszy zaznaczony komputer (jeden naraz); pomiar kończy się po ustawionym czasie albo przyciskiem «Przerwij» nad tabelą' -OnClick { param($m) Start-LoadMonitor -Module $m } | Out-Null
+    $why = New-UiElement $script:LoadWhyXaml
+    $copy = New-PlainButton -Text 'Kopiuj podsumowanie' -Icon 'E8C8'
+    $copy.Margin = '0,0,0,0'
+    Register-ControlHandler -Control $copy -EventName 'Click' -Module $m -Action {
+        param($m)
+        if (-not $m.Data['Load'] -or -not $m.Data.Load.Ticks.Count) { Show-Toast 'Brak danych – uruchom pomiar.' 'info'; return }
+        Set-ClipboardText (Get-LoadSummaryText -State $m.Data.Load)
+        Show-Toast 'Skopiowano podsumowanie pomiaru.' 'ok'
+    }
+    [void]$why.FindName('actions').Children.Add($copy)
+    $m.Data.LoadWhy = $why
+    Add-TopControl -Module $m -Control $why | Out-Null
+    $row2 = Add-ToolbarRow -Module $m -Title 'Widok'
+    $m.ViewSwitch = Add-Segmented -Parent $row2 -Items $script:LoadViews -Module $m -OnChange { param($m) Show-LoadView -Module $m }
+    Add-LoadTile -Module $m -Key 'cpu' -Label 'Procesor' -Icon 'E9D9'
+    Add-LoadTile -Module $m -Key 'mem' -Label 'Pamięć' -Icon 'E9D2'
+    Add-LoadTile -Module $m -Key 'disk' -Label 'Dyski' -Icon 'EDA2'
+    Add-LoadTile -Module $m -Key 'net' -Label 'Sieć' -Icon 'E968'
+    Add-StatTile -Module $m -Key 'mon' -Label 'Czas pomiaru' -Icon 'E916' | Out-Null
+    Add-RowAction -Module $m -Text 'Zakończ proces…' -Icon 'E711' -Danger -Action {
+        param($m, $rows)
+        $st = $m.Data['Load']
+        $sel = @($rows | Where-Object { (Get-ObjectValue $_ 'PID') -and [string](Get-ObjectValue $_ 'Stan') -eq 'działa' })
+        if (-not $st -or $sel.Count -eq 0) { Show-Warning 'Zaznacz działające procesy w widoku «Procesy».'; return }
+        $items = @($sel | ForEach-Object { '{0}: {1} (PID {2})' -f $st.Target, (Get-ObjectValue $_ 'Proces'), (Get-ObjectValue $_ 'PID') })
+        $chosen = @(Confirm-Action -Text 'Zakończyć wybrane procesy? Niezapisane dane w tych programach zostaną utracone.' -Items $items -ConfirmText 'Zakończ procesy' -Danger -Select -ReturnIndex)
+        if ($chosen.Count -eq 0) { return }
+        $pids = @($chosen | ForEach-Object { [int](Get-ObjectValue $sel[$_] 'PID') })
+        # W tle: moduł jest zajęty pomiarem, a zakończenie procesu nie powinno na niego czekać
+        Start-HostOperation -Module $m -Name 'Kończenie procesów' -Targets @($st.Target) -Parameters @{ Pids = $pids } -Output Log -Background -ScriptBlock {
+            param($P)
+            foreach ($id in $P.Pids) {
+                try { $proc = Get-Process -Id $id -ErrorAction Stop; $name = $proc.ProcessName; Stop-Process -Id $id -Force -ErrorAction Stop; "Zakończono $name (PID $id)." }
+                catch { "Błąd: PID $id – $($_.Exception.Message)" }
+            }
+        }
+    }
+    $m.EmptyHint = 'Zaznacz serwer na liście po lewej i kliknij «Start». Co kilka sekund widać obciążenie procesora, pamięci, dysków i sieci oraz procesy, które je powodują – z sumami od startu pomiaru.'
+}
+
+Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'LoadMonitor' -Title 'Monitor obciążenia' -Icon 'E916' -Badge 'nowe' `
+    -Description 'Na żywo, jak Monitor zasobów: procesor, pamięć, dyski i sieć co kilka sekund oraz procesy, które je obciążają – teraz, średnio i łącznie od startu (czas CPU, udział w obciążeniu, odczyt i zapis, szczyt pamięci, połączenia TCP). «Co się dzieje teraz» wskazuje wąskie gardło i jego sprawcę; podsumowanie okna mówi, kto zużył najwięcej. Jedno połączenie na cały pomiar.' -Build {
+    param($m)
+    Initialize-LoadModule -Module $m
 }
 #endregion
 
