@@ -4073,6 +4073,326 @@ function Start-IdleLock {
 }
 #endregion
 
+#region Kod QR (koder w PowerShellu, bez dodatkowych bibliotek)
+# Kod QR z linkiem otpauth:// do zeskanowania w aplikacji uwierzytelniającej przy dodawaniu konta MFA. Zgodnie z ISO/IEC
+# 18004: tryb bajtowy (UTF-8), poziom korekcji M (~15% uszkodzeń), najmniejsza mieszcząca tekst wersja 1-40, maska
+# o najniższej karze. Wynik New-QrMatrix: Modules - [bool[]] wiersz po wierszu (indeks y*Size+x, $true = ciemny moduł).
+$script:QrEccPerBlockM = [int[]]@(-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28)
+$script:QrBlocksM = [int[]]@(-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49)
+$script:QrGf = $null
+
+function Get-QrGf {
+    # Tablice potęg i logarytmów w GF(256), wielomian 0x11D (Reed-Solomon kodu QR)
+    if (-not $script:QrGf) {
+        $exp = New-Object int[] 512
+        $log = New-Object int[] 256
+        $x = 1
+        for ($i = 0; $i -lt 255; $i++) {
+            $exp[$i] = $x; $log[$x] = $i
+            $x = $x -shl 1
+            if ($x -band 0x100) { $x = $x -bxor 0x11D }
+        }
+        for ($i = 255; $i -lt 512; $i++) { $exp[$i] = $exp[$i - 255] }
+        $script:QrGf = @{ Exp = $exp; Log = $log }
+    }
+    return $script:QrGf
+}
+
+function Get-QrRawModules([int]$Version) {
+    # Moduły na dane i korekcję (bez wzorców stałych, formatu i wersji)
+    $r = (16 * $Version + 128) * $Version + 64
+    if ($Version -ge 2) {
+        $na = [int][Math]::Floor($Version / 7) + 2
+        $r -= (25 * $na - 10) * $na - 55
+        if ($Version -ge 7) { $r -= 36 }
+    }
+    return $r
+}
+
+function Get-QrRsDivisor([int]$Degree) {
+    # Wielomian generujący kodu korekcyjnego stopnia $Degree (współczynniki bez wiodącej jedynki)
+    $gf = Get-QrGf
+    $exp = $gf.Exp; $log = $gf.Log
+    $r = New-Object int[] $Degree
+    $r[$Degree - 1] = 1
+    $root = 1
+    for ($i = 0; $i -lt $Degree; $i++) {
+        for ($j = 0; $j -lt $Degree; $j++) {
+            $v = if ($r[$j] -eq 0) { 0 } else { $exp[$log[$r[$j]] + $log[$root]] }
+            if ($j + 1 -lt $Degree) { $v = $v -bxor $r[$j + 1] }
+            $r[$j] = $v
+        }
+        $root = $exp[$log[$root] + 1]
+    }
+    return , $r
+}
+
+function Get-QrRsRemainder([int[]]$Data, [int[]]$Divisor) {
+    # Słowa korekcyjne bloku danych: reszta z dzielenia przez wielomian generujący
+    $gf = Get-QrGf
+    $exp = $gf.Exp; $log = $gf.Log
+    $n = $Divisor.Length
+    $r = New-Object int[] $n
+    foreach ($b in $Data) {
+        $f = $b -bxor $r[0]
+        [Array]::Copy($r, 1, $r, 0, $n - 1)
+        $r[$n - 1] = 0
+        if ($f -ne 0) {
+            $lf = $log[$f]
+            for ($i = 0; $i -lt $n; $i++) { if ($Divisor[$i] -ne 0) { $r[$i] = $r[$i] -bxor $exp[$log[$Divisor[$i]] + $lf] } }
+        }
+    }
+    return , $r
+}
+
+function Get-QrCodewords([byte[]]$Bytes, [int]$Version) {
+    # Ciąg bitów (tryb bajtowy, długość, dane, terminator, wypełnienie), bloki z korekcją, przeplot
+    $numBlocks = $script:QrBlocksM[$Version]
+    $eccLen = $script:QrEccPerBlockM[$Version]
+    $raw = (Get-QrRawModules $Version) -shr 3
+    $dataLen = $raw - $eccLen * $numBlocks
+    $cw = New-Object int[] $dataLen
+    $parts = New-Object System.Collections.Generic.List[int[]]
+    $parts.Add([int[]]@(4, 4))
+    $parts.Add([int[]]@($Bytes.Length, $(if ($Version -le 9) { 8 } else { 16 })))
+    foreach ($b in $Bytes) { $parts.Add([int[]]@([int]$b, 8)) }
+    $bit = 0
+    foreach ($p in $parts) {
+        for ($i = $p[1] - 1; $i -ge 0; $i--) {
+            if (($p[0] -shr $i) -band 1) { $cw[$bit -shr 3] = $cw[$bit -shr 3] -bor (0x80 -shr ($bit -band 7)) }
+            $bit++
+        }
+    }
+    # Terminator (do 4 zer) i dopełnienie do pełnego bajtu, potem bajty wypełnienia 0xEC / 0x11
+    $bit = [Math]::Min($bit + 4, $dataLen * 8)
+    $k0 = [int][Math]::Ceiling($bit / 8)
+    for ($k = $k0; $k -lt $dataLen; $k++) { $cw[$k] = $(if ((($k - $k0) % 2) -eq 0) { 0xEC } else { 0x11 }) }
+    $numShort = $numBlocks - $raw % $numBlocks
+    $shortLen = [int][Math]::Floor($raw / $numBlocks)
+    $div = Get-QrRsDivisor $eccLen
+    $blocks = New-Object System.Collections.Generic.List[int[]]
+    $k = 0
+    for ($i = 0; $i -lt $numBlocks; $i++) {
+        $len = $shortLen - $eccLen + $(if ($i -lt $numShort) { 0 } else { 1 })
+        $dat = New-Object int[] $len
+        [Array]::Copy($cw, $k, $dat, 0, $len)
+        $k += $len
+        $ecc = Get-QrRsRemainder $dat $div
+        # Krótsze bloki mają puste miejsce na pozycji ostatniego bajtu danych dłuższych bloków
+        $blk = New-Object int[] ($shortLen + 1)
+        [Array]::Copy($dat, 0, $blk, 0, $len)
+        [Array]::Copy($ecc, 0, $blk, $shortLen + 1 - $eccLen, $eccLen)
+        $blocks.Add($blk)
+    }
+    $all = New-Object int[] $raw
+    $n = 0
+    for ($i = 0; $i -le $shortLen; $i++) {
+        for ($j = 0; $j -lt $numBlocks; $j++) {
+            if ($i -ne $shortLen - $eccLen -or $j -ge $numShort) { $all[$n] = $blocks[$j][$i]; $n++ }
+        }
+    }
+    return , $all
+}
+
+function Set-QrModule([hashtable]$Qr, [int]$X, [int]$Y, [bool]$Dark) {
+    # Moduł wzorca stałego (nie zmieniają go dane ani maska)
+    $i = $Y * $Qr.Size + $X
+    $Qr.Modules[$i] = $Dark
+    $Qr.Function[$i] = $true
+}
+
+function Set-QrFormatBits([hashtable]$Qr, [int]$Mask) {
+    # Poziom korekcji (M = 00) i maska z kodem BCH - dwie kopie przy wzorcach pozycjonujących
+    $data = $Mask
+    $rem = $data
+    for ($i = 0; $i -lt 10; $i++) { $rem = ($rem -shl 1) -bxor (($rem -shr 9) * 0x537) }
+    $bits = (($data -shl 10) -bor $rem) -bxor 0x5412
+    $size = $Qr.Size
+    for ($i = 0; $i -le 5; $i++) { Set-QrModule $Qr 8 $i ((($bits -shr $i) -band 1) -eq 1) }
+    Set-QrModule $Qr 8 7 ((($bits -shr 6) -band 1) -eq 1)
+    Set-QrModule $Qr 8 8 ((($bits -shr 7) -band 1) -eq 1)
+    Set-QrModule $Qr 7 8 ((($bits -shr 8) -band 1) -eq 1)
+    for ($i = 9; $i -lt 15; $i++) { Set-QrModule $Qr (14 - $i) 8 ((($bits -shr $i) -band 1) -eq 1) }
+    for ($i = 0; $i -lt 8; $i++) { Set-QrModule $Qr ($size - 1 - $i) 8 ((($bits -shr $i) -band 1) -eq 1) }
+    for ($i = 8; $i -lt 15; $i++) { Set-QrModule $Qr 8 ($size - 15 + $i) ((($bits -shr $i) -band 1) -eq 1) }
+    Set-QrModule $Qr 8 ($size - 8) $true
+}
+
+function Initialize-QrPatterns([hashtable]$Qr) {
+    # Wzorce stałe: synchronizacja, pozycjonowanie, wyrównanie, miejsce na format, informacja o wersji (od 7)
+    $size = $Qr.Size
+    $ver = $Qr.Version
+    for ($i = 0; $i -lt $size; $i++) {
+        Set-QrModule $Qr 6 $i (($i % 2) -eq 0)
+        Set-QrModule $Qr $i 6 (($i % 2) -eq 0)
+    }
+    foreach ($c in @(@(3, 3), @(($size - 4), 3), @(3, ($size - 4)))) {
+        for ($dy = -4; $dy -le 4; $dy++) {
+            for ($dx = -4; $dx -le 4; $dx++) {
+                $xx = $c[0] + $dx; $yy = $c[1] + $dy
+                if ($xx -lt 0 -or $yy -lt 0 -or $xx -ge $size -or $yy -ge $size) { continue }
+                $dist = [Math]::Max([Math]::Abs($dx), [Math]::Abs($dy))
+                Set-QrModule $Qr $xx $yy ($dist -ne 2 -and $dist -ne 4)
+            }
+        }
+    }
+    if ($ver -ge 2) {
+        $na = [int][Math]::Floor($ver / 7) + 2
+        $step = [int][Math]::Floor(($ver * 8 + $na * 3 + 5) / ($na * 4 - 4)) * 2
+        $pos = New-Object int[] $na
+        $pos[0] = 6
+        for ($i = 0; $i -lt $na - 1; $i++) { $pos[$na - 1 - $i] = $size - 7 - $i * $step }
+        for ($i = 0; $i -lt $na; $i++) {
+            for ($j = 0; $j -lt $na; $j++) {
+                if (($i -eq 0 -and $j -eq 0) -or ($i -eq 0 -and $j -eq $na - 1) -or ($i -eq $na - 1 -and $j -eq 0)) { continue }
+                for ($dy = -2; $dy -le 2; $dy++) {
+                    for ($dx = -2; $dx -le 2; $dx++) {
+                        Set-QrModule $Qr ($pos[$i] + $dx) ($pos[$j] + $dy) ([Math]::Max([Math]::Abs($dx), [Math]::Abs($dy)) -ne 1)
+                    }
+                }
+            }
+        }
+    }
+    Set-QrFormatBits $Qr 0
+    if ($ver -ge 7) {
+        $rem = $ver
+        for ($i = 0; $i -lt 12; $i++) { $rem = ($rem -shl 1) -bxor (($rem -shr 11) * 0x1F25) }
+        $bits = ($ver -shl 12) -bor $rem
+        for ($i = 0; $i -lt 18; $i++) {
+            $dark = (($bits -shr $i) -band 1) -eq 1
+            $a = $size - 11 + $i % 3
+            $b = [int][Math]::Floor($i / 3)
+            Set-QrModule $Qr $a $b $dark
+            Set-QrModule $Qr $b $a $dark
+        }
+    }
+}
+
+function Get-QrMasked([hashtable]$Qr, [int]$Mask) {
+    # Kopia modułów z nałożoną maską (tylko moduły danych)
+    $size = $Qr.Size
+    $m = [bool[]]$Qr.Modules.Clone()
+    $fn = $Qr.Function
+    for ($y = 0; $y -lt $size; $y++) {
+        $row = $y * $size
+        for ($x = 0; $x -lt $size; $x++) {
+            if ($fn[$row + $x]) { continue }
+            if ($Mask -eq 0) { $inv = (($x + $y) % 2) -eq 0 }
+            elseif ($Mask -eq 1) { $inv = ($y % 2) -eq 0 }
+            elseif ($Mask -eq 2) { $inv = ($x % 3) -eq 0 }
+            elseif ($Mask -eq 3) { $inv = (($x + $y) % 3) -eq 0 }
+            elseif ($Mask -eq 4) { $inv = (([Math]::Floor($x / 3) + [Math]::Floor($y / 2)) % 2) -eq 0 }
+            elseif ($Mask -eq 5) { $inv = (($x * $y) % 2 + ($x * $y) % 3) -eq 0 }
+            elseif ($Mask -eq 6) { $inv = ((($x * $y) % 2 + ($x * $y) % 3) % 2) -eq 0 }
+            else { $inv = ((($x + $y) % 2 + ($x * $y) % 3) % 2) -eq 0 }
+            if ($inv) { $m[$row + $x] = -not $m[$row + $x] }
+        }
+    }
+    return , $m
+}
+
+function Get-QrPenalty([bool[]]$Modules, [int]$Size) {
+    # Kara maski (ISO/IEC 18004 7.8.3): serie 5+ modułów, bloki 2x2, wzorce podobne do pozycjonujących, proporcja ciemnych
+    $rows = New-Object char[] ($Size * $Size)
+    $cols = New-Object char[] ($Size * $Size)
+    $pairs = New-Object char[] ($Size * $Size)
+    $dark = 0
+    for ($y = 0; $y -lt $Size; $y++) {
+        $row = $y * $Size
+        for ($x = 0; $x -lt $Size; $x++) {
+            $c = if ($Modules[$row + $x]) { $dark++; [char]'1' } else { [char]'0' }
+            $rows[$row + $x] = $c
+            $cols[$x * $Size + $y] = $c
+            # Para z modułem wyżej: ta sama barwa albo 'x' (do wyszukania bloków 2x2 w jednym wierszu)
+            if ($y -gt 0) { $pairs[$row - $Size + $x] = $(if ($rows[$row - $Size + $x] -eq $c) { $c } else { [char]'x' }) }
+        }
+    }
+    $score = 0
+    $all = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $Size; $i++) {
+        $all.Add([string]::new($rows, $i * $Size, $Size))
+        $all.Add([string]::new($cols, $i * $Size, $Size))
+    }
+    foreach ($s in $all) {
+        foreach ($r in [regex]::Matches($s, '0{5,}|1{5,}')) { $score += $r.Length - 2 }
+        $padded = '0000' + $s + '0000'
+        $score += 40 * ([regex]::Matches($padded, '(?=00001011101)').Count + [regex]::Matches($padded, '(?=10111010000)').Count)
+    }
+    for ($i = 0; $i -lt $Size - 1; $i++) {
+        $score += 3 * [regex]::Matches([string]::new($pairs, $i * $Size, $Size), '(?=00|11)').Count
+    }
+    $total = $Size * $Size
+    $score += 10 * [int][Math]::Floor([Math]::Abs($dark * 20 - $total * 10) / $total)
+    return $score
+}
+
+function New-QrMatrix {
+    <#
+        Kod QR dla tekstu. Zwraca @{ Size; Version; Mask; Modules = [bool[]] (indeks y*Size+x) }.
+        -Mask 0-7 wymusza maskę (porównanie z innymi koderami); domyślnie maska o najniższej karze.
+    #>
+    param([Parameter(Mandatory)][string]$Text, [ValidateRange(-1, 7)][int]$Mask = -1)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $ver = 0
+    for ($v = 1; $v -le 40; $v++) {
+        $cap = ((Get-QrRawModules $v) -shr 3) - $script:QrEccPerBlockM[$v] * $script:QrBlocksM[$v]
+        if (4 + $(if ($v -le 9) { 8 } else { 16 }) + 8 * $bytes.Length -le $cap * 8) { $ver = $v; break }
+    }
+    if (-not $ver) { throw 'Tekst jest za długi na kod QR.' }
+    $size = $ver * 4 + 17
+    $qr = @{ Size = $size; Version = $ver; Mask = $Mask; Modules = (New-Object bool[] ($size * $size)); Function = (New-Object bool[] ($size * $size)) }
+    Initialize-QrPatterns $qr
+    # Dane w kolumnach po dwa moduły, zygzakiem od prawego dolnego rogu, z pominięciem kolumny synchronizacji
+    $data = Get-QrCodewords -Bytes $bytes -Version $ver
+    $nbits = $data.Length * 8
+    $mods = $qr.Modules
+    $fn = $qr.Function
+    $i = 0
+    for ($right = $size - 1; $right -ge 1; $right -= 2) {
+        if ($right -eq 6) { $right = 5 }
+        $upward = (($right + 1) -band 2) -eq 0
+        for ($vert = 0; $vert -lt $size; $vert++) {
+            $y = if ($upward) { $size - 1 - $vert } else { $vert }
+            for ($j = 0; $j -lt 2; $j++) {
+                $idx = $y * $size + $right - $j
+                if (-not $fn[$idx] -and $i -lt $nbits) {
+                    $mods[$idx] = (($data[$i -shr 3] -shr (7 - ($i -band 7))) -band 1) -eq 1
+                    $i++
+                }
+            }
+        }
+    }
+    if ($Mask -lt 0) {
+        $best = [int]::MaxValue
+        for ($k = 0; $k -lt 8; $k++) {
+            Set-QrFormatBits $qr $k
+            $p = Get-QrPenalty -Modules (Get-QrMasked $qr $k) -Size $size
+            if ($p -lt $best) { $best = $p; $Mask = $k }
+        }
+    }
+    Set-QrFormatBits $qr $Mask
+    return @{ Size = $size; Version = $ver; Mask = $Mask; Modules = (Get-QrMasked $qr $Mask) }
+}
+
+function New-QrBitmap {
+    # Obraz kodu QR (1 piksel na moduł, margines 4 moduły); do wyświetlenia w powiększeniu bez wygładzania
+    param([Parameter(Mandatory)][string]$Text)
+    $qr = New-QrMatrix -Text $Text
+    $border = 4
+    $n = $qr.Size + 2 * $border
+    $px = New-Object byte[] ($n * $n)
+    for ($i = 0; $i -lt $px.Length; $i++) { $px[$i] = 255 }
+    for ($y = 0; $y -lt $qr.Size; $y++) {
+        for ($x = 0; $x -lt $qr.Size; $x++) {
+            if ($qr.Modules[$y * $qr.Size + $x]) { $px[($y + $border) * $n + $x + $border] = 0 }
+        }
+    }
+    $bmp = [System.Windows.Media.Imaging.BitmapSource]::Create($n, $n, 96, 96, [System.Windows.Media.PixelFormats]::Gray8, $null, $px, $n)
+    $bmp.Freeze()
+    return $bmp
+}
+#endregion
+
 #region MFA przy odblokowaniu (kod z aplikacji uwierzytelniającej, TOTP)
 # Drugi składnik odblokowania programu: kod z aplikacji (Microsoft / Google Authenticator i podobne; TOTP wg RFC 6238:
 # HMAC-SHA1, 30 s, 6 cyfr). Klucze generuje program na tym komputerze i zapisuje w pliku $script:App.MfaFile
@@ -4355,18 +4675,31 @@ $script:MfaEnrollXaml = @'
     </StackPanel>
   </Grid>
   <Border Style="{StaticResource Card}" Padding="14,12" Margin="0,14,0,0">
-    <StackPanel>
-      <TextBlock TextWrapping="Wrap" Foreground="#C9D0DC"
-                 Text="1. W aplikacji uwierzytelniającej (Microsoft Authenticator, Google Authenticator i podobne) dodaj konto, wybierz wpisanie klucza ręcznie i konto oparte na czasie:"/>
-      <TextBox x:Name="enKey" IsReadOnly="True" FontFamily="Consolas" FontSize="17" Margin="0,10,0,0" HorizontalContentAlignment="Center"/>
-      <TextBlock x:Name="enLabel" Foreground="#8791A5" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"/>
-      <WrapPanel x:Name="enButtons" Margin="0,8,0,0"/>
-    </StackPanel>
+    <Grid>
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+      <Border x:Name="enQrPanel" Background="White" CornerRadius="6" Padding="3" Margin="0,0,14,0" VerticalAlignment="Top"
+              ToolTip="Kod QR z kluczem i nazwą konta – zeskanuj go aparatem w aplikacji uwierzytelniającej">
+        <Image x:Name="enQr" Stretch="Fill" RenderOptions.BitmapScalingMode="NearestNeighbor"/>
+      </Border>
+      <StackPanel Grid.Column="1">
+        <TextBlock x:Name="enStep1" TextWrapping="Wrap" Foreground="#C9D0DC"/>
+        <TextBlock x:Name="enLabel" Foreground="#8791A5" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap"/>
+        <WrapPanel x:Name="enButtons" Margin="0,8,0,0"/>
+      </StackPanel>
+      <TextBox x:Name="enKey" Grid.Row="1" Grid.ColumnSpan="2" IsReadOnly="True" FontFamily="Consolas" FontSize="17" Margin="0,10,0,0" HorizontalContentAlignment="Center"/>
+    </Grid>
   </Border>
   <TextBlock Text="2. Wpisz 6-cyfrowy kod, który pokazuje aplikacja" Foreground="#8791A5" FontSize="12" Margin="0,14,0,5"/>
   <TextBox x:Name="enCode" MaxLength="6" Width="150" HorizontalAlignment="Left" FontSize="16"/>
   <TextBlock Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="0,12,0,0"
-             Text="Klucz jest pokazywany tylko teraz. Program zapisuje go zaszyfrowanego (DPAPI) w pliku na tym komputerze – odczyta go tylko to konto Windows. Utrata telefonu: usunięcie pliku MFA przywraca odblokowanie samym PIN-em."/>
+             Text="Klucz i kod QR są pokazywane tylko teraz. Program zapisuje klucz zaszyfrowany (DPAPI) w pliku na tym komputerze – odczyta go tylko to konto Windows. Utrata telefonu: usunięcie pliku MFA przywraca odblokowanie samym PIN-em."/>
 </StackPanel>
 '@
 
@@ -4378,7 +4711,7 @@ function Show-MfaEnroll {
     #>
     param([switch]$Primary, [hashtable]$Account = $null)
     $title = if ($Account) { "Nowy klucz MFA – $($Account.Name)" } elseif ($Primary) { 'MFA dla konta podstawowego' } else { 'Nowe konto z MFA' }
-    $w = New-Dialog -Title $title -Subtitle 'Odblokowanie programu będzie wymagać PIN-u i kodu z aplikacji w telefonie.' -Body $script:MfaEnrollXaml -Icon 'E8D7' -OkText 'Zapisz' -Width 560 -Validate {
+    $w = New-Dialog -Title $title -Subtitle 'Odblokowanie programu będzie wymagać PIN-u i kodu z aplikacji w telefonie.' -Body $script:MfaEnrollXaml -Icon 'E8D7' -OkText 'Zapisz' -Width 620 -Validate {
         param($w)
         $t = $w.Tag
         $name = $w.FindName('enName').Text.Trim()
@@ -4437,10 +4770,41 @@ function Show-MfaEnroll {
             Show-Toast 'Skopiowano link – schowek wyczyści się po minucie.' 'ok'
         })
     foreach ($b in $copyKey, $copyUri) { [void]$buttons.Children.Add($b) }
+    Update-MfaEnrollQr -Window $w
+    # Kod QR zawiera nazwę konta: odświeżany chwilę po ostatniej zmianie nazwy
+    $qrTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $qrTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+    $qrTimer.Tag = $w
+    $qrTimer.add_Tick({ param($s, $e) $s.Stop(); Update-MfaEnrollQr -Window $s.Tag })
+    $nameBox.Tag = $qrTimer
+    $nameBox.add_TextChanged({ param($s, $e) $s.Tag.Stop(); $s.Tag.Start() })
+    $w.add_Closed({ param($s, $e) $s.FindName('enName').Tag.Stop() })
     $w.add_ContentRendered({ param($s, $e) $b = $s.FindName('enName'); [void]$b.Focus(); $b.SelectAll() })
     $ok = Invoke-Dialog $w
     if ($ok) { Write-Log ('MFA: {0} konto «{1}».' -f $(if ($Account) { 'nowy klucz dla' } else { 'dodano' }), $nameBox.Text.Trim()) 'OK' -Module '' }
     return $ok
+}
+
+function Update-MfaEnrollQr {
+    # Kod QR z linkiem otpauth:// (klucz i nazwa konta z pola); gdy nie da się go utworzyć - tylko klucz do wpisania
+    param([Parameter(Mandatory)]$Window)
+    $panel = $Window.FindName('enQrPanel')
+    $step = $Window.FindName('enStep1')
+    $n = $Window.FindName('enName').Text.Trim()
+    try {
+        $bmp = New-QrBitmap -Text (Get-MfaUri -Account $(if ($n) { $n } else { 'konto' }) -Base32 (ConvertTo-Base32 $Window.Tag.Secret))
+        $img = $Window.FindName('enQr')
+        # Całkowita liczba pikseli na moduł (ostre krawędzie), około 170-200 punktów
+        $img.Width = $bmp.PixelWidth * [Math]::Max(3, [Math]::Floor(210 / $bmp.PixelWidth))
+        $img.Height = $img.Width
+        $img.Source = $bmp
+        $panel.Visibility = 'Visible'
+        $step.Text = '1. W aplikacji uwierzytelniającej (Microsoft Authenticator, Google Authenticator i podobne) dodaj konto i zeskanuj kod QR. Bez skanowania: wybierz wpisanie klucza ręcznie, konto oparte na czasie i przepisz klucz spod kodu.'
+    }
+    catch {
+        $panel.Visibility = 'Collapsed'
+        $step.Text = '1. W aplikacji uwierzytelniającej (Microsoft Authenticator, Google Authenticator i podobne) dodaj konto, wybierz wpisanie klucza ręcznie, konto oparte na czasie i przepisz klucz z pola poniżej.'
+    }
 }
 
 $script:MfaManagerXaml = @'
