@@ -35,6 +35,8 @@
     są wczytywane przy starcie. Przykład w README.
 
 .NOTES
+    Copyright (c) 2025-2026 Borys Kaleta. Wszelkie prawa zastrzeżone - warunki w pliku LICENSE.
+
     Wymagania:
       - Windows PowerShell 5.1 (WPF, tryb STA - skrypt sam uruchomi się ponownie w odpowiednim trybie),
       - RSAT: moduł ActiveDirectory (przestrzenie AD i wczytywanie komputerów), opcjonalnie moduł LAPS,

@@ -45,7 +45,7 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 | `AD-ManagerDiamond.Modules\*.ps1` (katalog skryptu) | `AD-ManagerDiamond.ps1` | Opcjonalne własne moduły wczytywane przy starcie. |
 | `%LOCALAPPDATA%\AD-ManagerDiamond\Logs\DomainOps_RRRRMMDD.log` | `AD-ManagerDiamond.ps1` | Dziennik wszystkich operacji (kto, co, na których komputerach/kontach, wynik). |
 | `%SystemRoot%\Temp\DomainOps` na hostach docelowych | `AD-ManagerDiamond.ps1` | Kopiowane instalatory i ich logi; `EnableWinRM.log` po włączeniu WinRM przez DCOM (*Diagnostyka WinRM*, razem z regułą zapory „Domain Ops - WinRM (HTTP-In)”, jeśli wybrano); Windows Update: skrypt zadania (`DomainOps-WU.ps1`), parametry i wyniki (`WU-Search.json`, `WU-History.json`, `WU-Install.json` z wynikiem każdej aktualizacji), dzienniki `WU.log` (instalacja) i `WU-Search.log` / `WU-History.log`; zadania Harmonogramu `DomainOps-WindowsUpdate` (instalacja) oraz chwilowo `DomainOps-WU-Search` / `DomainOps-WU-History`. |
-| `LICENSE` | — | Informacja o licencji zbioru. |
+| `LICENSE` | — | Warunki licencji: wszelkie prawa zastrzeżone. |
 
 ## Lista skryptów
 
@@ -333,8 +333,12 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'TimeSync' -Tit
 - **Raporty cykliczne** wykonują kopię programu (z modułami własnymi) na koncie zadania — często z najwyższymi uprawnieniami albo jako SYSTEM. Folder zadań powinien być zapisywalny tylko dla administratorów (program sam zabezpiecza podfolder `Program`); kto może zmieniać definicje, może też zmienić adresatów raportów. Hasło konta zadania przechowuje Harmonogram zadań (program go nie zapisuje), a hasło SMTP jest zapisane w definicji zaszyfrowane DPAPI — odczyta je tylko konto, które je wpisało, na tym samym komputerze. Raporty i wiadomości zawierają nazwy kont, grup i ścieżek — wysyłaj je tylko do zaufanych odbiorców i na zaufany serwer SMTP (włącz TLS, jeśli serwer go obsługuje).
 - `PasswordGenerator` przechowuje wygenerowane hasła jawnym tekstem (historia w `%TEMP%`) — czyść historię i schowek po pracy. Hasła nowych kont w *Tworzeniu kont* są maskowane w tabeli i eksporcie (do czasu zaznaczenia „Pokaż poufne”) i nie są zapisywane w ustawieniach ani dzienniku.
 
+## Licencja
+
+Copyright © 2025–2026 Borys Kaleta. Wszelkie prawa zastrzeżone. Skrypty z tego repozytorium wolno używać, kopiować, modyfikować i rozpowszechniać wyłącznie na podstawie pisemnej zgody albo umowy licencyjnej z autorem i w zakresie w niej określonym — szczegóły w pliku [`LICENSE`](LICENSE).
+
 ## Kontakt
 
-Masz uwagi lub pomysł na nowy scenariusz? Otwórz Issue na GitHub lub skontaktuj się z autorem.
+Uwagi, pomysły na nowe scenariusze i pytania o licencję kieruj do autora.
 
 **Autor:** Boris
