@@ -204,7 +204,7 @@ $script:HiddenProperties = @('PSComputerName', 'RunspaceId', 'PSShowComputerName
 function Write-Log {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
-        [ValidateSet('INFO', 'OK', 'WARN', 'ERROR')][string]$Level = 'INFO',
+        [ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'DEBUG')][string]$Level = 'INFO',
         [AllowEmptyString()][AllowNull()][string]$Module = $script:LogContext
     )
     $now = Get-Date
@@ -236,6 +236,67 @@ function Write-Log {
     if ($script:App.RunLog) {
         try { [System.IO.File]::AppendAllText($script:App.RunLog, ('{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f $now, $Level, $Message) + [Environment]::NewLine, [System.Text.Encoding]::UTF8) } catch { }
     }
+}
+
+# Tryb diagnostyczny (Ustawienia): parametry operacji, czasy, szczegóły błędów ze stosem wywołań - poziom DEBUG.
+# Klucze parametrów pasujące do wzorca (hasła, klucze, PIN, poświadczenia) są ukrywane.
+$script:DebugSecretPattern = '(?i)(pass|secret|token|credential|hasł|haslo|pin$|mfa|apikey|privatekey|clientkey|thumbprint)'
+
+function Test-DebugLog { return [bool]($script:Settings -and $script:Settings['DebugLog']) }
+
+function Write-DebugLog {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Message, [AllowEmptyString()][AllowNull()][string]$Module = $script:LogContext)
+    if (Test-DebugLog) { Write-Log -Message $Message -Level 'DEBUG' -Module $Module }
+}
+
+function Format-DebugParams {
+    # Parametry operacji w jednym wierszu: wartości proste wprost, teksty i kolekcje skrócone, tajne ukryte
+    param([System.Collections.IDictionary]$Parameters)
+    if (-not $Parameters -or $Parameters.Count -eq 0) { return '(brak)' }
+    $parts = foreach ($k in @($Parameters.Keys | Sort-Object { [string]$_ })) {
+        $v = $Parameters[$k]
+        $text = if ([string]$k -match $script:DebugSecretPattern -or $v -is [System.Security.SecureString] -or $v -is [System.Management.Automation.PSCredential]) { '***' }
+        elseif ($null -eq $v) { '$null' }
+        elseif ($v -is [string]) {
+            if ($v.Length -gt 120 -or $v -match '\n') { '(tekst, {0} znaków)' -f $v.Length } else { "'" + $v + "'" }
+        }
+        elseif ($v -is [ValueType]) { [string]$v }
+        elseif ($v -is [scriptblock]) { '(blok skryptu)' }
+        elseif ($v -is [System.Collections.IDictionary]) {
+            $keys = @($v.Keys | ForEach-Object { [string]$_ } | Sort-Object | Select-Object -First 8)
+            '@{' + ($keys -join ', ') + $(if ($v.Count -gt 8) { ', …' } else { '' }) + '}'
+        }
+        elseif ($v -is [System.Collections.IEnumerable]) {
+            $a = @($v)
+            $simple = @($a | Where-Object { ($_ -is [string] -and $_.Length -le 60) -or $_ -is [ValueType] }).Count -eq $a.Count
+            if ($simple -and $a.Count -le 6) { '@(' + ($a -join ', ') + ')' } else { '@({0} elem.)' -f $a.Count }
+        }
+        else { '[' + $v.GetType().Name + ']' }
+        '{0}={1}' -f $k, $text
+    }
+    return ($parts -join '; ')
+}
+
+function Format-DebugError {
+    # Opis błędu do dziennika diagnostycznego: typ wyjątku, wiersz bloku z treścią i stos wywołań
+    param($Record)
+    if ($null -eq $Record) { return '' }
+    if ($Record -is [string]) { return $Record }
+    if ($Record -is [System.Collections.IDictionary]) {
+        $t = '{0} [{1}]' -f $Record['Message'], $Record['Type']
+        if ($Record['Line']) { $t += (' wiersz bloku {0}: {1}' -f $Record['Line'], $Record['Code']) }
+        if ($Record['Stack']) { $t += ' | stos: ' + $Record['Stack'] }
+        return $t
+    }
+    if ($Record -is [System.Management.Automation.ErrorRecord]) {
+        $t = '{0} [{1}]' -f $Record.Exception.Message, $Record.Exception.GetType().Name
+        $ii = $Record.InvocationInfo
+        if ($ii -and $ii.ScriptLineNumber) { $t += (' wiersz {0}: {1}' -f $ii.ScriptLineNumber, ([string]$ii.Line).Trim()) }
+        $st = ([string]$Record.ScriptStackTrace) -replace '\s*\r?\n\s*', ' ← '
+        if ($st) { $t += ' | stos: ' + $st }
+        return $t
+    }
+    return [string]$Record
 }
 
 function Update-LogBadge {
@@ -1602,6 +1663,7 @@ function Invoke-UiAction {
         if ($_.Exception.Data['DomainOpsAccess']) { Show-Warning $_.Exception.Message }
         else {
             Write-Log "Błąd: $($_.Exception.Message)" 'ERROR'
+            Write-DebugLog ('Akcja: ' + (Format-DebugError $_))
             Show-Error 'Operacja nie powiodła się.' $_
         }
     }
@@ -1664,16 +1726,6 @@ function Add-StretchTextBox {
     $border.Child = $tb
     [void](Add-ParamRow -Module $Module -Title $Title -Content $border)
     return $tb
-}
-
-function Add-Separator {
-    # Pozioma linia oddzielająca grupy wierszy w panelu parametrów
-    param([Parameter(Mandatory)][hashtable]$Module)
-    $b = New-Object System.Windows.Controls.Border
-    $b.Height = 1
-    $b.Background = Get-Brush '#242B36'
-    $b.Margin = '0,8,0,6'
-    [void]$Module.ParamsStack.Children.Add($b)
 }
 
 function Add-TopControl {
@@ -1782,15 +1834,6 @@ function Add-TextBox {
     $tb.Margin = '0,0,8,6'
     [void]$Parent.Children.Add($tb)
     return $tb
-}
-
-function Add-PasswordBox {
-    param([Parameter(Mandatory)]$Parent, [double]$Width = 200)
-    $pb = New-Object System.Windows.Controls.PasswordBox
-    $pb.Width = $Width
-    $pb.Margin = '0,0,8,6'
-    [void]$Parent.Children.Add($pb)
-    return $pb
 }
 
 function Add-ComboBox {
@@ -3424,7 +3467,7 @@ function Show-SettingsDialog {
       </CheckBox>
       <TextBlock x:Name="stRaInfo" Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="24,3,0,0"/>
       <CheckBox x:Name="stDebug" Margin="0,10,0,0">
-        <TextBlock TextWrapping="Wrap" Text="Tryb diagnostyczny – kolejne kroki operacji (np. podłączanie i odłączanie dysków) w dzienniku i w pliku dziennika"/>
+        <TextBlock TextWrapping="Wrap" Text="Tryb diagnostyczny – wpisy DEBUG w dzienniku i w pliku dziennika: parametry operacji (bez haseł), czas każdego obiektu, szczegóły błędów (typ, wiersz, stos wywołań) i kolejne kroki operacji (np. dyski sieciowe)"/>
       </CheckBox>
     </StackPanel>
   </Grid>
@@ -7405,6 +7448,17 @@ $script:WorkerScript = @'
 param($Target, $Mode, $ScriptText, $P, $Ctx, $Stream)
 $ProgressPreference = 'SilentlyContinue'
 $result = @{ Target = $Target; Ok = $true; Data = @(); Errors = @() }
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+# Tryb diagnostyczny: oprócz komunikatów - typ wyjątku, wiersz bloku i stos wywołań (ErrorDetails)
+$dbg = [bool]($Ctx -and $Ctx['Debug'])
+$details = New-Object System.Collections.ArrayList
+function Add-DoErrorDetail($e) {
+    if (-not $dbg -or $null -eq $e) { return }
+    $d = @{ Message = [string]$e.Exception.Message; Type = $e.Exception.GetType().Name; Line = 0; Code = ''; Stack = '' }
+    try { if ($e.InvocationInfo -and $e.InvocationInfo.ScriptLineNumber) { $d.Line = $e.InvocationInfo.ScriptLineNumber; $d.Code = ([string]$e.InvocationInfo.Line).Trim() } } catch { }
+    try { $d.Stack = ([string]$e.ScriptStackTrace) -replace '\s*\r?\n\s*', ' ← ' } catch { }
+    [void]$details.Add($d)
+}
 try {
     $sb = [scriptblock]::Create($ScriptText)
     # Pusta kolekcja w warunku daje fałsz - stąd porównanie z $null
@@ -7416,18 +7470,20 @@ try {
             if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
             if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
             Invoke-Command @ic | ForEach-Object { if ($null -ne $_) { $streamed++; $Stream.Enqueue($_) } }
-            if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { $_.Exception.Message }) }
+            if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { Add-DoErrorDetail $_; $_.Exception.Message }) }
         }
         else {
             $errs = New-Object System.Collections.ArrayList
             & $sb $Target $P $Ctx 2>&1 | ForEach-Object {
-                if ($_ -is [System.Management.Automation.ErrorRecord]) { [void]$errs.Add($_.Exception.Message) }
+                if ($_ -is [System.Management.Automation.ErrorRecord]) { Add-DoErrorDetail $_; [void]$errs.Add($_.Exception.Message) }
                 elseif ($null -ne $_) { $streamed++; $Stream.Enqueue($_) }
             }
             $result.Errors = @($errs)
         }
         if ($result.Errors.Count -gt 0 -and $streamed -eq 0) { $result.Ok = $false }
         $result.Streamed = $streamed
+        $result.Ms = $sw.ElapsedMilliseconds
+        if ($dbg) { $result.ErrorDetails = @($details) }
         [pscustomobject]$result
         return
     }
@@ -7444,7 +7500,7 @@ try {
         if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
         # $null z bloku (np. funkcja zwracająca $null) nie trafia do wyników - OnResult pracuje pod StrictMode
         $result.Data = @(Invoke-Command @ic | Where-Object { $null -ne $_ })
-        if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { $_.Exception.Message }) }
+        if ($icErrors) { $result.Errors = @($icErrors | ForEach-Object { Add-DoErrorDetail $_; $_.Exception.Message }) }
     }
     else {
         # Wyniki zbierane na bieżąco: błąd przerywający blok nie kasuje tego, co blok już zwrócił (OnResult je dostaje)
@@ -7452,15 +7508,18 @@ try {
         try { & $sb $Target $P $Ctx 2>&1 | ForEach-Object { [void]$raw.Add($_) } }
         finally {
             $result.Data = @($raw | Where-Object { $null -ne $_ -and $_ -isnot [System.Management.Automation.ErrorRecord] })
-            $result.Errors = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.Exception.Message })
+            $result.Errors = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { Add-DoErrorDetail $_; $_.Exception.Message })
         }
     }
 }
 catch {
+    Add-DoErrorDetail $_
     $result.Errors = @($result.Errors) + @($_.Exception.Message)
     $result.Terminated = $true
 }
 if ($result.Errors.Count -gt 0 -and ($result.Data.Count -eq 0 -or $result['Terminated'])) { $result.Ok = $false }
+$result.Ms = $sw.ElapsedMilliseconds
+if ($dbg) { $result.ErrorDetails = @($details) }
 [pscustomobject]$result
 '@
 
@@ -7594,6 +7653,7 @@ function Start-HostOperation {
         Credential    = Get-EffectiveCredential
         Server        = [string]$script:Settings.DomainController
         SessionOption = New-SessionOption
+        Debug         = (Test-DebugLog)
     }
     $mode = if ($Local) { 'Local' } else { 'Remote' }
     $scriptText = $ScriptBlock.ToString()
@@ -7640,6 +7700,16 @@ function Start-HostOperation {
     $list = (@($items | Select-Object -First 8) -join ', ')
     if ($items.Count -gt 8) { $list += ", … (+$($items.Count - 8))" }
     if (-not $Quiet) { Write-Log ("{0} – start ({1}): {2}" -f $Name, $items.Count, $list) -Module $Module.Title }
+    if ($ctx.Debug -and -not $Quiet) {
+        # Wpis diagnostyczny nigdy nie przerywa operacji
+        try {
+            $where = if ($ScriptBlock.File) { ' (blok: wiersz {0})' -f $ScriptBlock.StartPosition.StartLine } else { '' }
+            Write-DebugLog ("{0} – tryb {1}, pula {2}, wynik {3}{4}; parametry: {5}" -f $Name, $mode, $Pool, $Output, $where, (Format-DebugParams $Parameters)) -Module $Module.Title
+            $first = if ($PerTarget.Count) { $PerTarget[@($PerTarget.Keys)[0]] } else { $null }
+            if ($first -is [System.Collections.IDictionary]) { Write-DebugLog ("{0} – osobne parametry dla {1} obiektów, np.: {2}" -f $Name, $PerTarget.Count, (Format-DebugParams $first)) -Module $Module.Title }
+        }
+        catch { }
+    }
     $script:Engine.Timer.Start()
     Update-StatusBar
 }
@@ -7671,6 +7741,7 @@ function Invoke-SyncOperation {
         Credential    = Get-EffectiveCredential
         Server        = [string]$script:Settings.DomainController
         SessionOption = New-SessionOption
+        Debug         = (Test-DebugLog)
     }
     $pool = New-EnginePool ([Math]::Max(1, [Math]::Min($Throttle, $items.Count)))
     $jobs = New-Object System.Collections.ArrayList
@@ -7771,6 +7842,7 @@ function Update-Operations {
     }
     catch {
         Write-Log "Błąd silnika operacji: $($_.Exception.Message)" 'ERROR' -Module ''
+        Write-DebugLog ('Silnik operacji: ' + (Format-DebugError $_)) -Module ''
     }
     finally {
         $script:Engine.InTick = $false
@@ -7806,6 +7878,7 @@ function Receive-StreamItems {
                 if (-not $Item['ItemError']) {
                     $Item.ItemError = $true
                     Write-Log ("[{0}] błąd obsługi wyniku na bieżąco: {1}" -f $Item.Target, $_.Exception.Message) 'ERROR'
+                    Write-DebugLog ("[{0}] wynik na bieżąco: {1}" -f $Item.Target, (Format-DebugError $_))
                 }
             }
         }
@@ -7826,6 +7899,15 @@ function Complete-OperationItem {
     $script:LogContext = $m.Title
     try {
         $errorText = (@($Result.Errors | Where-Object { $_ } | Select-Object -Unique)) -join ' | '
+        if ((Test-DebugLog) -and (-not $Operation.Quiet -or $errorText)) {
+            try {
+                $ms = if ($Result.PSObject.Properties['Ms']) { [string]$Result.Ms + ' ms' } else { 'czas nieznany' }
+                $cut = if ($Result.PSObject.Properties['Terminated'] -and $Result.Terminated) { ', blok przerwany' } else { '' }
+                Write-DebugLog ("[{0}] {1}: {2}, obiektów wyniku: {3}, błędów: {4}{5}" -f $Result.Target, $Operation.Name, $ms, @($Result.Data).Count, @($Result.Errors).Count, $cut)
+                if ($Result.PSObject.Properties['ErrorDetails']) { foreach ($d in @($Result.ErrorDetails)) { Write-DebugLog ("[{0}] szczegóły błędu: {1}" -f $Result.Target, (Format-DebugError $d)) } }
+            }
+            catch { }
+        }
         if (-not $Result.Ok) {
             $Operation.Failed++
             if (-not $Operation.FirstError) { $Operation.FirstError = '{0}: {1}' -f $Result.Target, $errorText }
@@ -7859,7 +7941,7 @@ function Complete-OperationItem {
         }
         if ($Operation.OnResult) {
             try { $null = & $Operation.OnResult $m $Result }
-            catch { Write-Log "Błąd obsługi wyniku ($($Result.Target)): $($_.Exception.Message)" 'ERROR' }
+            catch { Write-Log "Błąd obsługi wyniku ($($Result.Target)): $($_.Exception.Message)" 'ERROR'; Write-DebugLog ('Obsługa wyniku: ' + (Format-DebugError $_)) }
         }
     }
     finally {
@@ -7901,7 +7983,7 @@ function Complete-Operation {
             if ($ov -and $m.RowRefresh -ne $false) { Invoke-WithTargets -Kind $ov.Kind -Names $ov.Names -Refresh -Action { $null = & $Operation.OnComplete $m $Operation } }
             else { $null = & $Operation.OnComplete $m $Operation }
         }
-        catch { Write-Log "Błąd po zakończeniu operacji: $($_.Exception.Message)" 'ERROR' }
+        catch { Write-Log "Błąd po zakończeniu operacji: $($_.Exception.Message)" 'ERROR'; Write-DebugLog ('Po zakończeniu operacji: ' + (Format-DebugError $_)) }
         finally { $script:LogContext = $previous }
     }
 }
@@ -8129,6 +8211,7 @@ function Initialize-Module {
     try { $null = & $Definition.Build $m }
     catch {
         Write-Log "Nie udało się zbudować modułu: $($_.Exception.Message)" 'ERROR'
+        Write-DebugLog ('Budowa modułu: ' + (Format-DebugError $_))
         Add-Label -Parent (Add-ToolbarRow -Module $m) -Text "Błąd modułu: $($_.Exception.Message)" | Out-Null
     }
     finally { $script:LogContext = $previous }
@@ -9480,7 +9563,7 @@ $script:MainXaml = @'
                   <TextBlock x:Name="lvl" Text="{Binding Level}" FontSize="10.5" FontWeight="SemiBold" Foreground="#AEB6C4"/>
                 </Border>
                 <TextBlock Grid.Column="2" Text="{Binding Module}" Foreground="#8CB0FF" Margin="0,0,12,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-                <TextBlock Grid.Column="3" Text="{Binding Message}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                <TextBlock x:Name="msg" Grid.Column="3" Text="{Binding Message}" TextWrapping="Wrap" VerticalAlignment="Center"/>
               </Grid>
               <DataTemplate.Triggers>
                 <DataTrigger Binding="{Binding Level}" Value="OK">
@@ -9494,6 +9577,11 @@ $script:MainXaml = @'
                 <DataTrigger Binding="{Binding Level}" Value="ERROR">
                   <Setter TargetName="pill" Property="Background" Value="#2E1A1E"/>
                   <Setter TargetName="lvl" Property="Foreground" Value="#FF7A86"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Level}" Value="DEBUG">
+                  <Setter TargetName="pill" Property="Background" Value="#1B2130"/>
+                  <Setter TargetName="lvl" Property="Foreground" Value="#8A93B2"/>
+                  <Setter TargetName="msg" Property="Foreground" Value="#9AA3B5"/>
                 </DataTrigger>
               </DataTemplate.Triggers>
             </DataTemplate>
@@ -12122,8 +12210,100 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'Install' 
     Add-RowAction -Module $m -Text 'Zainstaluj ponownie na tych komputerach' -Icon 'E896' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Run }
 }
 
+# Druga metoda: Invoke-GPUpdate (moduł GroupPolicy, RSAT) tworzy na komputerze zadanie Harmonogramu przez RPC,
+# które od razu uruchamia gpupdate - bez WinRM. Wynik gpupdate nie wraca: program czyta zdarzenia zasad grupy
+# z dziennika System komputera (zdalny odczyt dziennika). Blok działa w programie (tryb lokalny).
+$script:GpUpdateMethods = [ordered]@{ WinRM = 'WinRM – gpupdate z wynikiem'; Rpc = 'Invoke-GPUpdate – bez WinRM (RSAT)'; Auto = 'WinRM, a gdy niedostępny – Invoke-GPUpdate' }
+$script:GpUpdateWait = [ordered]@{ 'nie czekaj' = 0; '1 min' = 60; '2 min' = 120; '5 min' = 300 }
+$script:InvokeGpUpdateScript = {
+    param($Target, $P, $Ctx)
+    $ErrorActionPreference = 'Stop'
+    $notes = New-Object System.Collections.ArrayList
+    if ($P.Method -eq 'Auto') {
+        $ic = @{ ComputerName = $Target; ScriptBlock = [scriptblock]::Create($P.RemoteText); ArgumentList = @(, $P.Remote) }
+        if ($Ctx.Credential) { $ic.Credential = $Ctx.Credential }
+        if ($Ctx.SessionOption) { $ic.SessionOption = $Ctx.SessionOption }
+        $fallback = $false
+        try { $r = @(Invoke-Command @ic) }
+        catch {
+            # Na Invoke-GPUpdate przechodzi tylko brak połączenia WinRM; błąd samego gpupdate jest wynikiem
+            if ($_.Exception -isnot [System.Management.Automation.Remoting.PSRemotingTransportException]) { throw }
+            $fallback = $true
+            [void]$notes.Add('WinRM niedostępny: ' + (([string]$_.Exception.Message) -split "`r?`n")[0])
+        }
+        if (-not $fallback) { return $r }
+    }
+    try { Import-Module GroupPolicy -ErrorAction Stop -Verbose:$false }
+    catch { throw 'Brak modułu GroupPolicy na tym komputerze – zainstaluj RSAT: Zarządzanie zasadami grupy.' }
+    # Zapas na różnicę zegarów komputerów
+    $start = (Get-Date).AddSeconds(-60)
+    $gp = @{ Computer = $Target; RandomDelayInMinutes = 0; Force = [bool]$P.Force; ErrorAction = 'Stop' }
+    if ($P.Scope) { $gp.Target = $P.Scope }
+    try { Invoke-GPUpdate @gp }
+    catch {
+        $msg = (([string]$_.Exception.Message) -split "`r?`n")[0]
+        $hint = if ($msg -match '0x800706BA|0x80070005|RPC|odmow|denied') { ' – sprawdź na komputerze reguły zapory «Zdalne zarządzanie zaplanowanymi zadaniami» (RPC i RPC-EPMAP) i «Instrumentacja zarządzania Windows (WMI)»' } else { '' }
+        throw ('Invoke-GPUpdate: {0}{1}' -f $msg, $hint)
+    }
+    [void]$notes.Add('gpupdate uruchomiony zadaniem Harmonogramu na komputerze')
+    if ($Ctx.Credential) { [void]$notes.Add('zadanie utworzone z konta programu (Invoke-GPUpdate nie przyjmuje poświadczeń alternatywnych)') }
+    $row = [ordered]@{ 'Metoda' = 'Invoke-GPUpdate'; 'Wynik' = 'Zlecono'; 'Kod wyjścia' = $null; 'Czas (s)' = $null; 'Problem z zasadą' = ''; 'Nazwa zasady' = ''; 'Komunikaty' = ''; '__tone' = 'info' }
+    if ([int]$P.WaitSec -gt 0) {
+        # Zdarzenia Microsoft-Windows-GroupPolicy: 1500/1502 - zasady komputera, 1501/1503 - użytkownika zastosowane;
+        # błędy przetwarzania (m.in. 1058 - brak dostępu do gpt.ini, 1085 - rozszerzenie po stronie klienta, 1129 - brak sieci)
+        $okIds = @{ 1500 = 'Computer'; 1502 = 'Computer'; 1501 = 'User'; 1503 = 'User' }
+        $errIds = @(1030, 1053, 1054, 1055, 1058, 1085, 1096, 1125, 1129)
+        $ok = @{}; $bad = New-Object System.Collections.ArrayList; $seen = @{}; $texts = New-Object System.Collections.ArrayList
+        $readError = ''; $extra = $false
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            Start-Sleep -Seconds ([Math]::Max(0, [int]$P.PollSec))
+            $events = @()
+            try {
+                $we = @{ ComputerName = $Target; FilterHashtable = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-GroupPolicy'; StartTime = $start }; ErrorAction = 'Stop' }
+                if ($Ctx.Credential) { $we.Credential = $Ctx.Credential }
+                $events = @(Get-WinEvent @we)
+            }
+            catch {
+                if ([string]$_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $readError = (([string]$_.Exception.Message) -split "`r?`n")[0]; break }
+            }
+            foreach ($e in @($events | Sort-Object TimeCreated)) {
+                $key = '{0}|{1}' -f $e.RecordId, $e.Id
+                if ($seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
+                $id = [int]$e.Id
+                $text = if ($e.Message) { (@(([string]$e.Message) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) | Select-Object -First 2) -join ' ' } else { "zdarzenie $id" }
+                if ($okIds.ContainsKey($id)) { $ok[$okIds[$id]] = $true; [void]$texts.Add($text) }
+                elseif ($errIds -contains $id) { [void]$bad.Add($id); [void]$texts.Add($text) }
+            }
+            $done = $(if ($P.Scope -eq 'User') { [bool]$ok['User'] } else { [bool]$ok['Computer'] })
+            # Komputer i użytkownik: po wyniku komputera jeszcze jeden odczyt - zdarzenie użytkownika przychodzi chwilę później
+            if ($done -and -not $P.Scope -and -not $ok['User'] -and -not $extra -and $sw.Elapsed.TotalSeconds -lt [int]$P.WaitSec) { $extra = $true; continue }
+            if ($bad.Count -or $done -or $sw.Elapsed.TotalSeconds -ge [int]$P.WaitSec) { break }
+        }
+        $row['Czas (s)'] = [int][Math]::Round($sw.Elapsed.TotalSeconds)
+        if ($bad.Count) { $row['Wynik'] = 'Błąd – zdarzenie ' + ((@($bad | Select-Object -Unique)) -join ', '); $row['__tone'] = 'crit' }
+        elseif ($ok['Computer'] -or $ok['User']) {
+            $row['Wynik'] = 'OK'; $row['__tone'] = 'ok'
+            if (-not $P.Scope -and -not $ok['User']) { [void]$notes.Add('zasady użytkownika: brak zdarzenia (nikt nie jest zalogowany?)') }
+        }
+        elseif ($readError) {
+            $row['__tone'] = 'warn'
+            [void]$notes.Add('wyniku nie odczytano z dziennika zdarzeń: ' + $readError + ' (reguła zapory «Zdalne zarządzanie dziennikiem zdarzeń»)')
+        }
+        else { $row['Wynik'] = 'Zlecono – brak wyniku w ciągu {0} s' -f [int]$P.WaitSec; $row['__tone'] = 'warn' }
+        foreach ($x in $texts) { [void]$notes.Add($x) }
+    }
+    # GUID-y zasad z komunikatów; nazwy uzupełnia program z AD (OnResult modułu)
+    $all = @($notes) -join ' | '
+    $guids = @([regex]::Matches($all, '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') | ForEach-Object { $_.Value.ToUpperInvariant() } | Select-Object -Unique)
+    if ($guids.Count) { $row['Problem z zasadą'] = $guids -join ', '; $row['Nazwa zasady'] = (@($guids | ForEach-Object { '?' })) -join ', ' }
+    $row['Komunikaty'] = $all
+    [pscustomobject]$row
+}
+
 Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'GPUpdate' -Title 'Aktualizacja zasad grupy' -Icon 'E895' `
-    -Description 'Wymusza odświeżenie zasad grupy (gpupdate) na zaznaczonych komputerach.' -Build {
+    -Description 'Wymusza odświeżenie zasad grupy (gpupdate) na zaznaczonych komputerach – przez WinRM albo Invoke-GPUpdate (bez WinRM).' -Build {
     param($m)
     $m.PillColumns = @('Wynik')
     $row = Add-ToolbarRow -Module $m -Title 'Parametry'
@@ -12135,6 +12315,7 @@ Register-Module -Workspace 'Remote' -Category 'Zdalne wykonanie' -Key 'GPUpdate'
         $targets = @(Get-TargetComputers)
         if (-not $targets) { return }
         $scope = @('Computer', '', 'User')[$m.Scope.SelectedIndex]
+        $method = @($script:GpUpdateMethods.Keys)[[Math]::Max(0, $m.Method.SelectedIndex)]
         $arguments = @()
         if ($scope) { $arguments += "/target:$scope" }
         if (Test-Checked $m.Force) { $arguments += '/force' }
@@ -12160,6 +12341,7 @@ if (`$guids.Count) {
     }
 }
 [pscustomobject]@{
+    'Metoda'           = 'WinRM'
     'Wynik'            = `$(if (`$ok) { 'OK' } elseif (`$null -eq `$r.'Kod wyjścia') { `$r.'Stan' } else { 'Błąd – kod ' + `$r.'Kod wyjścia' })
     'Kod wyjścia'      = `$r.'Kod wyjścia'
     'Czas (s)'         = `$r.'Czas (s)'
@@ -12169,8 +12351,8 @@ if (`$guids.Count) {
     '__tone'           = `$(if (`$ok) { 'ok' } else { 'crit' })
 }
 "@)
-        Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters $params -ScriptBlock $sb -OnResult {
-            # Nazwy zasad, których komputer nie zna (np. nowa zasada, która od razu zawodzi) - z AD
+        $onResult = {
+            # Nazwy zasad, których komputer nie zna (np. nowa zasada, która od razu zawodzi, albo wynik Invoke-GPUpdate) - z AD
             param($m, $r)
             foreach ($row in @(Get-ResultRowsAll -Module $m | Where-Object { [string](Get-ObjectValue $_ 'Komputer') -eq $r.Target -and [string](Get-ObjectValue $_ 'Nazwa zasady') -match '\?' })) {
                 $guids = @(([string](Get-ObjectValue $row 'Problem z zasadą')).Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -12180,7 +12362,22 @@ if (`$guids.Count) {
                 Set-ResultValue -Module $m -Row $row -Column 'Nazwa zasady' -Value $text
             }
         }
+        if ($method -eq 'WinRM') {
+            Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Parameters $params -ScriptBlock $sb -OnResult $onResult
+            return
+        }
+        $lp = @{ Method = $method; Scope = $scope; Force = (Test-Checked $m.Force); WaitSec = [int]$script:GpUpdateWait[[string]$m.Wait.SelectedItem]; PollSec = 10; RemoteText = $sb.ToString(); Remote = $params }
+        Start-HostOperation -Module $m -Name 'GPUpdate' -Targets $targets -Local -Parameters $lp -ScriptBlock $script:InvokeGpUpdateScript -OnResult $onResult
     }
+    $row2 = Add-ToolbarRow -Module $m -Title 'Metoda'
+    $m.Method = Add-ComboBox -Parent $row2 -Items @($script:GpUpdateMethods.Values) -Width 330
+    $m.Method.ToolTip = 'WinRM: gpupdate na komputerze z pełnym wynikiem. Invoke-GPUpdate: zadanie Harmonogramu tworzone przez RPC – działa bez WinRM, wynik z dziennika zdarzeń.'
+    Add-Label -Parent $row2 -Text 'Czekaj na wynik' | Out-Null
+    $m.Wait = Add-ComboBox -Parent $row2 -Items @($script:GpUpdateWait.Keys) -Width 110 -Selected 2
+    $m.Wait.ToolTip = 'Invoke-GPUpdate: jak długo czekać na zdarzenie zasad grupy w dzienniku System komputera'
+    $m.Wait.IsEnabled = $false
+    Register-ControlHandler -Control $m.Method -EventName 'SelectionChanged' -Module $m -Action { param($m, $s) $m.Wait.IsEnabled = ($s.SelectedIndex -gt 0) }
+    Add-Label -Parent (Add-ToolbarRow -Module $m -Title ' ') -Hint -Text 'Invoke-GPUpdate wymaga modułu GroupPolicy (RSAT) u Ciebie, a na komputerach reguł zapory «Zdalne zarządzanie zaplanowanymi zadaniami» (RPC, RPC-EPMAP) i «Instrumentacja zarządzania Windows (WMI)»; wynik czyta przez «Zdalne zarządzanie dziennikiem zdarzeń». Działa na koncie programu (bez poświadczeń alternatywnych).' | Out-Null
     Add-RowAction -Module $m -Text 'Uruchom gpupdate na tych komputerach' -Icon 'E895' -Action { param($m, $rows) Invoke-ForRowTargets -Module $m -Rows $rows -Button $m.Btn.Run }
 }
 #endregion
@@ -19296,13 +19493,6 @@ function Get-LogPattern {
     $t = ($t -replace '\s+', ' ').Trim(' ', '-', '|', ':', '[', ']')
     if ($t.Length -gt 260) { $t = $t.Substring(0, 260) + '…' }
     return $t
-}
-
-function Get-LogFirstLine([string]$Text) {
-    $first = ($Text -split "`n")[0]
-    $more = @($Text -split "`n").Count - 1
-    if ($more -gt 0) { return ('{0}   ⏎ +{1} linii' -f $first, $more) }
-    return $first
 }
 
 function Show-LogView {
@@ -32093,7 +32283,8 @@ function New-ReportJob {
         Options  = $opts
         Server   = [string]$script:Settings.DomainController
         Output   = @{ Folder = ''; Keep = 30; Latest = $true; Csv = $false }
-        Mail     = @{ Mode = $t.MailMode; To = ''; Cc = ''; From = ''; Server = ''; Port = 25; Ssl = $false; Auth = 'None'; User = ''; Password = ''; PasswordOwner = ''; Attach = $true; MaxRows = 50 }
+        Mail     = @{ Mode = $t.MailMode; To = ''; Cc = ''; From = ''; Server = ''; Port = 25; Ssl = $false; Auth = 'None'; User = ''; Password = ''; PasswordOwner = ''; Attach = $true; MaxRows = 50
+                     Transport = 'Smtp'; TenantId = ''; ClientId = ''; GraphAuth = 'Certificate'; CertThumbprint = ''; ClientSecret = ''; ClientSecretOwner = ''; Proxy = '' }
         Schedule = @{ Frequency = 'Weekly'; Time = '07:00'; Days = @('Monday'); DayOfMonth = '1' }
         RunAs    = @{ Mode = 'Password'; Account = ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME); Highest = $true }
         TaskName = ''
@@ -32884,7 +33075,9 @@ function Test-ReportMailNeeded([hashtable]$Job, [hashtable]$Result, [hashtable]$
 }
 
 function Send-ReportMail {
+    # Serwer SMTP albo Microsoft Graph (Mail.Transport); bez wyniku - błąd jako wyjątek
     param([Parameter(Mandatory)][hashtable]$Mail, [Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$Body, [string[]]$Attachments = @())
+    if ([string]$Mail['Transport'] -eq 'Graph') { Send-GraphMail -Mail $Mail -Subject $Subject -Body $Body -Attachments $Attachments; return }
     $msg = New-Object System.Net.Mail.MailMessage
     $client = $null
     try {
@@ -32924,6 +33117,176 @@ function Send-ReportMail {
     finally {
         $msg.Dispose()
         if ($client) { $client.Dispose() }
+    }
+}
+#endregion
+
+#region Poczta przez Microsoft Graph
+# Aplikacja w Entra ID z uprawnieniem aplikacji Mail.Send (zgoda administratora); dla załączników powyżej 3 MB także
+# Mail.ReadWrite (szkic wiadomości i sesja przekazywania pliku). Uwierzytelnianie certyfikatem (zalecane - działa z każdym
+# kontem zadania, które może odczytać klucz prywatny) albo kluczem tajnym zaszyfrowanym DPAPI (tylko konto, które go wpisało).
+$script:GraphMailInlineLimit = 3MB
+$script:GraphUploadChunk = 3932160   # 12 × 320 KiB - wielokrotność wymagana przez sesję przekazywania
+
+function ConvertTo-Base64Url([byte[]]$Bytes) { return ([Convert]::ToBase64String($Bytes)).TrimEnd('=').Replace('+', '-').Replace('/', '_') }
+
+function Get-GraphCertificate([string]$Thumbprint) {
+    # Odcisk skopiowany z konsoli certyfikatów bywa z odstępami i niewidocznym znakiem na początku
+    $tp = ($Thumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    if ($tp.Length -ne 40) { throw 'Odcisk certyfikatu: 40 znaków szesnastkowych.' }
+    foreach ($store in 'Cert:\LocalMachine\My', 'Cert:\CurrentUser\My') {
+        $c = Get-Item -LiteralPath (Join-Path $store $tp) -ErrorAction SilentlyContinue
+        if ($c) {
+            if (-not $c.HasPrivateKey) { throw ('Certyfikat {0} ({1}) nie ma klucza prywatnego.' -f $tp, $store) }
+            return $c
+        }
+    }
+    throw ('Nie znaleziono certyfikatu {0} w magazynach Komputer lokalny\Osobisty ani Bieżący użytkownik\Osobisty konta {1}\{2}.' -f $tp, $env:USERDOMAIN, $env:USERNAME)
+}
+
+function New-GraphClientAssertion {
+    # Podpisany JWT (RS256) zamiast klucza tajnego - logowanie aplikacji certyfikatem
+    param([Parameter(Mandatory)]$Certificate, [Parameter(Mandatory)][string]$TenantId, [Parameter(Mandatory)][string]$ClientId)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $enc = [System.Text.Encoding]::UTF8
+    $header = [ordered]@{ alg = 'RS256'; typ = 'JWT'; x5t = (ConvertTo-Base64Url $Certificate.GetCertHash()) } | ConvertTo-Json -Compress
+    $payload = [ordered]@{ aud = ('https://login.microsoftonline.com/{0}/oauth2/v2.0/token' -f $TenantId); iss = $ClientId; sub = $ClientId; jti = [guid]::NewGuid().ToString(); nbf = $now - 60; exp = $now + 600 } | ConvertTo-Json -Compress
+    $unsigned = (ConvertTo-Base64Url $enc.GetBytes($header)) + '.' + (ConvertTo-Base64Url $enc.GetBytes($payload))
+    try { $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Certificate) }
+    catch { throw ('Brak dostępu do klucza prywatnego certyfikatu dla konta {0}\{1}: {2}' -f $env:USERDOMAIN, $env:USERNAME, $_.Exception.Message) }
+    if (-not $rsa) { throw 'Certyfikat nie ma klucza RSA (Microsoft Graph wymaga podpisu RS256).' }
+    $sig = $rsa.SignData($enc.GetBytes($unsigned), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    return $unsigned + '.' + (ConvertTo-Base64Url $sig)
+}
+
+function Get-GraphErrorText($ErrorRecord, [int]$Status) {
+    # Kod i opis błędu z odpowiedzi Entra ID / Graph ({ error, error_description } albo { error: { code, message } }) z podpowiedzią
+    $raw = ''
+    try { $raw = [string]$ErrorRecord.ErrorDetails.Message } catch { }
+    $text = ''
+    if ($raw) {
+        try {
+            $j = $raw | ConvertFrom-Json
+            if ($j.PSObject.Properties['error'] -and $j.error -is [string]) { $text = '{0}: {1}' -f $j.error, (([string]$j.error_description) -split "`r?`n")[0] }
+            elseif ($j.PSObject.Properties['error']) { $text = '{0}: {1}' -f $j.error.code, $j.error.message }
+        }
+        catch { $text = $raw.Substring(0, [Math]::Min(300, $raw.Length)) }
+    }
+    if (-not $text) { $text = $ErrorRecord.Exception.Message }
+    $hints = [ordered]@{
+        'AADSTS7000215|AADSTS7000222|AADSTS700027|invalid_client'                              = ' – sprawdź klucz tajny albo certyfikat aplikacji (wygasły, inny niż dodany w aplikacji)'
+        'AADSTS700016'                                                                         = ' – w tej dzierżawie nie ma aplikacji o tym identyfikatorze'
+        'AADSTS90002|AADSTS900023|AADSTS90013'                                                 = ' – sprawdź identyfikator dzierżawy'
+        'ErrorAccessDenied|Authorization_RequestDenied|AccessDenied'                           = ' – aplikacja nie ma uprawnienia aplikacji Mail.Send ze zgodą administratora albo zasady dostępu aplikacji w Exchange Online blokują tę skrzynkę'
+        'ResourceNotFound|ErrorInvalidUser|MailboxNotEnabledForRESTAPI|ErrorNonExistentMailbox' = ' – nadawca (Od) musi być istniejącą skrzynką w Exchange Online'
+    }
+    $hint = ''
+    foreach ($k in $hints.Keys) { if (-not $hint -and $text -match $k) { $hint = $hints[$k] } }
+    return ('Microsoft Graph{0}: {1}{2}' -f $(if ($Status) { " ($Status)" } else { '' }), $text, $hint)
+}
+
+function Invoke-GraphRequest {
+    # Wywołanie REST (TLS 1.2, opcjonalny serwer proxy); 429/503/504 - do dwóch ponowień po czasie z Retry-After
+    param([string]$Method = 'Get', [Parameter(Mandatory)][string]$Uri, [string]$Token = '', $Json = $null, [hashtable]$Form = $null,
+        [byte[]]$Bytes = $null, [switch]$Empty, [hashtable]$Headers = @{}, [hashtable]$Mail = @{})
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    $rp = @{ Method = $Method; Uri = $Uri; Headers = (@{} + $Headers); UseBasicParsing = $true; ErrorAction = 'Stop'; TimeoutSec = 100 }
+    if ($Token) { $rp.Headers['Authorization'] = 'Bearer ' + $Token }
+    if ($null -ne $Json) { $rp.ContentType = 'application/json; charset=utf-8'; $rp.Body = [System.Text.Encoding]::UTF8.GetBytes(($Json | ConvertTo-Json -Depth 8 -Compress)) }
+    elseif ($Form) { $rp.ContentType = 'application/x-www-form-urlencoded'; $rp.Body = (@($Form.Keys | ForEach-Object { '{0}={1}' -f $_, [uri]::EscapeDataString([string]$Form[$_]) }) -join '&') }
+    elseif ($null -ne $Bytes) { $rp.ContentType = 'application/octet-stream'; $rp.Body = $Bytes }
+    elseif ($Empty) { $rp.ContentType = 'application/json'; $rp.Body = '' }
+    if ($Mail['Proxy']) { $rp.Proxy = [string]$Mail.Proxy; $rp.ProxyUseDefaultCredentials = $true }
+    for ($attempt = 1; ; $attempt++) {
+        try { return (Invoke-RestMethod @rp) }
+        catch {
+            $status = 0
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($attempt -lt 3 -and @(429, 503, 504) -contains $status) {
+                $wait = 5
+                try { $ra = [string]$_.Exception.Response.Headers['Retry-After']; if ($ra -match '^\d+$') { $wait = [Math]::Min(60, [int]$ra) } } catch { }
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            throw (Get-GraphErrorText $_ $status)
+        }
+    }
+}
+
+function Get-GraphToken {
+    # Token aplikacji (client credentials) dla https://graph.microsoft.com
+    param([Parameter(Mandatory)][hashtable]$Mail)
+    $tenant = ([string]$Mail.TenantId).Trim()
+    $client = ([string]$Mail.ClientId).Trim()
+    if (-not $tenant -or -not $client) { throw 'Microsoft Graph: podaj dzierżawę i identyfikator aplikacji.' }
+    $form = @{ client_id = $client; scope = 'https://graph.microsoft.com/.default'; grant_type = 'client_credentials' }
+    if ([string]$Mail.GraphAuth -eq 'Secret') {
+        $secure = $null
+        try { $secure = Unprotect-ReportSecret ([string]$Mail.ClientSecret) }
+        catch { throw ('Nie można odszyfrować klucza tajnego aplikacji – zapisał go {0}, a raport działa jako {1}\{2}. Wpisz klucz ponownie z konta, na którym działa zadanie, albo użyj certyfikatu.' -f $Mail.ClientSecretOwner, $env:USERDOMAIN, $env:USERNAME) }
+        $form.client_secret = (New-Object System.Net.NetworkCredential('', $secure)).Password
+    }
+    else {
+        $form.client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+        $form.client_assertion = New-GraphClientAssertion -Certificate (Get-GraphCertificate ([string]$Mail.CertThumbprint)) -TenantId $tenant -ClientId $client
+    }
+    $r = Invoke-GraphRequest -Method Post -Uri ('https://login.microsoftonline.com/{0}/oauth2/v2.0/token' -f [uri]::EscapeDataString($tenant)) -Form $form -Mail $Mail
+    if (-not ($r -and $r.PSObject.Properties['access_token'] -and $r.access_token)) { throw 'Microsoft Graph: brak tokenu dostępu w odpowiedzi Entra ID.' }
+    return [string]$r.access_token
+}
+
+function Send-GraphMail {
+    # sendMail ze skrzynki nadawcy (Od); załączniki do 3 MB w treści żądania, większe - szkic, sesja przekazywania, wysłanie
+    param([Parameter(Mandatory)][hashtable]$Mail, [Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$Body, [string[]]$Attachments = @())
+    $rcpt = { param($list) @(Split-ListText $list | ForEach-Object { @{ emailAddress = @{ address = [string]$_ } } }) }
+    $to = @(& $rcpt ([string]$Mail.To))
+    if ($to.Count -eq 0) { throw 'Brak adresatów wiadomości.' }
+    $message = [ordered]@{ subject = $Subject; body = [ordered]@{ contentType = 'HTML'; content = $Body }; toRecipients = $to }
+    $cc = @(& $rcpt ([string]$Mail.Cc))
+    if ($cc.Count) { $message.ccRecipients = $cc }
+    $files = @($Attachments | Where-Object { $_ } | ForEach-Object { Get-Item -LiteralPath $_ -ErrorAction Stop })
+    $total = 0
+    foreach ($f in $files) { $total += $f.Length }
+    $token = Get-GraphToken -Mail $Mail
+    $base = 'https://graph.microsoft.com/v1.0/users/' + [uri]::EscapeDataString(([string]$Mail.From).Trim())
+    if ($total -le $script:GraphMailInlineLimit) {
+        if ($files.Count) {
+            $message.attachments = @(foreach ($f in $files) {
+                    [ordered]@{ '@odata.type' = '#microsoft.graph.fileAttachment'; name = $f.Name; contentType = 'text/html'; contentBytes = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($f.FullName)) }
+                })
+        }
+        $null = Invoke-GraphRequest -Method Post -Uri ($base + '/sendMail') -Token $token -Json ([ordered]@{ message = $message; saveToSentItems = $false }) -Mail $Mail
+        return
+    }
+    $draft = $null
+    try { $draft = Invoke-GraphRequest -Method Post -Uri ($base + '/messages') -Token $token -Json $message -Mail $Mail }
+    catch {
+        if ($_.Exception.Message -notmatch 'ErrorAccessDenied|AccessDenied|\(403\)') { throw }
+        # Bez Mail.ReadWrite szkicu nie da się utworzyć - wiadomość bez załącznika, z informacją
+        Write-Log ('Microsoft Graph: załącznik {0:N1} MB pominięty – większe pliki wymagają uprawnienia Mail.ReadWrite aplikacji.' -f ($total / 1MB)) 'WARN'
+        $message.body.content = $Body + ('<p style="color:#a33">Załącznik pominięty: raport ma {0:N1} MB, a wysyłka plików powyżej 3 MB przez Microsoft Graph wymaga uprawnienia Mail.ReadWrite aplikacji. Raport jest w folderze raportów.</p>' -f ($total / 1MB))
+        $null = Invoke-GraphRequest -Method Post -Uri ($base + '/sendMail') -Token $token -Json ([ordered]@{ message = $message; saveToSentItems = $false }) -Mail $Mail
+        return
+    }
+    $msgUri = $base + '/messages/' + [uri]::EscapeDataString([string]$draft.id)
+    try {
+        foreach ($f in $files) {
+            $item = [ordered]@{ AttachmentItem = [ordered]@{ attachmentType = 'file'; name = $f.Name; size = $f.Length; contentType = 'text/html' } }
+            $session = Invoke-GraphRequest -Method Post -Uri ($msgUri + '/attachments/createUploadSession') -Token $token -Json $item -Mail $Mail
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            for ($o = 0; $o -lt $bytes.Length; $o += $script:GraphUploadChunk) {
+                $n = [Math]::Min($script:GraphUploadChunk, $bytes.Length - $o)
+                $part = New-Object byte[] $n
+                [Array]::Copy($bytes, $o, $part, 0, $n)
+                # Adres sesji ma własne uprawnienie - bez nagłówka Authorization
+                $null = Invoke-GraphRequest -Method Put -Uri ([string]$session.uploadUrl) -Bytes $part -Headers @{ 'Content-Range' = ('bytes {0}-{1}/{2}' -f $o, ($o + $n - 1), $bytes.Length) } -Mail $Mail
+            }
+        }
+        $null = Invoke-GraphRequest -Method Post -Uri ($msgUri + '/send') -Token $token -Empty -Mail $Mail
+    }
+    catch {
+        try { $null = Invoke-GraphRequest -Method Delete -Uri $msgUri -Token $token -Mail $Mail } catch { }
+        throw
     }
 }
 #endregion
@@ -33284,6 +33647,8 @@ function Get-ReportTaskInfo {
 
 #region Raporty cykliczne – moduł (lista definicji, edytor, uruchamianie, zadania Harmonogramu)
 $script:ReportEditorContext = $null
+$script:ReportMailTransports = [ordered]@{ Smtp = 'Serwer SMTP'; Graph = 'Microsoft Graph (Microsoft 365)' }
+$script:ReportGraphAuth = [ordered]@{ Certificate = 'Certyfikat (zalecane)'; Secret = 'Klucz tajny klienta (client secret)' }
 
 function Get-ReportEditorFields {
     # Pola edytora: rodzaj raportu (opcje z prefiksem o_), wynik, poczta, harmonogram, konto zadania
@@ -33313,16 +33678,32 @@ function Get-ReportEditorFields {
     [void]$fields.Add(@{ Key = 'MailMode'; Label = 'Wysyłka e-mail'; Type = 'Combo'; Items = @($script:ReportMailModes.Values); Value = $script:ReportMailModes[[string]$Job.Mail.Mode]; Hint = 'Błąd raportu jest wysyłany zawsze, gdy wysyłka jest włączona. «Gdy są zmiany» – także przy pierwszym uruchomieniu (stan odniesienia).' })
     [void]$fields.Add(@{ Key = 'MailTo'; Label = 'Do (adresy rozdzielone przecinkami)'; Value = [string]$Job.Mail.To; EnabledWhen = $mailOn })
     [void]$fields.Add(@{ Key = 'MailCc'; Label = 'DW'; Value = [string]$Job.Mail.Cc; EnabledWhen = $mailOn })
-    [void]$fields.Add(@{ Key = 'MailFrom'; Label = 'Od'; Value = [string]$Job.Mail.From; Placeholder = 'np. domainops@contoso.pl'; EnabledWhen = $mailOn })
-    [void]$fields.Add(@{ Key = 'SmtpServer'; Label = 'Serwer SMTP'; Value = [string]$Job.Mail.Server; Placeholder = 'np. smtp.contoso.local albo smtp.office365.com'; EnabledWhen = $mailOn })
-    [void]$fields.Add(@{ Key = 'SmtpPort'; Label = 'Port'; Type = 'Number'; Value = [string]$Job.Mail.Port; EnabledWhen = $mailOn })
-    [void]$fields.Add(@{ Key = 'SmtpSsl'; Label = 'Szyfrowanie TLS (STARTTLS)'; Type = 'Check'; Value = [bool]$Job.Mail.Ssl; EnabledWhen = $mailOn })
+    [void]$fields.Add(@{ Key = 'MailFrom'; Label = 'Od (dla Microsoft Graph – skrzynka nadawcy w Exchange Online)'; Value = [string]$Job.Mail.From; Placeholder = 'np. domainops@contoso.pl'; EnabledWhen = $mailOn })
+    $tr = $script:ReportMailTransports
+    $trValue = if ($tr.Contains([string]$Job.Mail['Transport'])) { $tr[[string]$Job.Mail['Transport']] } else { $tr.Smtp }
+    [void]$fields.Add(@{ Key = 'MailTransport'; Label = 'Wysyłka przez'; Type = 'Combo'; Items = @($tr.Values); Value = $trValue; EnabledWhen = $mailOn
+            Hint = 'Microsoft Graph: aplikacja w Entra ID z uprawnieniem aplikacji Mail.Send (zgoda administratora), dla załączników powyżej 3 MB także Mail.ReadWrite. Ogranicz ją do skrzynki nadawcy (zasady dostępu aplikacji w Exchange Online).' })
+    $smtpOn = @($mailOn, @{ Key = 'MailTransport'; In = @($tr.Smtp) })
+    $graphOn = @($mailOn, @{ Key = 'MailTransport'; In = @($tr.Graph) })
+    [void]$fields.Add(@{ Key = 'SmtpServer'; Label = 'Serwer SMTP'; Value = [string]$Job.Mail.Server; Placeholder = 'np. smtp.contoso.local albo smtp.office365.com'; EnabledWhen = $smtpOn })
+    [void]$fields.Add(@{ Key = 'SmtpPort'; Label = 'Port'; Type = 'Number'; Value = [string]$Job.Mail.Port; EnabledWhen = $smtpOn })
+    [void]$fields.Add(@{ Key = 'SmtpSsl'; Label = 'Szyfrowanie TLS (STARTTLS)'; Type = 'Check'; Value = [bool]$Job.Mail.Ssl; EnabledWhen = $smtpOn })
     $auth = [ordered]@{ None = 'Bez uwierzytelniania (przekaźnik w sieci firmy)'; Windows = 'Konto, na którym działa zadanie (Windows)'; Login = 'Login i hasło' }
-    [void]$fields.Add(@{ Key = 'SmtpAuth'; Label = 'Uwierzytelnianie SMTP'; Type = 'Combo'; Items = @($auth.Values); Value = $auth[[string]$Job.Mail.Auth]; EnabledWhen = $mailOn })
-    $loginOn = @($mailOn, @{ Key = 'SmtpAuth'; In = @($auth.Login) })
+    [void]$fields.Add(@{ Key = 'SmtpAuth'; Label = 'Uwierzytelnianie SMTP'; Type = 'Combo'; Items = @($auth.Values); Value = $auth[[string]$Job.Mail.Auth]; EnabledWhen = $smtpOn })
+    $loginOn = @($smtpOn + @(@{ Key = 'SmtpAuth'; In = @($auth.Login) }))
     [void]$fields.Add(@{ Key = 'SmtpUser'; Label = 'Login SMTP'; Value = [string]$Job.Mail.User; EnabledWhen = $loginOn })
     $pwHint = if ([string]$Job.Mail.Password) { ('Hasło jest zapisane (zaszyfrował je {0}) – puste pole zostawia je bez zmian.' -f $Job.Mail.PasswordOwner) } else { 'Hasło zostanie zaszyfrowane (DPAPI) – odczyta je tylko to samo konto na tym komputerze, więc zadanie musi działać na Twoim koncie.' }
     [void]$fields.Add(@{ Key = 'SmtpPassword'; Label = 'Hasło SMTP'; Type = 'Password'; Hint = $pwHint; EnabledWhen = $loginOn })
+    [void]$fields.Add(@{ Key = 'GraphTenant'; Label = 'Dzierżawa (identyfikator albo domena)'; Value = [string]$Job.Mail['TenantId']; Placeholder = 'np. contoso.onmicrosoft.com'; EnabledWhen = $graphOn })
+    [void]$fields.Add(@{ Key = 'GraphClient'; Label = 'Identyfikator aplikacji (Client ID)'; Value = [string]$Job.Mail['ClientId']; Placeholder = '00000000-0000-0000-0000-000000000000'; EnabledWhen = $graphOn })
+    $ga = $script:ReportGraphAuth
+    $gaValue = if ($ga.Contains([string]$Job.Mail['GraphAuth'])) { $ga[[string]$Job.Mail['GraphAuth']] } else { $ga.Certificate }
+    [void]$fields.Add(@{ Key = 'GraphAuth'; Label = 'Logowanie aplikacji'; Type = 'Combo'; Items = @($ga.Values); Value = $gaValue; EnabledWhen = $graphOn })
+    [void]$fields.Add(@{ Key = 'GraphCert'; Label = 'Odcisk certyfikatu (Thumbprint)'; Value = [string]$Job.Mail['CertThumbprint']; EnabledWhen = @($graphOn + @(@{ Key = 'GraphAuth'; In = @($ga.Certificate) }))
+            Hint = 'Certyfikat z kluczem prywatnym w magazynie Komputer lokalny\Osobisty (zadania na SYSTEM i gMSA) albo Bieżący użytkownik\Osobisty; konto zadania musi móc odczytać klucz prywatny. Część publiczną dodaj w aplikacji (Certyfikaty i klucze tajne).' })
+    $secHint = if ([string]$Job.Mail['ClientSecret']) { ('Klucz jest zapisany (zaszyfrował go {0}) – puste pole zostawia go bez zmian.' -f $Job.Mail['ClientSecretOwner']) } else { 'Klucz zostanie zaszyfrowany (DPAPI) – odczyta go tylko to samo konto na tym komputerze. Do zadań na SYSTEM i gMSA użyj certyfikatu.' }
+    [void]$fields.Add(@{ Key = 'GraphSecret'; Label = 'Klucz tajny klienta'; Type = 'Password'; Hint = $secHint; EnabledWhen = @($graphOn + @(@{ Key = 'GraphAuth'; In = @($ga.Secret) })) })
+    [void]$fields.Add(@{ Key = 'GraphProxy'; Label = 'Serwer proxy (opcjonalnie)'; Value = [string]$Job.Mail['Proxy']; Placeholder = 'np. http://proxy.contoso.local:8080'; EnabledWhen = $graphOn })
     [void]$fields.Add(@{ Key = 'Attach'; Label = 'Załącz raport HTML (do 15 MB)'; Type = 'Check'; Value = [bool]$Job.Mail.Attach; EnabledWhen = $mailOn })
     [void]$fields.Add(@{ Key = 'MaxRows'; Label = 'Wierszy w treści wiadomości (najwyżej)'; Type = 'Number'; Value = [string]$Job.Mail.MaxRows; EnabledWhen = $mailOn })
     [void]$fields.Add(@{ Type = 'Header'; Label = 'Harmonogram'; Hint = 'Zadanie trafia do Harmonogramu zadań (folder «Domain Ops») i uruchamia kopię programu z folderu zadań – bez okna.' })
@@ -33363,14 +33744,28 @@ function Test-ReportEditorValues {
         if (-not $to.Count) { return 'Podaj adresatów wiadomości (Do).' }
         foreach ($a in @($to + @(Split-ListText $Values.MailCc))) { if (-not (& $isEmail $a)) { return "Niepoprawny adres e-mail: $a" } }
         if (-not (& $isEmail $Values.MailFrom)) { return 'Podaj poprawny adres nadawcy (Od).' }
-        if (-not $Values.SmtpServer) { return 'Podaj serwer SMTP.' }
-        $port = 0
-        if (-not [int]::TryParse([string]$Values.SmtpPort, [ref]$port) -or $port -lt 1 -or $port -gt 65535) { return 'Port SMTP: liczba od 1 do 65535.' }
         $rows = 0
         if (-not [int]::TryParse([string]$Values.MaxRows, [ref]$rows) -or $rows -lt 5 -or $rows -gt 1000) { return 'Wierszy w treści wiadomości: od 5 do 1000.' }
-        if ($Values.SmtpAuth -eq 'Login i hasło') {
-            if (-not $Values.SmtpUser) { return 'Podaj login SMTP.' }
-            if ($Values.SmtpPassword.Length -eq 0 -and -not [string]$ctx.Job.Mail.Password) { return 'Podaj hasło SMTP.' }
+        if ($Values['MailTransport'] -eq $script:ReportMailTransports.Graph) {
+            $tenant = ([string]$Values.GraphTenant).Trim()
+            if ($tenant -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -and $tenant -notmatch '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$') { return 'Dzierżawa: identyfikator (GUID) albo domena, np. contoso.onmicrosoft.com.' }
+            if (([string]$Values.GraphClient).Trim() -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { return 'Identyfikator aplikacji (Client ID) to GUID z karty aplikacji w Entra ID.' }
+            if ($Values.GraphAuth -eq $script:ReportGraphAuth.Secret) {
+                if ($Values.GraphSecret.Length -eq 0 -and -not [string]$ctx.Job.Mail['ClientSecret']) { return 'Podaj klucz tajny klienta.' }
+            }
+            elseif ((([string]$Values.GraphCert) -replace '[^0-9A-Fa-f]', '').Length -ne 40) { return 'Odcisk certyfikatu: 40 znaków szesnastkowych.' }
+            $proxy = ([string]$Values.GraphProxy).Trim()
+            $pu = $null
+            if ($proxy -and -not ([uri]::TryCreate($proxy, [System.UriKind]::Absolute, [ref]$pu) -and @('http', 'https') -contains $pu.Scheme)) { return 'Serwer proxy: pełny adres, np. http://proxy.contoso.local:8080.' }
+        }
+        else {
+            if (-not $Values.SmtpServer) { return 'Podaj serwer SMTP.' }
+            $port = 0
+            if (-not [int]::TryParse([string]$Values.SmtpPort, [ref]$port) -or $port -lt 1 -or $port -gt 65535) { return 'Port SMTP: liczba od 1 do 65535.' }
+            if ($Values.SmtpAuth -eq 'Login i hasło') {
+                if (-not $Values.SmtpUser) { return 'Podaj login SMTP.' }
+                if ($Values.SmtpPassword.Length -eq 0 -and -not [string]$ctx.Job.Mail.Password) { return 'Podaj hasło SMTP.' }
+            }
         }
     }
     if ($Values.Frequency -ne $script:ReportFrequencies.Manual) {
@@ -33382,8 +33777,12 @@ function Test-ReportEditorValues {
         # Hasło SMTP (DPAPI) odczyta tylko konto, które je zaszyfrowało
         $me = "$env:USERDOMAIN\$env:USERNAME"
         $foreign = ($mode -eq 'System' -or $mode -eq 'Gmsa' -or ($mode -eq 'Password' -and $Values.Account -ne $me))
-        if ($Values.MailMode -ne $script:ReportMailModes.Never -and $Values.SmtpAuth -eq 'Login i hasło' -and $foreign) {
+        $graph = ($Values['MailTransport'] -eq $script:ReportMailTransports.Graph)
+        if ($Values.MailMode -ne $script:ReportMailModes.Never -and -not $graph -and $Values.SmtpAuth -eq 'Login i hasło' -and $foreign) {
             return ('Hasło SMTP zostanie zaszyfrowane dla konta {0} – zadanie działające na innym koncie go nie odczyta. Uruchamiaj zadanie na swoim koncie albo wybierz uwierzytelnianie kontem zadania (Windows) lub przekaźnik bez hasła.' -f $me)
+        }
+        if ($Values.MailMode -ne $script:ReportMailModes.Never -and $graph -and $Values.GraphAuth -eq $script:ReportGraphAuth.Secret -and $foreign) {
+            return ('Klucz tajny aplikacji zostanie zaszyfrowany dla konta {0} – zadanie działające na innym koncie go nie odczyta. Uruchamiaj zadanie na swoim koncie albo zaloguj aplikację certyfikatem.' -f $me)
         }
     }
     return ''
@@ -33421,6 +33820,16 @@ function Show-ReportJobEditor {
         if ($v.SmtpPassword -and $v.SmtpPassword.Length -gt 0) { $mail.Password = Protect-ReportSecret $v.SmtpPassword; $mail.PasswordOwner = "$env:USERDOMAIN\$env:USERNAME" }
     }
     else { $mail.Password = ''; $mail.PasswordOwner = '' }
+    $mail.Transport = & $modeKey $script:ReportMailTransports $v.MailTransport
+    if (-not $mail.Transport) { $mail.Transport = 'Smtp' }
+    $mail.TenantId = ([string]$v.GraphTenant).Trim(); $mail.ClientId = ([string]$v.GraphClient).Trim(); $mail.Proxy = ([string]$v.GraphProxy).Trim()
+    $mail.GraphAuth = & $modeKey $script:ReportGraphAuth $v.GraphAuth
+    if (-not $mail.GraphAuth) { $mail.GraphAuth = 'Certificate' }
+    $mail.CertThumbprint = (([string]$v.GraphCert) -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    if ($mail.Transport -eq 'Graph' -and $mail.GraphAuth -eq 'Secret') {
+        if ($v.GraphSecret -and $v.GraphSecret.Length -gt 0) { $mail.ClientSecret = Protect-ReportSecret $v.GraphSecret; $mail.ClientSecretOwner = "$env:USERDOMAIN\$env:USERNAME" }
+    }
+    else { $mail.ClientSecret = ''; $mail.ClientSecretOwner = '' }
     $s = $j.Schedule
     $s.Frequency = & $modeKey $script:ReportFrequencies $v.Frequency
     if ([string]$v.Time -match '^(\d{1,2}):(\d{2})$') { $s.Time = '{0:00}:{1}' -f [int]$Matches[1], $Matches[2] }
@@ -33676,6 +34085,28 @@ Register-Module -Workspace 'Domain' -Category 'Automatyzacja' -Key 'ScheduledRep
         $d = Get-ReportOutputDir -Job $jobs[0]
         if (-not (Test-Path -LiteralPath $d)) { Show-Warning "Folder jeszcze nie istnieje (raport nie był uruchamiany): $d"; return }
         Open-Folder $d
+    }
+    Add-RowAction -Module $m -Text 'Wyślij wiadomość testową' -Icon 'E715' -Action {
+        param($m, $rows)
+        $jobs = @(Get-ReportJobsFromRows -Module $m -Rows $rows)
+        if (-not $jobs.Count) { return }
+        $j = $jobs[0]
+        if ([string]$j.Mail.Mode -eq 'Never') { Show-Warning 'Ten raport nie ma włączonej wysyłki e-mail – ustaw ją w edytorze.'; return }
+        $via = if ([string]$j.Mail['Transport'] -eq 'Graph') { 'Microsoft Graph' } else { 'serwer SMTP ' + [string]$j.Mail.Server }
+        $body = '<p>Wiadomość testowa raportu cyklicznego <b>{0}</b> – wysłana z komputera {1} (konto {2}\{3}) przez {4}.</p>' -f (ConvertTo-HtmlText ([string]$j.Name)), $env:COMPUTERNAME, $env:USERDOMAIN, $env:USERNAME, $via
+        $previous = [System.Windows.Input.Mouse]::OverrideCursor
+        [System.Windows.Input.Mouse]::OverrideCursor = [System.Windows.Input.Cursors]::Wait
+        $failure = $null
+        try { Send-ReportMail -Mail $j.Mail -Subject ('Domain Ops – wiadomość testowa: ' + [string]$j.Name) -Body $body }
+        catch { $failure = $_ }
+        finally { [System.Windows.Input.Mouse]::OverrideCursor = $previous }
+        if ($failure) {
+            Write-Log ('Wiadomość testowa «{0}» nie wysłana: {1}' -f $j.Name, $failure.Exception.Message) 'ERROR'
+            Show-Error 'Nie wysłano wiadomości testowej.' $failure
+            return
+        }
+        Write-Log ('Wiadomość testowa «{0}» wysłana do: {1} ({2})' -f $j.Name, $j.Mail.To, $via) 'OK'
+        Show-Message -Title 'Poczta' -Tone 'ok' -Text ('Wysłano wiadomość testową do: {0} ({1}).' -f $j.Mail.To, $via)
     }
     Add-RowAction -Module $m -Text 'Historia uruchomień' -Icon 'E81C' -Action {
         param($m, $rows)
@@ -35638,6 +36069,7 @@ function Initialize-MainWindow {
             param($s, $e)
             $e.Handled = $true
             Write-Log "Nieobsłużony błąd interfejsu: $($e.Exception.Message)" 'ERROR' -Module ''
+            Write-DebugLog ('Nieobsłużony błąd interfejsu: {0} [{1}] | {2}' -f $e.Exception.Message, $e.Exception.GetType().Name, (([string]$e.Exception.StackTrace) -replace '\s*\r?\n\s*', ' ← ')) -Module ''
         })
 
     Write-Log ("Domain Ops {0} – PowerShell {1}, użytkownik {2}\{3}" -f $script:AppVersion, $PSVersionTable.PSVersion, $env:USERDOMAIN, $env:USERNAME) -Module ''
