@@ -15208,6 +15208,17 @@ Register-Module -Workspace 'Remote' -Category 'Oprogramowanie' -Key 'Programs' -
         $name = [string](Get-ObjectValue $rows[0] 'Nazwa')
         if ($name) { $m.FilterBox.Text = $name }
     }
+    Add-RowAction -Module $m -Text 'Analizuj aplikację (awarie, logi, rejestr)' -Icon 'EBE8' -Action {
+        # Moduł «Analiza aplikacji» dla programu z wiersza, na komputerach z zaznaczonych wierszy tego programu
+        param($m, $rows)
+        $name = [string](Get-ObjectValue $rows[0] 'Nazwa')
+        if (-not $name) { return }
+        $computers = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Nazwa') -eq $name } | ForEach-Object { [string](Get-ObjectValue $_ 'Komputer') } | Where-Object { $_ } | Select-Object -Unique)
+        Show-Module -Key 'AppAnalysis'
+        $am = $script:UI.Modules['AppAnalysis']
+        if (-not $am -or -not $am.AppName) { return }
+        Invoke-WithTargets -Kind Computer -Names $computers -Action { Start-AppAnalysis -Module $am -Name $name }
+    }
 }
 
 # Treści bloków zdalnych Windows Update (składane przez New-WuScript z funkcjami $script:WuTaskText)
@@ -20116,6 +20127,1757 @@ Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'AppLogs' -Titl
         Show-LogView -Module $m
     }
     $m.EmptyHint = 'Podaj ścieżkę logów (np. %ProgramData%\Firma\App\Logs\*.log), zaznacz komputery i kliknij «Wczytaj logi». «Porównanie komputerów» pokaże, czy dany komunikat występuje wszędzie, czy tylko na części maszyn.'
+}
+#endregion
+
+#region Zarządzanie zdalne: analiza aplikacji (co się stało z programem: diagnoza, zależności, zdarzenia, logi, połączenia)
+# Blok na komputerze docelowym, tylko odczyt. $P: Name (fragment nazwy programu albo plik .exe), From / To (okno czasu,
+# tekst ISO 8601), UserFilter, Offline (rejestr niezalogowanych z NTUSER.DAT), ScanLogs (błędy w końcówkach logów),
+# Network (połączenia z serwerami z plików konfiguracyjnych), MaxSeconds (limit przeszukiwania plików), Helpers.
+# Aplikację rozpoznaje sam - bez listy znanych programów: wpis deinstalacji, pakiet MSIX/Sklepu, App Paths, pliki .exe
+# i procesy; ślady szuka po nazwach plików .exe, folderach instalacji i słowach z nazwy. Hipotezy dostają ocenę (0-100)
+# z dowodów i ich zbieżności w czasie (np. zmiana tuż przed pierwszą awarią); wiersz «Zakres analizy» niesie odcisk
+# komputera (__fp, JSON) do porównania komputerów działających i z problemem.
+# Wynik: wiersze z kolumną Kategoria - Wniosek (na początku, od najpewniejszego), Aplikacja, Zależność, Proces, Usługa,
+# Zadanie, Awaria, Zdarzenie, Plik logu, Połączenie, Rejestr, System.
+$script:AppAnalysisScript = {
+    param($P)
+    . ([scriptblock]::Create($P.Helpers))
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $now = Get-Date
+    $since = if ($P.From) { [datetime]::Parse([string]$P.From, $inv) } else { $now.AddDays(-1) }
+    $until = if ($P.To) { [datetime]::Parse([string]$P.To, $inv) } else { $now }
+    $deadline = [datetime]::UtcNow.AddSeconds([Math]::Max(20, [int]$P.MaxSeconds))
+    $rows = New-Object System.Collections.ArrayList
+    $findings = New-Object System.Collections.ArrayList
+    $order = @{ 'Wniosek' = 0; 'Aplikacja' = 1; 'Zależność' = 2; 'Proces' = 3; 'Usługa' = 4; 'Zadanie' = 5; 'Awaria' = 6; 'Zdarzenie' = 7; 'Plik logu' = 8; 'Połączenie' = 9; 'Rejestr' = 10; 'System' = 11 }
+    function Out-Row([string]$Cat, [string]$Item, [string]$Desc, [string]$Detail = '', $Time = $null, [string]$Tone = '', [string]$Path = '', [string]$User = '', [string]$Kind = '', [int]$Score = -1, [string]$Fp = '') {
+        if ($Detail.Length -gt 6000) { $Detail = $Detail.Substring(0, 6000) + ' …' }
+        $conf = if ($Score -ge 75) { 'wysoka' } elseif ($Score -ge 45) { 'średnia' } elseif ($Score -ge 1) { 'niska' } else { '' }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                'Kategoria' = $Cat; 'Pewność' = $conf; 'Element' = $Item; 'Czas' = $(if ($Time) { ([datetime]$Time).ToString('yyyy-MM-dd HH:mm:ss') } else { '' }); 'Opis' = $Desc
+                'Użytkownik' = $User; 'Ścieżka' = $Path; 'Szczegóły' = $Detail; '__tone' = $Tone; '__kind' = $Kind; '__order' = $order[$Cat]; '__score' = [Math]::Max(0, $Score); '__fp' = $Fp
+            })
+    }
+    function Add-Finding([string]$Title, [string]$Text, [int]$Score, [string]$Detail = '', $Time = $null, [string]$Path = '', [string]$User = '', [string]$Kind = 'finding') {
+        [void]$findings.Add(@{ Title = $Title; Text = $Text; Score = [Math]::Max(1, [Math]::Min(100, $Score)); Detail = $Detail; Time = $Time; Path = $Path; User = $User; Kind = $Kind })
+    }
+    function Get-Norm([string]$Text) { return (([string]$Text).ToLowerInvariant() -replace '[\s\-_\.\(\)]', '') }
+    function Get-Short([string]$Text, [int]$Max = 300) { $t = (([string]$Text) -replace '\s+', ' ').Trim(); if ($t.Length -gt $Max) { $t.Substring(0, $Max) + '…' } else { $t } }
+    $codeCache = @{}
+    function Get-CodeText([string]$Hex) {
+        # Kod HRESULT / Win32 z tekstu (0x80070005) -> komunikat systemu tego komputera (w jego języku)
+        $h = ([string]$Hex).ToLowerInvariant()
+        if ($codeCache.ContainsKey($h)) { return $codeCache[$h] }
+        $msg = ''
+        try {
+            $u = [Convert]::ToUInt32(($h -replace '^0x', ''), 16)
+            # HRESULT z błędu Win32 (0x8007xxxx): opis kodu Win32 z dolnych 16 bitów
+            $i = if (($u -band 0xFFFF0000) -eq 0x80070000) { [int]($u -band 0xFFFF) } else { [BitConverter]::ToInt32([BitConverter]::GetBytes($u), 0) }
+            $msg = (New-Object System.ComponentModel.Win32Exception($i)).Message
+            if ($msg -match '^(Unknown error|Nieznany błąd)') { $msg = '' }
+        }
+        catch { }
+        $codeCache[$h] = $msg
+        return $msg
+    }
+    function Get-Codes([string]$Text) {
+        # Kody 0x8xxxxxxx / 0xCxxxxxxx z tekstu z opisem: '0x80070005 = Odmowa dostępu.'
+        @([regex]::Matches([string]$Text, '(?i)\b0x[8c][0-9a-f]{7}\b') | ForEach-Object { $_.Value.ToLowerInvariant() } | Select-Object -Unique -First 5 | ForEach-Object { $m0 = Get-CodeText $_; if ($m0) { '{0} = {1}' -f $_, $m0.Trim() } })
+    }
+    $is64 = [Environment]::Is64BitOperatingSystem
+    $sysDirFor = { param([string]$Machine) if ($Machine -eq 'x86' -and $is64) { Join-Path $env:SystemRoot 'SysWOW64' } else { Join-Path $env:SystemRoot 'System32' } }
+
+    # --- 1. Rozpoznanie aplikacji: słowa z nazwy, pliki .exe, foldery instalacji
+    $name = ([string]$P.Name).Trim().Trim('"')
+    $exeNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $folders = New-Object System.Collections.ArrayList
+    $keywords = New-Object System.Collections.ArrayList
+    # Nazwy folderów zbyt ogólne, by uznać je za folder aplikacji (zaglądamy tylko do ich podfolderów)
+    $generic = @('microsoft', 'windows', 'packages', 'temp', 'programs', 'commonfiles', 'packagecache', 'google', 'mozilla', 'intel', 'nvidia', 'amd', 'apple', 'adobe', 'oracle', 'java', 'software', 'local', 'roaming', 'locallow', 'data', 'program', 'application', 'app', 'apps', 'client', 'server', 'service', 'services', 'tools', 'common', 'shared', 'system', 'logs', 'log', 'cache', 'config', 'settings', 'update', 'updates', 'setup', 'installer', 'bin', 'lib')
+    $genericExe = '^(update|updater|launcher|setup|install|installer|helper|crashreporter|crashpad_handler|service|server|client|app|main|start|run|dotnet|java|javaw|python|pythonw|node|cmd|powershell|rundll32|dllhost|msiexec|conhost)$'
+    $addKeyword = { param([string]$k) $n = Get-Norm $k; if ($n.Length -ge 3 -and -not $keywords.Contains($n) -and $generic -notcontains $n) { [void]$keywords.Add($n) } }
+    $addFolder = {
+        param([string]$f)
+        $f = ([string]$f).Trim().Trim('"').TrimEnd('\')
+        if (-not $f -or $f.Length -lt 4) { return }
+        $f = [Environment]::ExpandEnvironmentVariables($f)
+        $lf = $f.ToLowerInvariant()
+        $win = ([string]$env:SystemRoot).ToLowerInvariant()
+        if ($lf -eq $win -or $lf.StartsWith($win + '\') -or $lf -like '*\package cache*' -or $lf -like '*\installer*' -or $lf -match '^[a-z]:$' -or $lf -match '\\program files( \(x86\))?$' -or $lf -match '\\common files$' -or $lf -match '\\windowsapps$') { return }
+        foreach ($x in $folders) { if ($lf -eq $x.ToLowerInvariant()) { return } }
+        [void]$folders.Add($f)
+    }
+    $exeFromCommand = {
+        param([string]$c)
+        $c = ([string]$c).Trim()
+        if (-not $c) { return '' }
+        if ($c -match '^"([^"]+)"') { $c = $Matches[1] } elseif ($c -match '^(.+?\.exe)\b') { $c = $Matches[1] } else { $c = ($c -split ',')[0] }
+        return [Environment]::ExpandEnvironmentVariables($c.Trim())
+    }
+    if ($name -match '\.exe$') { [void]$exeNames.Add((Split-Path -Leaf $name)); & $addKeyword ([System.IO.Path]::GetFileNameWithoutExtension($name)) }
+    else { & $addKeyword $name }
+    $nameNorm = Get-Norm ([System.IO.Path]::GetFileNameWithoutExtension($name))
+
+    # Wpisy deinstalacji: komputer (64/32-bit) i zalogowani; aktualizacje (ParentKeyName) pomijane; lista programów do odcisku
+    $uninstRoots = New-Object System.Collections.ArrayList
+    [void]$uninstRoots.Add(@('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'komputer'))
+    [void]$uninstRoots.Add(@('HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'komputer (32-bit)'))
+    foreach ($h in @(Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })) {
+        $u = $h.PSChildName
+        try { $u = (New-Object System.Security.Principal.SecurityIdentifier($h.PSChildName)).Translate([System.Security.Principal.NTAccount]).Value } catch { }
+        [void]$uninstRoots.Add(@("Registry::HKEY_USERS\$($h.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Uninstall", $u))
+    }
+    $apps = New-Object System.Collections.ArrayList
+    $vcRuntimes = New-Object System.Collections.ArrayList
+    $installed = New-Object System.Collections.ArrayList
+    foreach ($ur in $uninstRoots) {
+        foreach ($k in @(Get-ChildItem -LiteralPath $ur[0] -ErrorAction SilentlyContinue)) {
+            $dn = [string](Get-DoRegValue $k 'DisplayName')
+            if (-not $dn) { continue }
+            $ver = [string](Get-DoRegValue $k 'DisplayVersion')
+            if ($dn -like 'Microsoft Visual C++*Redistributable*') { [void]$vcRuntimes.Add(('{0} {1}' -f $dn, $ver).Trim()) }
+            if (Get-DoRegValue $k 'ParentKeyName') { continue }
+            if ([string](Get-DoRegValue $k 'SystemComponent') -ne '1' -and $installed.Count -lt 600) { [void]$installed.Add(('{0} {1}' -f $dn, $ver).Trim()) }
+            $icon = & $exeFromCommand ([string](Get-DoRegValue $k 'DisplayIcon'))
+            $hit = ($nameNorm.Length -ge 3 -and (Get-Norm $dn).Contains($nameNorm))
+            if (-not $hit -and $exeNames.Count -and $icon) { $hit = $exeNames.Contains((Split-Path -Leaf $icon)) }
+            if (-not $hit) { continue }
+            [void]$apps.Add(@{
+                    Name = $dn; Version = $ver; Publisher = [string](Get-DoRegValue $k 'Publisher')
+                    Location = [string](Get-DoRegValue $k 'InstallLocation'); Date = [string](Get-DoRegValue $k 'InstallDate'); Icon = $icon
+                    Uninstall = [string](Get-DoRegValue $k 'UninstallString'); Key = $k.PSChildName; Scope = $ur[1]; KeyPath = $k.Name; Kind = 'reg'
+                })
+        }
+    }
+    # Pakiety MSIX / Sklepu (np. nowy Teams): wersja, stan pakietu, plik .exe z manifestu
+    $appx = New-Object System.Collections.ArrayList
+    if ($nameNorm.Length -ge 3) {
+        try {
+            foreach ($pk in @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object { (Get-Norm $_.Name).Contains($nameNorm) -or (Get-Norm ([string]$_.PackageFamilyName)).Contains($nameNorm) } | Select-Object -First 5)) {
+                [void]$appx.Add($pk)
+                $loc = [string]$pk.InstallLocation
+                $man = Join-Path $loc 'AppxManifest.xml'
+                try {
+                    [xml]$mx = [System.IO.File]::ReadAllText($man)
+                    foreach ($a in @($mx.Package.Applications.Application)) { if ($a -and [string]$a.Executable) { [void]$exeNames.Add((Split-Path -Leaf ([string]$a.Executable))) } }
+                }
+                catch { }
+                [void]$apps.Add(@{ Name = [string]$pk.Name; Version = [string]$pk.Version; Publisher = [string]$pk.Publisher; Location = $loc; Date = ''; Icon = ''; Uninstall = ''; Key = [string]$pk.PackageFullName; Scope = 'pakiet MSIX'; KeyPath = [string]$pk.PackageFullName; Kind = 'appx'; Status = [string]$pk.Status })
+                if ($loc) { [void]$folders.Add($loc) }
+            }
+        }
+        catch { }
+    }
+    $publishers = New-Object System.Collections.ArrayList
+    foreach ($a in @($apps | Select-Object -First 8)) {
+        & $addKeyword $a.Name
+        if ($a.Publisher -and $a.Kind -eq 'reg') {
+            $pt = (($a.Publisher -split '[\s,\.]+') | Where-Object { $_.Length -ge 4 } | Select-Object -First 1)
+            if ($pt) { $pn = Get-Norm $pt; if ($generic -notcontains $pn -and -not $publishers.Contains($pn)) { [void]$publishers.Add($pn) } }
+        }
+        if ($a.Location -and $a.Kind -eq 'reg') { & $addFolder $a.Location }
+        if ($a.Icon -and $a.Icon -match '\.exe$') {
+            $leaf = Split-Path -Leaf $a.Icon
+            if ($leaf -notmatch '^(unins|uninst|setup|install)') { [void]$exeNames.Add($leaf); & $addFolder (Split-Path -Parent $a.Icon) }
+        }
+        $un = & $exeFromCommand $a.Uninstall
+        if ($un -and $un -notmatch 'msiexec' -and (Test-Path -LiteralPath $un)) { & $addFolder (Split-Path -Parent $un) }
+    }
+    # App Paths: rejestracja programu w systemie (Uruchom, Start) - ścieżka pliku .exe
+    foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths') {
+        foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+            $leaf = $k.PSChildName
+            $target = & $exeFromCommand ([string](Get-DoRegValue $k ''))
+            $hit = $exeNames.Contains($leaf) -or ($nameNorm.Length -ge 3 -and (Get-Norm ([System.IO.Path]::GetFileNameWithoutExtension($leaf))).Contains($nameNorm))
+            if (-not $hit -and $target) { foreach ($f in $folders) { if ($target.StartsWith($f + '\', [StringComparison]::OrdinalIgnoreCase)) { $hit = $true; break } } }
+            if (-not $hit) { continue }
+            [void]$exeNames.Add($leaf)
+            if ($target) { & $addFolder (Split-Path -Parent $target) }
+        }
+    }
+    $inFolders = {
+        param([string]$Path)
+        if (-not $Path) { return $false }
+        foreach ($f in $folders) { if ($Path.StartsWith($f + '\', [StringComparison]::OrdinalIgnoreCase) -or $Path -ieq $f) { return $true } }
+        return $false
+    }
+    $matchName = {
+        # Nazwa (folderu, źródła zdarzeń, procesu) pasuje do aplikacji: zawiera słowo z nazwy albo jest jego częścią
+        param([string]$Text)
+        $n = Get-Norm $Text
+        if (-not $n) { return $false }
+        foreach ($k in $keywords) { if ($n.Contains($k) -or ($n.Length -ge 4 -and $k.Contains($n) -and $generic -notcontains $n -and $publishers -notcontains $n)) { return $true } }
+        return $false
+    }
+    # Procesy: po pliku .exe, folderze instalacji albo nazwie
+    $procRows = @()
+    try { $procRows = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) } catch { }
+    $running = New-Object System.Collections.ArrayList
+    foreach ($pr in $procRows) {
+        $exePath = [string]$pr.ExecutablePath
+        $hit = $exeNames.Contains([string]$pr.Name) -or (& $inFolders $exePath) -or (& $matchName ([System.IO.Path]::GetFileNameWithoutExtension([string]$pr.Name)))
+        if (-not $hit) { continue }
+        [void]$running.Add($pr)
+        [void]$exeNames.Add([string]$pr.Name)
+        if ($exePath -and -not $folders.Count) { & $addFolder (Split-Path -Parent $exePath) }
+    }
+    # Pliki .exe w folderach instalacji (największe pierwsze - zwykle program główny); pomocnicze o ogólnych nazwach
+    # (update.exe, launcher.exe…) dałyby fałszywe trafienia w zdarzeniach innych programów
+    $exeFiles = New-Object System.Collections.ArrayList
+    foreach ($f in $folders) {
+        if (-not (Test-Path -LiteralPath $f -PathType Container)) { continue }
+        foreach ($x in @(Get-ChildItem -LiteralPath $f -Filter '*.exe' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '^(unins|uninst)' -and $_.BaseName -notmatch $genericExe } | Sort-Object Length -Descending | Select-Object -First 8)) {
+            [void]$exeFiles.Add($x)
+            [void]$exeNames.Add($x.Name)
+        }
+    }
+    foreach ($x in @($exeNames)) { & $addKeyword ([System.IO.Path]::GetFileNameWithoutExtension($x)) }
+
+    # --- 2. Zebrane fakty (do wniosków) i inwentarz: wpis instalacji, pliki programu, procesy, usługi, zadania
+    $facts = @{ Crashes = New-Object System.Collections.ArrayList; Hangs = New-Object System.Collections.ArrayList; DotNet = New-Object System.Collections.ArrayList
+        MissingDll = New-Object System.Collections.ArrayList; SxS = New-Object System.Collections.ArrayList; Blocks = New-Object System.Collections.ArrayList
+        Services = New-Object System.Collections.ArrayList; Tasks = New-Object System.Collections.ArrayList; Changes = New-Object System.Collections.ArrayList
+        Registry = New-Object System.Collections.ArrayList; LogErrors = New-Object System.Collections.ArrayList; Disk = New-Object System.Collections.ArrayList
+        Shutdowns = New-Object System.Collections.ArrayList; MissingFolders = New-Object System.Collections.ArrayList; BadSignature = New-Object System.Collections.ArrayList
+        Wer = New-Object System.Collections.ArrayList; Deps = New-Object System.Collections.ArrayList; Runtime = New-Object System.Collections.ArrayList
+        Bitness = New-Object System.Collections.ArrayList; Motw = New-Object System.Collections.ArrayList; Endpoints = New-Object System.Collections.ArrayList
+        Patterns = New-Object System.Collections.ArrayList; Configs = New-Object System.Collections.ArrayList; Memory = New-Object System.Collections.ArrayList
+        Proc = New-Object System.Collections.ArrayList; Appx = New-Object System.Collections.ArrayList; Codes = New-Object System.Collections.ArrayList; AppEvents = 0
+    }
+    foreach ($a in $apps) {
+        $date = ''
+        if ($a.Date -match '^(\d{4})(\d{2})(\d{2})$') { $date = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3] }
+        $desc = (@($(if ($a.Version) { "wersja $($a.Version)" }), $(if ($a.Publisher -and $a.Kind -eq 'reg') { "wydawca $($a.Publisher)" }), $(if ($date) { "zainstalowano $date" }), $a.Scope, $(if ($a.Kind -eq 'appx') { 'stan pakietu: ' + $a.Status })) | Where-Object { $_ }) -join ', '
+        $loc = if ($a.Location) { $a.Location } elseif ($folders.Count) { [string]$folders[0] } else { '' }
+        $tone = ''
+        if ($a.Kind -eq 'reg' -and $a.Location -and -not (Test-Path -LiteralPath ([Environment]::ExpandEnvironmentVariables($a.Location.Trim('"'))))) { $tone = 'crit'; [void]$facts.MissingFolders.Add($a.Location) }
+        if ($a.Kind -eq 'appx' -and $a.Status -and $a.Status -ne 'Ok') { $tone = 'crit'; [void]$facts.Appx.Add(@{ Name = $a.Name; Status = $a.Status }) }
+        Out-Row 'Aplikacja' $a.Name $desc ('Folder instalacji: {0}; klucz: {1}; odinstalowanie: {2}' -f $(if ($a.Location) { $a.Location } else { '(nie podany)' }), $a.KeyPath, $(if ($a.Uninstall) { $a.Uninstall } else { '—' })) $null $tone $loc '' $(if ($a.Kind -eq 'appx') { 'appx' } else { 'app' })
+    }
+    if ($apps.Count -gt 8) { Out-Row 'Aplikacja' ('… i {0} więcej pasujących programów' -f ($apps.Count - 8)) 'Zawęź nazwę, aby analiza dotyczyła jednego programu.' '' $null 'warn' }
+
+    # Nagłówek PE: architektura, czy program .NET, importowane biblioteki DLL (bez uruchamiania pliku)
+    $readPe = {
+        param([string]$Path)
+        $r = @{ Machine = ''; Managed = $false; Imports = @(); Error = '' }
+        try {
+            $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+            try {
+                $br = New-Object System.IO.BinaryReader($fs)
+                if ($fs.Length -lt 512 -or $br.ReadUInt16() -ne 0x5A4D) { $r.Error = 'nie jest plikiem programu (PE)'; return $r }
+                $fs.Position = 0x3C
+                $pe = $br.ReadInt32()
+                if ($pe -le 0 -or $pe -gt $fs.Length - 256) { $r.Error = 'uszkodzony nagłówek'; return $r }
+                $fs.Position = $pe
+                if ($br.ReadUInt32() -ne 0x4550) { $r.Error = 'brak nagłówka PE'; return $r }
+                $machine = $br.ReadUInt16(); $nsec = $br.ReadUInt16()
+                $fs.Position = $fs.Position + 12
+                $optSize = $br.ReadUInt16()
+                $fs.Position = $fs.Position + 2
+                $opt = $fs.Position
+                $magic = $br.ReadUInt16()
+                $r.Machine = switch ($machine) { 0x14c { 'x86' } 0x8664 { 'x64' } 0xAA64 { 'ARM64' } default { '0x{0:X}' -f $machine } }
+                $dd = if ($magic -eq 0x20b) { $opt + 112 } else { $opt + 96 }
+                $fs.Position = $dd + 8; $impRva = $br.ReadUInt32()
+                $fs.Position = $dd + 14 * 8; $clrRva = $br.ReadUInt32()
+                $r.Managed = ($clrRva -ne 0)
+                $fs.Position = $opt + $optSize
+                $secs = @(for ($i = 0; $i -lt [Math]::Min(96, $nsec); $i++) { $fs.Position = $fs.Position + 8; $vs = $br.ReadUInt32(); $va = $br.ReadUInt32(); $rs = $br.ReadUInt32(); $rp = $br.ReadUInt32(); $fs.Position = $fs.Position + 16; @{ VA = [int64]$va; Size = [int64][Math]::Max($vs, $rs); Raw = [int64]$rp } })
+                $toOff = { param([int64]$Rva) foreach ($s in $secs) { if ($Rva -ge $s.VA -and $Rva -lt $s.VA + $s.Size) { return ($Rva - $s.VA + $s.Raw) } }; return [int64]-1 }
+                $names = New-Object System.Collections.ArrayList
+                $off = & $toOff $impRva
+                if ($impRva -and $off -ge 0) {
+                    for ($i = 0; $i -lt 512; $i++) {
+                        $fs.Position = $off + $i * 20 + 12
+                        $nameRva = $br.ReadUInt32()
+                        if (-not $nameRva) { break }
+                        $no = & $toOff $nameRva
+                        if ($no -lt 0 -or $no -ge $fs.Length) { break }
+                        $fs.Position = $no
+                        $sb = New-Object System.Text.StringBuilder
+                        for ($j = 0; $j -lt 260; $j++) { $c = $br.ReadByte(); if ($c -eq 0) { break }; [void]$sb.Append([char]$c) }
+                        [void]$names.Add($sb.ToString())
+                    }
+                }
+                $r.Imports = @($names)
+            }
+            finally { $fs.Dispose() }
+        }
+        catch { $r.Error = $_.Exception.Message }
+        return $r
+    }
+    # Pliki programu: wersja, podpis cyfrowy, oznaczenie «pobrany z internetu», architektura i zależności
+    $peInfo = @{}
+    foreach ($x in @($exeFiles | Select-Object -First 4)) {
+        $vi = $x.VersionInfo
+        $pe = & $readPe $x.FullName
+        $peInfo[$x.FullName] = $pe
+        $sigText = ''; $tone = ''
+        try {
+            $sig = Get-AuthenticodeSignature -LiteralPath $x.FullName -ErrorAction Stop
+            switch ([string]$sig.Status) {
+                'Valid' { $sigText = 'podpis cyfrowy prawidłowy: ' + (([string]$sig.SignerCertificate.Subject -split ',')[0] -replace '^CN=', '') }
+                'NotSigned' { $sigText = 'bez podpisu cyfrowego' }
+                'HashMismatch' { $sigText = 'podpis NIE zgadza się z plikiem – plik zmieniony albo uszkodzony'; $tone = 'crit'; [void]$facts.BadSignature.Add($x.FullName) }
+                default { $sigText = 'podpis: ' + [string]$sig.Status; $tone = 'warn' }
+            }
+        }
+        catch { }
+        $kind = if ($pe.Managed) { 'program .NET' } elseif ($pe.Machine) { 'program natywny' } else { '' }
+        $desc = (@($(if ($vi.FileVersion) { 'wersja pliku ' + ([string]$vi.FileVersion).Trim() }), $(if ($pe.Machine) { '{0} {1}' -f $kind, $pe.Machine }), ('{0:N1} MB' -f ($x.Length / 1MB)), ('zmieniony {0:yyyy-MM-dd HH:mm}' -f $x.LastWriteTime), $sigText) | Where-Object { $_ }) -join ', '
+        Out-Row 'Aplikacja' $x.Name $desc ('{0}; produkt: {1} {2}; firma: {3}' -f $x.FullName, $vi.ProductName, $vi.ProductVersion, $vi.CompanyName) $x.LastWriteTime $tone $x.FullName '' 'exe'
+        if ($x.LastWriteTime -ge $since -and $x.LastWriteTime -le $until) { [void]$facts.Changes.Add(@{ Time = $x.LastWriteTime; Text = ('plik {0} zmieniony (wersja {1})' -f $x.Name, ([string]$vi.FileVersion).Trim()); App = $true }) }
+    }
+    # Zależności: biblioteki z tabeli importu programu i bibliotek w jego folderze - czy system je znajdzie
+    # (folder programu, folder systemowy dla tej architektury, Windows, PATH); zestawy API (api-ms-*) rozwiązuje system
+    $pathDirs = @(([string]$env:Path) -split ';' | Where-Object { $_ } | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_.Trim('"')) } | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -Unique -First 40)
+    $sxsCache = @{}
+    $resolve = {
+        param([string]$Dll, [string]$Dir, [string]$Machine)
+        if ($Dll -match '^(api|ext)-ms-') { return 'system' }
+        $cands = @($Dir, (& $sysDirFor $Machine), $env:SystemRoot) + $pathDirs
+        foreach ($d in $cands) { if ($d -and (Test-Path -LiteralPath (Join-Path $d $Dll) -PathType Leaf)) { return (Join-Path $d $Dll) } }
+        # Visual C++ 2005/2008 z WinSxS (manifest)
+        if ($Dll -match '^(msvc[pr]|mfc|atl)(80|90)') {
+            $key = $Matches[2]
+            if (-not $sxsCache.ContainsKey($key)) { $sxsCache[$key] = @(Get-ChildItem -LiteralPath (Join-Path $env:SystemRoot 'WinSxS') -Directory -Filter "*microsoft.vc$key.*" -ErrorAction SilentlyContinue).Count -gt 0 }
+            if ($sxsCache[$key]) { return 'WinSxS' }
+        }
+        return ''
+    }
+    $vcPackage = {
+        param([string]$Dll)
+        $l = $Dll.ToLowerInvariant()
+        if ($l -match '^(vcruntime140|msvcp140|mfc140|vcomp140|concrt140|vccorlib140)') { return 'Microsoft Visual C++ 2015-2022 Redistributable' }
+        if ($l -match '^(msvc[pr]|mfc|vcomp)120') { return 'Microsoft Visual C++ 2013 Redistributable' }
+        if ($l -match '^(msvc[pr]|mfc|vcomp)110') { return 'Microsoft Visual C++ 2012 Redistributable' }
+        if ($l -match '^(msvc[pr]|mfc|vcomp)100') { return 'Microsoft Visual C++ 2010 Redistributable' }
+        if ($l -match '^(msvc[pr]|mfc|atl)90') { return 'Microsoft Visual C++ 2008 Redistributable' }
+        if ($l -match '^(msvc[pr]|mfc|atl)80') { return 'Microsoft Visual C++ 2005 Redistributable' }
+        if ($l -match '^(d3dx9_|d3dx10|d3dx11|xinput1_[123]|x3daudio|xaudio2_[0-7]|d3dcompiler_4[0-3])') { return 'DirectX End-User Runtime (czerwiec 2010)' }
+        if ($l -eq 'ucrtbase.dll') { return 'Universal C Runtime (aktualizacja KB2999226)' }
+        return ''
+    }
+    $checked = 0
+    foreach ($f in $folders) {
+        if (-not (Test-Path -LiteralPath $f -PathType Container)) { continue }
+        $bins = @(@(Get-ChildItem -LiteralPath $f -Filter '*.exe' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '^(unins|uninst)' } | Select-Object -First 10) + @(Get-ChildItem -LiteralPath $f -Filter '*.dll' -File -ErrorAction SilentlyContinue | Select-Object -First 80))
+        $machines = @{}
+        foreach ($b in $bins) {
+            if (++$checked -gt 120 -or [datetime]::UtcNow -gt $deadline) { break }
+            $pe = if ($peInfo.ContainsKey($b.FullName)) { $peInfo[$b.FullName] } else { & $readPe $b.FullName }
+            $peInfo[$b.FullName] = $pe
+            if ($pe.Machine) { $machines[$b.Name.ToLowerInvariant()] = $pe.Machine }
+        }
+        foreach ($b in $bins) {
+            $pe = $peInfo[$b.FullName]
+            if (-not $pe -or -not $pe.Machine -or $pe.Managed) { continue }
+            foreach ($dll in $pe.Imports) {
+                $local = $machines[$dll.ToLowerInvariant()]
+                if ($local -and $local -ne $pe.Machine -and $pe.Machine -in 'x86', 'x64') { [void]$facts.Bitness.Add(@{ Dll = $dll; DllMachine = $local; By = $b.Name; ByMachine = $pe.Machine; Path = (Join-Path $f $dll) }); continue }
+                if ($local) { continue }
+                if (& $resolve $dll $f $pe.Machine) { continue }
+                [void]$facts.Deps.Add(@{ Dll = $dll; By = $b.Name; Machine = $pe.Machine; Package = (& $vcPackage $dll); Path = $b.FullName })
+            }
+        }
+    }
+    foreach ($g in @($facts.Deps | Group-Object { $_.Dll.ToLowerInvariant() })) {
+        $d0 = $g.Group[0]
+        $by = (@($g.Group | ForEach-Object { $_.By } | Select-Object -Unique -First 6)) -join ', '
+        Out-Row 'Zależność' ('Brak biblioteki: {0}' -f $d0.Dll) ('potrzebna dla: {0} ({1}){2}' -f $by, $d0.Machine, $(if ($d0.Package) { '; dostarcza ją: ' + $d0.Package + ' ' + $d0.Machine } else { '' })) ('Szukano w folderze programu, {0}, {1} i folderach ze zmiennej PATH.' -f (& $sysDirFor $d0.Machine), $env:SystemRoot) $null 'crit' $d0.Path '' 'dep'
+    }
+    foreach ($bm in @($facts.Bitness | Select-Object -First 10)) {
+        Out-Row 'Zależność' ('Niezgodna architektura: {0}' -f $bm.Dll) ('{0} ({1}) wczytuje bibliotekę {2} w wersji {3} – program nie uruchomi się (błąd 0xc000007b)' -f $bm.By, $bm.ByMachine, $bm.Dll, $bm.DllMachine) $bm.Path $null 'crit' $bm.Path '' 'bitness'
+    }
+    # Środowisko .NET: Framework z pliku .config (supportedRuntime), .NET 5+ z runtimeconfig.json (platforma i wersja)
+    $netRelease = [int](Get-DoRegValue 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' 'Release')
+    $netText = ''
+    foreach ($nv in @(@(533320, '4.8.1'), @(528040, '4.8'), @(461808, '4.7.2'), @(461308, '4.7.1'), @(460798, '4.7'), @(394802, '4.6.2'), @(394254, '4.6.1'), @(393295, '4.6'), @(379893, '4.5.2'), @(378389, '4.5'))) { if ($netRelease -ge $nv[0]) { $netText = $nv[1]; break } }
+    $toVer = { param([string]$v) [version](((@(([string]$v).Split('.') | Where-Object { $_ -match '^\d+$' }) + @('0', '0', '0', '0'))[0..3]) -join '.') }
+    $net35 = [string](Get-DoRegValue 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v3.5' 'Install') -eq '1'
+    $netCore = @{}
+    foreach ($exe in @($exeFiles | Select-Object -First 4)) {
+        $pe = $peInfo[$exe.FullName]
+        $cfg = $exe.FullName + '.config'
+        $rc = Join-Path $exe.DirectoryName ($exe.BaseName + '.runtimeconfig.json')
+        if (Test-Path -LiteralPath $rc) {
+            try {
+                $j = ConvertFrom-Json ([System.IO.File]::ReadAllText($rc))
+                $ro = $j.runtimeOptions
+                $fws = @()
+                if ($ro.PSObject.Properties['framework'] -and $ro.framework) { $fws += $ro.framework }
+                if ($ro.PSObject.Properties['frameworks'] -and $ro.frameworks) { $fws += @($ro.frameworks) }
+                $arch = if ($pe -and $pe.Machine -eq 'x86') { 'x86' } else { 'x64' }
+                $roots = @($(if ($arch -eq 'x86' -and $is64) { Join-Path ${env:ProgramFiles(x86)} 'dotnet' } else { Join-Path $env:ProgramFiles 'dotnet' }))
+                foreach ($fw in $fws) {
+                    $fwName = [string]$fw.name; $fwVer = [string]$fw.version
+                    if (-not $fwName -or $fwVer -notmatch '^(\d+)\.(\d+)') { continue }
+                    $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+                    $have = @(foreach ($rt in $roots) { Get-ChildItem -LiteralPath (Join-Path $rt "shared\$fwName") -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } })
+                    $ok = @($have | Where-Object { $_ -match '^(\d+)\.(\d+)' -and [int]$Matches[1] -eq $major -and [int]$Matches[2] -ge $minor })
+                    $text = '{0} {1} ({2})' -f $fwName, $fwVer, $arch
+                    if ($ok.Count) { Out-Row 'Zależność' ('Środowisko .NET: {0}' -f $fwName) ('wymagane {0}; zainstalowane: {1}' -f $text, ($ok -join ', ')) $rc $null '' $rc '' 'runtime' }
+                    else {
+                        [void]$facts.Runtime.Add(@{ Text = $text; Have = ($have -join ', '); Path = $rc })
+                        Out-Row 'Zależność' ('Brak środowiska .NET: {0} {1}' -f $fwName, $fwVer) ('program {0} wymaga {1}; zainstalowane wersje tej platformy: {2}' -f $exe.Name, $text, $(if ($have.Count) { $have -join ', ' } else { 'brak' })) $rc $null 'crit' $rc '' 'runtime'
+                    }
+                }
+            }
+            catch { }
+        }
+        elseif ($pe -and $pe.Managed) {
+            $need = ''
+            if (Test-Path -LiteralPath $cfg) {
+                try {
+                    [xml]$cx = [System.IO.File]::ReadAllText($cfg)
+                    $sr = @($cx.SelectNodes('//startup/supportedRuntime'))
+                    $skus = @($sr | ForEach-Object { [string]$_.sku } | Where-Object { $_ })
+                    $vers = @($sr | ForEach-Object { [string]$_.version })
+                    if ($skus.Count -and $skus[0] -match 'Version=v(\d+\.\d+(\.\d+)?)') { $need = $Matches[1] }
+                    elseif ($vers.Count -and ($vers -notcontains 'v4.0') -and ($vers -contains 'v2.0.50727')) { $need = '3.5' }
+                }
+                catch { [void]$facts.Configs.Add(@{ Path = $cfg; Time = (Get-Item -LiteralPath $cfg).LastWriteTime; Broken = ('plik konfiguracyjny programu jest uszkodzony (niepoprawny XML): ' + $_.Exception.Message) }) }
+            }
+            $okNet = $true
+            if ($need -eq '3.5') { $okNet = $net35 }
+            elseif ($need) { $okNet = ($netText -and (& $toVer $netText) -ge (& $toVer $need)) }
+            $text = if ($need) { ".NET Framework $need" } else { '.NET Framework (wersja nie podana)' }
+            if ($okNet) { Out-Row 'Zależność' ('Środowisko: {0}' -f $text) ('{0} – program .NET; zainstalowane .NET Framework {1}{2}' -f $exe.Name, $(if ($netText) { $netText } else { 'brak 4.x' }), $(if ($net35) { ' i 3.5' } else { '' })) $cfg $null '' $cfg '' 'runtime' }
+            else {
+                [void]$facts.Runtime.Add(@{ Text = $text; Have = $netText; Path = $cfg })
+                Out-Row 'Zależność' ('Brak środowiska: {0}' -f $text) ('program {0} wymaga {1}; zainstalowane: .NET Framework {2}{3}' -f $exe.Name, $text, $(if ($netText) { $netText } else { 'brak 4.x' }), $(if ($net35) { ' i 3.5' } else { ', bez 3.5' })) $cfg $null 'crit' $cfg '' 'runtime'
+            }
+        }
+    }
+    # Pliki programu z oznaczeniem «pobrany z internetu» (Zone.Identifier): .NET i zasady mogą ich nie wczytać
+    $motwChecked = 0
+    foreach ($f in $folders) {
+        if (-not (Test-Path -LiteralPath $f -PathType Container)) { continue }
+        foreach ($b in @(Get-ChildItem -LiteralPath $f -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.exe', '.dll', '.config', '.ps1', '.vbs', '.js' } | Select-Object -First 300)) {
+            if (++$motwChecked -gt 400) { break }
+            try {
+                $zs = Get-Item -LiteralPath $b.FullName -Stream 'Zone.Identifier' -ErrorAction Stop
+                if ($zs) { $zt = ''; try { $zt = [string](Get-Content -LiteralPath $b.FullName -Stream 'Zone.Identifier' -ErrorAction Stop | Where-Object { $_ -match 'ZoneId' } | Select-Object -First 1) } catch { }; if ($zt -notmatch 'ZoneId=[0-2]\b') { [void]$facts.Motw.Add($b.FullName) } }
+            }
+            catch { }
+        }
+    }
+    if ($facts.Motw.Count) { Out-Row 'Zależność' ('Pliki zablokowane: {0}' -f $facts.Motw.Count) 'pliki programu oznaczone jako pobrane z internetu (Mark of the Web)' ((@($facts.Motw | Select-Object -First 20)) -join "`n") $null 'warn' ([string]$facts.Motw[0]) '' 'motw' }
+    # Procesy: czas działania, pamięć, uchwyty (wyciek), limit pamięci programu 32-bitowego
+    foreach ($pr in @($running | Select-Object -First 30)) {
+        $owner = ''
+        try { $o = Invoke-CimMethod -InputObject $pr -MethodName GetOwner -ErrorAction Stop; if ($o.User) { $owner = $(if ($o.Domain) { "$($o.Domain)\$($o.User)" } else { [string]$o.User }) } } catch { }
+        $started = $null
+        try { $started = [datetime]$pr.CreationDate } catch { }
+        $handles = 0; $privMb = 0
+        try { $handles = [int]$pr.HandleCount } catch { }
+        try { $privMb = [double]$pr.PageFileUsage / 1KB } catch { }
+        $tone = ''; $note = ''
+        $pe = if ([string]$pr.ExecutablePath -and $peInfo.ContainsKey([string]$pr.ExecutablePath)) { $peInfo[[string]$pr.ExecutablePath] } elseif ([string]$pr.ExecutablePath) { & $readPe ([string]$pr.ExecutablePath) } else { $null }
+        if ($handles -gt 10000) { $tone = 'warn'; $note = '; dużo uchwytów – możliwy wyciek'; [void]$facts.Proc.Add(@{ Text = ('proces {0} (PID {1}) ma {2} uchwytów – możliwy wyciek zasobów; objawy: spowolnienie, błędy po dłuższej pracy' -f $pr.Name, $pr.ProcessId, $handles); Score = 45 }) }
+        if ($pe -and $pe.Machine -eq 'x86' -and $privMb -gt 1500) { $tone = 'crit'; $note += '; blisko limitu pamięci programu 32-bitowego'; [void]$facts.Proc.Add(@{ Text = ('proces {0} (32-bitowy) używa {1:N0} MB pamięci prywatnej – blisko limitu 2–4 GB dla programu 32-bitowego (awarie z braku pamięci)' -f $pr.Name, $privMb); Score = 70 }) }
+        $desc = (@($(if ($started) { 'działa od {0:yyyy-MM-dd HH:mm}' -f $started }), ('pamięć {0:N0} MB' -f ([double]$pr.WorkingSetSize / 1MB)), $(if ($handles) { "uchwyty $handles" }), ('PID {0}' -f $pr.ProcessId)) | Where-Object { $_ }) -join ', '
+        Out-Row 'Proces' ([string]$pr.Name) ($desc + $note) (Get-Short ([string]$pr.CommandLine) 2000) $started $tone ([string]$pr.ExecutablePath) $owner 'proc'
+    }
+    $serviceNames = New-Object System.Collections.ArrayList
+    try {
+        foreach ($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)) {
+            $bin = & $exeFromCommand ([string]$s.PathName)
+            $hit = (& $inFolders $bin) -or ($bin -and $exeNames.Contains((Split-Path -Leaf $bin))) -or (& $matchName ([string]$s.Name)) -or (& $matchName ([string]$s.DisplayName))
+            if (-not $hit) { continue }
+            [void]$serviceNames.Add([string]$s.DisplayName); [void]$serviceNames.Add([string]$s.Name)
+            $tone = ''
+            if ([string]$s.StartMode -eq 'Auto' -and [string]$s.State -ne 'Running') { $tone = 'warn'; [void]$facts.Services.Add(@{ Text = ('usługa {0} ma start automatyczny, ale nie działa (stan: {1})' -f $s.DisplayName, $s.State); Score = 55 }) }
+            Out-Row 'Usługa' ('{0} ({1})' -f $s.DisplayName, $s.Name) ('stan: {0}, uruchamianie: {1}, konto: {2}' -f $s.State, $s.StartMode, $s.StartName) ([string]$s.PathName) $null $tone $bin '' 'svc'
+        }
+    }
+    catch { }
+    try {
+        $taskRows = 0
+        foreach ($t in @(Get-ScheduledTask -ErrorAction Stop)) {
+            $acts = @($t.Actions | Where-Object { $_.PSObject.Properties['Execute'] -and $_.Execute })
+            $hit = (& $matchName ([string]$t.TaskName))
+            foreach ($ac in $acts) { $ex = [Environment]::ExpandEnvironmentVariables(([string]$ac.Execute).Trim('"')); if ((& $inFolders $ex) -or $exeNames.Contains((Split-Path -Leaf $ex))) { $hit = $true } }
+            if (-not $hit) { continue }
+            $info = $null
+            try { $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop } catch { }
+            $res = if ($info) { [int64]$info.LastTaskResult } else { $null }
+            if ($null -ne $res -and $res -lt 0) { $res += 4294967296 }
+            $tone = ''
+            # 0 - OK, 267008/267009/267011/267014 - gotowe, działa, nie uruchamiane, zatrzymane
+            if ($null -ne $res -and $res -notin 0, 267008, 267009, 267011, 267014) {
+                $tone = 'warn'
+                $ct = Get-CodeText ('0x{0:X8}' -f $res)
+                [void]$facts.Tasks.Add(@{ Text = ('zadanie {0}{1}: ostatni wynik 0x{2:X}{3}' -f $t.TaskPath, $t.TaskName, $res, $(if ($ct) { " – $ct" } else { '' })); Score = 30 })
+            }
+            $desc = (@(('stan: {0}' -f $t.State), $(if ($info -and $info.LastRunTime -and $info.LastRunTime.Year -gt 2000) { 'ostatnio {0:yyyy-MM-dd HH:mm}, wynik 0x{1:X}' -f $info.LastRunTime, $res })) | Where-Object { $_ }) -join ', '
+            Out-Row 'Zadanie' ([string]$t.TaskPath + [string]$t.TaskName) $desc ((@($acts | ForEach-Object { ('{0} {1}' -f $_.Execute, $_.Arguments).Trim() })) -join ' ; ') $(if ($info) { $info.LastRunTime } else { $null }) $tone '' ([string]$t.Principal.UserId) 'task'
+            if (++$taskRows -ge 25) { break }
+        }
+    }
+    catch { }
+
+    # --- 3. Zdarzenia z dzienników w oknie czasu
+    $exceptionText = @{
+        '0xc0000005' = 'naruszenie dostępu do pamięci (błąd w programie albo w załadowanej bibliotece, uszkodzone dane)'
+        '0xc0000409' = 'przepełnienie bufora albo natychmiastowe zatrzymanie przez program (często błąd biblioteki C++ albo wtyczki)'
+        '0xc0000374' = 'uszkodzenie sterty pamięci'
+        '0xe0434352' = 'nieobsłużony wyjątek .NET – przyczyna w zdarzeniu .NET Runtime'
+        '0xe06d7363' = 'nieobsłużony wyjątek C++'
+        '0xc0000135' = 'brak wymaganej biblioteki DLL'
+        '0xc0000142' = 'biblioteka DLL nie uruchomiła się (często brak zasobów pulpitu albo zamykanie systemu)'
+        '0xc000007b' = 'niezgodna architektura biblioteki (32/64-bit) albo uszkodzony plik'
+        '0xc00000fd' = 'przepełnienie stosu (np. nieskończona rekurencja)'
+        '0x80000003' = 'punkt przerwania – program sam się zatrzymał (asercja)'
+        '0xc0000006' = 'błąd odczytu strony – plik programu na dysku lub udziale stał się niedostępny'
+        '0xc0000094' = 'dzielenie przez zero'
+        '0xc000001d' = 'niedozwolona instrukcja procesora'
+        '0xc0000417' = 'nieprawidłowy parametr funkcji biblioteki C'
+        '0x40000015' = 'błąd krytyczny programu (abort)'
+        '0xc0000602' = 'natychmiastowe zatrzymanie (fail fast)'
+        '0xc06d007e' = 'nie znaleziono biblioteki DLL (ładowanie opóźnione)'
+        '0xc06d007f' = 'nie znaleziono funkcji w bibliotece DLL – niezgodna wersja biblioteki'
+        '0xc0000017' = 'brak pamięci'
+    }
+    $systemModules = @('ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'ucrtbase.dll', 'msvcrt.dll', 'user32.dll', 'combase.dll', 'ole32.dll', 'rpcrt4.dll', 'win32u.dll', 'gdi32full.dll', 'gdiplus.dll', 'shell32.dll', 'windows.storage.dll', 'comctl32.dll', 'oleaut32.dll', 'sechost.dll', 'msvcp_win.dll')
+    $classifyModule = {
+        param([string]$Module, [string]$ModulePath, [string]$Code)
+        $lm = ([string]$Module).ToLowerInvariant()
+        if ($lm -in 'clr.dll', 'coreclr.dll', 'clrjit.dll', 'mscorwks.dll' -or $lm -like 'mscorlib*' -or $lm -like 'system.*.ni.dll' -or $Code -eq '0xe0434352') { return @('dotnet', 'środowisko .NET (przyczyna w zdarzeniu .NET Runtime)') }
+        if ($lm -match '^(msvcp|vcruntime|msvcr|mfc)\d') { return @('vc', 'biblioteka Visual C++') }
+        if (($ModulePath -and (& $inFolders $ModulePath)) -or $exeNames.Contains($Module)) { return @('app', 'moduł aplikacji') }
+        if ($lm -eq 'unknown' -or $lm -eq 'nieznany') { return @('unknown', 'moduł nieznany (kod poza bibliotekami – uszkodzona pamięć albo kod generowany w locie)') }
+        if ($systemModules -contains $lm -or ($ModulePath -and $ModulePath.StartsWith([string]$env:SystemRoot, [StringComparison]::OrdinalIgnoreCase))) { return @('system', 'moduł systemu Windows (błąd zwykle w programie albo dodatku, który go wywołał)') }
+        if ($ModulePath) { return @('external', ('moduł zewnętrzny: {0}' -f $ModulePath)) }
+        return @('external', 'moduł zewnętrzny (wtyczka, dodatek, oprogramowanie zabezpieczające albo sterownik)')
+    }
+    $normCode = { param([string]$c) $c = ([string]$c).Trim().ToLowerInvariant() -replace '^0x', ''; if ($c -match '^[0-9a-f]{1,8}$') { '0x' + $c.PadLeft(8, '0') } else { [string]$c } }
+    $fileTime = { param([string]$h) try { $v = [Convert]::ToInt64((([string]$h).Trim() -replace '^0x', ''), 16); if ($v -gt 0) { [datetime]::FromFileTime($v) } else { $null } } catch { $null } }
+    $getEvents = {
+        param([hashtable]$Filter, [int]$Max = 500)
+        try { @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $Max -ErrorAction Stop) } catch { @() }
+    }
+    $propText = { param($e) (@($e.Properties | ForEach-Object { [string]$_.Value }) -join ' | ') }
+    $msgOf = { param($e) $t = ''; try { $t = [string]$e.Message } catch { }; if (-not $t) { $t = & $propText $e }; $t }
+    $hitText = {
+        # Tekst (treść zdarzenia) dotyczy aplikacji: nazwa pliku .exe albo folder instalacji
+        param([string]$Text)
+        if (-not $Text) { return $false }
+        foreach ($x in $exeNames) { if ($Text.IndexOf($x, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
+        foreach ($f in $folders) { if ($Text.IndexOf($f, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
+        return $false
+    }
+    $flt = { param([string]$Log, $Ids, $Levels) $h = @{ LogName = $Log; StartTime = $since; EndTime = $until }; if ($Ids) { $h.Id = $Ids }; if ($Levels) { $h.Level = $Levels }; $h }
+    $handled = @{}
+    # Awarie (Application Error 1000) z czasem działania procesu (start czy w trakcie pracy) i zawieszenia (Application Hang 1002)
+    foreach ($e in (& $getEvents (& $flt 'Application' @(1000, 1002)) 1000)) {
+        $pv = @($e.Properties | ForEach-Object { [string]$_.Value })
+        $app = if ($pv.Count) { $pv[0] } else { '' }
+        if ($e.Id -eq 1000 -and $e.ProviderName -eq 'Application Error') {
+            $appPath = if ($pv.Count -gt 10) { $pv[10] } else { '' }
+            if (-not ($exeNames.Contains($app) -or (& $inFolders $appPath) -or (& $matchName ([System.IO.Path]::GetFileNameWithoutExtension($app))))) { continue }
+            $module = if ($pv.Count -gt 3) { $pv[3] } else { '' }
+            $modPath = if ($pv.Count -gt 11) { $pv[11] } else { '' }
+            $code = & $normCode $(if ($pv.Count -gt 6) { $pv[6] } else { '' })
+            $class = & $classifyModule $module $modPath $code
+            $started = if ($pv.Count -gt 9) { & $fileTime $pv[9] } else { $null }
+            $life = if ($started -and $started -le $e.TimeCreated) { ($e.TimeCreated - $started).TotalSeconds } else { -1 }
+            $meaning = $exceptionText[$code]
+            [void]$facts.Crashes.Add(@{ Time = $e.TimeCreated; App = $app; Version = $(if ($pv.Count -gt 1) { $pv[1] } else { '' }); Module = $module; ModulePath = $modPath; Code = $code; Class = $class[0]; ClassText = $class[1]; Life = $life })
+            $lifeText = if ($life -ge 0) { if ($life -lt 60) { '; po {0:N0} s od uruchomienia' -f $life } elseif ($life -lt 7200) { '; po {0:N0} min pracy' -f ($life / 60) } else { '; po {0:N1} godz. pracy' -f ($life / 3600) } } else { '' }
+            Out-Row 'Awaria' ('Awaria: {0} {1}' -f $app, $(if ($pv.Count -gt 1) { $pv[1] } else { '' })).Trim() ('moduł {0} {1} – {2}; wyjątek {3}{4}{5}' -f $module, $(if ($pv.Count -gt 4) { $pv[4] } else { '' }), $class[1], $code, $(if ($meaning) { ": $meaning" } else { '' }), $lifeText) (& $msgOf $e) $e.TimeCreated 'crit' $appPath '' 'crash'
+            $handled[$e.RecordId] = $true
+        }
+        elseif ($e.Id -eq 1002 -and $e.ProviderName -eq 'Application Hang') {
+            $appPath = if ($pv.Count -gt 5) { $pv[5] } else { '' }
+            if (-not ($exeNames.Contains($app) -or (& $inFolders $appPath) -or (& $matchName ([System.IO.Path]::GetFileNameWithoutExtension($app))))) { continue }
+            [void]$facts.Hangs.Add(@{ Time = $e.TimeCreated; App = $app })
+            Out-Row 'Awaria' ('Zawieszenie: {0} {1}' -f $app, $(if ($pv.Count -gt 1) { $pv[1] } else { '' })).Trim() 'Program przestał odpowiadać i został zamknięty (Application Hang)' (& $msgOf $e) $e.TimeCreated 'warn' $appPath '' 'hang'
+        }
+    }
+    # .NET Runtime 1026 (nieobsłużony wyjątek, z kodem HRESULT), SideBySide (brak środowiska / manifest)
+    foreach ($e in (& $getEvents (& $flt 'Application' @(1026)) 300)) {
+        $t = & $propText $e
+        if (-not (& $hitText $t)) { continue }
+        $type = ''
+        if ($t -match 'Exception Info:\s*([\w\.`]+)') { $type = $Matches[1] } elseif ($t -match '((?:System|Microsoft)\.[\w\.]+Exception)') { $type = $Matches[1] }
+        $codes = @(Get-Codes $t)
+        foreach ($c in $codes) { [void]$facts.Codes.Add($c) }
+        [void]$facts.DotNet.Add(@{ Time = $e.TimeCreated; Type = $type; Text = (Get-Short $t 400) })
+        Out-Row 'Awaria' ('Wyjątek .NET: {0}' -f $(if ($type) { $type } else { 'nieobsłużony' })) ((Get-Short $t 280) + $(if ($codes.Count) { ' [' + ($codes -join '; ') + ']' } else { '' })) $t $e.TimeCreated 'crit' '' '' 'dotnet'
+    }
+    foreach ($e in (& $getEvents @{ LogName = 'Application'; ProviderName = 'SideBySide'; Level = 1, 2; StartTime = $since; EndTime = $until } 200)) {
+        $t = & $msgOf $e
+        if (-not (& $hitText $t)) { continue }
+        [void]$facts.SxS.Add(@{ Time = $e.TimeCreated; Text = (Get-Short $t 300) })
+        Out-Row 'Zdarzenie' 'SideBySide: błąd konfiguracji programu' (Get-Short $t 280) $t $e.TimeCreated 'crit' '' '' 'sxs'
+    }
+    # Okno błędu systemu (Application Popup 26): m.in. brak biblioteki DLL przy starcie programu
+    foreach ($e in (& $getEvents @{ LogName = 'System'; ProviderName = 'Application Popup'; StartTime = $since; EndTime = $until } 300)) {
+        $t = & $msgOf $e
+        if (-not (& $hitText $t)) { continue }
+        $dll = ''
+        if ($t -match '([\w\.\-]+\.dll)') { $dll = $Matches[1]; [void]$facts.MissingDll.Add(@{ Time = $e.TimeCreated; Dll = $dll; Text = (Get-Short $t 300) }) }
+        Out-Row 'Zdarzenie' ('Okno błędu: {0}' -f $(if ($dll) { "brak lub błąd biblioteki $dll" } else { 'komunikat systemu' })) (Get-Short $t 280) $t $e.TimeCreated 'crit' '' '' 'popup'
+    }
+    # Usługi aplikacji w dzienniku Menedżera sterowania usługami
+    if ($serviceNames.Count) {
+        $scmText = @{ 7000 = 'usługa nie uruchomiła się'; 7009 = 'przekroczony czas uruchamiania usługi'; 7011 = 'usługa nie odpowiedziała w czasie'; 7022 = 'usługa zawiesiła się przy starcie'; 7023 = 'usługa zakończyła się błędem'; 7024 = 'usługa zakończyła się błędem własnym'; 7031 = 'usługa nieoczekiwanie zakończyła działanie (z akcją odzyskiwania)'; 7034 = 'usługa nieoczekiwanie zakończyła działanie' }
+        foreach ($e in (& $getEvents @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = @($scmText.Keys | ForEach-Object { [int]$_ }); StartTime = $since; EndTime = $until } 500)) {
+            $svc = if (@($e.Properties).Count) { [string]$e.Properties[0].Value } else { '' }
+            if ($serviceNames -notcontains $svc) { continue }
+            $bad = $e.Id -in 7031, 7034, 7023, 7024, 7000
+            [void]$facts.Services.Add(@{ Text = ('{0}: {1} ({2:yyyy-MM-dd HH:mm})' -f $svc, $scmText[[int]$e.Id], $e.TimeCreated); Score = $(if ($bad) { 65 } else { 45 }); Time = $e.TimeCreated })
+            Out-Row 'Zdarzenie' ('Usługa {0}' -f $svc) $scmText[[int]$e.Id] (& $msgOf $e) $e.TimeCreated $(if ($bad) { 'crit' } else { 'warn' }) '' '' 'scm'
+        }
+    }
+    # Brak pamięci wirtualnej (Resource-Exhaustion-Detector 2004): w treści procesy, które zużywały najwięcej
+    foreach ($e in (& $getEvents @{ LogName = 'System'; Id = 2004; StartTime = $since; EndTime = $until } 50)) {
+        if ($e.ProviderName -notlike '*Resource-Exhaustion-Detector*') { continue }
+        $t = & $msgOf $e
+        [void]$facts.Memory.Add(@{ Time = $e.TimeCreated; Text = (Get-Short $t 300); App = (& $hitText $t) })
+        Out-Row 'Zdarzenie' 'Brak pamięci wirtualnej' (Get-Short $t 280) $t $e.TimeCreated 'crit' '' '' 'memory'
+    }
+    # Blokady: Microsoft Defender (wykrycia, ASR, kontrolowany dostęp do folderów), AppLocker, Code Integrity (WDAC)
+    $blockSources = @(
+        @{ Log = 'Microsoft-Windows-Windows Defender/Operational'; Ids = @(1116, 1117, 1118, 1119, 1121, 1122, 1123, 1124); Name = 'Microsoft Defender' }
+        @{ Log = 'Microsoft-Windows-AppLocker/EXE and DLL'; Ids = @(8003, 8004); Name = 'AppLocker' }
+        @{ Log = 'Microsoft-Windows-AppLocker/MSI and Script'; Ids = @(8006, 8007); Name = 'AppLocker' }
+        @{ Log = 'Microsoft-Windows-CodeIntegrity/Operational'; Ids = @(3033, 3076, 3077); Name = 'Code Integrity (WDAC)' }
+    )
+    $blockText = @{ 1116 = 'wykrył zagrożenie'; 1117 = 'usunął lub poddał kwarantannie zagrożenie'; 1118 = 'nie usunął zagrożenia'; 1119 = 'błąd przy usuwaniu zagrożenia'; 1121 = 'reguła ASR zablokowała działanie'; 1122 = 'reguła ASR (tryb inspekcji) zablokowałaby działanie'; 1123 = 'kontrolowany dostęp do folderów zablokował zapis'; 1124 = 'kontrolowany dostęp do folderów (inspekcja) zablokowałby zapis'; 8003 = 'zablokowałby uruchomienie (tryb inspekcji)'; 8004 = 'zablokował uruchomienie'; 8006 = 'zablokowałby skrypt lub instalator (inspekcja)'; 8007 = 'zablokował skrypt lub instalator'; 3033 = 'odrzucił bibliotekę – nie spełnia wymagań podpisu'; 3076 = 'zablokowałby plik (tryb inspekcji)'; 3077 = 'zablokował plik' }
+    foreach ($b in $blockSources) {
+        foreach ($e in (& $getEvents (& $flt $b.Log $b.Ids) 500)) {
+            $t = & $propText $e
+            if (-not (& $hitText $t)) { continue }
+            $audit = $e.Id -in 1122, 1124, 8003, 8006, 3076
+            $what = '{0} {1}' -f $b.Name, $blockText[[int]$e.Id]
+            if (-not $audit) { [void]$facts.Blocks.Add(@{ Time = $e.TimeCreated; Text = $what; Id = [int]$e.Id }) }
+            Out-Row 'Zdarzenie' $what (Get-Short (& $msgOf $e) 280) (& $msgOf $e) $e.TimeCreated $(if ($audit) { 'warn' } else { 'crit' }) '' '' 'block'
+        }
+    }
+    # Instalacja pakietu MSIX (AppXDeployment): błędy wdrażania i rejestracji pakietu aplikacji
+    if ($appx.Count) {
+        foreach ($e in (& $getEvents (& $flt 'Microsoft-Windows-AppXDeploymentServer/Operational' $null @(1, 2)) 300)) {
+            $t = & $propText $e
+            $hit = $false
+            foreach ($pk in $appx) { if ($t.IndexOf([string]$pk.Name, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $hit = $true } }
+            if (-not $hit) { continue }
+            $codes = @(Get-Codes $t)
+            [void]$facts.Appx.Add(@{ Name = 'wdrażanie pakietu'; Status = (Get-Short $t 200); Time = $e.TimeCreated })
+            Out-Row 'Zdarzenie' ('Wdrażanie pakietu MSIX ({0})' -f $e.Id) ((Get-Short (& $msgOf $e) 260) + $(if ($codes.Count) { ' [' + ($codes -join '; ') + ']' } else { '' })) (& $msgOf $e) $e.TimeCreated 'crit' '' '' 'appxdeploy'
+        }
+    }
+    # Pozostałe błędy i ostrzeżenia w dzienniku Aplikacja ze źródeł aplikacji albo z jej plikami w treści
+    $known = @('Application Error', 'Application Hang', '.NET Runtime', 'SideBySide', 'MsiInstaller', 'Windows Error Reporting')
+    $added = 0
+    foreach ($e in (& $getEvents (& $flt 'Application' $null @(1, 2, 3)) 3000)) {
+        if ($known -contains $e.ProviderName -or $handled.ContainsKey($e.RecordId)) { continue }
+        if (-not ((& $matchName ([string]$e.ProviderName)) -or ($serviceNames -contains [string]$e.ProviderName) -or (& $hitText (& $propText $e)))) { continue }
+        $t = & $msgOf $e
+        foreach ($c in @(Get-Codes $t)) { [void]$facts.Codes.Add($c) }
+        $facts.AppEvents++
+        Out-Row 'Zdarzenie' ('{0} ({1})' -f $e.ProviderName, $e.Id) (Get-Short $t 280) $t $e.TimeCreated $(if ($e.Level -le 2) { 'crit' } else { 'warn' }) '' '' 'appevent'
+        if (++$added -ge 150) { break }
+    }
+    # Własne dzienniki aplikacji (np. «Nazwa programu» w Dziennikach aplikacji i usług)
+    try {
+        foreach ($lg in @(Get-WinEvent -ListLog * -ErrorAction SilentlyContinue | Where-Object { $_.RecordCount -gt 0 -and $_.LogName -notlike 'Microsoft-Windows-*' -and $_.LogName -notin 'Application', 'System', 'Security', 'Setup', 'ForwardedEvents' -and (& $matchName ([string]$_.LogName)) } | Select-Object -First 5)) {
+            foreach ($e in (& $getEvents (& $flt $lg.LogName $null @(1, 2, 3)) 200)) {
+                $t = & $msgOf $e
+                $facts.AppEvents++
+                Out-Row 'Zdarzenie' ('{0}: {1} ({2})' -f $lg.LogName, $e.ProviderName, $e.Id) (Get-Short $t 280) $t $e.TimeCreated $(if ($e.Level -le 2) { 'crit' } else { 'warn' }) '' '' 'appevent'
+            }
+        }
+    }
+    catch { }
+    # Instalator Windows: instalacje, aktualizacje i usunięcia w oknie (tej aplikacji i innych programów)
+    $msiText = @{ 1033 = 'zainstalowano'; 1034 = 'odinstalowano'; 1035 = 'zmieniono konfigurację (naprawa / zmiana)'; 1036 = 'zaktualizowano'; 1037 = 'usunięto aktualizację'; 11708 = 'instalacja nie powiodła się'; 11725 = 'odinstalowanie nie powiodło się' }
+    $others = 0
+    foreach ($e in (& $getEvents @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = @($msiText.Keys | ForEach-Object { [int]$_ }); StartTime = $since.AddDays(-7); EndTime = $until } 400)) {
+        $pv = @($e.Properties | ForEach-Object { [string]$_.Value })
+        $prod = if ($pv.Count) { $pv[0] -replace '^Product:\s*', '' -replace '\s*--.*$', '' } else { '' }
+        $ver = if ($e.Id -in 1033, 1034, 1035, 1036 -and $pv.Count -gt 1) { $pv[1] } else { '' }
+        $status = if ($e.Id -in 1033, 1034, 1035, 1036 -and $pv.Count -gt 3) { $pv[3] } else { '' }
+        $isApp = (& $matchName $prod) -or @($apps | Where-Object { $_.Name -ieq $prod }).Count -gt 0
+        if (-not $isApp -and ++$others -gt 25) { continue }
+        $failed = $e.Id -in 11708, 11725 -or ($status -and $status -ne '0')
+        # Środowiska wykonawcze (Visual C++, .NET) - ich usunięcie albo zmiana często psuje programy
+        $isRuntime = $prod -match '(?i)visual c\+\+|\.net|directx|runtime'
+        $text = '{0} {1}{2}{3}' -f $msiText[[int]$e.Id], $prod, $(if ($ver) { " $ver" } else { '' }), $(if ($status -and $status -ne '0') { " (kod $status)" } else { '' })
+        [void]$facts.Changes.Add(@{ Time = $e.TimeCreated; Text = $text; App = $isApp; Failed = $failed; Runtime = $isRuntime; Removed = ($e.Id -in 1034, 1037) })
+        if ($e.TimeCreated -lt $since) { continue }
+        Out-Row 'System' $(if ($isApp) { 'Instalator Windows – ta aplikacja' } else { 'Instalator Windows – inny program' }) $text (& $msgOf $e) $e.TimeCreated $(if ($failed) { 'warn' } elseif ($isApp) { 'info' } else { '' }) '' '' 'msi'
+    }
+    # Aktualizacje Windows i nieoczekiwane wyłączenia
+    foreach ($e in (& $getEvents @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = @(19, 20); StartTime = $since.AddDays(-7); EndTime = $until } 80)) {
+        $title = if (@($e.Properties).Count) { [string]$e.Properties[0].Value } else { '' }
+        $text = '{0}: {1}' -f $(if ($e.Id -eq 19) { 'zainstalowano aktualizację' } else { 'aktualizacja nie zainstalowała się' }), $title
+        [void]$facts.Changes.Add(@{ Time = $e.TimeCreated; Text = $text; App = $false; Update = $true; Failed = ($e.Id -eq 20) })
+        if ($e.TimeCreated -lt $since) { continue }
+        Out-Row 'System' 'Windows Update' $text (& $msgOf $e) $e.TimeCreated $(if ($e.Id -eq 20) { 'warn' } else { '' }) '' '' 'wu'
+    }
+    foreach ($e in (& $getEvents @{ LogName = 'System'; Id = @(41, 6008); StartTime = $since; EndTime = $until } 30)) {
+        if (-not ($e.ProviderName -like '*Kernel-Power' -or $e.ProviderName -eq 'EventLog')) { continue }
+        [void]$facts.Shutdowns.Add($e.TimeCreated)
+        Out-Row 'System' 'Nieoczekiwane wyłączenie' 'Komputer wyłączył się albo uruchomił ponownie bez zamknięcia systemu (zanik zasilania, zawieszenie, twardy reset)' (& $msgOf $e) $e.TimeCreated 'warn' '' '' 'shutdown'
+    }
+
+    # --- 4. Raporty błędów Windows (WER) i zrzuty pamięci
+    $profiles = @(Get-DoProfiles -UserFilter ([string]$P.UserFilter))
+    $werRoots = New-Object System.Collections.ArrayList
+    foreach ($w in 'ReportArchive', 'ReportQueue') { [void]$werRoots.Add(@((Join-Path $env:ProgramData "Microsoft\Windows\WER\$w"), '')) }
+    foreach ($pf in $profiles) { foreach ($w in 'ReportArchive', 'ReportQueue') { [void]$werRoots.Add(@((Join-Path $pf.Path "AppData\Local\Microsoft\Windows\WER\$w"), $pf.User)) } }
+    foreach ($wr in $werRoots) {
+        foreach ($d in @(Get-ChildItem -LiteralPath $wr[0] -Directory -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since -and $_.LastWriteTime -le $until.AddHours(1) } | Sort-Object LastWriteTime -Descending | Select-Object -First 300)) {
+            $file = Join-Path $d.FullName 'Report.wer'
+            if (-not (Test-Path -LiteralPath $file)) { continue }
+            $kv = @{}
+            try { foreach ($line in [System.IO.File]::ReadAllLines($file)) { $i = $line.IndexOf('='); if ($i -gt 0) { $kv[$line.Substring(0, $i)] = $line.Substring($i + 1) } } } catch { continue }
+            $sig = @{}
+            foreach ($key in @($kv.Keys)) { if ($key -match '^Sig\[(\d+)\]\.Name$') { $sig[[string]$kv[$key]] = [string]$kv["Sig[$($Matches[1])].Value"] } }
+            $appName = @($sig['Application Name'], $sig['Nazwa aplikacji'], $kv['AppName'], $kv['OriginalFilename']) | Where-Object { $_ } | Select-Object -First 1
+            $appPath = [string]$kv['AppPath']
+            if (-not ($exeNames.Contains([string]$appName) -or (& $inFolders $appPath) -or (& $matchName ([System.IO.Path]::GetFileNameWithoutExtension([string]$appName))))) { continue }
+            $time = $d.LastWriteTime
+            $ft = [int64]0
+            if ([int64]::TryParse([string]$kv['EventTime'], [ref]$ft) -and $ft -gt 0) { try { $time = [datetime]::FromFileTimeUtc($ft).ToLocalTime() } catch { } }
+            $module = @($sig['Fault Module Name'], $sig['Nazwa modułu powodującego błąd']) | Where-Object { $_ } | Select-Object -First 1
+            $code = & $normCode (@($sig['Exception Code'], $sig['Kod wyjątku']) | Where-Object { $_ } | Select-Object -First 1)
+            $dumps = @(Get-ChildItem -LiteralPath $d.FullName -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.dmp', '.mdmp', '.hdmp' })
+            $type = [string]$kv['EventType']
+            [void]$facts.Wer.Add(@{ Time = $time; User = $wr[1]; Module = $module; Code = $code; Type = $type })
+            $desc = (@($(if ($kv['FriendlyEventName']) { [string]$kv['FriendlyEventName'] }), $(if ($module) { "moduł $module" }), $(if ($code -match '^0x') { "wyjątek $code" + $(if ($exceptionText[$code]) { ': ' + $exceptionText[$code] } else { '' }) }), $(if ($dumps.Count) { 'zrzut pamięci: {0} ({1:N0} MB)' -f $dumps[0].Name, ($dumps[0].Length / 1MB) })) | Where-Object { $_ }) -join '; '
+            Out-Row 'Awaria' ('Raport WER {0}: {1}' -f $type, $appName) $desc ((@($kv.Keys | Where-Object { $_ -match '^(EventType|AppPath|Sig\[\d+\]\.(Name|Value)|FriendlyEventName|ConsentKey|ReportStatus)$' } | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $kv[$_] })) -join "`n") $time $(if ($type -match 'hang') { 'warn' } else { 'crit' }) $d.FullName $wr[1] 'wer'
+        }
+    }
+    foreach ($pf in $profiles) {
+        foreach ($dmp in @(Get-ChildItem -LiteralPath (Join-Path $pf.Path 'AppData\Local\CrashDumps') -Filter '*.dmp' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since })) {
+            $exe = ($dmp.Name -split '\.\d+\.dmp$')[0]
+            if (-not $exeNames.Contains($exe)) { continue }
+            Out-Row 'Awaria' ('Zrzut pamięci: {0}' -f $dmp.Name) ('{0:N0} MB – przyda się producentowi do analizy awarii' -f ($dmp.Length / 1MB)) $dmp.FullName $dmp.LastWriteTime 'info' $dmp.FullName $pf.User 'dump'
+        }
+    }
+
+    # --- 5. Pliki logów: foldery instalacji, ProgramData, AppData użytkowników (Local, Roaming, LocalLow), Temp
+    $searchRoots = New-Object System.Collections.ArrayList
+    foreach ($f in $folders) { if (Test-Path -LiteralPath $f -PathType Container) { [void]$searchRoots.Add(@{ Path = $f; User = ''; Depth = 4; Install = $true }) } }
+    $findDirs = {
+        # Foldery aplikacji w katalogu bazowym: nazwa pasuje do aplikacji, a w folderach wydawcy albo ogólnych - ich podfoldery
+        param([string]$Base, [string]$User)
+        foreach ($d in @(Get-ChildItem -LiteralPath $Base -Directory -Force -ErrorAction SilentlyContinue | Where-Object { -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) })) {
+            $n = Get-Norm $d.Name
+            $isPub = $publishers -contains $n
+            if (-not $isPub -and (& $matchName $d.Name)) { [void]$searchRoots.Add(@{ Path = $d.FullName; User = $User; Depth = 4; Install = $false }); continue }
+            if ($isPub -or $generic -contains $n) {
+                foreach ($c in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Force -ErrorAction SilentlyContinue | Where-Object { -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) })) {
+                    if ($isPub -or (& $matchName $c.Name)) { [void]$searchRoots.Add(@{ Path = $c.FullName; User = $User; Depth = 3; Install = $false }) }
+                }
+            }
+        }
+    }
+    & $findDirs $env:ProgramData ''
+    foreach ($pf in $profiles) { foreach ($sub in 'AppData\Local', 'AppData\Roaming', 'AppData\LocalLow') { $b = Join-Path $pf.Path $sub; if (Test-Path -LiteralPath $b) { & $findDirs $b $pf.User } } }
+    $logExt = @('.log', '.trc', '.trace', '.err', '.etl', '.evtx')
+    $textExt = @('.txt', '.xml', '.json', '.csv', '.out')
+    $cfgExt = @('.config', '.ini', '.json', '.xml', '.cfg', '.conf', '.properties', '.yaml', '.yml', '.settings', '.udl', '.env')
+    $logDirRx = '\\(log|logs|logfiles|logging|trace|traces|diagnostics|diag|crash|crashes|crashreports|error|errors)(\\|$)'
+    $files = New-Object System.Collections.ArrayList
+    $cfgFiles = New-Object System.Collections.ArrayList
+    $seen = @{}
+    $truncated = $false
+    foreach ($sr in $searchRoots) {
+        $stack = New-Object System.Collections.Stack
+        $stack.Push(@($sr.Path, 0))
+        $scanned = 0
+        while ($stack.Count) {
+            if ([datetime]::UtcNow -gt $deadline) { $truncated = $true; break }
+            $cur = $stack.Pop()
+            $items = @()
+            try { $items = @(Get-ChildItem -LiteralPath $cur[0] -Force -ErrorAction Stop) } catch { continue }
+            $inLogDir = $cur[0] -match $logDirRx
+            foreach ($it in $items) {
+                if ($it.PSIsContainer) {
+                    if (-not ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and $cur[1] -lt $sr.Depth) { $stack.Push(@($it.FullName, ($cur[1] + 1))) }
+                    continue
+                }
+                if (++$scanned -gt 5000) { $truncated = $true; break }
+                $ln = $it.Name.ToLowerInvariant()
+                $ext = $it.Extension.ToLowerInvariant()
+                if ($seen.ContainsKey($it.FullName.ToLowerInvariant())) { continue }
+                $isLog = ($logExt -contains $ext) -or ($ln -match '\.log\.(\d+|old|bak|\d{4}-?\d{2}-?\d{2}.*)$') -or ($textExt -contains $ext -and ($inLogDir -or $ln -match 'log|trace|debug|error|crash'))
+                if ($isLog) { $seen[$it.FullName.ToLowerInvariant()] = $true; [void]$files.Add(@{ File = $it; User = $sr.User }); continue }
+                # Pliki ustawień (do 2 poziomów w głąb, do 1 MB): zmiany, poprawność, serwery
+                if ($cfgExt -contains $ext -and $cur[1] -le 2 -and $it.Length -le 1MB -and $cfgFiles.Count -lt 80 -and $ln -notmatch '(\.deps\.json|appxmanifest\.xml|\.manifest|^license|^eula|^third.?party|\.resources\.)' ) { $seen[$it.FullName.ToLowerInvariant()] = $true; [void]$cfgFiles.Add(@{ File = $it; User = $sr.User }) }
+            }
+        }
+    }
+    # Temp: logi instalatorów i programów z nazwą aplikacji w nazwie pliku
+    $temps = New-Object System.Collections.ArrayList
+    [void]$temps.Add(@((Join-Path $env:SystemRoot 'Temp'), ''))
+    foreach ($pf in $profiles) { [void]$temps.Add(@((Join-Path $pf.Path 'AppData\Local\Temp'), $pf.User)) }
+    foreach ($tp in $temps) {
+        foreach ($it in @(Get-ChildItem -LiteralPath $tp[0] -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.log', '.txt' -and (& $matchName $_.BaseName) } | Select-Object -First 30)) {
+            if ($seen.ContainsKey($it.FullName.ToLowerInvariant())) { continue }
+            $seen[$it.FullName.ToLowerInvariant()] = $true
+            [void]$files.Add(@{ File = $it; User = $tp[1] })
+        }
+    }
+    # Czas wpisu z początku wiersza (RRRR-MM-DD gg:mm, DD.MM.RRRR gg:mm, MM/DD/RRRR wg ustawień regionalnych) i wzorzec
+    # komunikatu bez dat, liczb, identyfikatorów i adresów - te same błędy z różnymi parametrami dają jeden wzorzec
+    $mdy = ([string][System.Globalization.CultureInfo]::CurrentCulture.DateTimeFormat.ShortDatePattern) -match '^M'
+    function Get-LineTime([string]$Line) {
+        $head = if ($Line.Length -gt 64) { $Line.Substring(0, 64) } else { $Line }
+        if ($head -match '(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})[ T_](\d{1,2}):(\d{2})(?::(\d{2}))?') {
+            try { return [datetime]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4], [int]$Matches[5], $(if ($Matches[6]) { [int]$Matches[6] } else { 0 })) } catch { return $null }
+        }
+        if ($head -match '(\d{1,2})([./-])(\d{1,2})\2(\d{4})[ T,]+(\d{1,2}):(\d{2})(?::(\d{2}))?') {
+            $a = [int]$Matches[1]; $b = [int]$Matches[3]
+            $day, $mon = if ($Matches[2] -eq '/' -and ($mdy -or $b -gt 12) -and $a -le 12) { $b, $a } else { $a, $b }
+            try { return [datetime]::new([int]$Matches[4], $mon, $day, [int]$Matches[5], [int]$Matches[6], $(if ($Matches[7]) { [int]$Matches[7] } else { 0 })) } catch { return $null }
+        }
+        return $null
+    }
+    function Get-Pattern([string]$Text) {
+        $t = $Text -replace '^\W*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}[ T_]\d{1,2}:\d{2}(:\d{2})?([\.,]\d+)?(Z|[+-]\d{2}:?\d{2})?\W*', ''
+        $t = $t -replace '^\W*\d{1,2}[./-]\d{1,2}[./-]\d{4}[ T,]+\d{1,2}:\d{2}(:\d{2})?([\.,]\d+)?\W*', ''
+        $t = $t -replace '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<guid>'
+        $t = $t -replace '\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b', '<ip>'
+        $t = $t -replace '\d{1,2}:\d{2}(:\d{2})?([\.,]\d+)?', ' '
+        $t = $t -replace '(?i)\b0x[0-9a-f]+\b', '<hex>'
+        $t = $t -replace '\d+', '#'
+        $t = ($t -replace '\s+', ' ').Trim()
+        if ($t.Length -gt 160) { $t = $t.Substring(0, 160) }
+        return $t
+    }
+    $readTail = {
+        # Końcówka pliku (do 512 KB) bez blokowania pliku aplikacji; UTF-16 rozpoznawane po zerach co drugi bajt
+        param([string]$Path)
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite, Delete')
+        try {
+            $len = [int][Math]::Min([int64]524288, $fs.Length)
+            [void]$fs.Seek(-$len, 'End')
+            $buf = New-Object 'byte[]' $len
+            $read = $fs.Read($buf, 0, $len)
+            $whole = ($len -ge $fs.Length)
+        }
+        finally { $fs.Dispose() }
+        $odd = 0; $even = 0; $probe = [Math]::Min($read, 4000)
+        for ($i = 0; $i -lt $probe; $i++) { if ($buf[$i] -eq 0) { if ($i % 2) { $odd++ } else { $even++ } } }
+        $text = if ($odd -gt $probe / 4) { [System.Text.Encoding]::Unicode.GetString($buf, 0, $read) }
+        elseif ($even -gt $probe / 4) { [System.Text.Encoding]::Unicode.GetString($buf, 1, $read - 1) }
+        else { (New-Object System.Text.UTF8Encoding($false)).GetString($buf, 0, $read) }
+        $lines = @($text -split "\r?\n")
+        if (-not $whole -and $lines.Count -gt 1) { $lines = @($lines | Select-Object -Skip 1) }
+        return , $lines
+    }
+    $sorted = @($files | Sort-Object { $_.File.LastWriteTime } -Descending)
+    $recent = @($sorted | Where-Object { $_.File.LastWriteTime -ge $since -and $_.File.LastWriteTime -le $until.AddHours(1) })
+    $older = @($sorted | Where-Object { $_.File.LastWriteTime -lt $since } | Select-Object -First 40)
+    $errRx = '(?i)\b(error|err|exception|fatal|critical|crit|failed|failure|unhandled|błąd|bład|błędu|wyjątek|krytyczny|niepowodzenie)\b'
+    $warnRx = '(?i)\b(warn|warning|wrn|ostrzeżenie)\b'
+    $zeroRx = '(?i)\b(0|no|zero|bez)\s+(errors?|błędów|exceptions?|failures?)\b|\b(errors?|failures?)\s*[:=]\s*0\b'
+    $scannedFiles = 0
+    foreach ($entry in @($recent | Select-Object -First 150) + $older) {
+        $fi = $entry.File
+        $isRecent = $fi.LastWriteTime -ge $since
+        $desc = '{0:N1} MB, zmieniony {1:yyyy-MM-dd HH:mm}{2}' -f ($fi.Length / 1MB), $fi.LastWriteTime, $(if ($isRecent) { ' – w oknie czasu' } else { '' })
+        $detail = $fi.FullName
+        $tone = ''
+        if ($P.ScanLogs -and $isRecent -and $fi.Length -gt 0 -and $fi.Extension -notin '.etl', '.evtx' -and $scannedFiles -lt 15 -and [datetime]::UtcNow -lt $deadline.AddSeconds(30)) {
+            $scannedFiles++
+            try {
+                $lines = & $readTail $fi.FullName
+                $pats = @{}
+                $errCount = 0; $warnCount = 0; $lastTime = $null; $earliest = $null; $lastErr = ''
+                foreach ($line in $lines) {
+                    $lt = Get-LineTime $line
+                    if ($lt) { $lastTime = $lt; if (-not $earliest) { $earliest = $lt } }
+                    if ($line -match $errRx -and $line -notmatch $zeroRx) {
+                        $errCount++
+                        $lastErr = $line
+                        $pat = Get-Pattern $line
+                        if (-not $pats.ContainsKey($pat)) { $pats[$pat] = @{ Pattern = $pat; Count = 0; In = 0; Before = 0; First = $null; Last = $null; Example = (Get-Short $line 300) } }
+                        $ps = $pats[$pat]
+                        $ps.Count++
+                        if ($lastTime -and $lastTime -lt $since) { $ps.Before++ } else { $ps.In++ }
+                        if ($lastTime) { if (-not $ps.First) { $ps.First = $lastTime }; $ps.Last = $lastTime }
+                        $ps.Example = Get-Short $line 300
+                        foreach ($c in @(Get-Codes $line)) { if (-not $facts.Codes.Contains($c)) { [void]$facts.Codes.Add($c) } }
+                    }
+                    elseif ($line -match $warnRx) { $warnCount++ }
+                }
+                # Wzorzec «nowy»: w końcówce są wpisy sprzed okna czasu, a tego błędu wśród nich nie było
+                $coversBefore = ($earliest -and $earliest -lt $since)
+                $top = @($pats.Values | Sort-Object { $_.In } -Descending)
+                $new = @($top | Where-Object { $coversBefore -and $_.Before -eq 0 -and $_.In -gt 0 })
+                foreach ($ps in $top) { [void]$facts.Patterns.Add(@{ File = $fi.FullName; Pattern = $ps.Pattern; In = $ps.In; Before = $ps.Before; First = $ps.First; Last = $ps.Last; Example = $ps.Example; New = ($coversBefore -and $ps.Before -eq 0 -and $ps.In -gt 0); User = $entry.User }) }
+                if ($errCount -or $warnCount) {
+                    $desc += '; w końcówce ({0} wierszy): błędy {1} ({2} rodzajów{3}), ostrzeżenia {4}' -f $lines.Count, $errCount, $pats.Count, $(if ($new.Count) { ", nowe: $($new.Count)" } else { '' }), $warnCount
+                    if ($errCount) {
+                        $tone = 'warn'
+                        $last = Get-Short $lastErr 220
+                        $desc += '; ostatni błąd: «' + $last + '»'
+                        [void]$facts.LogErrors.Add(@{ File = $fi.FullName; Count = $errCount; Last = $last; Time = $fi.LastWriteTime })
+                    }
+                    $detail = $fi.FullName + "`n`nNajczęstsze błędy (w oknie czasu / wcześniej, pierwszy – ostatni):`n" + ((@($top | Select-Object -First 10 | ForEach-Object { '{0,4}× / {1}×  {2}{3}  {4}' -f $_.In, $_.Before, $(if ($_.First) { '{0:MM-dd HH:mm}' -f $_.First } else { '?' }), $(if ($_.Last) { ' – {0:MM-dd HH:mm}' -f $_.Last } else { '' }), $_.Example })) -join "`n")
+                }
+            }
+            catch { $desc += '; nie odczytano: ' + $_.Exception.Message }
+        }
+        Out-Row 'Plik logu' $fi.Name $desc $detail $fi.LastWriteTime $tone $fi.FullName $entry.User 'log'
+    }
+    if ($truncated) { Out-Row 'Plik logu' '(przeszukiwanie niepełne)' ('Przekroczono limit czasu albo liczby plików – przejrzano {0} folderów aplikacji' -f $searchRoots.Count) '' $null 'warn' }
+    if (-not $files.Count) { Out-Row 'Plik logu' '(nie znaleziono plików logów)' ('Przejrzano foldery: {0}' -f $(if ($searchRoots.Count) { (@($searchRoots | ForEach-Object { $_.Path }) | Select-Object -First 6) -join '; ' } else { 'brak folderów pasujących do aplikacji' })) '' $null '' }
+
+    # --- 6. Konfiguracja programu: zmienione i uszkodzone pliki ustawień, serwery z ustawień (nazwa i port - bez haseł)
+    $endpoints = [ordered]@{}
+    $addEp = {
+        param([string]$HostName, [int]$Port, [string]$Src, [string]$Key, [string]$Note = '')
+        $hn = ([string]$HostName).Trim().Trim('"', "'", '[', ']').TrimEnd('.').ToLowerInvariant()
+        if ($hn -in '.', '(local)', '(localdb)', '127.0.0.1', '::1') { $hn = 'localhost' }
+        if ($hn -in 'true', 'false', 'yes', 'no', 'on', 'off', 'none', 'null', 'auto', 'default', 'enabled', 'disabled', 'local', 'any', 'all', 'tak', 'nie') { return }
+        if ($hn -notmatch '^[a-z0-9][a-z0-9\-\.]*$' -or $hn.Length -lt 2 -or $hn -match '^\d+$' -or $hn -match '(^|\.)(w3\.org|xmlsoap\.org|openxmlformats\.org|json-schema\.org|purl\.org|tempuri\.org|example\.(com|org|net)|apache\.org|adobe\.com)$' -or $hn -match '^schemas?\.') { return }
+        $k = '{0}:{1}' -f $hn, $Port
+        if ($endpoints.Contains($k) -or $endpoints.Count -ge 20) { return }
+        $endpoints[$k] = @{ Host = $hn; Port = $Port; Source = $Src; Key = $Key; Note = $Note }
+    }
+    foreach ($cf in $cfgFiles) {
+        $fi = $cf.File
+        $text = ''
+        try { $text = [System.IO.File]::ReadAllText($fi.FullName) } catch { continue }
+        $broken = ''
+        if ($fi.Extension -in '.config', '.xml' -and $text.TrimStart().StartsWith('<')) { try { [void]([xml]$text) } catch { $broken = 'niepoprawny XML: ' + (Get-Short $_.Exception.Message 160) } }
+        elseif ($fi.Extension -eq '.json' -and $text.Trim()) { try { [void](ConvertFrom-Json $text) } catch { $broken = 'niepoprawny JSON: ' + (Get-Short $_.Exception.Message 160) } }
+        if ($fi.Length -eq 0 -and $fi.Extension -in '.config', '.xml', '.json') { $broken = 'pusty plik' }
+        if ($broken -or ($fi.LastWriteTime -ge $since.AddDays(-7) -and $fi.LastWriteTime -le $until)) { [void]$facts.Configs.Add(@{ Path = $fi.FullName; Time = $fi.LastWriteTime; Broken = $broken; User = $cf.User }) }
+        if ($broken) { Out-Row 'Aplikacja' $fi.Name ('Plik ustawień uszkodzony – ' + $broken) $fi.FullName $fi.LastWriteTime 'crit' $fi.FullName $cf.User 'config' }
+        elseif ($fi.LastWriteTime -ge $since -and $fi.LastWriteTime -le $until) { Out-Row 'Aplikacja' $fi.Name ('Plik ustawień zmieniony {0:yyyy-MM-dd HH:mm}' -f $fi.LastWriteTime) $fi.FullName $fi.LastWriteTime 'info' $fi.FullName $cf.User 'config' }
+        if (-not $P.Network) { continue }
+        if ($fi.Extension -eq '.json') { $text = $text -replace '\\\\', '\' }
+        $src = $fi.FullName
+        foreach ($mt in [regex]::Matches($text, '(?i)\b(https?|wss?|ftp|net\.tcp)://([a-z0-9][a-z0-9\-\.]*[a-z0-9])(?::(\d{1,5}))?')) {
+            $pre = $text.Substring([Math]::Max(0, $mt.Index - 40), [Math]::Min(40, $mt.Index))
+            if ($pre -match '(?i)xmlns(:\w+)?\s*=\s*["'']?$|schemaLocation|DOCTYPE') { continue }
+            $port = if ($mt.Groups[3].Success) { [int]$mt.Groups[3].Value } else { @{ http = 80; https = 443; ws = 80; wss = 443; ftp = 21; 'net.tcp' = 808 }[$mt.Groups[1].Value.ToLowerInvariant()] }
+            & $addEp $mt.Groups[2].Value $port $src 'adres URL'
+        }
+        foreach ($mt in [regex]::Matches($text, '(?i)(?<![\w\.])(data source|server|host|address|addr|network address)\s*=\s*([^;"''<>\r\n]+)')) {
+            $v = $mt.Groups[2].Value.Trim() -replace '^(?i)(tcp|np|lpc):', ''
+            if ($v -match '^[a-z]:\\|^\||^\\\\|\.(mdb|accdb|sdf|db|sqlite|fdb|gdb)$') { continue }
+            $line = $text.Substring([Math]::Max(0, $mt.Index - 200), [Math]::Min($text.Length - [Math]::Max(0, $mt.Index - 200), 600))
+            $portKey = if ($line -match '(?i)\bport\s*=\s*(\d{2,5})') { [int]$Matches[1] } else { 0 }
+            if ($v -match '^([^\\,:]+)\\([^,;]+)$') { & $addEp $Matches[1] 0 $src $mt.Groups[1].Value ('instancja nazwana {0} – port dynamiczny, sprawdzono nazwę' -f $Matches[2]); continue }
+            if ($v -match '^([^,:\\]+)[,:](\d{2,5})$') { & $addEp $Matches[1] ([int]$Matches[2]) $src $mt.Groups[1].Value; continue }
+            $dflt = if ($portKey) { $portKey } elseif ($line -match '(?i)initial catalog|integrated security|trusted_connection|multipleactiveresultsets|encrypt\s*=') { 1433 } elseif ($line -match '(?i)\bhost\s*=.*\bdatabase\s*=|\bdatabase\s*=.*\bhost\s*=') { 5432 } else { 0 }
+            & $addEp $v $dflt $src $mt.Groups[1].Value
+        }
+        foreach ($mt in [regex]::Matches($text, '(?i)(?<![\w\\])\\\\([a-z0-9][a-z0-9\-\.]*)\\[\w\$\-\. ]+')) { & $addEp $mt.Groups[1].Value 445 $src 'udział sieciowy' }
+        foreach ($mt in [regex]::Matches($text, '(?i)(?<![\w\-\.@/:])([a-z][a-z0-9\-]*(?:\.[a-z0-9\-]+)+|\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})(?![\d\.])')) { & $addEp $mt.Groups[1].Value ([int]$mt.Groups[2].Value) $src 'adres:port' }
+        # Klucz kończy się słowem serwer / host / adres (np. LogServer, DbHost, ServerName) - nie HostingEnvironment
+        $hosts = @([regex]::Matches($text, '(?im)^\s*"?([\w\.\-]*?(?:server|host|serwer|address|endpoint|ip)(?:name|address|addr|ip)?\d*)"?\s*[=:]\s*["'']?([a-z0-9][a-z0-9\-\.]*[a-z0-9])["'']?\s*,?\s*$'))
+        $ports = @([regex]::Matches($text, '(?im)^\s*"?[\w\.\-]*port[\w\.\-]*"?\s*[=:]\s*["'']?(\d{2,5})["'']?\s*,?\s*$'))
+        foreach ($mt in $hosts) { & $addEp $mt.Groups[2].Value $(if ($hosts.Count -eq 1 -and $ports.Count -eq 1) { [int]$ports[0].Groups[1].Value } else { 0 }) $src $mt.Groups[1].Value }
+        foreach ($mt in [regex]::Matches($text, '(?i)\b(server|host|hostname|address|serverName|dataSource)\s*=\s*"([a-z0-9][a-z0-9\-\.]*[a-z0-9])"')) {
+            $pp = if ($text -match '(?i)\bport\s*=\s*"(\d{2,5})"') { [int]$Matches[1] } else { 0 }
+            & $addEp $mt.Groups[2].Value $pp $src $mt.Groups[1].Value
+        }
+    }
+    if ($endpoints.Count) {
+        # Równolegle: najpierw nazwy (DNS, do 3 s łącznie), potem połączenia TCP (do 2,5 s łącznie)
+        $dns = @{}
+        foreach ($ep in $endpoints.Values) { if (-not $dns.ContainsKey($ep.Host)) { $dns[$ep.Host] = $(try { [System.Net.Dns]::BeginGetHostAddresses($ep.Host, $null, $null) } catch { $null }) } }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $addr = @{}; $dnsErr = @{}
+        foreach ($hn in @($dns.Keys)) {
+            $ar = $dns[$hn]
+            if (-not $ar) { $addr[$hn] = @(); $dnsErr[$hn] = 'niepoprawna nazwa'; continue }
+            if ($ar.AsyncWaitHandle.WaitOne([int][Math]::Max(0, 3000 - $sw.ElapsedMilliseconds))) {
+                try { $addr[$hn] = @([System.Net.Dns]::EndGetHostAddresses($ar)) } catch { $addr[$hn] = @(); $dnsErr[$hn] = $(if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }) }
+            }
+            else { $addr[$hn] = $null }
+        }
+        $conns = @{}
+        foreach ($k in @($endpoints.Keys)) {
+            $ep = $endpoints[$k]
+            $al = $addr[$ep.Host]
+            if ($ep.Port -le 0 -or -not $al -or -not @($al).Count) { continue }
+            $ip = @(@($al | Where-Object { $_.AddressFamily -eq 'InterNetwork' }) + @($al))[0]
+            try { $cl = New-Object System.Net.Sockets.TcpClient($ip.AddressFamily); $conns[$k] = @{ Client = $cl; Async = $cl.BeginConnect($ip, $ep.Port, $null, $null); Ip = [string]$ip } } catch { $conns[$k] = @{ Error = $_.Exception.Message; Ip = [string]$ip } }
+        }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        foreach ($k in @($conns.Keys)) {
+            $c = $conns[$k]
+            if (-not $c.Client) { continue }
+            if ($c.Async.AsyncWaitHandle.WaitOne([int][Math]::Max(0, 2500 - $sw.ElapsedMilliseconds))) {
+                try { $c.Client.EndConnect($c.Async); $c.Ok = $true } catch { $c.Error = $(if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }) }
+            }
+            else { $c.Error = 'brak odpowiedzi w 2,5 s (serwer wyłączony, zapora albo zła trasa)' }
+            try { $c.Client.Close() } catch { }
+        }
+        foreach ($k in @($endpoints.Keys)) {
+            $ep = $endpoints[$k]
+            $al = $addr[$ep.Host]
+            $item = if ($ep.Port -gt 0) { '{0}:{1}' -f $ep.Host, $ep.Port } else { $ep.Host }
+            $from = 'z pliku {0} ({1})' -f (Split-Path -Leaf $ep.Source), $ep.Key
+            $ok = $false; $why = ''
+            if ($null -eq $al) { $why = 'nazwa nie rozwiązała się w 3 s (DNS)' }
+            elseif (-not @($al).Count) { $why = 'nazwa nie istnieje w DNS: ' + $dnsErr[$ep.Host] }
+            elseif ($ep.Port -le 0) { $ok = $true; $why = 'nazwa rozwiązuje się: ' + ((@($al | Select-Object -First 3 | ForEach-Object { [string]$_ })) -join ', ') + $(if ($ep.Note) { '; ' + $ep.Note } else { '; port nieznany – sprawdzono tylko nazwę' }) }
+            elseif ($conns[$k] -and $conns[$k].Ok) { $ok = $true; $why = 'odpowiada ({0})' -f $conns[$k].Ip }
+            else { $why = 'port nie odpowiada ({0}): {1}' -f $(if ($conns[$k]) { $conns[$k].Ip } else { '?' }), $(if ($conns[$k]) { $conns[$k].Error } else { 'nie sprawdzono' }) }
+            if (-not $ok) { [void]$facts.Endpoints.Add(@{ Item = $item; Host = $ep.Host; Why = $why; Source = $ep.Source }) }
+            Out-Row 'Połączenie' $item ('{0} – {1}' -f $(if ($ok) { 'OK' } else { 'BRAK' }), $why) $from $null $(if ($ok) { '' } else { 'crit' }) $ep.Source '' 'endpoint'
+        }
+    }
+
+    # --- 7. Rejestr: klucze aplikacji (komputer i użytkownicy), tryb zgodności, Image File Execution Options, zasady
+    $maskRx = '(?i)pass|pwd|secret|token|hasło|haslo|key$|apikey|credential|connectionstring'
+    $regState = @{ Count = 0 }
+    $describeKey = {
+        param([string]$Path, [string]$Label, [string]$User)
+        if ($regState.Count -ge 40) { return }
+        $regState.Count++
+        try { $k = Get-Item -LiteralPath $Path -ErrorAction Stop } catch { return }
+        $vals = @($k.GetValueNames() | Select-Object -First 25 | ForEach-Object {
+                $vn = $_
+                $v = $null
+                try { $v = $k.GetValue($vn) } catch { }
+                $shown = if ($vn -match $maskRx) { '••••' } elseif ($v -is [byte[]]) { '(binarne, {0} B)' -f $v.Length } elseif ($v -is [array]) { Get-Short (($v | ForEach-Object { [string]$_ }) -join '; ') 200 } else { Get-Short ([string]$v) 200 }
+                '{0} = {1}' -f $(if ($vn) { $vn } else { '(domyślna)' }), $shown
+            })
+        $subs = @($k.GetSubKeyNames())
+        Out-Row 'Rejestr' $Label ('wartości: {0}, podklucze: {1}{2}' -f $k.ValueCount, $subs.Count, $(if ($subs.Count) { ' (' + ((@($subs | Select-Object -First 8)) -join ', ') + $(if ($subs.Count -gt 8) { ', …' } else { '' }) + ')' } else { '' })) ($vals -join "`n") $null '' ([string]$k.Name) $User 'reg'
+    }
+    $scanReg = {
+        # Klucze aplikacji: nazwa pasuje do aplikacji albo klucz wydawcy (wtedy także jego podklucze); najwyżej 40 kluczy
+        param([string]$Root, [string]$Label, [string]$User)
+        foreach ($k in @(Get-ChildItem -LiteralPath $Root -ErrorAction SilentlyContinue)) {
+            if ($regState.Count -ge 40) { return }
+            $n = Get-Norm $k.PSChildName
+            $isPub = $publishers -contains $n
+            if (-not $isPub -and (& $matchName $k.PSChildName)) { & $describeKey $k.PSPath ('{0}\{1}' -f $Label, $k.PSChildName) $User; continue }
+            if ($isPub) {
+                & $describeKey $k.PSPath ('{0}\{1}' -f $Label, $k.PSChildName) $User
+                foreach ($c in @(Get-ChildItem -LiteralPath $k.PSPath -ErrorAction SilentlyContinue | Select-Object -First 15)) { & $describeKey $c.PSPath ('{0}\{1}\{2}' -f $Label, $k.PSChildName, $c.PSChildName) $User }
+            }
+        }
+    }
+    & $scanReg 'HKLM:\SOFTWARE' 'HKLM\SOFTWARE' ''
+    & $scanReg 'HKLM:\SOFTWARE\WOW6432Node' 'HKLM\SOFTWARE\WOW6432Node' ''
+    $layerText = { param([string]$v) ((@(($v -replace '^[~\$#]\s*', '') -split '\s+' | Where-Object { $_ } | ForEach-Object { switch ($_) { 'RUNASADMIN' { 'uruchamianie jako administrator' } 'WIN7RTM' { 'zgodność z Windows 7' } 'WIN8RTM' { 'zgodność z Windows 8' } 'VISTARTM' { 'zgodność z Windows Vista' } 'VISTASP2' { 'zgodność z Windows Vista SP2' } 'WINXPSP3' { 'zgodność z Windows XP SP3' } 'HIGHDPIAWARE' { 'skalowanie DPI przez aplikację' } 'DPIUNAWARE' { 'skalowanie DPI przez system' } 'GDIDPISCALING' { 'skalowanie DPI przez system (rozszerzone)' } '640X480' { 'rozdzielczość 640×480' } '256COLOR' { 'tryb 256 kolorów' } 'DISABLEDXMAXIMIZEDWINDOWEDMODE' { 'wyłączone optymalizacje pełnego ekranu' } default { $_ } } })) -join ', ') }
+    $checkCompat = {
+        param([string]$Root, [string]$User)
+        $layers = Join-Path $Root 'Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
+        try { $k = Get-Item -LiteralPath $layers -ErrorAction Stop } catch { return }
+        foreach ($vn in $k.GetValueNames()) {
+            if (-not ((& $inFolders $vn) -or $exeNames.Contains((Split-Path -Leaf $vn)))) { continue }
+            $txt = & $layerText ([string]$k.GetValue($vn))
+            [void]$facts.Registry.Add(@{ Score = 30; Kind = 'compat'; Text = ('tryb zgodności dla {0}: {1}{2}' -f (Split-Path -Leaf $vn), $txt, $(if ($User) { " (użytkownik $User)" } else { ' (wszyscy użytkownicy)' })) })
+            Out-Row 'Rejestr' ('Tryb zgodności: {0}' -f (Split-Path -Leaf $vn)) $txt ('{0}\{1} = {2}' -f $layers, $vn, $k.GetValue($vn)) $null 'warn' $layers $User 'compat'
+        }
+    }
+    & $checkCompat 'HKLM:\SOFTWARE' ''
+    $ifeoSeen = @{}
+    foreach ($exe in @($exeNames)) {
+        foreach ($ifeoRoot in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options') {
+            $kp = Join-Path $ifeoRoot $exe
+            if (-not (Test-Path -LiteralPath $kp)) { continue }
+            $dbg = [string](Get-DoRegValue $kp 'Debugger')
+            $gf = Get-DoRegValue $kp 'GlobalFlag'
+            $vd = [string](Get-DoRegValue $kp 'VerifierDlls')
+            # Klucz bywa wspólny dla widoku 64- i 32-bitowego rejestru - ten sam wpis tylko raz
+            $sig = '{0}|{1}|{2}|{3}' -f $exe, $dbg, $gf, $vd
+            if ($ifeoSeen.ContainsKey($sig)) { continue }
+            $ifeoSeen[$sig] = $true
+            if ($dbg) { [void]$facts.Registry.Add(@{ Score = 90; Kind = 'ifeo'; Text = ('uruchamianie {0} przekierowane do: {1} (Image File Execution Options – Debugger); bez tego wpisu program startuje normalnie' -f $exe, $dbg) }) }
+            if ($gf -or $vd) { [void]$facts.Registry.Add(@{ Score = 45; Kind = 'ifeo'; Text = ('dla {0} włączone flagi diagnostyczne (GlobalFlag / Application Verifier) – spowalniają program i mogą go zatrzymywać' -f $exe) }) }
+            if ($dbg -or $gf -or $vd) { Out-Row 'Rejestr' ('Image File Execution Options: {0}' -f $exe) ((@($(if ($dbg) { "Debugger = $dbg" }), $(if ($gf) { "GlobalFlag = $gf" }), $(if ($vd) { "VerifierDlls = $vd" })) | Where-Object { $_ }) -join '; ') $kp $null $(if ($dbg) { 'crit' } else { 'warn' }) $kp '' 'ifeo' }
+        }
+        $ld = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$exe"
+        if (Test-Path -LiteralPath $ld) { Out-Row 'Rejestr' ('Zrzuty pamięci WER: {0}' -f $exe) ('zrzuty awarii zapisywane do: {0}' -f [Environment]::ExpandEnvironmentVariables([string](Get-DoRegValue $ld 'DumpFolder'))) $ld $null 'info' $ld '' 'localdumps' }
+    }
+    foreach ($pf in $profiles) {
+        try {
+            Use-DoUserHive -Profile $pf -LoadOffline ([bool]$P.Offline) -Action {
+                param($Root, $Source)
+                & $scanReg "$Root\Software" ('HKU\{0}\Software' -f $pf.User) $pf.User
+                & $checkCompat "$Root\Software" $pf.User
+                $dr = "$Root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\DisallowRun"
+                if (Test-Path -LiteralPath $dr) {
+                    $k = Get-Item -LiteralPath $dr
+                    foreach ($vn in $k.GetValueNames()) {
+                        $v = [string]$k.GetValue($vn)
+                        if ($exeNames.Contains($v)) {
+                            [void]$facts.Registry.Add(@{ Score = 90; Kind = 'policy'; Text = ('zasada «Nie uruchamiaj określonych aplikacji» blokuje {0} u użytkownika {1}' -f $v, $pf.User) })
+                            Out-Row 'Rejestr' ('Zasada blokuje: {0}' -f $v) 'Nie uruchamiaj określonych aplikacji systemu Windows (DisallowRun)' "$dr\$vn = $v" $null 'crit' $dr $pf.User 'policy'
+                        }
+                    }
+                }
+            }
+        }
+        catch { Out-Row 'Rejestr' ('Rejestr użytkownika {0}' -f $pf.User) ('nie odczytano: ' + $_.Exception.Message) '' $null 'warn' '' $pf.User }
+    }
+
+    # --- 8. Stan systemu: miejsce na dyskach, pamięć, oczekujący restart; wersja systemu i poprawki (do odcisku)
+    $drives = @(@($folders | Where-Object { $_ -match '^[A-Za-z]:' } | ForEach-Object { ([string]$_).Substring(0, 2).ToUpperInvariant() }) + @(([string]$env:SystemDrive).ToUpperInvariant()) | Where-Object { $_ -match '^[A-Z]:$' } | Select-Object -Unique)
+    try {
+        foreach ($ld in @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | Where-Object { $drives -contains ([string]$_.DeviceID).ToUpperInvariant() })) {
+            if (-not $ld.Size) { continue }
+            $freeGb = [double]$ld.FreeSpace / 1GB
+            $pct = 100.0 * [double]$ld.FreeSpace / [double]$ld.Size
+            $tone = if ($freeGb -lt 1 -or $pct -lt 3) { 'crit' } elseif ($freeGb -lt 5 -or $pct -lt 10) { 'warn' } else { '' }
+            if ($tone) { [void]$facts.Disk.Add(@{ Tone = $tone; Text = ('na dysku {0} zostało {1:N1} GB ({2:N0}%)' -f $ld.DeviceID, $freeGb, $pct) }) }
+            Out-Row 'System' ('Dysk {0}' -f $ld.DeviceID) ('wolne {0:N1} GB z {1:N0} GB ({2:N0}%)' -f $freeGb, ([double]$ld.Size / 1GB), $pct) '' $null $tone '' '' 'disk'
+        }
+    }
+    catch { }
+    $osText = ''
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $osText = '{0} {1} (kompilacja {2}.{3})' -f ([string]$os.Caption).Trim(), (Get-DoRegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'DisplayVersion'), $os.BuildNumber, (Get-DoRegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'UBR')
+        if ($os.TotalVisibleMemorySize) {
+            $freePct = 100.0 * [double]$os.FreePhysicalMemory / [double]$os.TotalVisibleMemorySize
+            $tone = if ($freePct -lt 10) { 'warn' } else { '' }
+            if ($tone) { [void]$facts.Memory.Add(@{ Time = $null; Text = ('wolnej pamięci RAM zostało {0:N0}% ({1:N1} z {2:N1} GB)' -f $freePct, ([double]$os.FreePhysicalMemory / 1MB), ([double]$os.TotalVisibleMemorySize / 1MB)); App = $false; Low = $true }) }
+            Out-Row 'System' 'Pamięć RAM' ('wolne {0:N1} GB z {1:N1} GB ({2:N0}%)' -f ([double]$os.FreePhysicalMemory / 1MB), ([double]$os.TotalVisibleMemorySize / 1MB), $freePct) $osText $null $tone '' '' 'ram'
+        }
+    }
+    catch { }
+    $pending = @()
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending += 'obsługa składników Windows' }
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pending += 'Windows Update' }
+    if (Get-DoRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations') { $pending += 'zamiana plików przy restarcie (np. po instalacji programu)' }
+    if ($pending.Count) { Out-Row 'System' 'Oczekujący restart' ('Komputer czeka na ponowne uruchomienie: ' + ($pending -join ', ')) '' $null 'warn' '' '' 'reboot' }
+
+    # --- 9. Diagnoza: hipotezy z oceną 0-100 z dowodów i ich zbieżności w czasie (zmiana tuż przed pierwszym problemem,
+    # awaria przy starcie a brak biblioteki itd.); najpewniejsze na górze, z podsumowaniem
+    $found = $apps.Count -or $exeFiles.Count -or $running.Count -or $facts.Crashes.Count -or $facts.Wer.Count -or $files.Count
+    if (-not $found) { Add-Finding 'Nie rozpoznano aplikacji' ('Na komputerze nie ma programu, pakietu, procesu ani śladów pasujących do «{0}». Podaj fragment nazwy z modułu «Zainstalowane programy» albo nazwę pliku .exe (np. program.exe).' -f $name) 100 '' $null '' '' 'notfound' }
+    $problemTimes = @(@($facts.Crashes | ForEach-Object { $_.Time }) + @($facts.Hangs | ForEach-Object { $_.Time }) + @($facts.DotNet | ForEach-Object { $_.Time }) + @($facts.MissingDll | ForEach-Object { $_.Time }) + @($facts.SxS | ForEach-Object { $_.Time }) + @($facts.Wer | ForEach-Object { $_.Time }) | Where-Object { $_ } | Sort-Object)
+    $firstProblem = if ($problemTimes.Count) { [datetime]$problemTimes[0] } else { $null }
+    $crashes = @($facts.Crashes | Sort-Object { $_.Time })
+    $startupShare = if ($crashes.Count) { @($crashes | Where-Object { $_.Life -ge 0 -and $_.Life -lt 60 }).Count / [double]$crashes.Count } else { 0 }
+    $atStartup = ($crashes.Count -and $startupShare -ge 0.7) -or (-not $running.Count -and ($facts.MissingDll.Count -or $facts.SxS.Count))
+    $hasDotnet = { param([string]$Rx) @($facts.DotNet | Where-Object { $_.Type -match $Rx }).Count -gt 0 }
+    $logMentions = { param([string]$Rx) @($facts.Patterns | Where-Object { $_.Example -match $Rx }).Count -gt 0 }
+    $vcList = if ($vcRuntimes.Count) { ($vcRuntimes | Sort-Object -Unique) -join '; ' } else { 'brak' }
+    foreach ($mf in $facts.MissingFolders) { Add-Finding 'Brak folderu instalacji' ('Folder {0} z wpisu instalacji nie istnieje – program usunięto ręcznie albo przeniesiono. Napraw albo zainstaluj go ponownie.' -f $mf) 92 '' $null $mf '' 'missingfolder' }
+    foreach ($bs in $facts.BadSignature) { Add-Finding 'Plik programu zmieniony albo uszkodzony' ('Podpis cyfrowy {0} nie zgadza się z zawartością. Zainstaluj program ponownie i sprawdź komputer programem antywirusowym.' -f $bs) 88 '' $null $bs '' 'badsig' }
+    foreach ($ax in @($facts.Appx | Select-Object -First 3)) { Add-Finding ('Pakiet aplikacji: {0}' -f $ax.Name) ('Stan pakietu MSIX: {0}. Napraw go: Ustawienia → Aplikacje → «Napraw» / «Resetuj» (albo Reset-AppxPackage), w ostateczności zainstaluj ponownie.' -f $ax.Status) $(if ($ax.Time) { 70 } else { 85 }) '' $ax.Time '' '' 'appx' }
+    # Brakujące biblioteki: z nagłówka programu i z okien błędu systemu (te same nazwy wzmacniają się nawzajem)
+    $popupDll = @{}
+    foreach ($md in $facts.MissingDll) { $popupDll[$md.Dll.ToLowerInvariant()] = $md }
+    foreach ($g in @($facts.Deps | Group-Object { $_.Dll.ToLowerInvariant() })) {
+        $d0 = $g.Group[0]
+        $seenPopup = $popupDll.ContainsKey($g.Name)
+        # Brak dla samego programu (.exe) waży więcej niż dla biblioteki w jego folderze (np. opcjonalnej wtyczki)
+        $byExe = @($g.Group | Where-Object { $_.By -match '\.exe$' }).Count -gt 0
+        $score = $(if ($byExe) { 80 } else { 55 }) + $(if ($seenPopup) { 15 } elseif ($atStartup -or ($byExe -and -not $running.Count)) { 10 } else { 0 })
+        $adv = if ($d0.Package) { 'Zainstaluj albo napraw: {0} {1}. Zainstalowane pakiety Visual C++: {2}.' -f $d0.Package, $d0.Machine, $vcList } else { 'Napraw albo zainstaluj ponownie program (albo składnik, który dostarcza tę bibliotekę).' }
+        Add-Finding ('Brak biblioteki {0}' -f $d0.Dll) ('Program ({0}, {1}) wymaga biblioteki, której system nie znajdzie{2}. {3}' -f ((@($g.Group | ForEach-Object { $_.By } | Select-Object -Unique -First 4)) -join ', '), $d0.Machine, $(if ($seenPopup) { ' – Windows zgłosił też jej brak przy uruchamianiu' } else { '' }), $adv) $score '' $null $d0.Path '' 'dep'
+        if ($seenPopup) { $popupDll.Remove($g.Name) }
+    }
+    foreach ($md in $popupDll.Values) {
+        $isVc = $md.Dll -match '^(msvcp|vcruntime|msvcr|mfc|vcomp|concrt|ucrtbase)'
+        Add-Finding ('Brak biblioteki {0}' -f $md.Dll) ('Windows nie uruchomił programu: {0}. {1}' -f $md.Text, $(if ($isVc) { 'To biblioteka Visual C++ – zainstaluj albo napraw pakiet Microsoft Visual C++ Redistributable (x86 i x64). Zainstalowane: ' + $vcList } else { 'Napraw albo zainstaluj ponownie program (albo składnik, który dostarcza tę bibliotekę).' })) 88 $md.Text $md.Time '' '' 'popup'
+    }
+    foreach ($bm in @($facts.Bitness | Select-Object -First 3)) { Add-Finding ('Niezgodna architektura: {0}' -f $bm.Dll) ('{0} jest programem {1}, a biblioteka {2} w jego folderze – {3}. Program nie uruchomi się (0xc000007b) – zainstaluj wersję programu albo biblioteki w tej samej architekturze.' -f $bm.By, $bm.ByMachine, $bm.Dll, $bm.DllMachine) 88 '' $null $bm.Path '' 'bitness' }
+    foreach ($rt in $facts.Runtime) { Add-Finding ('Brak środowiska: {0}' -f $rt.Text) ('Program wymaga {0}, a na komputerze go nie ma (zainstalowane: {1}). Zainstaluj właściwe środowisko .NET w tej architekturze.' -f $rt.Text, $(if ($rt.Have) { $rt.Have } else { 'brak' })) 90 '' $null $rt.Path '' 'runtime' }
+    if ($facts.SxS.Count) { Add-Finding 'Błąd konfiguracji side-by-side' ('Program nie uruchomił się ({0}×) – brak wymaganej wersji środowiska Visual C++ albo uszkodzony manifest. Zainstaluj pakiety Microsoft Visual C++ Redistributable (zainstalowane: {1}) albo napraw program.' -f $facts.SxS.Count, $vcList) 80 $facts.SxS[0].Text $facts.SxS[0].Time '' '' 'sxs' }
+    foreach ($bg in @($facts.Blocks | Group-Object Text)) {
+        $detect = @($bg.Group | Where-Object { $_.Id -in 1116, 1117 }).Count -gt 0
+        Add-Finding $bg.Name ('Zabezpieczenia blokowały aplikację ({0}×, ostatnio {1:yyyy-MM-dd HH:mm}). Sprawdź zdarzenie w kategorii «Zdarzenie»; jeśli program jest zaufany – dodaj wyjątek w zasadach (Defender, AppLocker, WDAC).' -f $bg.Count, (@($bg.Group | Sort-Object { $_.Time })[-1]).Time) $(if ($detect) { 90 } else { 85 }) '' (@($bg.Group | Sort-Object { $_.Time })[-1]).Time '' '' 'block'
+    }
+    foreach ($r in $facts.Registry) { Add-Finding $(switch ($r.Kind) { 'ifeo' { 'Przekierowanie uruchamiania programu' } 'policy' { 'Zasada blokuje uruchomienie' } default { 'Tryb zgodności' } }) $r.Text $(if ($r.Kind -eq 'compat' -and $atStartup) { $r.Score + 20 } else { $r.Score }) '' $null '' '' $r.Kind }
+    if ($facts.Motw.Count) {
+        $boost = (& $hasDotnet 'FileLoad|Security|NotSupported') -or $atStartup
+        Add-Finding ('Pliki programu zablokowane: {0}' -f $facts.Motw.Count) ('Pliki programu mają oznaczenie «pobrany z internetu» (Mark of the Web) – .NET i zasady bezpieczeństwa mogą odmówić ich wczytania. Odblokuj je (Właściwości pliku → Odblokuj albo Unblock-File) i zainstaluj program z zaufanego źródła.') $(if ($boost) { 70 } else { 40 }) ((@($facts.Motw | Select-Object -First 15)) -join "`n") $null ([string]$facts.Motw[0]) '' 'motw'
+    }
+    foreach ($ep in $facts.Endpoints) {
+        $hostRx = [regex]::Escape($ep.Host)
+        $score = $(if ($ep.Item -match ':\d+$') { 60 } else { 45 })
+        if ($facts.Hangs.Count -or (& $logMentions ('(?i)' + $hostRx + '|timeout|timed out|connect|połącz|network|socket|unreachable|refused'))) { $score += 20 }
+        if (& $hasDotnet 'Socket|Web|Http|Sql|Communication|Endpoint|Timeout') { $score += 10 }
+        Add-Finding ('Serwer niedostępny: {0}' -f $ep.Item) ('Program ma w ustawieniach serwer {0} – {1}. Sprawdź, czy serwer działa, nazwę w DNS, zaporę i trasę z tego komputera (plik: {2}).' -f $ep.Item, $ep.Why, $ep.Source) $score '' $null $ep.Source '' 'endpoint'
+    }
+    if ($crashes.Count) {
+        $top = @($crashes | Group-Object { ([string]$_.Module).ToLowerInvariant() } | Sort-Object Count -Descending)[0]
+        $c0 = $top.Group[0]
+        $codes = @($top.Group | Group-Object Code | Sort-Object Count -Descending)[0].Name
+        $advice = switch ($c0.Class) {
+            'app' { 'błąd w samej aplikacji – sprawdź, czy jest nowsza wersja, i zgłoś producentowi (z paczką diagnostyczną)' }
+            'dotnet' { 'przyczyna jest w zdarzeniu .NET Runtime (typ wyjątku) – zwykle brak pliku, uprawnień albo zła konfiguracja' }
+            'vc' { 'napraw albo zainstaluj ponownie pakiety Microsoft Visual C++ Redistributable (x86 i x64)' }
+            'external' { 'biblioteka spoza aplikacji i systemu (wtyczka, dodatek, oprogramowanie zabezpieczające, sterownik drukarki) – sprawdź, co ją dostarcza, i zaktualizuj albo wyłącz' }
+            default { 'błąd zgłosił moduł systemu, ale zwykle wywołał go sam program albo jego dodatek – sprawdź logi aplikacji z tego czasu i aktualizacje' }
+        }
+        $when = if ($startupShare -ge 0.7) { ' Program pada zaraz po uruchomieniu – szukaj przyczyny w zależnościach, ustawieniach i dodatkach wczytywanych przy starcie.' } elseif ($startupShare -le 0.3 -and @($crashes | Where-Object { $_.Life -ge 0 }).Count) { ' Awarie w trakcie pracy – zwykle przy konkretnej operacji; sprawdź logi aplikacji z tych chwil.' } else { '' }
+        $score = 45 + [Math]::Min(30, 6 * $crashes.Count) + $(if ($c0.Class -eq 'external') { 10 } else { 0 })
+        Add-Finding ('Awarie programu: {0} (moduł {1})' -f $crashes.Count, $c0.Module) ('Ostatnia {0:yyyy-MM-dd HH:mm}. Najczęściej moduł {1} ({2}×) – {3}; wyjątek {4}{5}. Co zrobić: {6}.{7}' -f $crashes[-1].Time, $c0.Module, $top.Count, $c0.ClassText, $codes, $(if ($exceptionText[$codes]) { ' – ' + $exceptionText[$codes] } else { '' }), $advice, $when) $score ((@($crashes | Select-Object -Last 12 | ForEach-Object { '{0:yyyy-MM-dd HH:mm:ss}  {1} {2}  moduł {3}  {4}{5}' -f $_.Time, $_.App, $_.Version, $_.Module, $_.Code, $(if ($_.Life -ge 0) { '  po {0:N0} s' -f $_.Life } else { '' }) })) -join "`n") $crashes[-1].Time '' '' 'crash'
+    }
+    elseif ($facts.Wer.Count) { Add-Finding ('Raporty awarii (WER): {0}' -f $facts.Wer.Count) 'Windows zapisał raporty awarii albo zawieszeń programu, choć w dzienniku zdarzeń ich nie ma (mógł zostać wyczyszczony). Szczegóły w kategorii «Awaria».' 50 '' (@($facts.Wer | Sort-Object { $_.Time })[-1]).Time '' '' 'wer' }
+    $werUsers = @($facts.Wer | Where-Object { $_.User } | ForEach-Object { $_.User } | Select-Object -Unique)
+    if ($werUsers.Count -eq 1 -and $profiles.Count -gt 1 -and $facts.Wer.Count -ge 2) { Add-Finding 'Problem jednego użytkownika' ('Raporty awarii są tylko u użytkownika {0} – możliwy problem z jego profilem (ustawienia, pliki w AppData, dodatki). Porównaj z innym użytkownikiem albo zresetuj ustawienia programu w jego profilu.' -f $werUsers[0]) 55 '' $null '' $werUsers[0] 'user' }
+    if ($facts.Hangs.Count) { Add-Finding ('Zawieszenia programu: {0}' -f $facts.Hangs.Count) 'Program przestawał odpowiadać. Częste przyczyny: niedostępny zasób sieciowy albo serwer, blokada bazy danych, dodatek, brak pamięci – sprawdź połączenia i logi aplikacji z tego czasu.' (40 + [Math]::Min(25, 5 * $facts.Hangs.Count)) '' (@($facts.Hangs | Sort-Object { $_.Time })[-1]).Time '' '' 'hang' }
+    if ($facts.DotNet.Count) {
+        $tt = @($facts.DotNet | Group-Object Type | Sort-Object Count -Descending)[0]
+        $n0 = [string]$tt.Name
+        $hint = if ($n0 -match 'FileNotFound|FileLoad|DllNotFound|BadImageFormat') { 'brakuje pliku albo biblioteki, albo jest w złej wersji (32/64-bit) – napraw lub zainstaluj ponownie program i wymagane środowisko .NET' }
+        elseif ($n0 -match 'UnauthorizedAccess|Security') { 'brak uprawnień do pliku, folderu albo klucza rejestru – sprawdź uprawnienia konta, na którym działa program' }
+        elseif ($n0 -match 'Sql|Db|Oracle|Npgsql|MySql') { 'błąd bazy danych – sprawdź połączenie z serwerem bazy i jego dostępność' }
+        elseif ($n0 -match 'Socket|Web|Http|Communication|Endpoint|Timeout') { 'błąd połączenia sieciowego albo serwera – sprawdź dostępność serwera, proxy i zaporę' }
+        elseif ($n0 -match 'Configuration|TypeInitialization|Xml|Json') { 'uszkodzona albo niepoprawna konfiguracja (pliki .config, ustawienia użytkownika)' }
+        elseif ($n0 -match 'OutOfMemory') { 'brak pamięci – sprawdź obciążenie komputera i wielkość danych programu' }
+        elseif ($n0 -match 'IO') { 'błąd odczytu lub zapisu pliku (zajęty, brak miejsca, niedostępny udział)' }
+        else { 'szczegóły w treści zdarzenia .NET Runtime (stos wywołań wskazuje miejsce błędu)' }
+        Add-Finding ('Nieobsłużony wyjątek .NET: {0}' -f $(if ($tt.Name) { $tt.Name } else { 'nieznany' })) ('Wystąpił {0}×. {1}.' -f $tt.Count, $hint) $(if ($tt.Count -ge 3) { 75 } else { 65 }) $tt.Group[0].Text $tt.Group[0].Time '' '' 'dotnet'
+    }
+    foreach ($mm in @($facts.Memory | Select-Object -First 2)) { Add-Finding $(if ($mm.Low) { 'Mało wolnej pamięci' } else { 'Brak pamięci wirtualnej' }) ($mm.Text + $(if ($mm.App) { ' – program był wśród procesów zużywających najwięcej pamięci.' } else { '' })) $(if ($mm.Low) { 45 } elseif ($mm.App) { 85 } else { 70 }) '' $mm.Time '' '' 'memory' }
+    foreach ($pp in $facts.Proc) { Add-Finding 'Stan procesu' $pp.Text $pp.Score '' $null '' '' 'proc' }
+    foreach ($sg in @($facts.Services | Group-Object Text | Select-Object -First 5)) { Add-Finding 'Usługa aplikacji' $sg.Name ([int](@($sg.Group | ForEach-Object { $_.Score } | Measure-Object -Maximum).Maximum)) '' $null '' '' 'service' }
+    foreach ($t in @($facts.Tasks | Select-Object -First 3)) { Add-Finding 'Zadanie aplikacji' $t.Text $t.Score '' $null '' '' 'task' }
+    # Logi: nowe rodzaje błędów (nie było ich przed oknem czasu) i najczęstsze
+    $newPats = @($facts.Patterns | Where-Object { $_.New } | Sort-Object { $_.In } -Descending)
+    foreach ($np in @($newPats | Select-Object -First 3)) {
+        $near = $firstProblem -and $np.First -and [Math]::Abs(($np.First - $firstProblem).TotalHours) -le 2
+        Add-Finding ('Nowy błąd w logu {0}' -f (Split-Path -Leaf $np.File)) ('«{0}» – {1}× w oknie czasu, wcześniej w logu go nie było{2}{3}.' -f $np.Example, $np.In, $(if ($np.First) { '; pierwszy raz {0:yyyy-MM-dd HH:mm}' -f $np.First } else { '' }), $(if ($near) { ' – w tym samym czasie zaczęły się awarie programu' } else { '' })) (55 + $(if ($near) { 20 } else { 0 }) + $(if ($np.In -ge 10) { 10 } else { 0 })) $np.Pattern $np.First $np.File $np.User 'logpattern'
+    }
+    $frequent = @($facts.Patterns | Where-Object { -not $_.New -and $_.In -ge 5 } | Sort-Object { $_.In } -Descending | Select-Object -First 1)
+    foreach ($fp0 in $frequent) { Add-Finding ('Najczęstszy błąd w logu {0}' -f (Split-Path -Leaf $fp0.File)) ('«{0}» – {1}× w oknie czasu (wcześniej {2}×) – błąd powtarzający się, nie nowy.' -f $fp0.Example, $fp0.In, $fp0.Before) (35 + $(if ($fp0.In -ge 50) { 10 } else { 0 })) $fp0.Pattern $fp0.Last $fp0.File $fp0.User 'logfrequent' }
+    if ($facts.LogErrors.Count -and -not $newPats.Count -and -not $frequent.Count) {
+        $le = @($facts.LogErrors | Sort-Object { $_.Time } -Descending | Select-Object -First 3)
+        Add-Finding ('Błędy w logach aplikacji: {0} plików' -f $facts.LogErrors.Count) ((@($le | ForEach-Object { '{0} ({1} błędów, ostatni: «{2}»)' -f (Split-Path -Leaf $_.File), $_.Count, $_.Last })) -join '; ') 30 ((@($facts.LogErrors | ForEach-Object { $_.File })) -join "`n") $le[0].Time $le[0].File '' 'logerrors'
+    }
+    # Kody błędów (HRESULT) z zdarzeń i logów z opisem z tego komputera; znane rodziny dostają własną hipotezę
+    $codeList = @($facts.Codes | Select-Object -Unique)
+    if ($codeList.Count) {
+        $family = $null
+        foreach ($c in $codeList) {
+            if ($c -match '^0x80070005|^0x80070020|^0x80070021') { $family = @('Odmowa dostępu albo plik w użyciu', 'Program nie ma dostępu do pliku, folderu albo klucza rejestru (albo plik blokuje inny proces) – sprawdź uprawnienia konta, na którym działa, i oprogramowanie zabezpieczające.', 60); break }
+            if ($c -match '^0x80070070|^0x80070027') { $family = @('Brak miejsca na dysku', 'Zapis się nie udał z braku miejsca na dysku – zwolnij miejsce.', 70); break }
+            if ($c -match '^0x800706ba|^0x80072ee7|^0x80072efd|^0x80072ee2|^0x8007274c|^0x8007274d|^0x80072f8f') { $family = @('Problem z połączeniem sieciowym', 'Program nie połączył się z serwerem (nazwa, odmowa, przekroczony czas albo certyfikat) – sprawdź serwer, DNS, proxy i zaporę.', 60); break }
+            if ($c -match '^0x80070002|^0x80070003') { $family = @('Brak pliku albo ścieżki', 'Program nie znalazł pliku albo folderu – sprawdź ścieżki w ustawieniach (także udziały sieciowe i dyski mapowane) albo napraw instalację.', 50); break }
+        }
+        if ($family) { Add-Finding $family[0] ($family[1] + ' Kody: ' + ($codeList -join '; ')) $family[2] '' $null '' '' 'codes' }
+        else { Add-Finding 'Kody błędów w zdarzeniach i logach' ($codeList -join '; ') 30 '' $null '' '' 'codes' }
+    }
+    # Ustawienia: uszkodzone pliki i zmiany tuż przed pierwszym problemem
+    foreach ($cf in @($facts.Configs | Where-Object { $_.Broken } | Select-Object -First 3)) { Add-Finding ('Uszkodzony plik ustawień: {0}' -f (Split-Path -Leaf $cf.Path)) ('{0} – {1}. Program może przez to nie startować albo działać źle; przywróć kopię albo usuń plik (wiele programów utworzy nowy).' -f $cf.Path, $cf.Broken) 85 '' $cf.Time $cf.Path $cf.User 'configbroken' }
+    $cfgBefore = @($facts.Configs | Where-Object { -not $_.Broken -and $firstProblem -and $_.Time -le $firstProblem -and $_.Time -ge $firstProblem.AddDays(-3) } | Sort-Object { $_.Time } -Descending)
+    if ($cfgBefore.Count) { Add-Finding 'Zmiana ustawień przed pierwszym problemem' ('{0:yyyy-MM-dd HH:mm}: zmieniono {1}{2}; pierwszy problem {3:yyyy-MM-dd HH:mm}. Porównaj z kopią albo z innym komputerem.' -f $cfgBefore[0].Time, $cfgBefore[0].Path, $(if ($cfgBefore.Count -gt 1) { " (i $($cfgBefore.Count - 1) inne)" } else { '' }), $firstProblem) (60 + $(if ($atStartup) { 15 } else { 0 })) ((@($cfgBefore | ForEach-Object { '{0:yyyy-MM-dd HH:mm}  {1}' -f $_.Time, $_.Path })) -join "`n") $cfgBefore[0].Time $cfgBefore[0].Path $cfgBefore[0].User 'config' }
+    # Zmiany w systemie z 7 dni przed pierwszym problemem: aplikacja, środowiska wykonawcze, aktualizacje, inne programy
+    if ($firstProblem) {
+        $before = @($facts.Changes | Where-Object { $_.Time -le $firstProblem -and $_.Time -ge $firstProblem.AddDays(-7) -and -not $_.Failed } | Sort-Object { $_.Time } -Descending)
+        $appChange = @($before | Where-Object { $_.App }) | Select-Object -First 1
+        if ($appChange) { Add-Finding 'Problemy zaczęły się po zmianie aplikacji' ('{0:yyyy-MM-dd HH:mm}: {1}; pierwszy problem {2:yyyy-MM-dd HH:mm}. Sprawdź informacje o wydaniu, napraw instalację albo wróć do poprzedniej wersji.' -f $appChange.Time, $appChange.Text, $firstProblem) (65 + $(if (($firstProblem - $appChange.Time).TotalHours -le 24) { 15 } else { 0 })) '' $appChange.Time '' '' 'change' }
+        $rtChange = @($before | Where-Object { $_.Runtime -and -not $_.App }) | Select-Object -First 1
+        if ($rtChange) { Add-Finding 'Zmiana środowiska wykonawczego przed problemem' ('{0:yyyy-MM-dd HH:mm}: {1} – programy zależne od tego pakietu mogą przestać działać; przywróć go albo napraw.' -f $rtChange.Time, $rtChange.Text) $(if ($rtChange.Removed) { 70 } else { 45 }) '' $rtChange.Time '' '' 'change' }
+        $upd = @($before | Where-Object { -not $_.App -and -not $_.Runtime })
+        if ($upd.Count) { Add-Finding 'Zmiany w systemie przed pierwszym problemem' ('{0} zmian w ciągu 7 dni przed {1:yyyy-MM-dd HH:mm}, ostatnia: {2}.' -f $upd.Count, $firstProblem, $upd[0].Text) (30 + $(if (($firstProblem - $upd[0].Time).TotalHours -le 24) { 10 } else { 0 })) ((@($upd | Select-Object -First 15 | ForEach-Object { '{0:yyyy-MM-dd HH:mm}  {1}' -f $_.Time, $_.Text })) -join "`n") $upd[0].Time '' '' 'change' }
+    }
+    foreach ($fc in @($facts.Changes | Where-Object { $_.Failed -and $_.App -and $_.Time -ge $since })) { Add-Finding 'Nieudana instalacja aplikacji' ('{0:yyyy-MM-dd HH:mm}: {1} – sprawdź log instalatora (Temp) i zainstaluj ponownie.' -f $fc.Time, $fc.Text) 50 '' $fc.Time '' '' 'change' }
+    foreach ($dk in $facts.Disk) { Add-Finding 'Mało miejsca na dysku' ($dk.Text + ' – programy przestają zapisywać dane i logi.') $(if ($dk.Tone -eq 'crit') { 75 } else { 40 }) '' $null '' '' 'disk' }
+    if ($facts.Shutdowns.Count) { Add-Finding 'Nieoczekiwane wyłączenia komputera' ('{0}× w oknie czasu – przerwana praca programu może uszkodzić jego dane lub ustawienia.' -f $facts.Shutdowns.Count) 25 '' $null '' '' 'shutdown' }
+    if ($pending.Count) { Add-Finding 'Komputer czeka na restart' ('Po instalacji lub aktualizacji część plików zmieni się dopiero po ponownym uruchomieniu: ' + ($pending -join ', ') + '.') $(if (@($facts.Changes | Where-Object { $_.App }).Count) { 50 } else { 30 }) '' $null '' '' 'reboot' }
+
+    $problem = ($crashes.Count + $facts.Hangs.Count + $facts.DotNet.Count + $facts.MissingDll.Count + $facts.SxS.Count + $facts.Blocks.Count + $facts.Deps.Count + $facts.Runtime.Count + $facts.Endpoints.Count + $facts.Wer.Count + $newPats.Count + $facts.Bitness.Count + @($facts.Configs | Where-Object { $_.Broken }).Count) -gt 0
+    $ranked = @($findings | Sort-Object { $_.Score } -Descending)
+    if ($found -and -not @($ranked | Where-Object { $_.Score -ge 45 }).Count) {
+        Out-Row 'Wniosek' 'Brak śladów problemu' ('W oknie czasu {0:yyyy-MM-dd HH:mm} – {1:yyyy-MM-dd HH:mm} nie ma awarii, zawieszeń, blokad, braków ani błędów, które wskazywałyby przyczynę. Rozszerz okno czasu, porównaj z komputerem, na którym program działa, albo przejrzyj treść logów (menu wiersza «Pokaż końcówkę pliku»).' -f $since, $until) '' $null 'ok' '' '' 'ok' 0
+    }
+    $strong = @($ranked | Where-Object { $_.Score -ge 45 } | Select-Object -First 3)
+    if ($strong.Count) {
+        $i = 0
+        $sum = (@($strong | ForEach-Object { $i++; '{0}) {1} ({2})' -f $i, $_.Title, $(if ($_.Score -ge 75) { 'pewność wysoka' } else { 'pewność średnia' }) }) -join '; ')
+        Out-Row 'Wniosek' 'Diagnoza: najbardziej prawdopodobne przyczyny' $sum ((@($ranked | ForEach-Object { '[{0,3}] {1}: {2}' -f $_.Score, $_.Title, $_.Text })) -join "`n") $null $(if ($strong[0].Score -ge 75) { 'crit' } else { 'warn' }) '' '' 'summary' $strong[0].Score
+    }
+    foreach ($fd in $ranked) { Out-Row 'Wniosek' $fd.Title $fd.Text $fd.Detail $fd.Time $(if ($fd.Score -ge 75) { 'crit' } elseif ($fd.Score -ge 45) { 'warn' } else { 'info' }) $fd.Path $fd.User $fd.Kind $fd.Score }
+
+    # --- 10. Odcisk komputera do porównania komputerów (moduł porównuje działające z tymi z problemem)
+    $features = New-Object System.Collections.ArrayList
+    foreach ($a in $apps) { [void]$features.Add(('Wersja aplikacji: {0} {1}' -f $a.Name, $a.Version).Trim()) }
+    foreach ($x in @($exeFiles | Select-Object -First 4)) { [void]$features.Add(('Plik {0}: {1}' -f $x.Name, ([string]$x.VersionInfo.FileVersion).Trim()).Trim()) }
+    if ($osText) { [void]$features.Add('System: ' + $osText) }
+    foreach ($v in @($vcRuntimes | Sort-Object -Unique)) { [void]$features.Add('Visual C++: ' + $v) }
+    if ($netText) { [void]$features.Add('.NET Framework ' + $netText) }
+    if ($net35) { [void]$features.Add('.NET Framework 3.5') }
+    foreach ($dn in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'dotnet\shared' }) {
+        foreach ($fw in @(Get-ChildItem -LiteralPath $dn -Directory -ErrorAction SilentlyContinue)) { foreach ($vv in @(Get-ChildItem -LiteralPath $fw.FullName -Directory -ErrorAction SilentlyContinue)) { [void]$features.Add(('.NET: {0} {1}{2}' -f $fw.Name, $vv.Name, $(if ($dn -like '*(x86)*') { ' (x86)' } else { '' }))) } }
+    }
+    $appNames = @($apps | ForEach-Object { $_.Name })
+    foreach ($ip in $installed) { if ($ip -notlike 'Microsoft Visual C++*' -and -not @($appNames | Where-Object { $ip -like "$_*" }).Count) { [void]$features.Add('Program: ' + $ip) } }
+    try { foreach ($kb in @(Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction Stop | ForEach-Object { [string]$_.HotFixID } | Where-Object { $_ } | Select-Object -Unique)) { [void]$features.Add('Poprawka: ' + $kb) } } catch { }
+    foreach ($c in @($crashes | ForEach-Object { $_.Module } | Select-Object -Unique)) { [void]$features.Add('Moduł awarii: ' + $c) }
+    foreach ($d in @($facts.Deps | ForEach-Object { $_.Dll } | Select-Object -Unique)) { [void]$features.Add('Brak biblioteki: ' + $d) }
+    foreach ($e in $facts.Endpoints) { [void]$features.Add('Niedostępny serwer: ' + $e.Item) }
+    $fpChanges = @(if ($firstProblem) { @($facts.Changes | Where-Object { $_.Time -le $firstProblem -and $_.Time -ge $firstProblem.AddDays(-7) -and -not $_.Failed } | ForEach-Object { $_.Text } | Select-Object -Unique) })
+    $fp = ConvertTo-Json -Compress -Depth 3 -InputObject @{ Found = [bool]$found; Problem = [bool]$problem; Score = $(if ($ranked.Count) { [int]$ranked[0].Score } else { 0 }); Top = $(if ($strong.Count) { $strong[0].Title } else { '' }); First = $(if ($firstProblem) { $firstProblem.ToString('yyyy-MM-dd HH:mm') } else { '' }); Features = @($features | Select-Object -Unique); Changes = $fpChanges }
+    Out-Row 'Wniosek' 'Zakres analizy' ('okno {0:yyyy-MM-dd HH:mm} – {1:yyyy-MM-dd HH:mm}; pliki .exe: {2}; foldery: {3}' -f $since, $until, $(if ($exeNames.Count) { (@($exeNames) | Select-Object -First 8) -join ', ' } else { '—' }), $(if ($folders.Count) { ($folders | Select-Object -First 4) -join '; ' } else { '—' })) ('Słowa wyszukiwania: {0}{1}' -f ($keywords -join ', '), $(if ($osText) { "`nSystem: $osText" } else { '' })) $null '' '' '' 'scope' -1 $fp
+
+    $rank = { if ($_.__kind -eq 'summary') { -1 } elseif ($_.__kind -eq 'scope') { 1000 } elseif ($_.Kategoria -eq 'Wniosek') { 100 - $_.__score } elseif ($_.__tone -eq 'crit') { 0 } elseif ($_.__tone -eq 'warn') { 1 } else { 2 } }
+    $rows | Sort-Object @{ Expression = { $_.__order } }, @{ Expression = $rank }, @{ Expression = { $_.Czas }; Descending = $true } | Select-Object 'Kategoria', 'Pewność', 'Element', 'Czas', 'Opis', 'Użytkownik', 'Ścieżka', 'Szczegóły', '__tone', '__kind', '__score', '__fp'
+}
+
+# Końcówka plików logów (podgląd z menu wiersza). $P: Files (ścieżki lokalne), Lines
+$script:AppTailScript = {
+    param($P)
+    foreach ($f in @($P.Files)) {
+        $res = [ordered]@{ Path = [string]$f; Text = ''; Error = ''; Size = 0; Modified = $null; Lines = 0 }
+        try {
+            $fi = Get-Item -LiteralPath $f -ErrorAction Stop
+            $res.Size = $fi.Length
+            $res.Modified = $fi.LastWriteTime
+            $fs = [System.IO.File]::Open($fi.FullName, 'Open', 'Read', 'ReadWrite, Delete')
+            try {
+                $len = [int][Math]::Min([int64]1048576, $fs.Length)
+                [void]$fs.Seek(-$len, 'End')
+                $buf = New-Object 'byte[]' $len
+                $read = $fs.Read($buf, 0, $len)
+            }
+            finally { $fs.Dispose() }
+            $odd = 0; $even = 0; $probe = [Math]::Min($read, 4000)
+            for ($i = 0; $i -lt $probe; $i++) { if ($buf[$i] -eq 0) { if ($i % 2) { $odd++ } else { $even++ } } }
+            $text = if ($odd -gt $probe / 4) { [System.Text.Encoding]::Unicode.GetString($buf, 0, $read) }
+            elseif ($even -gt $probe / 4) { [System.Text.Encoding]::Unicode.GetString($buf, 1, $read - 1) }
+            else { (New-Object System.Text.UTF8Encoding($false)).GetString($buf, 0, $read) }
+            $lines = @($text -split "\r?\n")
+            if ($len -lt $fi.Length -and $lines.Count -gt 1) { $lines = @($lines | Select-Object -Skip 1) }
+            $lines = @($lines | Select-Object -Last ([Math]::Max(10, [int]$P.Lines)))
+            $res.Lines = $lines.Count
+            $res.Text = $lines -join "`n"
+        }
+        catch { $res.Error = $_.Exception.Message }
+        [pscustomobject]$res
+    }
+}
+
+# Paczka diagnostyczna na komputerze docelowym: logi, raporty WER, dzienniki zdarzeń z okna czasu (.evtx), klucze rejestru
+# (.reg) i tabela analizy (CSV) w jednym pliku ZIP w %SystemRoot%\Temp\DomainOps. $P: Name, From, To (ISO 8601), Files,
+# Wer (foldery raportów), Dumps, RegKeys, Csv, Logs/Events/Registry/WerOn (co dołączyć), MaxMB
+$script:AppPackageScript = {
+    param($P)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $safe = ([string]$P.Name -replace '[\\/:*?"<>|\s]+', '_').Trim('_')
+    if (-not $safe) { $safe = 'aplikacja' }
+    $base = Join-Path $env:SystemRoot 'Temp\DomainOps'
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $dir = Join-Path $base ('Paczka_{0}_{1}' -f $safe, $stamp)
+    $zip = "$dir.zip"
+    $notes = New-Object System.Collections.ArrayList
+    $budget = [int64]([Math]::Max(10, [int]$P.MaxMB)) * 1MB
+    $used = [int64]0
+    $copy = {
+        # Kopia pliku otwartego przez program (współdzielenie odczytu i zapisu); pomija pliki ponad budżet paczki
+        param([string]$Src, [string]$DstDir)
+        $fi = Get-Item -LiteralPath $Src -ErrorAction Stop
+        if ($used + $fi.Length -gt $budget) { [void]$notes.Add(('pominięto (limit {0} MB): {1}' -f [int]$P.MaxMB, $Src)); return }
+        if (-not (Test-Path -LiteralPath $DstDir)) { New-Item -ItemType Directory -Path $DstDir -Force | Out-Null }
+        $dst = Join-Path $DstDir $fi.Name
+        $n = 1
+        while (Test-Path -LiteralPath $dst) { $dst = Join-Path $DstDir ('{0}_{1}{2}' -f $fi.BaseName, $n, $fi.Extension); $n++ }
+        $in = [System.IO.File]::Open($fi.FullName, 'Open', 'Read', 'ReadWrite, Delete')
+        try { $out = [System.IO.File]::Create($dst); try { $in.CopyTo($out) } finally { $out.Dispose() } }
+        finally { $in.Dispose() }
+        Set-Variable -Name used -Value ($used + $fi.Length) -Scope 1
+    }
+    try {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $dir 'analiza.csv'), [string]$P.Csv, (New-Object System.Text.UTF8Encoding($true)))
+        if ($P.Logs) {
+            $i = 0
+            foreach ($f in @($P.Files)) {
+                $i++
+                # Struktura folderów źródła (np. C\ProgramData\Firma\App\Logs) - ten sam plik z kilku miejsc się nie pomyli
+                $rel = ([string](Split-Path -Parent $f)) -replace '^([A-Za-z]):', '$1' -replace '^\\\\', 'UNC\'
+                try { & $copy $f (Join-Path (Join-Path $dir 'logi') $rel) } catch { [void]$notes.Add(('nie skopiowano {0}: {1}' -f $f, $_.Exception.Message)) }
+            }
+        }
+        if ($P.WerOn) {
+            foreach ($w in @($P.Wer)) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $w -File -ErrorAction SilentlyContinue)) {
+                    try { & $copy $f.FullName (Join-Path (Join-Path $dir 'WER') (Split-Path -Leaf $w)) } catch { [void]$notes.Add(('nie skopiowano {0}: {1}' -f $f.FullName, $_.Exception.Message)) }
+                }
+            }
+            foreach ($d in @($P.Dumps)) { try { & $copy $d (Join-Path $dir 'zrzuty') } catch { [void]$notes.Add(('nie skopiowano {0}: {1}' -f $d, $_.Exception.Message)) } }
+        }
+        if ($P.Events) {
+            $from = [datetime]::Parse([string]$P.From, $inv).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000Z')
+            $to = [datetime]::Parse([string]$P.To, $inv).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000Z')
+            $q = "*[System[TimeCreated[@SystemTime>='$from' and @SystemTime<='$to']]]"
+            foreach ($log in 'Application', 'System') {
+                $out = Join-Path $dir ('{0}.evtx' -f $log)
+                try {
+                    $o = & (Join-Path $env:SystemRoot 'System32\wevtutil.exe') epl $log $out "/q:$q" /ow:true 2>&1
+                    if ($LASTEXITCODE -ne 0) { [void]$notes.Add(('dziennik {0}: {1}' -f $log, ((@($o | ForEach-Object { [string]$_ })) -join ' '))) }
+                }
+                catch { [void]$notes.Add(('dziennik {0}: {1}' -f $log, $_.Exception.Message)) }
+            }
+        }
+        if ($P.Registry) {
+            $i = 0
+            foreach ($k in @($P.RegKeys)) {
+                $i++
+                if ($k -notmatch '^HKEY_(LOCAL_MACHINE|USERS\\S-1-5-21-[\d-]+)\\') { continue }
+                $out = Join-Path (Join-Path $dir 'rejestr') ('{0:D2}_{1}.reg' -f $i, ((Split-Path -Leaf $k) -replace '[\\/:*?"<>|\s]+', '_'))
+                if (-not (Test-Path -LiteralPath (Split-Path -Parent $out))) { New-Item -ItemType Directory -Path (Split-Path -Parent $out) -Force | Out-Null }
+                try {
+                    $o = & (Join-Path $env:SystemRoot 'System32\reg.exe') export $k $out /y 2>&1
+                    if ($LASTEXITCODE -ne 0) { [void]$notes.Add(('rejestr {0}: {1}' -f $k, ((@($o | ForEach-Object { [string]$_ })) -join ' '))) }
+                }
+                catch { [void]$notes.Add(('rejestr {0}: {1}' -f $k, $_.Exception.Message)) }
+            }
+        }
+        $info = @('Paczka diagnostyczna Domain Ops', ('Komputer: {0}' -f $env:COMPUTERNAME), ('Aplikacja: {0}' -f $P.Name), ('Okno czasu: {0} – {1}' -f $P.From, $P.To), ('Utworzono: {0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date)), '') + @($notes)
+        [System.IO.File]::WriteAllLines((Join-Path $dir 'opis.txt'), [string[]]$info, (New-Object System.Text.UTF8Encoding($true)))
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($dir, $zip)
+        [pscustomobject]@{ Zip = $zip; Size = (Get-Item -LiteralPath $zip).Length; Notes = @($notes) }
+    }
+    finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+$script:AppAnalysisViews = [ordered]@{
+    'Wszystko'             = ''
+    'Wnioski'              = "[Kategoria] = 'Wniosek'"
+    'Oś czasu'             = "[Czas] <> '' AND [Kategoria] <> 'Wniosek'"
+    'Awarie i zdarzenia'   = "[Kategoria] IN ('Awaria', 'Zdarzenie')"
+    'Logi'                 = "[Kategoria] = 'Plik logu'"
+    'Program i zależności' = "[Kategoria] IN ('Aplikacja', 'Zależność', 'Proces', 'Usługa', 'Zadanie', 'Połączenie')"
+    'Rejestr'              = "[Kategoria] = 'Rejestr'"
+    'System'               = "[Kategoria] = 'System'"
+}
+$script:AppAnalysisRanges = [ordered]@{ 'ostatnie 6 godz.' = 6; 'ostatnie 24 godz.' = 24; 'ostatnie 3 dni' = 72; 'ostatnie 7 dni' = 168; 'ostatnie 30 dni' = 720; 'przedział od – do' = 0 }
+
+function Get-AppAnalysisWindow {
+    # Okno czasu z panelu: @{ From; To } albo $null (komunikat już pokazany)
+    param([hashtable]$Module)
+    $hours = [int]$script:AppAnalysisRanges[[string]$Module.Range.SelectedItem]
+    $end = Get-Date
+    if ($hours -gt 0) { return @{ From = $end.AddHours(-$hours); To = $end } }
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $formats = [string[]]@('yyyy-MM-dd HH:mm:ss', 'yyyy-MM-dd HH:mm', 'yyyy-MM-dd')
+    $start = [datetime]::MinValue
+    $t = $Module.From.Text.Trim()
+    if (-not [datetime]::TryParseExact($t, $formats, $culture, 'None', [ref]$start)) { Show-Warning ('Początek przedziału «{0}»: użyj formatu RRRR-MM-DD gg:mm, np. 2026-10-30 14:00.' -f $t); return $null }
+    $t = $Module.To.Text.Trim()
+    if ($t) {
+        $d = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($t, $formats, $culture, 'None', [ref]$d)) { Show-Warning ('Koniec przedziału «{0}»: użyj formatu RRRR-MM-DD gg:mm.' -f $t); return $null }
+        $end = $d
+    }
+    if ($end -le $start) { Show-Warning 'Koniec przedziału musi być późniejszy niż początek.'; return $null }
+    return @{ From = $start; To = $end }
+}
+
+function Get-AppComparisonRows {
+    <#
+        Porównanie komputerów z odcisków (__fp wiersza «Zakres analizy»): cechy obecne na wszystkich komputerach z problemem
+        i na żadnym działającym (i odwrotnie) - wersja aplikacji i plików, system, środowiska Visual C++ / .NET, programy,
+        poprawki. Gdy problem jest wszędzie - wspólne zmiany przed jego początkiem. Wynik: wiersze «Wniosek» do tabeli.
+    #>
+    param([object[]]$Prints)
+    $out = New-Object System.Collections.ArrayList
+    $add = {
+        param([string]$Item, [string]$Desc, [string]$Detail, [int]$Score)
+        $tone = if ($Score -ge 75) { 'crit' } elseif ($Score -ge 45) { 'warn' } else { 'info' }
+        $conf = if ($Score -ge 75) { 'wysoka' } elseif ($Score -ge 45) { 'średnia' } elseif ($Score -ge 1) { 'niska' } else { '' }
+        [void]$out.Add([pscustomobject][ordered]@{ 'Kategoria' = 'Wniosek'; 'Pewność' = $conf; 'Element' = $Item; 'Czas' = ''; 'Opis' = $Desc; 'Użytkownik' = ''; 'Ścieżka' = ''; 'Szczegóły' = $Detail; '__tone' = $tone; '__kind' = 'compare'; '__score' = $Score; '__fp' = '' })
+    }
+    $found = @($Prints | Where-Object { $_.Found })
+    if ($found.Count -lt 2) { return @() }
+    $sick = @($found | Where-Object { $_.Problem })
+    $ok = @($found | Where-Object { -not $_.Problem })
+    $names = { param($list) (@($list | ForEach-Object { $_.Host })) -join ', ' }
+    if (-not $sick.Count) { & $add 'Porównanie: problemu nie ma na żadnym komputerze' ('Przeanalizowane: {0}.' -f (& $names $found)) '' 0; return $out.ToArray() }
+    if (-not $ok.Count) {
+        $common = @($sick[0].Changes)
+        foreach ($sp in @($sick | Select-Object -Skip 1)) { $common = @($common | Where-Object { @($sp.Changes) -contains $_ }) }
+        & $add ('Problem na wszystkich komputerach ({0})' -f $sick.Count) ('Przyczyna jest raczej wspólna – wersja aplikacji, serwer, zasady albo aktualizacja. {0}' -f $(if ($common.Count) { 'Ta sama zmiana przed problemem na wszystkich: ' + (($common | Select-Object -First 3) -join '; ') + '.' } else { 'Zaznacz też komputer, na którym program działa – porównanie wskaże różnice.' })) ((@($sick | ForEach-Object { '{0}: {1}' -f $_.Host, $_.Top })) -join "`n") $(if ($common.Count) { 70 } else { 35 })
+        return $out.ToArray()
+    }
+    $setOf = { param($pr) $h = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase); foreach ($f in @($pr.Features)) { [void]$h.Add([string]$f) }; , $h }
+    $sickSets = @($sick | ForEach-Object { , (& $setOf $_) })
+    $okSets = @($ok | ForEach-Object { , (& $setOf $_) })
+    # Różnice dotyczą stanu komputera - same objawy (moduł awarii, brak biblioteki, niedostępny serwer) są już we wnioskach
+    $skip = '^(Moduł awarii|Brak biblioteki|Niedostępny serwer): '
+    $onlySick = @($sickSets[0] | Where-Object { $f = $_; $f -notmatch $skip -and -not @($sickSets | Where-Object { -not $_.Contains($f) }).Count -and -not @($okSets | Where-Object { $_.Contains($f) }).Count })
+    $onlyOk = @($okSets[0] | Where-Object { $f = $_; $f -notmatch $skip -and -not @($okSets | Where-Object { -not $_.Contains($f) }).Count -and -not @($sickSets | Where-Object { $_.Contains($f) }).Count })
+    $weight = { param([string]$f) if ($f -match '^Wersja aplikacji') { 85 } elseif ($f -match '^Plik ') { 80 } elseif ($f -match '^(Visual C\+\+|\.NET)') { 75 } elseif ($f -match '^Program') { 55 } elseif ($f -match '^System') { 50 } elseif ($f -match '^Poprawka') { 45 } else { 40 } }
+    # Jeden komputer z każdej strony to słaby dowód; kilka po obu stronach - mocny
+    $evidence = if ($sick.Count -ge 2 -and $ok.Count -ge 2) { 10 } elseif ($sick.Count -eq 1 -and $ok.Count -eq 1) { -15 } else { 0 }
+    & $add ('Porównanie: {0} z problemem, {1} działających' -f $sick.Count, $ok.Count) ('Z problemem: {0}; działające: {1}. Różnice obecne na wszystkich komputerach z jednej grupy i na żadnym z drugiej:' -f (& $names $sick), (& $names $ok)) '' 0
+    $value = { param([string]$f) ($f -split ': ', 2)[1] }
+    $kindOf = { param([string]$f) ($f -split ': ', 2)[0] }
+    $pairs = @{}
+    foreach ($f in $onlyOk) { $k = & $kindOf $f; if (-not $pairs.ContainsKey($k)) { $pairs[$k] = New-Object System.Collections.ArrayList }; [void]$pairs[$k].Add((& $value $f)) }
+    $used = 0
+    foreach ($f in @($onlySick | Sort-Object { - (& $weight $_) } | Select-Object -First 8)) {
+        $k = & $kindOf $f
+        $other = if ($pairs.ContainsKey($k) -and $k -match '^(Wersja aplikacji|Plik |System)') { '; na działających: ' + ((@($pairs[$k]) | Select-Object -First 3) -join ', ') } else { '' }
+        & $add ('Tylko na komputerach z problemem – {0}' -f $k) ((& $value $f) + $other) '' ([Math]::Min(90, (& $weight $f) + $evidence))
+        $used++
+    }
+    foreach ($f in @($onlyOk | Where-Object { -not ((& $kindOf $_) -match '^(Wersja aplikacji|Plik |System)' -and @($onlySick | Where-Object { (& $kindOf $_) -eq (& $kindOf $f) }).Count) } | Sort-Object { - (& $weight $_) } | Select-Object -First 5)) {
+        & $add ('Brak na komputerach z problemem – {0}' -f (& $kindOf $f)) ('jest na wszystkich działających: ' + (& $value $f)) '' ([Math]::Min(85, (& $weight $f) - 5 + $evidence))
+        $used++
+    }
+    if (-not $used) { & $add 'Porównanie: brak różnic w wersjach i składnikach' 'Komputery z problemem i działające mają te same wersje aplikacji, systemu, środowisk i programów – szukaj przyczyny w danych, profilu użytkownika, ustawieniach albo sieci.' '' 30 }
+    $more = $onlySick.Count + $onlyOk.Count - $used
+    if ($more -gt 0) { $out[0].'Szczegóły' = ('Pozostałe różnice ({0}):' -f $more) + "`n" + ((@($onlySick | Select-Object -Skip 8 | ForEach-Object { '+ ' + $_ }) + @($onlyOk | Select-Object -Skip 5 | ForEach-Object { '- ' + $_ }) | Select-Object -First 60) -join "`n") }
+    return $out.ToArray()
+}
+
+function Start-AppAnalysis {
+    # Analiza aplikacji na zaznaczonych komputerach (albo -Name / -Computers z innego modułu)
+    param([hashtable]$Module, [string]$Name = '')
+    $m = $Module
+    if ($Name) { $m.AppName.Text = $Name }
+    $app = $m.AppName.Text.Trim()
+    if (-not $app) { Show-Warning 'Podaj nazwę programu (fragment, np. Optima) albo nazwę pliku .exe.'; return }
+    $targets = @(Get-TargetComputers)
+    if (-not $targets) { return }
+    $win = Get-AppAnalysisWindow -Module $m
+    if (-not $win) { return }
+    $recent = @(@($app) + @(Get-ModuleSetting -Module $m -Name 'Names' -Default @()) | Where-Object { $_ } | Select-Object -Unique -First 15)
+    Set-ModuleSetting -Module $m -Name 'Names' -Value $recent
+    $m.Data.Last = @{ Name = $app; From = $win.From; To = $win.To }
+    $params = @{
+        Helpers = $script:NetResHelpers; Name = $app; From = $win.From.ToString('o'); To = $win.To.ToString('o'); UserFilter = $m.UserFilter.Text.Trim()
+        Offline = (Test-Checked $m.Offline); ScanLogs = (Test-Checked $m.ScanLogs); Network = (Test-Checked $m.Network); MaxSeconds = 120
+    }
+    if ($params.Offline) { Write-Log 'Rejestr niezalogowanych użytkowników: pliki NTUSER.DAT ładowane na chwilę (reg load / unload).' -Module $m.Title }
+    Reset-StatTiles $m
+    Start-HostOperation -Module $m -Name ('Analiza aplikacji «{0}»' -f $app) -Targets $targets -Parameters $params -ScriptBlock $script:AppAnalysisScript -OnComplete {
+        param($m)
+        $rows = @(Get-ResultRowsAll -Module $m)
+        $count = { param([string]$Cat, [string[]]$Kinds) @($rows | Where-Object { [string](Get-ObjectValue $_ 'Kategoria') -eq $Cat -and (-not $Kinds -or $Kinds -contains [string](Get-ObjectValue $_ '__kind')) }).Count }
+        $hyp = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Kategoria') -eq 'Wniosek' -and [string](Get-ObjectValue $_ '__kind') -notin 'summary', 'scope', 'ok' })
+        $high = @($hyp | Where-Object { [int](Get-ObjectValue $_ '__score') -ge 75 }).Count
+        $mid = @($hyp | Where-Object { [int](Get-ObjectValue $_ '__score') -ge 45 -and [int](Get-ObjectValue $_ '__score') -lt 75 }).Count
+        Set-StatTile -Module $m -Key 'findings' -Value ('{0} / {1}' -f $high, $mid) -Tone $(if ($high) { 'crit' } elseif ($mid) { 'warn' } else { 'ok' })
+        $crashes = & $count 'Awaria' @('crash', 'dotnet')
+        Set-StatTile -Module $m -Key 'crashes' -Value ([string]$crashes) -Tone $(if ($crashes) { 'crit' } else { '' })
+        Set-StatTile -Module $m -Key 'hangs' -Value ([string](& $count 'Awaria' @('hang')))
+        Set-StatTile -Module $m -Key 'events' -Value ([string](& $count 'Zdarzenie' @()))
+        $logErr = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Kategoria') -eq 'Plik logu' -and [string](Get-ObjectValue $_ '__tone') -eq 'warn' -and [string](Get-ObjectValue $_ '__kind') -eq 'log' }).Count
+        Set-StatTile -Module $m -Key 'logs' -Value ('{0} / {1}' -f $logErr, (& $count 'Plik logu' @('log'))) -Tone $(if ($logErr) { 'warn' } else { '' })
+        $down = @($rows | Where-Object { [string](Get-ObjectValue $_ 'Kategoria') -eq 'Połączenie' -and [string](Get-ObjectValue $_ '__tone') -eq 'crit' }).Count
+        Set-StatTile -Module $m -Key 'conns' -Value ('{0} / {1}' -f $down, (& $count 'Połączenie' @('endpoint'))) -Tone $(if ($down) { 'crit' } else { '' })
+        # Porównanie komputerów (działające a z problemem) - wiersze «(porównanie)» dopisane do tabeli
+        $prints = @(foreach ($r in @($rows | Where-Object { [string](Get-ObjectValue $_ '__kind') -eq 'scope' })) {
+                try { $o = ConvertFrom-Json ([string](Get-ObjectValue $r '__fp')); $o | Add-Member -NotePropertyName Host -NotePropertyValue ([string](Get-ObjectValue $r 'Komputer')) -Force; $o } catch { }
+            })
+        $cmp = @(Get-AppComparisonRows -Prints $prints)
+        if ($cmp.Count) {
+            $m.Data.CompareRows = $cmp
+            Invoke-Deferred -Module $m -Action {
+                param($m)
+                Start-HostOperation -Module $m -Name 'Porównanie komputerów' -Targets @('(porównanie)') -Local -Append -Quiet -Parameters @{ Rows = $m.Data.CompareRows } -ScriptBlock { param($Target, $P, $Ctx) $P.Rows }
+            }
+        }
+    }
+}
+
+function Get-AppAnalysisRows {
+    # Wiersze zaznaczone albo - bez zaznaczenia - wszystkie; -Kinds: tylko wiersze tych rodzajów (__kind)
+    param([hashtable]$Module, $Rows, [string[]]$Kinds = @())
+    $src = @(if ($Rows) { $Rows } else { Get-ResultRowsAll -Module $Module })
+    return @($src | Where-Object { -not $Kinds.Count -or $Kinds -contains [string](Get-RowValue $_ '__kind') })
+}
+
+function Show-AppLogTail {
+    # Podgląd końcówki zaznaczonych plików logów (do 3) - odczyt na komputerze przez WinRM
+    param([hashtable]$Module, $Rows)
+    $m = $Module
+    $logs = @(Get-AppAnalysisRows -Module $m -Rows $Rows -Kinds @('log') | Where-Object { [string](Get-RowValue $_ 'Ścieżka') })
+    if (-not $logs.Count) { Show-Warning 'Zaznacz wiersze «Plik logu».'; return }
+    $per = @{}
+    foreach ($r in @($logs | Select-Object -First 3)) {
+        $c = [string](Get-RowValue $r 'Komputer')
+        if (-not $per.ContainsKey($c)) { $per[$c] = @{ Files = New-Object System.Collections.ArrayList; Lines = 400 } }
+        [void]$per[$c].Files.Add([string](Get-RowValue $r 'Ścieżka'))
+    }
+    Start-HostOperation -Module $m -Name 'Podgląd logu' -Targets @($per.Keys) -PerTarget $per -Output None -ScriptBlock $script:AppTailScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { Show-Warning ('{0}: {1}' -f $r.Target, ((@($r.Errors)) -join ' | ')); return }
+        foreach ($d in @($r.Data)) {
+            if ($d.Error) { Show-Warning ('{0}: {1}' -f $d.Path, $d.Error); continue }
+            $sub = '{0} • {1:N1} MB • zmieniony {2:yyyy-MM-dd HH:mm:ss} • ostatnie {3} wierszy' -f $r.Target, ($d.Size / 1MB), $d.Modified, $d.Lines
+            Show-TextDialog -Title (Split-Path -Leaf ([string]$d.Path)) -Subtitle $sub -Text ([string]$d.Text)
+        }
+    }
+}
+
+function Open-AppLogInLogsModule {
+    # Plik z wiersza w module «Logi aplikacji» (oś czasu, filtr, śledzenie) - na tym samym komputerze
+    param([hashtable]$Module, $Rows)
+    $r = @(Get-AppAnalysisRows -Module $Module -Rows $Rows -Kinds @('log') | Where-Object { [string](Get-RowValue $_ 'Ścieżka') }) | Select-Object -First 1
+    if (-not $r) { Show-Warning 'Zaznacz wiersz «Plik logu».'; return }
+    $computer = [string](Get-RowValue $r 'Komputer')
+    $path = [string](Get-RowValue $r 'Ścieżka')
+    Show-Module -Key 'AppLogs'
+    $al = $script:UI.Modules['AppLogs']
+    if (-not $al -or -not $al.Path) { return }
+    $al.Path.Text = $path
+    $al.Files.SelectedIndex = 0
+    Invoke-WithTargets -Kind Computer -Names @($computer) -Action {
+        $q = Get-LogQuery -Module $al
+        if ($q) { $al.Data.Pattern = ''; Start-LogRead -Module $al -Targets @($computer) -Query $q }
+    }
+}
+
+function Start-AppPackage {
+    # Paczka diagnostyczna (ZIP) dla komputerów z zaznaczonych wierszy (bez zaznaczenia - wszystkich z wyników):
+    # tworzona na komputerze, kopiowana przez udział administracyjny do wybranego folderu i usuwana z komputera
+    param([hashtable]$Module, $Rows)
+    $m = $Module
+    $all = @(Get-ResultRowsAll -Module $m)
+    if (-not $all.Count -or -not $m.Data.Last) { Show-Warning 'Najpierw uruchom analizę aplikacji.'; return }
+    $hosts = @(@(if ($Rows) { $Rows } else { $all }) | ForEach-Object { [string](Get-ObjectValue $_ 'Komputer') } | Where-Object { $_ } | Select-Object -Unique)
+    if (-not $hosts.Count) { return }
+    $v = Show-FormDialog -Title 'Paczka diagnostyczna' -Subtitle ('{0} • komputery: {1}' -f $m.Data.Last.Name, ($hosts -join ', ')) -Icon 'E7B8' -OkText 'Utwórz paczki' -Fields @(
+        @{ Key = 'Dir'; Label = 'Folder docelowy (na tym komputerze albo udziale)'; Type = 'Folder'; Value = [string](Get-ModuleSetting -Module $m -Name 'PackageDir' -Default '') }
+        @{ Key = 'Logs'; Label = 'Pliki logów aplikacji z wyników'; Type = 'Check'; Value = $true }
+        @{ Key = 'Wer'; Label = 'Raporty błędów Windows (WER) i zrzuty pamięci'; Type = 'Check'; Value = $true }
+        @{ Key = 'Events'; Label = 'Dzienniki zdarzeń Aplikacja i System z okna czasu (.evtx)'; Type = 'Check'; Value = $true }
+        @{ Key = 'Registry'; Label = 'Klucze rejestru aplikacji (.reg) – mogą zawierać zapisane hasła programu'; Type = 'Check'; Value = $false }
+        @{ Key = 'MaxMB'; Label = 'Limit plików na komputer (MB)'; Type = 'Number'; Value = 300; Min = 10; Max = 5000 }
+    ) -Validate {
+        param($values)
+        $d = ([string]$values.Dir).Trim()
+        if (-not $d) { return 'Wybierz folder docelowy.' }
+        if (-not (Test-Path -LiteralPath $d -PathType Container)) { return 'Folder nie istnieje albo nie ma do niego dostępu z tego komputera.' }
+        return ''
+    }
+    if (-not $v) { return }
+    $dest = ([string]$v.Dir).Trim().TrimEnd('\')
+    $maxMb = 300
+    [void][int]::TryParse([string]$v.MaxMB, [ref]$maxMb)
+    Set-ModuleSetting -Module $m -Name 'PackageDir' -Value $dest
+    $per = @{}
+    foreach ($h in $hosts) {
+        $hr = @($all | Where-Object { [string](Get-ObjectValue $_ 'Komputer') -eq $h })
+        $pick = { param([string[]]$Kinds) @($hr | Where-Object { $Kinds -contains [string](Get-ObjectValue $_ '__kind') } | ForEach-Object { [string](Get-RowValue $_ 'Ścieżka') } | Where-Object { $_ } | Select-Object -Unique) }
+        $csv = (@($hr | ForEach-Object { [pscustomobject][ordered]@{ 'Komputer' = $h; 'Kategoria' = Get-ObjectValue $_ 'Kategoria'; 'Pewność' = Get-ObjectValue $_ 'Pewność'; 'Czas' = Get-ObjectValue $_ 'Czas'; 'Element' = Get-ObjectValue $_ 'Element'; 'Opis' = Get-ObjectValue $_ 'Opis'; 'Użytkownik' = Get-ObjectValue $_ 'Użytkownik'; 'Ścieżka' = Get-ObjectValue $_ 'Ścieżka'; 'Szczegóły' = Get-ObjectValue $_ 'Szczegóły' } } | ConvertTo-Csv -NoTypeInformation -Delimiter ';')) -join "`r`n"
+        $per[$h] = @{
+            Name = $m.Data.Last.Name; From = $m.Data.Last.From.ToString('o'); To = $m.Data.Last.To.ToString('o'); Csv = $csv
+            Files = & $pick @('log'); Wer = & $pick @('wer'); Dumps = & $pick @('dump'); RegKeys = & $pick @('reg')
+            Logs = [bool]$v.Logs; WerOn = [bool]$v.Wer; Events = [bool]$v.Events; Registry = [bool]$v.Registry; MaxMB = [Math]::Max(10, $maxMb)
+        }
+    }
+    $m.Data.PackDest = $dest
+    $m.Data.PackZips = @{}
+    Write-Log ('Paczka diagnostyczna «{0}»: {1} komputerów, folder {2}.' -f $m.Data.Last.Name, $hosts.Count, $dest) -Module $m.Title
+    Start-HostOperation -Module $m -Name 'Paczka diagnostyczna' -Targets $hosts -PerTarget $per -Output None -ScriptBlock $script:AppPackageScript -OnResult {
+        param($m, $r)
+        if (-not $r.Ok) { Write-Log ('[{0}] Paczka diagnostyczna: {1}' -f $r.Target, ((@($r.Errors)) -join ' | ')) 'ERROR' -Module $m.Title; return }
+        $d = @($r.Data)[0]
+        if ($d -and $d.Zip) { $m.Data.PackZips[$r.Target] = $d }
+    } -OnComplete {
+        param($m)
+        if (-not $m.Data.PackZips.Count) { return }
+        Invoke-Deferred -Module $m -Action {
+            param($m)
+            $copy = @{}
+            foreach ($h in @($m.Data.PackZips.Keys)) {
+                $d = $m.Data.PackZips[$h]
+                $copy[$h] = @{ Unc = (Get-M365UncPath -Computer $h -Path ([string]$d.Zip)); Dest = $m.Data.PackDest; Notes = @($d.Notes); Size = [int64]$d.Size }
+            }
+            Start-HostOperation -Module $m -Name 'Kopiowanie paczek diagnostycznych' -Targets @($copy.Keys) -PerTarget $copy -Local -Output Log -ScriptBlock {
+                param($Target, $P, $Ctx)
+                $leaf = Split-Path -Leaf ([string]$P.Unc)
+                $dst = Join-Path ([string]$P.Dest) (('{0}_{1}' -f ($Target -replace '[\\/:*?"<>|]', '_'), $leaf))
+                try {
+                    Copy-Item -LiteralPath $P.Unc -Destination $dst -ErrorAction Stop
+                    Remove-Item -LiteralPath $P.Unc -Force -ErrorAction SilentlyContinue
+                    [pscustomobject][ordered]@{ 'Paczka' = $dst; 'Rozmiar (MB)' = [Math]::Round($P.Size / 1MB, 1); 'Wynik' = $(if (@($P.Notes).Count) { 'OK – uwagi: ' + ((@($P.Notes) | Select-Object -First 5) -join '; ') } else { 'OK' }) }
+                }
+                catch { [pscustomobject][ordered]@{ 'Paczka' = [string]$P.Unc; 'Wynik' = 'Błąd – ' + $_.Exception.Message + ' (paczka została na komputerze)' } }
+            }
+        }
+    }
+}
+
+Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'AppAnalysis' -Title 'Analiza aplikacji' -Icon 'EBE8' -Badge 'nowe' `
+    -Description 'Co się dzieje z programem na zaznaczonych komputerach – z diagnozą: przyczyny od najpewniejszej (brakujące biblioteki i środowiska, awarie z modułem i kodem błędu, nowe błędy w logach, niedostępne serwery z ustawień, blokady zabezpieczeń, zmiany przed pierwszym problemem) oraz porównanie komputerów działających z tymi z problemem. Dla dowolnego programu, tylko odczyt.' -Build {
+    param($m)
+    $m.PillColumns = @('Kategoria')
+    $m.Data.Last = $null
+    $row = Add-ToolbarRow -Module $m -Title 'Aplikacja'
+    $m.AppName = Add-TextBox -Parent $row -Width 340 -Placeholder 'nazwa programu albo plik .exe, np. Optima, Teams, program.exe'
+    $m.AppName.Text = [string](@(Get-ModuleSetting -Module $m -Name 'Names' -Default @()) | Select-Object -First 1)
+    Add-Button -Parent $row -Text '' -Icon 'E81C' -Module $m -AlwaysEnabled -ToolTip 'Ostatnio analizowane aplikacje' -OnClick {
+        param($m)
+        $recent = @(Get-ModuleSetting -Module $m -Name 'Names' -Default @())
+        if (-not $recent.Count) { Show-Message -Text 'Brak zapamiętanych nazw – pojawią się po pierwszej analizie.' -Title 'Ostatnie aplikacje'; return }
+        $pick = Show-FormDialog -Title 'Ostatnie aplikacje' -Icon 'E81C' -Fields @(@{ Key = 'N'; Label = 'Aplikacja'; Type = 'Combo'; Items = $recent; Value = $recent[0] })
+        if ($pick) { $m.AppName.Text = $pick.N }
+    } | Out-Null
+    $m.UserFilter = Add-TextBox -Parent $row -Width 170 -Placeholder 'Użytkownik (fragment)'
+    $m.UserFilter.ToolTip = 'Profile, w których szukać logów, raportów WER i ustawień (puste – wszyscy)'
+    $row2 = Add-ToolbarRow -Module $m -Title 'Okno czasu'
+    $m.Range = Add-ComboBox -Parent $row2 -Items @($script:AppAnalysisRanges.Keys) -Width 180 -Selected 1
+    $m.From = Add-TextBox -Parent $row2 -Width 150 -Placeholder 'od RRRR-MM-DD gg:mm'
+    $m.To = Add-TextBox -Parent $row2 -Width 150 -Placeholder 'do (puste = teraz)'
+    $m.From.IsEnabled = $false
+    $m.To.IsEnabled = $false
+    Register-ControlHandler -Control $m.Range -EventName 'SelectionChanged' -Module $m -Action {
+        param($m)
+        $custom = ([int]$script:AppAnalysisRanges[[string]$m.Range.SelectedItem] -eq 0)
+        $m.From.IsEnabled = $custom
+        $m.To.IsEnabled = $custom
+    }
+    Add-Label -Parent $row2 -Text 'Zdarzenia, awarie i zmiany z tego okna; błędy w logach – w plikach zmienionych w tym czasie.' -Hint -MaxWidth 480 | Out-Null
+    $row3 = Add-ToolbarRow -Module $m -Title 'Opcje'
+    $m.ScanLogs = Add-CheckBox -Parent $row3 -Text 'Błędy w treści logów' -Checked $true -ToolTip 'Końcówka (do 512 KB) najnowszych plików logów zmienionych w oknie czasu: rodzaje błędów (wzorce), nowe i powtarzające się, kody błędów z opisem'
+    $m.Network = Add-CheckBox -Parent $row3 -Text 'Połączenia z serwerów z ustawień' -Checked $true -ToolTip 'Serwery z plików ustawień programu (bazy danych, adresy URL, udziały): czy nazwa się rozwiązuje i port odpowiada – z komputera docelowego (bez haseł z ustawień)'
+    $m.Offline = Add-CheckBox -Parent $row3 -Text 'Także rejestr niezalogowanych (NTUSER.DAT)' -ToolTip 'Pliki NTUSER.DAT niezalogowanych użytkowników są na chwilę ładowane do rejestru komputera (reg load) i od razu zwalniane – nie używaj, gdy użytkownicy właśnie się logują.'
+    Add-Button -Parent $row3 -Text 'Analizuj' -Icon 'EBE8' -Module $m -Primary -OnClick { param($m) Start-AppAnalysis -Module $m } | Out-Null
+    Add-Button -Parent $row3 -Text 'Paczka diagnostyczna…' -Icon 'E7B8' -Module $m -ToolTip 'ZIP z logami, raportami WER, dziennikami zdarzeń i wynikiem analizy – np. dla producenta programu' -OnClick { param($m) Start-AppPackage -Module $m -Rows $null } | Out-Null
+    $row4 = Add-ToolbarRow -Module $m -Title 'Widok'
+    $m.ViewSel = Add-Segmented -Parent $row4 -Items @($script:AppAnalysisViews.Keys) -Module $m -OnChange {
+        param($m)
+        $i = Get-SegmentIndex $m.ViewSel
+        $m.ExtraFilter = [string]@($script:AppAnalysisViews.Values)[$i]
+        # Oś czasu: wszystko, co ma czas, od najnowszego (bez wniosków)
+        if ($m.View) { try { $m.View.Sort = $(if (@($script:AppAnalysisViews.Keys)[$i] -eq 'Oś czasu') { 'Czas DESC' } else { '' }) } catch { } }
+        Update-ResultFilter -Module $m
+    }
+    (Add-StatTile -Module $m -Key 'findings' -Label 'Przyczyny' -Icon 'E7BA').ToolTip = 'Przyczyny o wysokiej / średniej pewności (wiersze «Wniosek»)'
+    Add-StatTile -Module $m -Key 'crashes' -Label 'Awarie' -Icon 'EA39' | Out-Null
+    Add-StatTile -Module $m -Key 'hangs' -Label 'Zawieszenia' -Icon 'E916' | Out-Null
+    Add-StatTile -Module $m -Key 'events' -Label 'Zdarzenia' -Icon 'E81C' | Out-Null
+    (Add-StatTile -Module $m -Key 'logs' -Label 'Logi z błędami' -Icon 'E8A5').ToolTip = 'Pliki logów z błędami w końcówce / wszystkie znalezione pliki logów'
+    (Add-StatTile -Module $m -Key 'conns' -Label 'Serwery' -Icon 'E968').ToolTip = 'Serwery z ustawień programu: niedostępne / sprawdzone'
+    Add-RowAction -Module $m -Text 'Pokaż pełną treść…' -Icon 'E8A5' -Action {
+        param($m, $rows)
+        $r = $rows[0]
+        $text = (@('Kategoria', 'Czas', 'Element', 'Opis', 'Użytkownik', 'Ścieżka') | ForEach-Object { $val = [string](Get-RowValue $r $_); if ($val) { '{0}: {1}' -f $_, $val } }) -join "`r`n"
+        $det = [string](Get-RowValue $r 'Szczegóły')
+        if ($det) { $text += "`r`n`r`n" + $det }
+        Show-TextDialog -Title ([string](Get-RowValue $r 'Element')) -Subtitle ([string](Get-RowValue $r 'Komputer')) -Text $text
+    }
+    Add-RowAction -Module $m -Text 'Pokaż końcówkę pliku logu…' -Icon 'E8A5' -Action { param($m, $rows) Show-AppLogTail -Module $m -Rows $rows }
+    Add-RowAction -Module $m -Text 'Otwórz w module «Logi aplikacji»' -Icon 'E7C3' -Action { param($m, $rows) Open-AppLogInLogsModule -Module $m -Rows $rows }
+    Add-RowAction -Module $m -Text 'Pokaż w Eksploratorze (udział administracyjny)' -Icon 'E838' -Separator -Action {
+        param($m, $rows)
+        $paths = @(foreach ($r in @($rows)) { $p0 = [string](Get-RowValue $r 'Ścieżka'); if ($p0 -match '^[A-Za-z]:\\') { Get-M365UncPath -Computer ([string](Get-RowValue $r 'Komputer')) -Path $p0 } })
+        if (-not $paths.Count) { Show-Warning 'Zaznaczone wiersze nie mają ścieżki pliku ani folderu.'; return }
+        foreach ($u in @($paths | Select-Object -Unique -First 5)) {
+            try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('/select,"{0}"' -f $u) } catch { Show-Error "Nie można otworzyć $u." $_ }
+        }
+    }
+    Add-RowAction -Module $m -Text 'Kopiuj ścieżkę' -Icon 'E8C8' -Action {
+        param($m, $rows)
+        $paths = @($rows | ForEach-Object { [string](Get-RowValue $_ 'Ścieżka') } | Where-Object { $_ } | Select-Object -Unique)
+        if (-not $paths.Count) { Show-Warning 'Zaznaczone wiersze nie mają ścieżki.'; return }
+        Set-ClipboardText ($paths -join [Environment]::NewLine)
+        Show-Toast "Skopiowano ścieżek: $($paths.Count)" 'ok'
+    }
+    Add-RowAction -Module $m -Text 'Paczka diagnostyczna dla tych komputerów…' -Icon 'E7B8' -Separator -Action { param($m, $rows) Start-AppPackage -Module $m -Rows $rows }
+    $m.EmptyHint = 'Podaj nazwę programu (fragment z «Zainstalowanych programów») albo plik .exe, wybierz okno czasu i kliknij «Analizuj». Na górze tabeli – diagnoza: przyczyny od najpewniejszej, z dowodami i tym, co zrobić. Zaznacz też komputer, na którym program działa – moduł porówna je i wskaże różnice. Analizę uruchomisz też z menu wiersza w «Zainstalowanych programach».'
 }
 #endregion
 
@@ -36460,6 +38222,42 @@ $script:HelpTexts = @{
 
 **Jak działa.** Skrypt na komputerze rozpoznaje kodowanie (UTF-8, UTF-16, ANSI) i format daty, łączy wpisy wielowierszowe (stos wywołań) i czyta duże pliki od końca, bez blokowania pliku aplikacji.
 '@
+'Remote|Analiza aplikacji' = @'
+**Do czego.** Ustalić, co się dzieje z programem, który się zamyka, zawiesza, nie startuje albo działa źle — na zaznaczonych komputerach, dla dowolnej aplikacji. Moduł sam rozpoznaje program, zbiera ślady z całego komputera i układa je w **diagnozę**: przyczyny od najbardziej prawdopodobnej, z dowodami i tym, co zrobić. Nie wymaga konfiguracji pod konkretną aplikację.
+
+**Co możesz zrobić**
+- podać fragment nazwy programu (jak w *Zainstalowanych programach*, np. „Optima”, „Teams”) albo nazwę pliku `.exe` i okno czasu (6 godz. – 30 dni albo przedział od – do); opcjonalnie zawęzić profile do jednego użytkownika;
+- przeczytać **diagnozę** na górze tabeli: wiersz z trzema najbardziej prawdopodobnymi przyczynami, a pod nim hipotezy z kolumną **Pewność** (wysoka / średnia / niska), np.:
+  - „Brak biblioteki `mfc120u.dll` – zainstaluj Visual C++ 2013 x64”, „Brak środowiska Microsoft.WindowsDesktop.App 8.0 (x64)”, „Niezgodna architektura biblioteki (32/64-bit)”;
+  - „Serwer niedostępny: `db01:1433`” (z pliku ustawień programu), „Uszkodzony plik ustawień”, „Zmiana ustawień przed pierwszym problemem”;
+  - „Awarie programu: 3 (moduł `plugin.dll`) – moduł zewnętrzny”, z informacją, czy program pada przy starcie, czy w trakcie pracy;
+  - „Problemy zaczęły się po zmianie aplikacji”, „Zmiana środowiska wykonawczego przed problemem” (np. usunięty pakiet Visual C++);
+  - „Nowy błąd w logu `app.log`” (rodzaj błędu, którego wcześniej nie było), „Odmowa dostępu albo plik w użyciu” (z kodów błędów);
+  - „Defender / AppLocker / WDAC zablokował …”, „Przekierowanie uruchamiania”, „Zasada blokuje uruchomienie”, „Pliki programu zablokowane (pobrane z internetu)”;
+  - „Brak pamięci wirtualnej”, „Stan procesu – możliwy wyciek uchwytów”, „Problem jednego użytkownika”, „Komputer czeka na restart”;
+- zaznaczyć kilka komputerów — także taki, na którym program **działa** — i dostać **porównanie**: różnice obecne na wszystkich komputerach z problemem i na żadnym działającym (wersja aplikacji i plików, system, pakiety Visual C++ i .NET, inne programy, poprawki KB). Gdy problem jest wszędzie, porównanie pokazuje wspólne zmiany sprzed jego początku;
+- przełączać **widoki**: wnioski, oś czasu (wszystko z datą, od najnowszego), awarie i zdarzenia, logi, program i zależności, rejestr, system;
+- z menu wiersza: **pełna treść**, **końcówka pliku logu** (ostatnie 400 wierszy), **otwarcie logu w module «Logi aplikacji»** (oś czasu, filtr, śledzenie), pokazanie pliku w Eksploratorze przez udział administracyjny, kopiowanie ścieżki;
+- utworzyć **paczkę diagnostyczną** (ZIP na komputer, np. dla producenta programu): wynik analizy (CSV), pliki logów, raporty WER i zrzuty pamięci, dzienniki Aplikacja i System z okna czasu (`.evtx`), opcjonalnie klucze rejestru aplikacji (`.reg` — mogą zawierać zapisane hasła programu);
+- uruchomić analizę z modułu *Zainstalowane programy* (menu wiersza **Analizuj aplikację**).
+
+**Jak działa**
+- **Rozpoznanie programu** bez listy znanych aplikacji: wpis deinstalacji (wersja, wydawca, folder, plik `.exe` z ikony), pakiet MSIX / Sklepu (stan pakietu, plik z manifestu), rejestracja *App Paths*, pliki `.exe` w folderze instalacji i uruchomione procesy. Z tego program składa słowa wyszukiwania (nazwa, pliki `.exe`, wydawca).
+- **Zależności** z samych plików, bez uruchamiania: tabela importu programu i bibliotek w jego folderze (nagłówek PE) — czy system znajdzie każdą bibliotekę (folder programu, folder systemowy dla tej architektury, PATH, WinSxS) i jaki pakiet ją dostarcza; architektura 32/64-bit; środowisko .NET z pliku `.config` (.NET Framework) albo `runtimeconfig.json` (.NET 5+ — wersja i architektura); pliki z oznaczeniem „pobrany z internetu”; podpis cyfrowy.
+- **Zdarzenia z okna czasu**: awarie (*Application Error*) z modułem, opisanym kodem wyjątku i czasem działania procesu, zawieszenia, wyjątki .NET (typ i kody HRESULT), okna błędu systemu (brak biblioteki DLL), błędy side-by-side, awarie usług aplikacji, brak pamięci wirtualnej, blokady Defendera (wykrycia, ASR, kontrolowany dostęp do folderów), AppLockera i Code Integrity, błędy wdrażania pakietu MSIX, zdarzenia ze źródeł i dzienników aplikacji; instalacje MSI i aktualizacje Windows — także z 7 dni przed oknem, do porównania z początkiem problemu; nieoczekiwane wyłączenia.
+- **Raporty błędów Windows (WER)** z `ProgramData` i profili użytkowników, zrzuty pamięci z `CrashDumps`.
+- **Logi**: pliki z folderu instalacji, `ProgramData`, `AppData\Local`, `Roaming` i `LocalLow` każdego użytkownika (foldery o nazwie aplikacji, w folderach wydawcy — wszystkie podfoldery) oraz z `Temp`. W najnowszych plikach zmienionych w oknie czasu program czyta końcówkę (do 512 KB, UTF-8 / UTF-16), rozpoznaje datę wpisu, grupuje błędy w **rodzaje** (bez dat, liczb, identyfikatorów) i odróżnia **nowe** (nie było ich przed oknem czasu) od powtarzających się. Kody błędów (np. `0x80070005`) tłumaczy na opis systemu tego komputera.
+- **Ustawienia i połączenia**: pliki ustawień programu (`.config`, `.json`, `.ini`, `.xml` …) — czy są poprawne, czy zmieniły się przed problemem; serwery z ustawień (ciągi połączenia z bazą, adresy URL, udziały, `host:port`) — czy nazwa się rozwiązuje i port odpowiada, sprawdzane z komputera docelowego równolegle (kilka sekund). Do wyników trafiają tylko nazwa i port — hasła z ustawień nie.
+- **Rejestr**: klucze aplikacji (komputer i użytkownicy; wartości jak hasło, token, klucz, ciąg połączenia są ukryte), tryb zgodności, *Image File Execution Options*, zrzuty WER, zasada *DisallowRun*. **System**: wolne miejsce, pamięć RAM, oczekujący restart.
+- **Diagnoza**: każda hipoteza dostaje ocenę 0–100 z dowodów i ich zbieżności — np. brak biblioteki zgłoszony też przez system przy starcie, nowy błąd w logu w chwili pierwszej awarii, zmiana aplikacji tuż przed pierwszym problemem, niedostępny serwer przy zawieszeniach. **Porównanie komputerów** korzysta z odcisku każdego komputera (wersje, środowiska, programy, poprawki).
+- Tylko odczyt: program niczego nie zmienia na komputerze. Paczka powstaje w `%SystemRoot%\Temp\DomainOps`, jest kopiowana przez udział administracyjny do wybranego folderu i usuwana z komputera.
+
+**Uwagi**
+- Przeszukiwanie plików ma limit 2 minut i 5000 plików na folder; przy przekroczeniu w wynikach jest wiersz „przeszukiwanie niepełne”.
+- Krótka albo bardzo ogólna nazwa (np. „App”) da więcej fałszywych trafień — podaj pełniejszą nazwę albo plik `.exe`.
+- Ocena to wskazówka, nie wyrok: przy kilku hipotezach o podobnej ocenie sprawdź dowody (pełna treść wiersza) i porównaj z działającym komputerem.
+- Rejestr niezalogowanych użytkowników jest czytany tylko z opcją *Także rejestr niezalogowanych (NTUSER.DAT)*; ich pliki logów i raporty WER — zawsze. Sprawdzanie połączeń wyłączysz opcją *Połączenia z serwerów z ustawień*.
+'@
 'Remote|Zasilanie i uptime' = @'
 **Do czego.** Sprawdzić, od kiedy komputery działają i czy czekają na restart; zaplanować restart lub wyłączenie.
 
@@ -36706,7 +38504,8 @@ $script:HelpTexts = @{
 - odczytać programy z rejestru (64- i 32-bitowe oraz z profili zalogowanych użytkowników);
 - sprawdzić w kolumnie **„Odinstalowanie zdalne”**, czy i jak program da się usunąć: MSI, tryb cichy producenta, Inno Setup (zielone); tylko z przełącznikami albo w sesji użytkownika (żółte); brak deinstalatora, blokada producenta albo profil bez trybu cichego (czerwone);
 - odinstalować zaznaczone programy (z limitem czasu) albo *Odinstaluj z przełącznikami…*;
-- *Pokaż ten program na wszystkich komputerach*.
+- *Pokaż ten program na wszystkich komputerach*;
+- **Analizuj aplikację** — moduł *Analiza aplikacji* dla programu z wiersza (awarie, logi, rejestr, wnioski).
 
 **Jak działa.** Deinstalacja działa przez WinRM. Po niej program sprawdza, czy aplikacja zniknęła z rejestru, i pisze wynik z przyczyną w kolumnie „Stan” (np. „deinstalator czekał na odpowiedź użytkownika”, „MSI 1618 – trwa inna instalacja”, „nadal zainstalowany – wymaga restartu”). Programy z profilu zalogowanego użytkownika są usuwane jednorazowym zadaniem Harmonogramu w jego sesji, **bez okna konsoli**: krótki skrypt `wscript.exe` uruchamia deinstalator w ukrytym oknie i zapisuje jego kod wyjścia (gdy Windows Script Host jest wyłączony — `cmd`, wtedy okno konsoli widać, a wynik o tym mówi). Gdy użytkownik nie jest zalogowany interaktywnie, zadanie nie rusza i wynik mówi o tym po kilku sekundach, zamiast czekać do limitu czasu. Po przekroczeniu limitu deinstalator jest zamykany razem z procesami, które uruchomił.
 '@
