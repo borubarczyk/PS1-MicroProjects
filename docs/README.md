@@ -2,7 +2,7 @@
 
 Domain Ops to centrum administracji domeną Windows w jednym pliku `AD-ManagerDiamond.ps1`. Program zbiera w jednym oknie operacje, które zwykle robi się w kilku konsolach: zarządzanie komputerami przez PowerShell Remoting, konta i grupy w Active Directory, uprawnienia NTFS, przegląd bezpieczeństwa i stanu domeny oraz raporty wysyłane według harmonogramu.
 
-Ta dokumentacja opisuje każdą sekcję programu: **do czego służy, co można w niej zrobić i jak działa**. Krótszy przegląd wszystkich funkcji jest w [README repozytorium](../README.md).
+Ta dokumentacja opisuje każdą sekcję programu: **do czego służy, co można w niej zrobić i jak działa**. Ten sam opis program pokazuje w oknie **Jak to działa** przy każdym module (`F1`) — jest osadzany w skrypcie z tych plików przez `dev/Update-EmbeddedHelp.ps1` (uruchom go po każdej zmianie dokumentacji). Krótszy przegląd wszystkich funkcji jest w [README repozytorium](../README.md).
 
 ## Spis treści
 
@@ -39,7 +39,7 @@ Ta dokumentacja opisuje każdą sekcję programu: **do czego służy, co można 
   - Zaznaczanie polami wyboru (także kilku wierszy naraz i spacją), szybkie wyszukiwanie, kolorowa kropka stanu (np. wynik testu łączności, konto zablokowane).
   - Menu pod prawym przyciskiem na komputerach: pulpit zdalny, pomoc zdalna (gdy włączona w Ustawieniach), **wiadomość do zalogowanych** na wszystkich zaznaczonych komputerach, Zarządzanie komputerem, Usługi, Podgląd zdarzeń, udział `C$`, kopiowanie nazw.
 - **Nawigacja modułów** — moduły pogrupowane w kategorie; kategorie można zwijać kliknięciem nagłówka (prawy przycisk: zwiń albo rozwiń wszystkie). Kropka przy module oznacza trwającą operację. Każda przestrzeń pamięta ostatnio otwarty moduł.
-- **Moduł** — nagłówek z opisem, panel parametrów (zwijany), kafelki z podsumowaniem, tabela wyników i panel szczegółów wiersza.
+- **Moduł** — nagłówek z opisem i przyciskiem **Jak to działa** (albo `F1`), panel parametrów (zwijany), kafelki z podsumowaniem, tabela wyników i panel szczegółów wiersza.
 - **Dziennik operacji** (`Ctrl+L`) — wszystkie operacje z wynikiem; licznik nowych ostrzeżeń na przycisku. Po starcie programu dziennik jest zwinięty.
 - **Pasek stanu** — postęp i przycisk *Przerwij* dla wszystkich operacji.
 
@@ -49,6 +49,8 @@ Ta dokumentacja opisuje każdą sekcję programu: **do czego służy, co można 
 2. Ustaw parametry w panelu modułu.
 3. Kliknij główny przycisk (albo `F5`). Operacja działa w tle — możesz pracować dalej, także w innych modułach.
 4. Wyniki pojawiają się w tabeli na bieżąco. Niedostępny komputer albo błąd to wiersz „Błąd” z przyczyną.
+
+**Jak to działa** — przycisk obok nazwy modułu (albo klawisz `F1`) otwiera opis modułu z tej dokumentacji: do czego służy, co można w nim zrobić, jak działa i na co uważać. Zakładki w tym oknie pokazują też wstęp przestrzeni roboczej i podstawy pracy z programem.
 
 **Tabela wyników**
 

@@ -61,6 +61,7 @@
 **Do czego.** Obserwować jeden serwer na żywo, jak w Monitorze zasobów, i dowiedzieć się, kto zużył najwięcej od początku pomiaru.
 
 **Co możesz zrobić**
+- wybrać komputer w polu **Komputer** — lista komputerów zaznaczonych po lewej (domyślnie pierwszy); zmiana w trakcie pomiaru **przełącza pomiar** na wybrany komputer;
 - uruchomić pomiar z próbką co kilka sekund (domyślnie 5 s) na zadany czas (najdłużej 15 min);
 - widzieć **kafelki z wykresami** ostatnich próbek: procesor, pamięć, najwolniejszy dysk, sieć;
 - czytać **„Co się dzieje teraz”** — wąskie gardło i jego sprawca, np. „Dysk D: 60 ms na operację – najwięcej I/O: backup 25 MB/s”;
@@ -68,7 +69,7 @@
 - przełączać widoki *Procesy* (teraz, średnio, szczyt, łącznie), *Dyski*, *Sieć*, *Przebieg* (próbka po próbce) i *Podsumowanie*;
 - skopiować podsumowanie do schowka i zakończyć proces z menu wiersza bez przerywania pomiaru.
 
-**Jak działa.** Jedno połączenie WinRM na cały pomiar: na serwerze działa pętla, która odczytuje liczniki i wysyła tylko różnice od poprzedniego odczytu, a program je sumuje. Tabela odświeża się w miejscu (sortowanie i zaznaczenie zostają). Koszt po stronie serwera widać w tabeli jako proces monitora — zwykle ułamek procenta CPU.
+**Jak działa.** Jedno połączenie WinRM na cały pomiar: na serwerze działa pętla, która odczytuje liczniki i wysyła tylko różnice od poprzedniego odczytu, a program je sumuje. Monitor obserwuje jeden komputer naraz — jego nazwę widać w polu *Komputer*, w nagłówku „Co się dzieje teraz – …” i na kafelku czasu pomiaru. Przy przełączeniu bieżący pomiar jest kończony, a nowy rusza od zera na wybranym komputerze. Tabela odświeża się w miejscu (sortowanie i zaznaczenie zostają). Koszt po stronie serwera widać w tabeli jako proces monitora — zwykle ułamek procenta CPU.
 
 **Uwagi.** Ruch sieciowy procesów to tylko liczba połączeń TCP — bajty na proces wymagałyby śledzenia jądra (ETW).
 
