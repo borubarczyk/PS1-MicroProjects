@@ -19228,7 +19228,8 @@ $script:LoadWhyXaml = @'
 
 function Set-LoadLines {
     # Wiersze z kolorową kropką (ocena) w panelu «Co się dzieje»: jedna linia na wpis (pełny tekst - widok «Podsumowanie»
-    # i kopia), istniejące wiersze zmieniane w miejscu bez tworzenia elementów co próbkę
+    # i kopia), istniejące wiersze zmieniane w miejscu bez tworzenia elementów co próbkę. Bez podpowiedzi (ToolTip):
+    # zmieniana co próbkę otwierałaby się na nowo pod kursorem, a pod Wine potrafiła zawiesić okno
     param($Panel, [object[]]$Lines)
     $kids = $Panel.Children
     while ($kids.Count -gt $Lines.Count) { $kids.RemoveAt($kids.Count - 1) }
@@ -19249,7 +19250,6 @@ function Set-LoadLines {
         }
         if ([string]$tb.Tag -eq "$color|$text") { continue }
         $tb.Tag = "$color|$text"
-        $tb.ToolTip = $text
         $runs = @($tb.Inlines)
         $runs[0].Foreground = Get-Brush $color
         $runs[1].Text = $text
