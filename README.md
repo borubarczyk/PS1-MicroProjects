@@ -65,6 +65,8 @@ Skrypty zawierają polskie znaki i są zapisane jako **UTF-8 z BOM**. Windows Po
 
 ## AD-ManagerDiamond — Domain Ops
 
+**Dokumentacja:** opis każdej sekcji programu — do czego służy, co można w niej zrobić i jak działa — jest w folderze [`docs/`](docs/README.md), po jednym pliku na przestrzeń roboczą.
+
 Uruchomienie: `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1`. Interfejs jest napisany w WPF dla Windows PowerShell 5.1 — skrypt sam uruchomi się ponownie w trybie STA, a z PowerShell 7 przełączy się na `powershell.exe`.
 
 **PIN przy starcie.** Zanim pokaże się okno główne, program prosi o PIN: klawiatura numeryczna na ekranie albo cyfry z klawiatury (Backspace kasuje cyfrę, Esc wszystkie), sprawdzenie od razu po wpisaniu ostatniej cyfry; po 5 błędnych próbach program się zamyka. To ochrona przed przypadkowym uruchomieniem przez osobę postronną, nie przed kimś, kto może edytować skrypt — w skrypcie zapisany jest tylko skrót SHA-256 PIN-u. Zmianę PIN-u albo wyłączenie blokady (pusty skrót) opisuje komentarz na początku regionu „Odblokowanie programu (PIN)” w skrypcie. Raporty cykliczne (`-RunReport`, bez okna) nie pytają o PIN.
