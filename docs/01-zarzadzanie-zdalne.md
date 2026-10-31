@@ -374,7 +374,7 @@
 - odinstalować zaznaczone programy (z limitem czasu) albo *Odinstaluj z przełącznikami…*;
 - *Pokaż ten program na wszystkich komputerach*.
 
-**Jak działa.** Deinstalacja działa przez WinRM. Po niej program sprawdza, czy aplikacja zniknęła z rejestru, i pisze wynik z przyczyną w kolumnie „Stan” (np. „deinstalator czekał na odpowiedź użytkownika”, „MSI 1618 – trwa inna instalacja”, „nadal zainstalowany – wymaga restartu”). Programy z profilu zalogowanego użytkownika są usuwane jednorazowym zadaniem Harmonogramu w jego sesji.
+**Jak działa.** Deinstalacja działa przez WinRM. Po niej program sprawdza, czy aplikacja zniknęła z rejestru, i pisze wynik z przyczyną w kolumnie „Stan” (np. „deinstalator czekał na odpowiedź użytkownika”, „MSI 1618 – trwa inna instalacja”, „nadal zainstalowany – wymaga restartu”). Programy z profilu zalogowanego użytkownika są usuwane jednorazowym zadaniem Harmonogramu w jego sesji, **bez okna konsoli**: krótki skrypt `wscript.exe` uruchamia deinstalator w ukrytym oknie i zapisuje jego kod wyjścia (gdy Windows Script Host jest wyłączony — `cmd`, wtedy okno konsoli widać, a wynik o tym mówi). Gdy użytkownik nie jest zalogowany interaktywnie, zadanie nie rusza i wynik mówi o tym po kilku sekundach, zamiast czekać do limitu czasu. Po przekroczeniu limitu deinstalator jest zamykany razem z procesami, które uruchomił.
 
 ### Windows Update
 
@@ -400,7 +400,7 @@
 - **Dodatki Outlooka:** dodatki COM i VSTO ze stanem (w tym **wyłączone przez Outlooka**); z menu wiersza **włącz na stałe** albo **wyłącz u użytkownika**;
 - **Teams, OneDrive, Outlook:** stan synchronizacji OneDrive, zasady grupy OneDrive, czy aplikacje działają i ile zajmuje ich pamięć podręczna; z menu wiersza **wyczyść pamięć Teams**, **wyczyść pamięć Outlooka**, **zresetuj OneDrive**.
 
-**Jak działa.** Wyłącznie dane z komputera (rejestr, pliki, `dsregcmd`), bez łączenia z Exchange Online ani Graph. Zalogowanych użytkowników czyta z ich gałęzi rejestru, niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`. Skrzynki z automapowania pochodzą z kopii odpowiedzi Autodiscover zapisanej w profilu (skrzynki otwierane ręcznie nie są tam zapisywane). Kopiowanie PST wykonuje Twój komputer przez udział administracyjny; plik otwarty w Outlooku jest pomijany, oryginały zostają. Czyszczenie pamięci najpierw zamyka aplikację tego użytkownika. Reset OneDrive działa w sesji zalogowanego użytkownika przez jednorazowe zadanie Harmonogramu (pliki zostają, pełna synchronizacja może potrwać).
+**Jak działa.** Wyłącznie dane z komputera (rejestr, pliki, `dsregcmd`), bez łączenia z Exchange Online ani Graph. Zalogowanych użytkowników czyta z ich gałęzi rejestru, niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`. Skrzynki z automapowania pochodzą z kopii odpowiedzi Autodiscover zapisanej w profilu (skrzynki otwierane ręcznie nie są tam zapisywane). Kopiowanie PST wykonuje Twój komputer przez udział administracyjny; plik otwarty w Outlooku jest pomijany, oryginały zostają. Czyszczenie pamięci najpierw zamyka aplikację tego użytkownika. Reset OneDrive działa w sesji zalogowanego użytkownika przez jednorazowe zadanie Harmonogramu: program czeka na zakończenie `OneDrive.exe /reset` (do 2 min) i podaje jego wynik — także kod błędu — a potem uruchamia OneDrive ponownie (pliki zostają, pełna synchronizacja może potrwać).
 
 ---
 
@@ -479,7 +479,7 @@ Akcje:
 **Jak działa**
 - Dyski zalogowanych program czyta z ich gałęzi rejestru (polecenie w sesji WinRM nie widzi cudzych dysków), niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`.
 - Pochodzenie *skrypt logowania* program ustala, czytając skrypty u siebie, w tle (skrypty z AD i GPO). Ścieżek składanych ze zmiennych nie rozpozna.
-- Podłączanie i odłączanie u zalogowanego działa **w jego sesji, bez okna konsoli** — przez jednorazowe zadanie Harmonogramu i krótki skrypt `wscript.exe`. Gdy Windows Script Host jest wyłączony, program używa `net use` (okno konsoli mignie).
+- Podłączanie i odłączanie u zalogowanego działa **w jego sesji, bez okna konsoli** — przez jednorazowe zadanie Harmonogramu i krótki skrypt `wscript.exe`. Gdy Windows Script Host jest wyłączony, program używa `net use` (okno konsoli mignie). Gdy zadanie nie wystartuje (użytkownik bez logowania interaktywnego), wynik mówi o tym wprost.
 - U niezalogowanego program zapisuje albo usuwa wpis trwały w `NTUSER.DAT` — dysk pojawi się albo zniknie przy logowaniu.
 - W trybie diagnostycznym każdy krok podłączania i odłączania trafia do dziennika.
 

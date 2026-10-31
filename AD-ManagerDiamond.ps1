@@ -14758,6 +14758,179 @@ function New-WuScript([string]$Body) {
     return [scriptblock]::Create("param(`$P)`n" + $script:WuTaskText + "`n" + $Body)
 }
 
+# Wspólne funkcje zdalne: program w sesji zalogowanego użytkownika jednorazowym zadaniem Harmonogramu. Korzystają z nich
+# dyski sieciowe (Zasoby sieciowe użytkowników), reset OneDrive (Outlook i Microsoft 365) i deinstalacja programów z profilu.
+$script:UserSessionHelpers = @'
+function Get-DoRegValue {
+    <#
+        Jedna wartość z rejestru (RegistryKey.GetValue); $Key - klucz z Get-Item/Get-ChildItem albo ścieżka; brak -> $null.
+        Nie Get-ItemProperty: czyta wszystkie wartości klucza i przerywa się (mimo -ErrorAction) na nietypowej, np. ExecTime
+        skryptów zasad grupy (REG_QWORD o długości 16 bajtów) - «Specified cast is not valid».
+    #>
+    param($Key, [string]$Name)
+    try {
+        $k = if ($Key -is [Microsoft.Win32.RegistryKey]) { $Key } else { Get-Item -LiteralPath $Key -ErrorAction Stop }
+        return $k.GetValue($Name)
+    }
+    catch { return $null }
+}
+
+function Invoke-DoInUserSession {
+    <#
+        Program w sesji zalogowanego użytkownika: jednorazowe zadanie Harmonogramu (konto po SID - działa także, gdy nazwy
+        nie da się przetłumaczyć; logowanie interaktywne, bez podniesienia uprawnień; startuje także na zasilaniu z baterii),
+        potem usuwane. Zwraca kod wyjścia programu albo $null: nie skończył się w czasie albo zadanie nie wystartowało.
+        -TimeoutSeconds 0 - bez limitu. -StopOnTimeout - po czasie program jest zamykany razem z procesami potomnymi; bez
+        tego działa dalej (np. OneDrive), a zadanie nie ma limitu czasu. -Status (tabela) dostaje: Started (program ruszył),
+        NotStarted (zadanie nie wystartowało - użytkownik nie jest zalogowany interaktywnie), TimedOut, Code.
+    #>
+    # $Trace - lista na kroki (tryb diagnostyczny): zadanie, zmiany stanu z czasem, brak wyniku
+    param([string]$Name, [string]$Sid, [string]$Execute, [string]$Argument, [int]$TimeoutSeconds = 15, [switch]$StopOnTimeout, [hashtable]$Status, [System.Collections.IList]$Trace)
+    $add = { param($t) if ($null -ne $Trace) { [void]$Trace.Add($t) } }
+    if ($null -eq $Status) { $Status = @{} }
+    $Status.Started = $false; $Status.NotStarted = $false; $Status.TimedOut = $false; $Status.Code = $null
+    $task = 'DomainOps-{0}-{1}' -f $Name, [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $principal = New-ScheduledTaskPrincipal -UserId $Sid -LogonType Interactive -RunLevel Limited
+        # Domyślne ustawienia zadania nie startują na baterii (laptopy) i zatrzymują program po 72 godz.
+        $limit = if ($StopOnTimeout -and $TimeoutSeconds -gt 0) { [TimeSpan]::FromSeconds($TimeoutSeconds + 60) } else { [TimeSpan]::Zero }
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit $limit
+        Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $Execute -Argument $Argument) -Principal $principal -Settings $settings -Force | Out-Null
+        & $add ('zadanie {0}: {1} {2}' -f $task, $Execute, $Argument)
+        Start-ScheduledTask -TaskName $task
+        $last = ''
+        while ($TimeoutSeconds -le 0 -or $sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+            Start-Sleep -Milliseconds 500
+            $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+            $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
+            $state = if ($t) { [string]$t.State } else { '' }
+            $code = if ($info) { [int64]$info.LastTaskResult } else { $null }
+            if ($null -ne $code -and $code -lt 0) { $code += 4294967296 }
+            $now = 'stan {0}, ostatni wynik {1}' -f $(if ($state) { $state } else { '?' }), $(if ($null -ne $code) { $code } else { '?' })
+            if ($now -ne $last) { & $add ('po {0:N1} s: {1}' -f $sw.Elapsed.TotalSeconds, $now); $last = $now }
+            if ($state -eq 'Running') { $Status.Started = $true; continue }
+            if (-not $state -or $null -eq $code) { continue }
+            # 267011 (0x41303) - zadanie jeszcze nie ruszyło: po 5 s to brak sesji interaktywnej; 0x800710E0 - Harmonogram odmówił
+            if ($code -eq 2147946720 -or ($code -eq 267011 -and -not $Status.Started -and $sw.Elapsed.TotalSeconds -ge 5)) {
+                $Status.NotStarted = $true
+                & $add ('zadanie nie wystartowało (wynik {0}) – użytkownik nie jest zalogowany interaktywnie' -f $code)
+                return $null
+            }
+            # 267009 (0x41301) - program jeszcze działa
+            if ($code -notin 267009, 267011) { $Status.Started = $true; $Status.Code = $code; return $code }
+        }
+        $Status.TimedOut = $true
+        & $add ('brak wyniku po {0} s' -f $TimeoutSeconds)
+        if ($StopOnTimeout) {
+            # Zatrzymanie zadania kończy tylko jego proces - najpierw drzewo procesów (np. deinstalator uruchomiony przez cmd)
+            try {
+                $leaf = (Split-Path -Leaf $Execute).Replace("'", "''")
+                foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='$leaf'" -ErrorAction Stop | Where-Object { $_.CommandLine -and ([string]$_.CommandLine).Contains($Argument) })) {
+                    $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+                    if ($owner -and [string]$owner.Sid -eq $Sid) {
+                        $kill = New-Object System.Diagnostics.ProcessStartInfo((Join-Path $env:SystemRoot 'System32\taskkill.exe'), ('/T /F /PID {0}' -f $p.ProcessId))
+                        $kill.UseShellExecute = $false
+                        $kill.CreateNoWindow = $true
+                        [void][System.Diagnostics.Process]::Start($kill).WaitForExit(10000)
+                        & $add ('zamknięto proces {0} z procesami potomnymi' -f $p.ProcessId)
+                    }
+                }
+            }
+            catch { & $add ('zamykanie procesów: ' + $_.Exception.Message) }
+            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+        }
+        return $null
+    }
+    finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+}
+
+function New-DoUserWorkDir {
+    # Folder roboczy na pliki zadania w sesji użytkownika: Temp profilu (użytkownik ma tam prawa), gdy go nie ma - Windows\Temp;
+    # zawsze z prawem modyfikacji dla użytkownika
+    param([string]$Sid, [string]$ProfilePath, [string]$Name, [System.Collections.IList]$Trace)
+    $base = if ($ProfilePath) { Join-Path $ProfilePath 'AppData\Local\Temp' } else { '' }
+    if (-not $base -or -not (Test-Path -LiteralPath $base)) { $base = Join-Path $env:SystemRoot 'Temp' }
+    $dir = Join-Path $base ('DomainOps-{0}-{1}' -f $Name, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    try {
+        $acl = Get-Acl -LiteralPath $dir
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($Sid)), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+        Set-Acl -LiteralPath $dir -AclObject $acl
+    }
+    catch { if ($null -ne $Trace) { [void]$Trace.Add('uprawnienia folderu roboczego: ' + $_.Exception.Message) } }
+    if ($null -ne $Trace) { [void]$Trace.Add('folder roboczy: ' + $dir) }
+    return $dir
+}
+
+function Test-DoWshDisabled {
+    # Windows Script Host wyłączony dla komputera albo użytkownika (Enabled = 0) - wtedy zostaje cmd z oknem konsoli
+    param([string]$Sid, [System.Collections.IList]$Trace)
+    $off = $false
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings', "Registry::HKEY_USERS\$Sid\Software\Microsoft\Windows Script Host\Settings") {
+        if ([string](Get-DoRegValue $k 'Enabled') -eq '0') { $off = $true; if ($null -ne $Trace) { [void]$Trace.Add('Windows Script Host wyłączony: ' + $k) } }
+    }
+    return $off
+}
+
+function Invoke-DoUserCommand {
+    <#
+        Polecenie (wiersz cmd) w sesji zalogowanego użytkownika bez okna konsoli: skrypt JScript uruchamia je przez
+        WScript.Shell.Run z ukrytym oknem i zapisuje kod wyjścia; skrypt startuje wscript.exe jednorazowym zadaniem w sesji.
+        Gdy Windows Script Host jest wyłączony albo skrypt w ogóle nie ruszył - cmd /c (okno konsoli będzie widać).
+        -TimeoutSeconds 0 - bez limitu; po czasie polecenie jest zamykane razem z procesami potomnymi.
+        Wynik: @{ Code (kod wyjścia, $null - brak); TimedOut; NotStarted (użytkownik nie jest zalogowany interaktywnie); Message; Method }
+    #>
+    param([string]$Name, [string]$Sid, [string]$ProfilePath, [string]$CommandLine, [int]$TimeoutSeconds = 0, [System.Collections.IList]$Trace)
+    $add = { param($t) if ($null -ne $Trace) { [void]$Trace.Add($t) } }
+    $result = @{ Code = $null; TimedOut = $false; NotStarted = $false; Message = ''; Method = '' }
+    $dir = $null
+    try {
+        $dir = New-DoUserWorkDir -Sid $Sid -ProfilePath $ProfilePath -Name $Name -Trace $Trace
+        $out = Join-Path $dir 'wynik.txt'
+        $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        if (-not (Test-DoWshDisabled -Sid $Sid -Trace $Trace)) {
+            # Znacznik «ruszył» przed poleceniem: bez niego wiadomo, że skrypt nie wystartował, i można spróbować przez cmd
+            $js = Join-Path $dir 'polecenie.js'
+            $code = @(
+                "var o = WScript.Arguments(0), c = 0, m = '', fs = new ActiveXObject('Scripting.FileSystemObject');"
+                "fs.CreateTextFile(o + '.start', true).Close();"
+                ("try {{ c = new ActiveXObject('WScript.Shell').Run({0}, 0, true); }} catch (e) {{ c = e.number & 0xFFFF; if (!c) c = 1; m = e.description; }}" -f (ConvertTo-Json -InputObject ('"{0}" /d /s /c "{1}"' -f $cmd, $CommandLine) -Compress))
+                "var f = fs.CreateTextFile(o, true, true); f.Write(c + '|' + m); f.Close();"
+                'WScript.Quit(c);'
+            ) -join "`r`n"
+            [System.IO.File]::WriteAllText($js, $code, [System.Text.Encoding]::Unicode)
+            & $add ('polecenie: ' + $CommandLine)
+            $result.Method = 'wscript'
+            $st = @{}
+            $result.Code = Invoke-DoInUserSession -Name $Name -Sid $Sid -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "{0}" "{1}"' -f $js, $out) -TimeoutSeconds $TimeoutSeconds -StopOnTimeout -Status $st -Trace $Trace
+            $result.TimedOut = [bool]$st.TimedOut
+            $result.NotStarted = [bool]$st.NotStarted
+            if (Test-Path -LiteralPath $out) {
+                $text = [System.IO.File]::ReadAllText($out)
+                & $add ('wynik skryptu: ' + $text)
+                $parts = $text.Split('|', 2)
+                $n = [int64]0
+                if ([int64]::TryParse($parts[0], [ref]$n)) { $result.Code = $n }
+                $result.Message = $(if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' })
+                return $result
+            }
+            if ($null -eq $result.Code) { return $result }
+            # Polecenie ruszyło (znacznik), ale wyniku nie ma - np. deinstalator wyczyścił folder Temp; drugi raz go nie uruchamiamy
+            if ((Test-Path -LiteralPath "$out.start") -or -not (Test-Path -LiteralPath $dir)) { $result.Message = 'polecenie nie zapisało wyniku – kod wyjścia wscript'; return $result }
+            & $add ('skrypt nie wystartował (kod {0}) – próba przez cmd' -f $result.Code)
+        }
+        $result.Method = 'cmd'
+        $st = @{}
+        $result.Code = Invoke-DoInUserSession -Name $Name -Sid $Sid -Execute $cmd -Argument ('/d /s /c "{0}"' -f $CommandLine) -TimeoutSeconds $TimeoutSeconds -StopOnTimeout -Status $st -Trace $Trace
+        $result.TimedOut = [bool]$st.TimedOut
+        $result.NotStarted = [bool]$st.NotStarted
+        return $result
+    }
+    finally { if ($dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue } }
+}
+'@
+
 # Wspólna funkcja (wklejana do bloków zdalnych): jak odinstalować program z danego wpisu rejestru.
 # Kind: msi | quiet | inno (da się po cichu), interactive (tylko z przełącznikami), none, blocked.
 $script:UninstallPlanText = @'
@@ -14834,7 +15007,7 @@ foreach ($root in $roots) {
 }
 '@
 
-$script:ProgramUninstallBody = @'
+$script:ProgramUninstallBody = $script:UserSessionHelpers + @'
 $ErrorActionPreference = 'Stop'
 $logDir = Join-Path $env:SystemRoot 'Temp\DomainOps'
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -14869,26 +15042,17 @@ foreach ($item in $P.Items) {
             if ($item.Args) { $command += ' ' + $item.Args }
         }
         $timedOut = $false
+        $notes = New-Object System.Collections.ArrayList
         if ($item.Scope -eq 'Użytkownik') {
-            # Program w profilu: deinstalator musi działać jako ten użytkownik - zadanie w jego zalogowanej sesji
-            $account = (New-Object System.Security.Principal.SecurityIdentifier($item.Hive)).Translate([System.Security.Principal.NTAccount]).Value
-            $taskName = 'DomainOps_Uninstall_' + [guid]::NewGuid().ToString('N')
-            $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument ('/d /s /c "' + $command + '"')
-            $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromSeconds([Math]::Max(60, [int]$P.TimeoutSec)))
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-            try {
-                Start-ScheduledTask -TaskName $taskName
-                Start-Sleep -Seconds 2
-                while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
-                    if ([int]$P.TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge [int]$P.TimeoutSec) { $timedOut = $true; Stop-ScheduledTask -TaskName $taskName; break }
-                    Start-Sleep -Seconds 1
-                }
-                $info = Get-ScheduledTaskInfo -TaskName $taskName
-                $res.Code = [int64]$info.LastTaskResult
-                if ($res.Code -eq 0x41303 -or $res.Code -eq 0x41306) { throw "Zadanie nie wystartowało – użytkownik $account nie jest zalogowany interaktywnie (zaloguj go albo odinstaluj program w jego sesji)." }
-            }
-            finally { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
+            # Program w profilu: deinstalator musi działać jako ten użytkownik - zadanie w jego zalogowanej sesji, bez okna konsoli
+            $account = try { (New-Object System.Security.Principal.SecurityIdentifier($item.Hive)).Translate([System.Security.Principal.NTAccount]).Value } catch { $item.Hive }
+            $profilePath = [Environment]::ExpandEnvironmentVariables([string](Get-DoRegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($item.Hive)" 'ProfileImagePath'))
+            $u = Invoke-DoUserCommand -Name 'Uninstall' -Sid $item.Hive -ProfilePath $profilePath -CommandLine $command -TimeoutSeconds ([int]$P.TimeoutSec)
+            if ($u.NotStarted) { throw "Zadanie nie wystartowało – użytkownik $account nie jest zalogowany interaktywnie (zaloguj go albo odinstaluj program w jego sesji)." }
+            $timedOut = $u.TimedOut
+            if (-not $timedOut) { $res.Code = $u.Code }
+            if ($u.Method -eq 'cmd') { [void]$notes.Add('Windows Script Host wyłączony – deinstalator uruchomiony przez cmd (okno konsoli u użytkownika)') }
+            if ($u.Message) { [void]$notes.Add($u.Message) }
         }
         else {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -14923,7 +15087,7 @@ foreach ($item in $P.Items) {
                 if ($res.Tone -eq 'ok') { $res.Status = 'Deinstalator zakończył się bez błędu, ale program nadal jest zainstalowany – mógł czekać na potwierdzenie, uruchomić osobny proces albo wymaga restartu'; $res.Tone = 'warn' }
             }
         }
-        if ($msiLog) { $res.Detail = "Log MSI: $msiLog" }
+        $res.Detail = (@(@($(if ($msiLog) { "Log MSI: $msiLog" })) + @($notes) | Where-Object { $_ }) -join '; ')
     }
     catch {
         $res.Status = $_.Exception.Message
@@ -16121,21 +16285,7 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
 # (HKEY_USERS\<SID> zalogowanych; opcjonalnie NTUSER.DAT pozostałych, ładowany na chwilę), mapowania z Preferencji
 # zasad grupy z historii GPP (profil użytkownika, ProgramData), a nazwy GPO z zapisanego stanu zasad grupy. Kod pomocniczy jako tekst
 # ($P.Helpers), bo blok wykonuje się na komputerze docelowym.
-$script:NetResHelpers = @'
-function Get-DoRegValue {
-    <#
-        Jedna wartość z rejestru (RegistryKey.GetValue); $Key - klucz z Get-Item/Get-ChildItem albo ścieżka; brak -> $null.
-        Nie Get-ItemProperty: czyta wszystkie wartości klucza i przerywa się (mimo -ErrorAction) na nietypowej, np. ExecTime
-        skryptów zasad grupy (REG_QWORD o długości 16 bajtów) - «Specified cast is not valid».
-    #>
-    param($Key, [string]$Name)
-    try {
-        $k = if ($Key -is [Microsoft.Win32.RegistryKey]) { $Key } else { Get-Item -LiteralPath $Key -ErrorAction Stop }
-        return $k.GetValue($Name)
-    }
-    catch { return $null }
-}
-
+$script:NetResHelpers = $script:UserSessionHelpers + @'
 function Get-DoProfiles {
     # Profile kont użytkowników (S-1-5-21-…): SID, folder, nazwa konta, czy gałąź rejestru jest załadowana (zalogowany)
     param([string]$UserFilter = '')
@@ -16175,38 +16325,6 @@ function Use-DoUserHive {
     }
 }
 
-function Invoke-DoInUserSession {
-    <#
-        Program w sesji zalogowanego użytkownika: jednorazowe zadanie Harmonogramu (konto po SID - działa także, gdy nazwy
-        nie da się przetłumaczyć; logowanie interaktywne, bez podniesienia uprawnień), potem usuwane. Zwraca kod wyjścia
-        programu albo $null, gdy nie skończył się w czasie (267009/267011 - zadanie jeszcze trwa / jeszcze nie ruszyło).
-    #>
-    # $Trace - lista na kroki (tryb diagnostyczny): zadanie, zmiany stanu z czasem, brak wyniku
-    param([string]$Name, [string]$Sid, [string]$Execute, [string]$Argument, [int]$TimeoutSeconds = 15, [System.Collections.IList]$Trace)
-    $task = 'DomainOps-{0}-{1}' -f $Name, [guid]::NewGuid().ToString('N').Substring(0, 8)
-    $start = Get-Date
-    try {
-        $principal = New-ScheduledTaskPrincipal -UserId $Sid -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $Execute -Argument $Argument) -Principal $principal -Force | Out-Null
-        if ($null -ne $Trace) { [void]$Trace.Add(('zadanie {0}: {1} {2}' -f $task, $Execute, $Argument)) }
-        Start-ScheduledTask -TaskName $task
-        $last = ''
-        for ($i = 0; $i -lt $TimeoutSeconds * 2; $i++) {
-            Start-Sleep -Milliseconds 500
-            $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-            $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
-            if ($null -ne $Trace) {
-                $now = 'stan {0}, ostatni wynik {1}' -f $(if ($t) { [string]$t.State } else { '?' }), $(if ($info) { [string]$info.LastTaskResult } else { '?' })
-                if ($now -ne $last) { [void]$Trace.Add(('po {0:N1} s: {1}' -f ((Get-Date) - $start).TotalSeconds, $now)); $last = $now }
-            }
-            if ($t -and [string]$t.State -ne 'Running' -and $info -and [int64]$info.LastTaskResult -notin 267009, 267011) { return [int64]$info.LastTaskResult }
-        }
-        if ($null -ne $Trace) { [void]$Trace.Add(('brak wyniku po {0} s' -f $TimeoutSeconds)) }
-        return $null
-    }
-    finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
-}
-
 function Get-DoDesktopSids {
     # SID-y właścicieli explorer.exe (użytkownicy z pulpitem); $null - nie udało się sprawdzić. Gałąź rejestru bywa załadowana
     # także dla kont usług bez pulpitu, a zadanie «tylko gdy użytkownik jest zalogowany» by tam nie ruszyło.
@@ -16225,30 +16343,17 @@ function Invoke-DoNetDrive {
         Podłączenie (Map) albo odłączenie (Unmap) dysku w sesji zalogowanego użytkownika bez okna konsoli: skrypt JScript
         (obiekt WScript.Network) uruchamiany przez wscript.exe jednorazowym zadaniem w jego sesji. Gdy Windows Script Host
         jest wyłączony albo skrypt nie zapisał wyniku - cmd z net use (okno konsoli mignie).
-        Wynik: @{ Code (0 - OK, $null - brak odpowiedzi); NotConnected (odłączanie: dysku nie było w sesji); Message; Method }
+        Wynik: @{ Code (0 - OK, $null - brak odpowiedzi); NotConnected (odłączanie: dysku nie było w sesji);
+        NotStarted (zadanie nie wystartowało - brak logowania interaktywnego); Message; Method }
     #>
     param($Profile, [ValidateSet('Map', 'Unmap')][string]$Op, [string]$Letter, [string]$Path, [System.Collections.IList]$Trace)
     $add = { param($t) if ($null -ne $Trace) { [void]$Trace.Add($t) } }
-    # Folder roboczy w Temp profilu (użytkownik ma tam prawa); gdy go nie ma - Windows\Temp z prawem zapisu dla użytkownika
-    $base = Join-Path $Profile.Path 'AppData\Local\Temp'
-    if (-not (Test-Path -LiteralPath $base)) { $base = Join-Path $env:SystemRoot 'Temp' }
-    $dir = Join-Path $base ('DomainOps-{0}-{1}' -f $Op, [guid]::NewGuid().ToString('N').Substring(0, 8))
-    $out = Join-Path $dir 'wynik.txt'
-    $result = @{ Code = $null; NotConnected = $false; Message = ''; Method = '' }
+    $result = @{ Code = $null; NotConnected = $false; NotStarted = $false; Message = ''; Method = '' }
+    $dir = $null
     try {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        try {
-            $acl = Get-Acl -LiteralPath $dir
-            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($Profile.Sid)), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
-            Set-Acl -LiteralPath $dir -AclObject $acl
-        }
-        catch { & $add ('uprawnienia folderu roboczego: ' + $_.Exception.Message) }
-        & $add ('folder roboczy: ' + $dir)
-        $wshOff = $false
-        foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings', "Registry::HKEY_USERS\$($Profile.Sid)\Software\Microsoft\Windows Script Host\Settings") {
-            if ([string](Get-DoRegValue $k 'Enabled') -eq '0') { $wshOff = $true; & $add ('Windows Script Host wyłączony: ' + $k) }
-        }
-        if (-not $wshOff) {
+        $dir = New-DoUserWorkDir -Sid $Profile.Sid -ProfilePath $Profile.Path -Name $Op -Trace $Trace
+        $out = Join-Path $dir 'wynik.txt'
+        if (-not (Test-DoWshDisabled -Sid $Profile.Sid -Trace $Trace)) {
             $l = ConvertTo-Json -InputObject ($Letter + ':') -Compress
             $call = if ($Op -eq 'Map') { 'MapNetworkDrive({0}, {1}, true)' -f $l, (ConvertTo-Json -InputObject $Path -Compress) } else { 'RemoveNetworkDrive({0}, true, true)' -f $l }
             $js = Join-Path $dir 'dysk.js'
@@ -16261,7 +16366,9 @@ function Invoke-DoNetDrive {
             [System.IO.File]::WriteAllText($js, $code, [System.Text.Encoding]::Unicode)
             & $add ('skrypt: ' + $call)
             $result.Method = 'wscript'
-            $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "{0}" "{1}"' -f $js, $out) -TimeoutSeconds 30 -Trace $Trace
+            $st = @{}
+            $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "{0}" "{1}"' -f $js, $out) -TimeoutSeconds 30 -Status $st -Trace $Trace
+            $result.NotStarted = [bool]$st.NotStarted
             if (Test-Path -LiteralPath $out) {
                 $text = [System.IO.File]::ReadAllText($out)
                 & $add ('wynik skryptu: ' + $text)
@@ -16279,7 +16386,9 @@ function Invoke-DoNetDrive {
         # cmd z net use (okno konsoli mignie); komunikat net use w stronie kodowej OEM
         $arg = if ($Op -eq 'Map') { '/d /c net use {0}: "{1}" /persistent:yes >"{2}" 2>&1' -f $Letter, $Path, $out } else { '/d /c net use {0}: /delete /y >"{1}" 2>&1' -f $Letter, $out }
         $result.Method = 'cmd'
-        $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $arg -TimeoutSeconds 30 -Trace $Trace
+        $st = @{}
+        $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $arg -TimeoutSeconds 30 -Status $st -Trace $Trace
+        $result.NotStarted = [bool]$st.NotStarted
         $oem = try { [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { [System.Text.Encoding]::Default }
         try { $result.Message = (@([System.IO.File]::ReadAllLines($out, $oem) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' ') } catch { }
         & $add ('net use: ' + $result.Message)
@@ -16287,7 +16396,7 @@ function Invoke-DoNetDrive {
         $result.NotConnected = ($Op -eq 'Unmap' -and $result.Code -eq 2)
         return $result
     }
-    finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    finally { if ($dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 
 function Get-DoGpHistoryRoots {
@@ -16479,6 +16588,7 @@ $script:NetUnmapScript = {
                     $r = Invoke-DoNetDrive -Profile $pr -Op Unmap -Letter $letter -Trace $trace
                     $sessionPart = if ($r.Code -eq 0) { 'odłączono w sesji użytkownika' }
                     elseif ($r.NotConnected) { 'w sesji nie był połączony' }
+                    elseif ($r.NotStarted) { 'zadanie w sesji nie wystartowało (brak logowania interaktywnego) – dysk zniknie po wylogowaniu' }
                     elseif ($null -eq $r.Code) { 'sesja nie odpowiedziała – dysk zniknie po wylogowaniu' }
                     else { 'w sesji nie odłączono: {0}' -f $(if ($r.Message) { '{0} (kod {1})' -f $r.Message, $r.Code } else { 'kod {0}' -f $r.Code }) }
                 }
@@ -16597,6 +16707,7 @@ $script:NetMapScript = {
                     catch { $res.Wynik += '; etykiety nie ustawiono: ' + $_.Exception.Message }
                 }
             }
+            elseif ($r.NotStarted) { $res.Wynik = 'Błąd – zadanie w sesji użytkownika nie wystartowało (brak logowania interaktywnego); dysku nie podłączono' }
             elseif ($null -eq $r.Code) { $res.Wynik = 'Nieznany – sesja nie odpowiedziała w 30 s; sprawdź za chwilę w widoku «Dyski zmapowane»' }
             else { $res.Wynik = 'Błąd – ' + $(if ($r.Message) { '{0} (kod {1})' -f $r.Message, $r.Code } else { 'kod {0}' -f $r.Code }) }
         }
@@ -17608,14 +17719,22 @@ $script:M365AppActionScript = {
                 foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) { if ($pf) { $cands += (Join-Path $pf 'Microsoft OneDrive\OneDrive.exe') } }
                 $exe = $cands | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
                 if (-not $exe) { throw 'nie znaleziono OneDrive.exe (profil użytkownika ani Program Files)' }
-                $principal = New-ScheduledTaskPrincipal -UserId $it.User -LogonType Interactive -RunLevel Limited
-                foreach ($arg in '/reset', '/background') {
-                    $task = 'DomainOps-OneDrive-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-                    Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $exe -Argument $arg) -Principal $principal -Force | Out-Null
-                    try { Start-ScheduledTask -TaskName $task; Start-Sleep -Seconds $(if ($arg -eq '/reset') { 10 } else { 2 }) }
-                    finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+                # Reset w sesji użytkownika: OneDrive zamyka się, czyści stan synchronizacji i kończy pracę - czekamy na wynik
+                $st = @{}
+                $code = Invoke-DoInUserSession -Name 'OneDrive' -Sid $it.Sid -Execute $exe -Argument '/reset' -TimeoutSeconds 120 -Status $st
+                if ($st.NotStarted) { throw 'zadanie w sesji użytkownika nie wystartowało – użytkownik nie jest zalogowany interaktywnie' }
+                if ($st.TimedOut) {
+                    [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = 'reset OneDrive'; 'Wynik' = 'Nieznany – reset trwa dłużej niż 2 min'; 'Uwagi' = 'OneDrive kończy reset w tle; jeśli potem sam nie ruszy, użytkownik uruchomi go z menu Start' }
+                    continue
                 }
-                [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = 'reset OneDrive'; 'Wynik' = 'OK'; 'Uwagi' = 'OneDrive zresetowany i uruchomiony ponownie – ponowna synchronizacja bibliotek może potrwać; pliki zostają' }
+                if ($code -ne 0) { throw ('OneDrive /reset zakończył się kodem {0}' -f $code) }
+                # Ponowne uruchomienie: OneDrive działa dalej (zadanie bez limitu czasu) albo od razu kończy, gdy już działa
+                $st2 = @{}
+                $code2 = Invoke-DoInUserSession -Name 'OneDrive' -Sid $it.Sid -Execute $exe -Argument '/background' -TimeoutSeconds 8 -Status $st2
+                $started = ($st2.TimedOut -and $st2.Started) -or $code2 -eq 0
+                $note = if ($started) { 'OneDrive zresetowany i uruchomiony ponownie – ponowna synchronizacja bibliotek może potrwać; pliki zostają' }
+                else { 'OneDrive zresetowany, ale nie uruchomił się ponownie ({0}) – użytkownik uruchomi go z menu Start; pliki zostają' -f $(if ($null -ne $code2) { "kod $code2" } else { 'brak odpowiedzi' }) }
+                [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = 'reset OneDrive'; 'Wynik' = $(if ($started) { 'OK' } else { 'OK – bez ponownego uruchomienia' }); 'Uwagi' = $note }
                 continue
             }
             if ($P.Op -eq 'Teams') {
@@ -36589,7 +36708,7 @@ $script:HelpTexts = @{
 - odinstalować zaznaczone programy (z limitem czasu) albo *Odinstaluj z przełącznikami…*;
 - *Pokaż ten program na wszystkich komputerach*.
 
-**Jak działa.** Deinstalacja działa przez WinRM. Po niej program sprawdza, czy aplikacja zniknęła z rejestru, i pisze wynik z przyczyną w kolumnie „Stan” (np. „deinstalator czekał na odpowiedź użytkownika”, „MSI 1618 – trwa inna instalacja”, „nadal zainstalowany – wymaga restartu”). Programy z profilu zalogowanego użytkownika są usuwane jednorazowym zadaniem Harmonogramu w jego sesji.
+**Jak działa.** Deinstalacja działa przez WinRM. Po niej program sprawdza, czy aplikacja zniknęła z rejestru, i pisze wynik z przyczyną w kolumnie „Stan” (np. „deinstalator czekał na odpowiedź użytkownika”, „MSI 1618 – trwa inna instalacja”, „nadal zainstalowany – wymaga restartu”). Programy z profilu zalogowanego użytkownika są usuwane jednorazowym zadaniem Harmonogramu w jego sesji, **bez okna konsoli**: krótki skrypt `wscript.exe` uruchamia deinstalator w ukrytym oknie i zapisuje jego kod wyjścia (gdy Windows Script Host jest wyłączony — `cmd`, wtedy okno konsoli widać, a wynik o tym mówi). Gdy użytkownik nie jest zalogowany interaktywnie, zadanie nie rusza i wynik mówi o tym po kilku sekundach, zamiast czekać do limitu czasu. Po przekroczeniu limitu deinstalator jest zamykany razem z procesami, które uruchomił.
 '@
 'Remote|Windows Update' = @'
 **Do czego.** Sprawdzić i zainstalować aktualizacje na wielu komputerach oraz zrozumieć, dlaczego coś się nie instaluje.
@@ -36613,7 +36732,7 @@ $script:HelpTexts = @{
 - **Dodatki Outlooka:** dodatki COM i VSTO ze stanem (w tym **wyłączone przez Outlooka**); z menu wiersza **włącz na stałe** albo **wyłącz u użytkownika**;
 - **Teams, OneDrive, Outlook:** stan synchronizacji OneDrive, zasady grupy OneDrive, czy aplikacje działają i ile zajmuje ich pamięć podręczna; z menu wiersza **wyczyść pamięć Teams**, **wyczyść pamięć Outlooka**, **zresetuj OneDrive**.
 
-**Jak działa.** Wyłącznie dane z komputera (rejestr, pliki, `dsregcmd`), bez łączenia z Exchange Online ani Graph. Zalogowanych użytkowników czyta z ich gałęzi rejestru, niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`. Skrzynki z automapowania pochodzą z kopii odpowiedzi Autodiscover zapisanej w profilu (skrzynki otwierane ręcznie nie są tam zapisywane). Kopiowanie PST wykonuje Twój komputer przez udział administracyjny; plik otwarty w Outlooku jest pomijany, oryginały zostają. Czyszczenie pamięci najpierw zamyka aplikację tego użytkownika. Reset OneDrive działa w sesji zalogowanego użytkownika przez jednorazowe zadanie Harmonogramu (pliki zostają, pełna synchronizacja może potrwać).
+**Jak działa.** Wyłącznie dane z komputera (rejestr, pliki, `dsregcmd`), bez łączenia z Exchange Online ani Graph. Zalogowanych użytkowników czyta z ich gałęzi rejestru, niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`. Skrzynki z automapowania pochodzą z kopii odpowiedzi Autodiscover zapisanej w profilu (skrzynki otwierane ręcznie nie są tam zapisywane). Kopiowanie PST wykonuje Twój komputer przez udział administracyjny; plik otwarty w Outlooku jest pomijany, oryginały zostają. Czyszczenie pamięci najpierw zamyka aplikację tego użytkownika. Reset OneDrive działa w sesji zalogowanego użytkownika przez jednorazowe zadanie Harmonogramu: program czeka na zakończenie `OneDrive.exe /reset` (do 2 min) i podaje jego wynik — także kod błędu — a potem uruchamia OneDrive ponownie (pliki zostają, pełna synchronizacja może potrwać).
 '@
 'Remote|Szybki audyt bezpieczeństwa' = @'
 **Do czego.** W jednym przebiegu sprawdzić podstawowe zabezpieczenia wielu komputerów.
@@ -36677,7 +36796,7 @@ Akcje:
 **Jak działa**
 - Dyski zalogowanych program czyta z ich gałęzi rejestru (polecenie w sesji WinRM nie widzi cudzych dysków), niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`.
 - Pochodzenie *skrypt logowania* program ustala, czytając skrypty u siebie, w tle (skrypty z AD i GPO). Ścieżek składanych ze zmiennych nie rozpozna.
-- Podłączanie i odłączanie u zalogowanego działa **w jego sesji, bez okna konsoli** — przez jednorazowe zadanie Harmonogramu i krótki skrypt `wscript.exe`. Gdy Windows Script Host jest wyłączony, program używa `net use` (okno konsoli mignie).
+- Podłączanie i odłączanie u zalogowanego działa **w jego sesji, bez okna konsoli** — przez jednorazowe zadanie Harmonogramu i krótki skrypt `wscript.exe`. Gdy Windows Script Host jest wyłączony, program używa `net use` (okno konsoli mignie). Gdy zadanie nie wystartuje (użytkownik bez logowania interaktywnego), wynik mówi o tym wprost.
 - U niezalogowanego program zapisuje albo usuwa wpis trwały w `NTUSER.DAT` — dysk pojawi się albo zniknie przy logowaniu.
 - W trybie diagnostycznym każdy krok podłączania i odłączania trafia do dziennika.
 
