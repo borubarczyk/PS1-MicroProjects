@@ -1420,7 +1420,9 @@ $script:ThemeXaml = @'
     <Setter Property="MinRowHeight" Value="28"/>
     <Setter Property="FontSize" Value="12.5"/>
     <Setter Property="EnableRowVirtualization" Value="True"/>
-    <Setter Property="EnableColumnVirtualization" Value="True"/>
+    <!-- Bez wirtualizacji kolumn: nagłówki są elementami okna (nazwa i lejek filtra), a ponownie używany kontener
+         nagłówka przy przewijaniu w poziomie potrafi zgubić taki element - kolumna zostaje bez nazwy -->
+    <Setter Property="EnableColumnVirtualization" Value="False"/>
     <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
     <Setter Property="ColumnHeaderStyle" Value="{StaticResource GridHeader}"/>
     <Setter Property="CellStyle" Value="{StaticResource GridCell}"/>
@@ -1621,6 +1623,7 @@ $script:Dispatchers = @{
     Checked          = { param($s, $e) Invoke-ControlHandler -Source $s -EventName 'Checked' }
     Unchecked        = { param($s, $e) Invoke-ControlHandler -Source $s -EventName 'Unchecked' }
     SelectionChanged = { param($s, $e) Invoke-ControlHandler -Source $s -EventName 'SelectionChanged' }
+    DropDownOpened   = { param($s, $e) Invoke-ControlHandler -Source $s -EventName 'DropDownOpened' }
 }
 
 function Register-ControlHandler {
@@ -5461,6 +5464,8 @@ $script:ModuleViewXaml = @'
         <Border Style="{StaticResource Chip}" Margin="12,2,0,0">
           <TextBlock x:Name="hdrCategory" FontSize="11" Foreground="#8791A5"/>
         </Border>
+        <Button x:Name="btnHelp" Style="{StaticResource GhostButton}" Padding="8,1" MinHeight="22" Margin="8,2,0,0" VerticalAlignment="Center"
+                ToolTip="Jak działa ten moduł: do czego służy, co można w nim zrobić i jak to działa (F1)"/>
       </StackPanel>
       <TextBlock x:Name="hdrDesc" Foreground="#8791A5" TextWrapping="Wrap" Margin="0,4,0,0" MaxWidth="1000" HorizontalAlignment="Left"/>
     </StackPanel>
@@ -5579,7 +5584,7 @@ function New-ModuleView {
     $Module.Root = $root
     foreach ($n in 'paramsCard', 'paramsStack', 'paramsScroll', 'paramsSide', 'hdrGrid', 'resHeader', 'statsGrid', 'busyChip', 'busyText', 'countText', 'btnFilters', 'resultHint', 'filterBox', 'chkReveal',
         'btnDetail', 'btnColumns', 'btnCopy', 'btnExport', 'grid', 'emptyState', 'emptyIcon', 'emptyText', 'emptyHint', 'detailCol', 'detailSplit',
-        'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse', 'btnStopOp') {
+        'detailPane', 'detailText', 'btnDetailCopy', 'btnCollapse', 'btnStopOp', 'btnHelp') {
         $Module.View_[$n] = $root.FindName($n)
     }
     $Module.ParamsCard = $Module.View_['paramsCard']
@@ -5603,6 +5608,9 @@ function New-ModuleView {
     $v.btnCollapse.Content = New-IconContent -Text '' -Icon 'E70E' -IconSize 12
     $v.btnCollapse.Visibility = 'Collapsed'
     $v.btnStopOp.Content = New-IconContent -Text 'Przerwij' -Icon 'E71A' -IconSize 10
+    $v.btnHelp.Content = New-IconContent -Text 'Jak to działa' -Icon 'E897' -IconSize 11
+    if (-not (Get-ModuleHelpText -Module $Module)) { $v.btnHelp.Visibility = 'Collapsed' }
+    Register-ControlHandler -Control $v.btnHelp -EventName 'Click' -Module $Module -Action { param($m) Show-ModuleHelp -Module $m }
     Register-ControlHandler -Control $v.btnStopOp -EventName 'Click' -Module $Module -Action { param($m) Stop-ModuleOperations -Module $m }
     Register-ControlHandler -Control $v.btnCollapse -EventName 'Click' -Module $Module -Action {
         param($m)
@@ -5650,6 +5658,172 @@ function New-ModuleView {
         $contentHost.add_SizeChanged($script:ParamsFitHostHandler)
     }
 }
+
+#region Pomoc modułu («Jak to działa», F1) – treść z $script:HelpTexts, osadzonej z dokumentacji docs/*.md
+# (dev/Update-EmbeddedHelp.ps1). Klucze: '<przestrzeń>|<nazwa modułu>', '<przestrzeń>|*' – wstęp przestrzeni, '*' – podstawy.
+function Get-HelpText([string]$Key) {
+    $all = Get-Variable -Name HelpTexts -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($all -and $all.ContainsKey($Key)) { return [string]$all[$Key] }
+    return ''
+}
+
+function Get-ModuleHelpText {
+    param([hashtable]$Module)
+    if (-not $Module) { return '' }
+    return (Get-HelpText ('{0}|{1}' -f $Module['Workspace'], $Module['Title']))
+}
+
+function Add-HelpInlines {
+    # Fragment tekstu z dokumentacji jako elementy TextBlock: **pogrubienie**, *kursywa*, `kod`, [odnośnik](…) – sam tekst
+    param($Inlines, [string]$Text)
+    $parts = [regex]::Split($Text, '(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]*\)|(?<![\w*])\*[^*\s][^*]*\*(?![\w*]))')
+    foreach ($part in $parts) {
+        if (-not $part) { continue }
+        if ($part -match '^\*\*(.+)\*\*$') {
+            $b = New-Object System.Windows.Documents.Bold (New-Object System.Windows.Documents.Run $Matches[1])
+            $b.Foreground = Get-Brush '#E9EDF3'
+            [void]$Inlines.Add($b)
+        }
+        elseif ($part -match '^`(.+)`$') {
+            $r = New-Object System.Windows.Documents.Run $Matches[1]
+            $r.FontFamily = New-Object System.Windows.Media.FontFamily 'Consolas'
+            $r.Foreground = Get-Brush '#9FD0FF'
+            [void]$Inlines.Add($r)
+        }
+        elseif ($part -match '^\[([^\]]+)\]\(') {
+            $r = New-Object System.Windows.Documents.Run $Matches[1]
+            $r.Foreground = Get-Brush '#8CB0FF'
+            [void]$Inlines.Add($r)
+        }
+        elseif ($part -match '^\*(.+)\*$') { [void]$Inlines.Add((New-Object System.Windows.Documents.Italic (New-Object System.Windows.Documents.Run $Matches[1]))) }
+        else { [void]$Inlines.Add((New-Object System.Windows.Documents.Run $part)) }
+    }
+}
+
+function Add-HelpMarkdown {
+    # Dokumentacja w oknie pomocy: akapity, nagłówki, listy (z wcięciem i numerowane), wiersze tabel jako punkty, bloki kodu
+    param($Panel, [string]$Text)
+    $code = $null
+    foreach ($raw in ($Text -split "`n")) {
+        $line = $raw.TrimEnd()
+        if ($line -match '^\s*```') {
+            if ($null -eq $code) { $code = New-Object System.Collections.ArrayList }
+            else {
+                $cb = New-Object System.Windows.Controls.TextBox
+                $cb.Style = Get-ThemeResource 'ReadOnlyText'
+                $cb.FontFamily = New-Object System.Windows.Media.FontFamily 'Consolas'
+                $cb.Text = ($code -join "`r`n")
+                $cb.Margin = '0,6,0,6'
+                [void]$Panel.Children.Add($cb)
+                $code = $null
+            }
+            continue
+        }
+        if ($null -ne $code) { [void]$code.Add($raw); continue }
+        if (-not $line.Trim() -or $line -eq '---') { continue }
+        if ($line -match '^\s*\|') {
+            if ($line -match '^\s*\|[\s|:-]+\|\s*$') { continue }
+            $cells = @($line.Trim().Trim('|').Split('|') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $line = '- ' + ($cells -join ' — ')
+        }
+        if ($line -match '^#{2,4} (.+)$') {
+            $h = New-Object System.Windows.Controls.TextBlock
+            $h.Text = $Matches[1]
+            $h.FontSize = 15
+            $h.FontWeight = 'SemiBold'
+            $h.Foreground = Get-Brush '#FFFFFF'
+            $h.TextWrapping = 'Wrap'
+            $h.Margin = '0,16,0,4'
+            [void]$Panel.Children.Add($h)
+            continue
+        }
+        $mark = ''
+        $indent = 0
+        if ($line -match '^(\s*)[-*] (.+)$') { $indent = [int][Math]::Floor($Matches[1].Length / 2); $line = $Matches[2]; $mark = '•' }
+        elseif ($line -match '^(\s*)(\d+)\. (.+)$') { $indent = [int][Math]::Floor($Matches[1].Length / 2); $mark = $Matches[2] + '.'; $line = $Matches[3] }
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.TextWrapping = 'Wrap'
+        $tb.FontSize = 13
+        $tb.Foreground = Get-Brush '#C9D0DC'
+        Add-HelpInlines -Inlines $tb.Inlines -Text $line
+        if ($mark) {
+            $dp = New-Object System.Windows.Controls.DockPanel
+            $dp.Margin = ('{0},3,0,0' -f (6 + 18 * $indent))
+            $m1 = New-Object System.Windows.Controls.TextBlock
+            $m1.Text = $mark
+            $m1.Width = 18
+            $m1.Foreground = Get-Brush '#6F8FD8'
+            [System.Windows.Controls.DockPanel]::SetDock($m1, 'Left')
+            [void]$dp.Children.Add($m1)
+            [void]$dp.Children.Add($tb)
+            [void]$Panel.Children.Add($dp)
+        }
+        else {
+            $tb.Margin = '0,10,0,0'
+            [void]$Panel.Children.Add($tb)
+        }
+    }
+}
+
+function Show-ModuleHelp {
+    # Okno «Jak to działa»: opis modułu z dokumentacji, wstęp jego przestrzeni roboczej i podstawy pracy z programem
+    param([hashtable]$Module)
+    $text = Get-ModuleHelpText -Module $Module
+    if (-not $text) { Show-Message -Title 'Pomoc' -Text ('Moduł «{0}» nie ma opisu w dokumentacji programu.' -f $Module.Title); return }
+    $body = @'
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto"/>
+    <RowDefinition Height="*"/>
+  </Grid.RowDefinitions>
+  <StackPanel x:Name="hlpTabs" Orientation="Horizontal" Margin="0,0,0,6"/>
+  <Border Grid.Row="1" BorderBrush="#242B36" BorderThickness="0,1,0,0" Padding="0,4,0,0">
+    <ScrollViewer x:Name="hlpScroll" MaxHeight="560" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel x:Name="hlpBody" Margin="0,0,14,8"/>
+    </ScrollViewer>
+  </Border>
+</Grid>
+'@
+    $w = New-Dialog -Title ('Jak to działa: {0}' -f $Module.Title) -Subtitle ('{0}  •  {1}' -f $Module.WorkspaceTitle, $Module.Category) -Icon 'E897' -Body $body -Width 820 -NoCancel -OkText 'Zamknij' -Resizable
+    $pages = [ordered]@{ 'Ten moduł' = $text }
+    $space = Get-HelpText ('{0}|*' -f $Module.Workspace)
+    if ($space) { $pages[('Przestrzeń «{0}»' -f $Module.WorkspaceTitle)] = $space }
+    $basics = Get-HelpText '*'
+    if ($basics) { $pages['Podstawy pracy'] = $basics }
+    $w.Tag.HelpPages = $pages
+    $tabs = $w.FindName('hlpTabs')
+    foreach ($title in $pages.Keys) {
+        $b = New-Object System.Windows.Controls.Button
+        $b.Style = Get-ThemeResource 'GhostButton'
+        $b.Content = $title
+        $b.Tag = $title
+        $b.Padding = '10,3'
+        $b.Margin = '0,0,6,0'
+        $b.add_Click($script:HelpTabClick)
+        [void]$tabs.Children.Add($b)
+    }
+    Show-HelpPage -Window $w -Title 'Ten moduł'
+    [void](Invoke-Dialog $w)
+}
+
+$script:HelpTabClick = { param($s, $e) Show-HelpPage -Window ([System.Windows.Window]::GetWindow($s)) -Title ([string]$s.Tag) }
+
+function Show-HelpPage {
+    # Zakładka okna pomocy: treść strony i wyróżnienie jej przycisku
+    param([System.Windows.Window]$Window, [string]$Title)
+    $pages = $Window.Tag['HelpPages']
+    if (-not $pages -or -not $pages.Contains($Title)) { return }
+    $bodyPanel = $Window.FindName('hlpBody')
+    $bodyPanel.Children.Clear()
+    Add-HelpMarkdown -Panel $bodyPanel -Text ([string]$pages[$Title])
+    $Window.FindName('hlpScroll').ScrollToTop()
+    foreach ($b in $Window.FindName('hlpTabs').Children) {
+        $on = ([string]$b.Tag -eq $Title)
+        $b.Background = Get-Brush $(if ($on) { '#1A2640' } else { '#00000000' })
+        $b.Foreground = Get-Brush $(if ($on) { '#8CB0FF' } else { '#AEB6C4' })
+    }
+}
+#endregion
 
 $script:MinResultsHeight = 240
 $script:ParamsFitModules = New-Object 'System.Collections.Generic.Dictionary[object,hashtable]'
@@ -9691,7 +9865,11 @@ $script:ShellEvents = @{
             $ctrl = [System.Windows.Input.ModifierKeys]::Control
             $key = $e.Key
             $m = $script:UI.ActiveModule
-            if ($key -eq [System.Windows.Input.Key]::F5 -and $mods -eq $none) {
+            if ($key -eq [System.Windows.Input.Key]::F1 -and $mods -eq $none) {
+                $e.Handled = $true
+                if ($m) { Invoke-UiAction -Module $m -Action { param($m) Show-ModuleHelp -Module $m } }
+            }
+            elseif ($key -eq [System.Windows.Input.Key]::F5 -and $mods -eq $none) {
                 if ($m -and $m.PrimaryButton -and $m.PrimaryButton.IsEnabled) {
                     $b = $m.PrimaryButton
                     $b.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $b)))
@@ -14580,6 +14758,179 @@ function New-WuScript([string]$Body) {
     return [scriptblock]::Create("param(`$P)`n" + $script:WuTaskText + "`n" + $Body)
 }
 
+# Wspólne funkcje zdalne: program w sesji zalogowanego użytkownika jednorazowym zadaniem Harmonogramu. Korzystają z nich
+# dyski sieciowe (Zasoby sieciowe użytkowników), reset OneDrive (Outlook i Microsoft 365) i deinstalacja programów z profilu.
+$script:UserSessionHelpers = @'
+function Get-DoRegValue {
+    <#
+        Jedna wartość z rejestru (RegistryKey.GetValue); $Key - klucz z Get-Item/Get-ChildItem albo ścieżka; brak -> $null.
+        Nie Get-ItemProperty: czyta wszystkie wartości klucza i przerywa się (mimo -ErrorAction) na nietypowej, np. ExecTime
+        skryptów zasad grupy (REG_QWORD o długości 16 bajtów) - «Specified cast is not valid».
+    #>
+    param($Key, [string]$Name)
+    try {
+        $k = if ($Key -is [Microsoft.Win32.RegistryKey]) { $Key } else { Get-Item -LiteralPath $Key -ErrorAction Stop }
+        return $k.GetValue($Name)
+    }
+    catch { return $null }
+}
+
+function Invoke-DoInUserSession {
+    <#
+        Program w sesji zalogowanego użytkownika: jednorazowe zadanie Harmonogramu (konto po SID - działa także, gdy nazwy
+        nie da się przetłumaczyć; logowanie interaktywne, bez podniesienia uprawnień; startuje także na zasilaniu z baterii),
+        potem usuwane. Zwraca kod wyjścia programu albo $null: nie skończył się w czasie albo zadanie nie wystartowało.
+        -TimeoutSeconds 0 - bez limitu. -StopOnTimeout - po czasie program jest zamykany razem z procesami potomnymi; bez
+        tego działa dalej (np. OneDrive), a zadanie nie ma limitu czasu. -Status (tabela) dostaje: Started (program ruszył),
+        NotStarted (zadanie nie wystartowało - użytkownik nie jest zalogowany interaktywnie), TimedOut, Code.
+    #>
+    # $Trace - lista na kroki (tryb diagnostyczny): zadanie, zmiany stanu z czasem, brak wyniku
+    param([string]$Name, [string]$Sid, [string]$Execute, [string]$Argument, [int]$TimeoutSeconds = 15, [switch]$StopOnTimeout, [hashtable]$Status, [System.Collections.IList]$Trace)
+    $add = { param($t) if ($null -ne $Trace) { [void]$Trace.Add($t) } }
+    if ($null -eq $Status) { $Status = @{} }
+    $Status.Started = $false; $Status.NotStarted = $false; $Status.TimedOut = $false; $Status.Code = $null
+    $task = 'DomainOps-{0}-{1}' -f $Name, [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $principal = New-ScheduledTaskPrincipal -UserId $Sid -LogonType Interactive -RunLevel Limited
+        # Domyślne ustawienia zadania nie startują na baterii (laptopy) i zatrzymują program po 72 godz.
+        $limit = if ($StopOnTimeout -and $TimeoutSeconds -gt 0) { [TimeSpan]::FromSeconds($TimeoutSeconds + 60) } else { [TimeSpan]::Zero }
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit $limit
+        Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $Execute -Argument $Argument) -Principal $principal -Settings $settings -Force | Out-Null
+        & $add ('zadanie {0}: {1} {2}' -f $task, $Execute, $Argument)
+        Start-ScheduledTask -TaskName $task
+        $last = ''
+        while ($TimeoutSeconds -le 0 -or $sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+            Start-Sleep -Milliseconds 500
+            $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+            $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
+            $state = if ($t) { [string]$t.State } else { '' }
+            $code = if ($info) { [int64]$info.LastTaskResult } else { $null }
+            if ($null -ne $code -and $code -lt 0) { $code += 4294967296 }
+            $now = 'stan {0}, ostatni wynik {1}' -f $(if ($state) { $state } else { '?' }), $(if ($null -ne $code) { $code } else { '?' })
+            if ($now -ne $last) { & $add ('po {0:N1} s: {1}' -f $sw.Elapsed.TotalSeconds, $now); $last = $now }
+            if ($state -eq 'Running') { $Status.Started = $true; continue }
+            if (-not $state -or $null -eq $code) { continue }
+            # 267011 (0x41303) - zadanie jeszcze nie ruszyło: po 5 s to brak sesji interaktywnej; 0x800710E0 - Harmonogram odmówił
+            if ($code -eq 2147946720 -or ($code -eq 267011 -and -not $Status.Started -and $sw.Elapsed.TotalSeconds -ge 5)) {
+                $Status.NotStarted = $true
+                & $add ('zadanie nie wystartowało (wynik {0}) – użytkownik nie jest zalogowany interaktywnie' -f $code)
+                return $null
+            }
+            # 267009 (0x41301) - program jeszcze działa
+            if ($code -notin 267009, 267011) { $Status.Started = $true; $Status.Code = $code; return $code }
+        }
+        $Status.TimedOut = $true
+        & $add ('brak wyniku po {0} s' -f $TimeoutSeconds)
+        if ($StopOnTimeout) {
+            # Zatrzymanie zadania kończy tylko jego proces - najpierw drzewo procesów (np. deinstalator uruchomiony przez cmd)
+            try {
+                $leaf = (Split-Path -Leaf $Execute).Replace("'", "''")
+                foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='$leaf'" -ErrorAction Stop | Where-Object { $_.CommandLine -and ([string]$_.CommandLine).Contains($Argument) })) {
+                    $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+                    if ($owner -and [string]$owner.Sid -eq $Sid) {
+                        $kill = New-Object System.Diagnostics.ProcessStartInfo((Join-Path $env:SystemRoot 'System32\taskkill.exe'), ('/T /F /PID {0}' -f $p.ProcessId))
+                        $kill.UseShellExecute = $false
+                        $kill.CreateNoWindow = $true
+                        [void][System.Diagnostics.Process]::Start($kill).WaitForExit(10000)
+                        & $add ('zamknięto proces {0} z procesami potomnymi' -f $p.ProcessId)
+                    }
+                }
+            }
+            catch { & $add ('zamykanie procesów: ' + $_.Exception.Message) }
+            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+        }
+        return $null
+    }
+    finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+}
+
+function New-DoUserWorkDir {
+    # Folder roboczy na pliki zadania w sesji użytkownika: Temp profilu (użytkownik ma tam prawa), gdy go nie ma - Windows\Temp;
+    # zawsze z prawem modyfikacji dla użytkownika
+    param([string]$Sid, [string]$ProfilePath, [string]$Name, [System.Collections.IList]$Trace)
+    $base = if ($ProfilePath) { Join-Path $ProfilePath 'AppData\Local\Temp' } else { '' }
+    if (-not $base -or -not (Test-Path -LiteralPath $base)) { $base = Join-Path $env:SystemRoot 'Temp' }
+    $dir = Join-Path $base ('DomainOps-{0}-{1}' -f $Name, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    try {
+        $acl = Get-Acl -LiteralPath $dir
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($Sid)), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+        Set-Acl -LiteralPath $dir -AclObject $acl
+    }
+    catch { if ($null -ne $Trace) { [void]$Trace.Add('uprawnienia folderu roboczego: ' + $_.Exception.Message) } }
+    if ($null -ne $Trace) { [void]$Trace.Add('folder roboczy: ' + $dir) }
+    return $dir
+}
+
+function Test-DoWshDisabled {
+    # Windows Script Host wyłączony dla komputera albo użytkownika (Enabled = 0) - wtedy zostaje cmd z oknem konsoli
+    param([string]$Sid, [System.Collections.IList]$Trace)
+    $off = $false
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings', "Registry::HKEY_USERS\$Sid\Software\Microsoft\Windows Script Host\Settings") {
+        if ([string](Get-DoRegValue $k 'Enabled') -eq '0') { $off = $true; if ($null -ne $Trace) { [void]$Trace.Add('Windows Script Host wyłączony: ' + $k) } }
+    }
+    return $off
+}
+
+function Invoke-DoUserCommand {
+    <#
+        Polecenie (wiersz cmd) w sesji zalogowanego użytkownika bez okna konsoli: skrypt JScript uruchamia je przez
+        WScript.Shell.Run z ukrytym oknem i zapisuje kod wyjścia; skrypt startuje wscript.exe jednorazowym zadaniem w sesji.
+        Gdy Windows Script Host jest wyłączony albo skrypt w ogóle nie ruszył - cmd /c (okno konsoli będzie widać).
+        -TimeoutSeconds 0 - bez limitu; po czasie polecenie jest zamykane razem z procesami potomnymi.
+        Wynik: @{ Code (kod wyjścia, $null - brak); TimedOut; NotStarted (użytkownik nie jest zalogowany interaktywnie); Message; Method }
+    #>
+    param([string]$Name, [string]$Sid, [string]$ProfilePath, [string]$CommandLine, [int]$TimeoutSeconds = 0, [System.Collections.IList]$Trace)
+    $add = { param($t) if ($null -ne $Trace) { [void]$Trace.Add($t) } }
+    $result = @{ Code = $null; TimedOut = $false; NotStarted = $false; Message = ''; Method = '' }
+    $dir = $null
+    try {
+        $dir = New-DoUserWorkDir -Sid $Sid -ProfilePath $ProfilePath -Name $Name -Trace $Trace
+        $out = Join-Path $dir 'wynik.txt'
+        $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        if (-not (Test-DoWshDisabled -Sid $Sid -Trace $Trace)) {
+            # Znacznik «ruszył» przed poleceniem: bez niego wiadomo, że skrypt nie wystartował, i można spróbować przez cmd
+            $js = Join-Path $dir 'polecenie.js'
+            $code = @(
+                "var o = WScript.Arguments(0), c = 0, m = '', fs = new ActiveXObject('Scripting.FileSystemObject');"
+                "fs.CreateTextFile(o + '.start', true).Close();"
+                ("try {{ c = new ActiveXObject('WScript.Shell').Run({0}, 0, true); }} catch (e) {{ c = e.number & 0xFFFF; if (!c) c = 1; m = e.description; }}" -f (ConvertTo-Json -InputObject ('"{0}" /d /s /c "{1}"' -f $cmd, $CommandLine) -Compress))
+                "var f = fs.CreateTextFile(o, true, true); f.Write(c + '|' + m); f.Close();"
+                'WScript.Quit(c);'
+            ) -join "`r`n"
+            [System.IO.File]::WriteAllText($js, $code, [System.Text.Encoding]::Unicode)
+            & $add ('polecenie: ' + $CommandLine)
+            $result.Method = 'wscript'
+            $st = @{}
+            $result.Code = Invoke-DoInUserSession -Name $Name -Sid $Sid -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "{0}" "{1}"' -f $js, $out) -TimeoutSeconds $TimeoutSeconds -StopOnTimeout -Status $st -Trace $Trace
+            $result.TimedOut = [bool]$st.TimedOut
+            $result.NotStarted = [bool]$st.NotStarted
+            if (Test-Path -LiteralPath $out) {
+                $text = [System.IO.File]::ReadAllText($out)
+                & $add ('wynik skryptu: ' + $text)
+                $parts = $text.Split('|', 2)
+                $n = [int64]0
+                if ([int64]::TryParse($parts[0], [ref]$n)) { $result.Code = $n }
+                $result.Message = $(if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' })
+                return $result
+            }
+            if ($null -eq $result.Code) { return $result }
+            # Polecenie ruszyło (znacznik), ale wyniku nie ma - np. deinstalator wyczyścił folder Temp; drugi raz go nie uruchamiamy
+            if ((Test-Path -LiteralPath "$out.start") -or -not (Test-Path -LiteralPath $dir)) { $result.Message = 'polecenie nie zapisało wyniku – kod wyjścia wscript'; return $result }
+            & $add ('skrypt nie wystartował (kod {0}) – próba przez cmd' -f $result.Code)
+        }
+        $result.Method = 'cmd'
+        $st = @{}
+        $result.Code = Invoke-DoInUserSession -Name $Name -Sid $Sid -Execute $cmd -Argument ('/d /s /c "{0}"' -f $CommandLine) -TimeoutSeconds $TimeoutSeconds -StopOnTimeout -Status $st -Trace $Trace
+        $result.TimedOut = [bool]$st.TimedOut
+        $result.NotStarted = [bool]$st.NotStarted
+        return $result
+    }
+    finally { if ($dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue } }
+}
+'@
+
 # Wspólna funkcja (wklejana do bloków zdalnych): jak odinstalować program z danego wpisu rejestru.
 # Kind: msi | quiet | inno (da się po cichu), interactive (tylko z przełącznikami), none, blocked.
 $script:UninstallPlanText = @'
@@ -14656,7 +15007,7 @@ foreach ($root in $roots) {
 }
 '@
 
-$script:ProgramUninstallBody = @'
+$script:ProgramUninstallBody = $script:UserSessionHelpers + @'
 $ErrorActionPreference = 'Stop'
 $logDir = Join-Path $env:SystemRoot 'Temp\DomainOps'
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -14691,26 +15042,17 @@ foreach ($item in $P.Items) {
             if ($item.Args) { $command += ' ' + $item.Args }
         }
         $timedOut = $false
+        $notes = New-Object System.Collections.ArrayList
         if ($item.Scope -eq 'Użytkownik') {
-            # Program w profilu: deinstalator musi działać jako ten użytkownik - zadanie w jego zalogowanej sesji
-            $account = (New-Object System.Security.Principal.SecurityIdentifier($item.Hive)).Translate([System.Security.Principal.NTAccount]).Value
-            $taskName = 'DomainOps_Uninstall_' + [guid]::NewGuid().ToString('N')
-            $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument ('/d /s /c "' + $command + '"')
-            $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromSeconds([Math]::Max(60, [int]$P.TimeoutSec)))
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-            try {
-                Start-ScheduledTask -TaskName $taskName
-                Start-Sleep -Seconds 2
-                while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
-                    if ([int]$P.TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge [int]$P.TimeoutSec) { $timedOut = $true; Stop-ScheduledTask -TaskName $taskName; break }
-                    Start-Sleep -Seconds 1
-                }
-                $info = Get-ScheduledTaskInfo -TaskName $taskName
-                $res.Code = [int64]$info.LastTaskResult
-                if ($res.Code -eq 0x41303 -or $res.Code -eq 0x41306) { throw "Zadanie nie wystartowało – użytkownik $account nie jest zalogowany interaktywnie (zaloguj go albo odinstaluj program w jego sesji)." }
-            }
-            finally { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
+            # Program w profilu: deinstalator musi działać jako ten użytkownik - zadanie w jego zalogowanej sesji, bez okna konsoli
+            $account = try { (New-Object System.Security.Principal.SecurityIdentifier($item.Hive)).Translate([System.Security.Principal.NTAccount]).Value } catch { $item.Hive }
+            $profilePath = [Environment]::ExpandEnvironmentVariables([string](Get-DoRegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($item.Hive)" 'ProfileImagePath'))
+            $u = Invoke-DoUserCommand -Name 'Uninstall' -Sid $item.Hive -ProfilePath $profilePath -CommandLine $command -TimeoutSeconds ([int]$P.TimeoutSec)
+            if ($u.NotStarted) { throw "Zadanie nie wystartowało – użytkownik $account nie jest zalogowany interaktywnie (zaloguj go albo odinstaluj program w jego sesji)." }
+            $timedOut = $u.TimedOut
+            if (-not $timedOut) { $res.Code = $u.Code }
+            if ($u.Method -eq 'cmd') { [void]$notes.Add('Windows Script Host wyłączony – deinstalator uruchomiony przez cmd (okno konsoli u użytkownika)') }
+            if ($u.Message) { [void]$notes.Add($u.Message) }
         }
         else {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -14745,7 +15087,7 @@ foreach ($item in $P.Items) {
                 if ($res.Tone -eq 'ok') { $res.Status = 'Deinstalator zakończył się bez błędu, ale program nadal jest zainstalowany – mógł czekać na potwierdzenie, uruchomić osobny proces albo wymaga restartu'; $res.Tone = 'warn' }
             }
         }
-        if ($msiLog) { $res.Detail = "Log MSI: $msiLog" }
+        $res.Detail = (@(@($(if ($msiLog) { "Log MSI: $msiLog" })) + @($notes) | Where-Object { $_ }) -join '; ')
     }
     catch {
         $res.Status = $_.Exception.Message
@@ -15943,21 +16285,7 @@ Register-Module -Workspace 'Remote' -Category 'Udostępnianie' -Key 'Shares' -Ti
 # (HKEY_USERS\<SID> zalogowanych; opcjonalnie NTUSER.DAT pozostałych, ładowany na chwilę), mapowania z Preferencji
 # zasad grupy z historii GPP (profil użytkownika, ProgramData), a nazwy GPO z zapisanego stanu zasad grupy. Kod pomocniczy jako tekst
 # ($P.Helpers), bo blok wykonuje się na komputerze docelowym.
-$script:NetResHelpers = @'
-function Get-DoRegValue {
-    <#
-        Jedna wartość z rejestru (RegistryKey.GetValue); $Key - klucz z Get-Item/Get-ChildItem albo ścieżka; brak -> $null.
-        Nie Get-ItemProperty: czyta wszystkie wartości klucza i przerywa się (mimo -ErrorAction) na nietypowej, np. ExecTime
-        skryptów zasad grupy (REG_QWORD o długości 16 bajtów) - «Specified cast is not valid».
-    #>
-    param($Key, [string]$Name)
-    try {
-        $k = if ($Key -is [Microsoft.Win32.RegistryKey]) { $Key } else { Get-Item -LiteralPath $Key -ErrorAction Stop }
-        return $k.GetValue($Name)
-    }
-    catch { return $null }
-}
-
+$script:NetResHelpers = $script:UserSessionHelpers + @'
 function Get-DoProfiles {
     # Profile kont użytkowników (S-1-5-21-…): SID, folder, nazwa konta, czy gałąź rejestru jest załadowana (zalogowany)
     param([string]$UserFilter = '')
@@ -15997,38 +16325,6 @@ function Use-DoUserHive {
     }
 }
 
-function Invoke-DoInUserSession {
-    <#
-        Program w sesji zalogowanego użytkownika: jednorazowe zadanie Harmonogramu (konto po SID - działa także, gdy nazwy
-        nie da się przetłumaczyć; logowanie interaktywne, bez podniesienia uprawnień), potem usuwane. Zwraca kod wyjścia
-        programu albo $null, gdy nie skończył się w czasie (267009/267011 - zadanie jeszcze trwa / jeszcze nie ruszyło).
-    #>
-    # $Trace - lista na kroki (tryb diagnostyczny): zadanie, zmiany stanu z czasem, brak wyniku
-    param([string]$Name, [string]$Sid, [string]$Execute, [string]$Argument, [int]$TimeoutSeconds = 15, [System.Collections.IList]$Trace)
-    $task = 'DomainOps-{0}-{1}' -f $Name, [guid]::NewGuid().ToString('N').Substring(0, 8)
-    $start = Get-Date
-    try {
-        $principal = New-ScheduledTaskPrincipal -UserId $Sid -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $Execute -Argument $Argument) -Principal $principal -Force | Out-Null
-        if ($null -ne $Trace) { [void]$Trace.Add(('zadanie {0}: {1} {2}' -f $task, $Execute, $Argument)) }
-        Start-ScheduledTask -TaskName $task
-        $last = ''
-        for ($i = 0; $i -lt $TimeoutSeconds * 2; $i++) {
-            Start-Sleep -Milliseconds 500
-            $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-            $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
-            if ($null -ne $Trace) {
-                $now = 'stan {0}, ostatni wynik {1}' -f $(if ($t) { [string]$t.State } else { '?' }), $(if ($info) { [string]$info.LastTaskResult } else { '?' })
-                if ($now -ne $last) { [void]$Trace.Add(('po {0:N1} s: {1}' -f ((Get-Date) - $start).TotalSeconds, $now)); $last = $now }
-            }
-            if ($t -and [string]$t.State -ne 'Running' -and $info -and [int64]$info.LastTaskResult -notin 267009, 267011) { return [int64]$info.LastTaskResult }
-        }
-        if ($null -ne $Trace) { [void]$Trace.Add(('brak wyniku po {0} s' -f $TimeoutSeconds)) }
-        return $null
-    }
-    finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
-}
-
 function Get-DoDesktopSids {
     # SID-y właścicieli explorer.exe (użytkownicy z pulpitem); $null - nie udało się sprawdzić. Gałąź rejestru bywa załadowana
     # także dla kont usług bez pulpitu, a zadanie «tylko gdy użytkownik jest zalogowany» by tam nie ruszyło.
@@ -16047,30 +16343,17 @@ function Invoke-DoNetDrive {
         Podłączenie (Map) albo odłączenie (Unmap) dysku w sesji zalogowanego użytkownika bez okna konsoli: skrypt JScript
         (obiekt WScript.Network) uruchamiany przez wscript.exe jednorazowym zadaniem w jego sesji. Gdy Windows Script Host
         jest wyłączony albo skrypt nie zapisał wyniku - cmd z net use (okno konsoli mignie).
-        Wynik: @{ Code (0 - OK, $null - brak odpowiedzi); NotConnected (odłączanie: dysku nie było w sesji); Message; Method }
+        Wynik: @{ Code (0 - OK, $null - brak odpowiedzi); NotConnected (odłączanie: dysku nie było w sesji);
+        NotStarted (zadanie nie wystartowało - brak logowania interaktywnego); Message; Method }
     #>
     param($Profile, [ValidateSet('Map', 'Unmap')][string]$Op, [string]$Letter, [string]$Path, [System.Collections.IList]$Trace)
     $add = { param($t) if ($null -ne $Trace) { [void]$Trace.Add($t) } }
-    # Folder roboczy w Temp profilu (użytkownik ma tam prawa); gdy go nie ma - Windows\Temp z prawem zapisu dla użytkownika
-    $base = Join-Path $Profile.Path 'AppData\Local\Temp'
-    if (-not (Test-Path -LiteralPath $base)) { $base = Join-Path $env:SystemRoot 'Temp' }
-    $dir = Join-Path $base ('DomainOps-{0}-{1}' -f $Op, [guid]::NewGuid().ToString('N').Substring(0, 8))
-    $out = Join-Path $dir 'wynik.txt'
-    $result = @{ Code = $null; NotConnected = $false; Message = ''; Method = '' }
+    $result = @{ Code = $null; NotConnected = $false; NotStarted = $false; Message = ''; Method = '' }
+    $dir = $null
     try {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        try {
-            $acl = Get-Acl -LiteralPath $dir
-            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($Profile.Sid)), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
-            Set-Acl -LiteralPath $dir -AclObject $acl
-        }
-        catch { & $add ('uprawnienia folderu roboczego: ' + $_.Exception.Message) }
-        & $add ('folder roboczy: ' + $dir)
-        $wshOff = $false
-        foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings', "Registry::HKEY_USERS\$($Profile.Sid)\Software\Microsoft\Windows Script Host\Settings") {
-            if ([string](Get-DoRegValue $k 'Enabled') -eq '0') { $wshOff = $true; & $add ('Windows Script Host wyłączony: ' + $k) }
-        }
-        if (-not $wshOff) {
+        $dir = New-DoUserWorkDir -Sid $Profile.Sid -ProfilePath $Profile.Path -Name $Op -Trace $Trace
+        $out = Join-Path $dir 'wynik.txt'
+        if (-not (Test-DoWshDisabled -Sid $Profile.Sid -Trace $Trace)) {
             $l = ConvertTo-Json -InputObject ($Letter + ':') -Compress
             $call = if ($Op -eq 'Map') { 'MapNetworkDrive({0}, {1}, true)' -f $l, (ConvertTo-Json -InputObject $Path -Compress) } else { 'RemoveNetworkDrive({0}, true, true)' -f $l }
             $js = Join-Path $dir 'dysk.js'
@@ -16083,7 +16366,9 @@ function Invoke-DoNetDrive {
             [System.IO.File]::WriteAllText($js, $code, [System.Text.Encoding]::Unicode)
             & $add ('skrypt: ' + $call)
             $result.Method = 'wscript'
-            $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "{0}" "{1}"' -f $js, $out) -TimeoutSeconds 30 -Trace $Trace
+            $st = @{}
+            $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') -Argument ('//B //Nologo "{0}" "{1}"' -f $js, $out) -TimeoutSeconds 30 -Status $st -Trace $Trace
+            $result.NotStarted = [bool]$st.NotStarted
             if (Test-Path -LiteralPath $out) {
                 $text = [System.IO.File]::ReadAllText($out)
                 & $add ('wynik skryptu: ' + $text)
@@ -16101,7 +16386,9 @@ function Invoke-DoNetDrive {
         # cmd z net use (okno konsoli mignie); komunikat net use w stronie kodowej OEM
         $arg = if ($Op -eq 'Map') { '/d /c net use {0}: "{1}" /persistent:yes >"{2}" 2>&1' -f $Letter, $Path, $out } else { '/d /c net use {0}: /delete /y >"{1}" 2>&1' -f $Letter, $out }
         $result.Method = 'cmd'
-        $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $arg -TimeoutSeconds 30 -Trace $Trace
+        $st = @{}
+        $result.Code = Invoke-DoInUserSession -Name $Op -Sid $Profile.Sid -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') -Argument $arg -TimeoutSeconds 30 -Status $st -Trace $Trace
+        $result.NotStarted = [bool]$st.NotStarted
         $oem = try { [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { [System.Text.Encoding]::Default }
         try { $result.Message = (@([System.IO.File]::ReadAllLines($out, $oem) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' ') } catch { }
         & $add ('net use: ' + $result.Message)
@@ -16109,7 +16396,7 @@ function Invoke-DoNetDrive {
         $result.NotConnected = ($Op -eq 'Unmap' -and $result.Code -eq 2)
         return $result
     }
-    finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    finally { if ($dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 
 function Get-DoGpHistoryRoots {
@@ -16301,6 +16588,7 @@ $script:NetUnmapScript = {
                     $r = Invoke-DoNetDrive -Profile $pr -Op Unmap -Letter $letter -Trace $trace
                     $sessionPart = if ($r.Code -eq 0) { 'odłączono w sesji użytkownika' }
                     elseif ($r.NotConnected) { 'w sesji nie był połączony' }
+                    elseif ($r.NotStarted) { 'zadanie w sesji nie wystartowało (brak logowania interaktywnego) – dysk zniknie po wylogowaniu' }
                     elseif ($null -eq $r.Code) { 'sesja nie odpowiedziała – dysk zniknie po wylogowaniu' }
                     else { 'w sesji nie odłączono: {0}' -f $(if ($r.Message) { '{0} (kod {1})' -f $r.Message, $r.Code } else { 'kod {0}' -f $r.Code }) }
                 }
@@ -16419,6 +16707,7 @@ $script:NetMapScript = {
                     catch { $res.Wynik += '; etykiety nie ustawiono: ' + $_.Exception.Message }
                 }
             }
+            elseif ($r.NotStarted) { $res.Wynik = 'Błąd – zadanie w sesji użytkownika nie wystartowało (brak logowania interaktywnego); dysku nie podłączono' }
             elseif ($null -eq $r.Code) { $res.Wynik = 'Nieznany – sesja nie odpowiedziała w 30 s; sprawdź za chwilę w widoku «Dyski zmapowane»' }
             else { $res.Wynik = 'Błąd – ' + $(if ($r.Message) { '{0} (kod {1})' -f $r.Message, $r.Code } else { 'kod {0}' -f $r.Code }) }
         }
@@ -17430,14 +17719,22 @@ $script:M365AppActionScript = {
                 foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) { if ($pf) { $cands += (Join-Path $pf 'Microsoft OneDrive\OneDrive.exe') } }
                 $exe = $cands | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
                 if (-not $exe) { throw 'nie znaleziono OneDrive.exe (profil użytkownika ani Program Files)' }
-                $principal = New-ScheduledTaskPrincipal -UserId $it.User -LogonType Interactive -RunLevel Limited
-                foreach ($arg in '/reset', '/background') {
-                    $task = 'DomainOps-OneDrive-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-                    Register-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction -Execute $exe -Argument $arg) -Principal $principal -Force | Out-Null
-                    try { Start-ScheduledTask -TaskName $task; Start-Sleep -Seconds $(if ($arg -eq '/reset') { 10 } else { 2 }) }
-                    finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+                # Reset w sesji użytkownika: OneDrive zamyka się, czyści stan synchronizacji i kończy pracę - czekamy na wynik
+                $st = @{}
+                $code = Invoke-DoInUserSession -Name 'OneDrive' -Sid $it.Sid -Execute $exe -Argument '/reset' -TimeoutSeconds 120 -Status $st
+                if ($st.NotStarted) { throw 'zadanie w sesji użytkownika nie wystartowało – użytkownik nie jest zalogowany interaktywnie' }
+                if ($st.TimedOut) {
+                    [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = 'reset OneDrive'; 'Wynik' = 'Nieznany – reset trwa dłużej niż 2 min'; 'Uwagi' = 'OneDrive kończy reset w tle; jeśli potem sam nie ruszy, użytkownik uruchomi go z menu Start' }
+                    continue
                 }
-                [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = 'reset OneDrive'; 'Wynik' = 'OK'; 'Uwagi' = 'OneDrive zresetowany i uruchomiony ponownie – ponowna synchronizacja bibliotek może potrwać; pliki zostają' }
+                if ($code -ne 0) { throw ('OneDrive /reset zakończył się kodem {0}' -f $code) }
+                # Ponowne uruchomienie: OneDrive działa dalej (zadanie bez limitu czasu) albo od razu kończy, gdy już działa
+                $st2 = @{}
+                $code2 = Invoke-DoInUserSession -Name 'OneDrive' -Sid $it.Sid -Execute $exe -Argument '/background' -TimeoutSeconds 8 -Status $st2
+                $started = ($st2.TimedOut -and $st2.Started) -or $code2 -eq 0
+                $note = if ($started) { 'OneDrive zresetowany i uruchomiony ponownie – ponowna synchronizacja bibliotek może potrwać; pliki zostają' }
+                else { 'OneDrive zresetowany, ale nie uruchomił się ponownie ({0}) – użytkownik uruchomi go z menu Start; pliki zostają' -f $(if ($null -ne $code2) { "kod $code2" } else { 'brak odpowiedzi' }) }
+                [pscustomobject][ordered]@{ 'Użytkownik' = $it.User; 'Operacja' = 'reset OneDrive'; 'Wynik' = $(if ($started) { 'OK' } else { 'OK – bez ponownego uruchomienia' }); 'Uwagi' = $note }
                 continue
             }
             if ($P.Op -eq 'Teams') {
@@ -18904,31 +19201,35 @@ function Set-LoadTile {
     $line.Points = $points
 }
 
-# Stała wysokość i wiersze bez zawijania: zmienna wysokość panelu przy każdej próbce przesuwała kafelki i tabelę
+# Stała wysokość i wiersze bez zawijania: zmienna wysokość panelu przy każdej próbce przesuwała kafelki i tabelę.
+# Wspólny wiersz nagłówków: oba nagłówki i obie listy zaczynają się na tej samej wysokości (przycisk kopiowania
+# po prawej nie przesuwa listy w dół); w każdej kolumnie mieści się $script:LoadWhyLines wierszy.
+$script:LoadWhyLines = 8
 $script:LoadWhyXaml = @'
-<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Margin="0,4,0,6" Height="168" ClipToBounds="True">
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Margin="0,4,0,6" Height="200" ClipToBounds="True">
   <Grid.ColumnDefinitions>
     <ColumnDefinition Width="*"/>
     <ColumnDefinition Width="18"/>
     <ColumnDefinition Width="*"/>
   </Grid.ColumnDefinitions>
-  <StackPanel>
-    <TextBlock Text="Co się dzieje teraz" FontWeight="SemiBold" Foreground="#E4E8EF"/>
-    <StackPanel Name="now" Margin="0,6,0,0"/>
-  </StackPanel>
-  <StackPanel Grid.Column="2">
-    <DockPanel LastChildFill="True">
-      <StackPanel Name="actions" DockPanel.Dock="Right" Orientation="Horizontal"/>
-      <TextBlock Text="Od startu pomiaru" FontWeight="SemiBold" Foreground="#E4E8EF" VerticalAlignment="Center"/>
-    </DockPanel>
-    <StackPanel Name="total" Margin="0,6,0,0"/>
-  </StackPanel>
+  <Grid.RowDefinitions>
+    <RowDefinition Height="30"/>
+    <RowDefinition Height="*"/>
+  </Grid.RowDefinitions>
+  <TextBlock Name="nowTitle" Text="Co się dzieje teraz" FontWeight="SemiBold" Foreground="#E4E8EF" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+  <StackPanel Name="now" Grid.Row="1" Margin="0,4,0,0"/>
+  <DockPanel Grid.Column="2" LastChildFill="True">
+    <StackPanel Name="actions" DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center"/>
+    <TextBlock Text="Od startu pomiaru" FontWeight="SemiBold" Foreground="#E4E8EF" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+  </DockPanel>
+  <StackPanel Name="total" Grid.Row="1" Grid.Column="2" Margin="0,4,0,0"/>
 </Grid>
 '@
 
 function Set-LoadLines {
     # Wiersze z kolorową kropką (ocena) w panelu «Co się dzieje»: jedna linia na wpis (pełny tekst - widok «Podsumowanie»
-    # i kopia), istniejące wiersze zmieniane w miejscu bez tworzenia elementów co próbkę
+    # i kopia), istniejące wiersze zmieniane w miejscu bez tworzenia elementów co próbkę. Bez podpowiedzi (ToolTip):
+    # zmieniana co próbkę otwierałaby się na nowo pod kursorem, a pod Wine potrafiła zawiesić okno
     param($Panel, [object[]]$Lines)
     $kids = $Panel.Children
     while ($kids.Count -gt $Lines.Count) { $kids.RemoveAt($kids.Count - 1) }
@@ -18941,7 +19242,7 @@ function Set-LoadLines {
             $tb = New-Object System.Windows.Controls.TextBlock
             $tb.TextTrimming = 'CharacterEllipsis'
             $tb.FontSize = 12.5
-            $tb.Margin = '0,0,0,4'
+            $tb.Margin = '0,0,0,3'
             $tb.Foreground = Get-Brush '#C9D0DC'
             [void]$tb.Inlines.Add((New-Object System.Windows.Documents.Run '● '))
             [void]$tb.Inlines.Add((New-Object System.Windows.Documents.Run ''))
@@ -19150,9 +19451,10 @@ function Update-LoadUi {
     Set-StatTile -Module $m -Key 'mon' -Value (Format-LoadDuration $st.Seconds) -Label ('{0} • {1} • do {2} min' -f $st.Target, $state, $minutes) -Tone $(if ($st.Error) { 'crit' } elseif ($st.Running) { 'info' } else { '' })
     $why = $m.Data['LoadWhy']
     if ($why) {
-        Set-LoadLines -Panel $why.FindName('now') -Lines @(if ($st.Error) { @{ Tone = 'crit'; Text = $st.Error } } else { Get-LoadFindings -State $st })
-        # W panelu najważniejsze pozycje; pełna lista w widoku «Podsumowanie» i w kopii
-        Set-LoadLines -Panel $why.FindName('total') -Lines @(Get-LoadSummary -State $st | Where-Object { $_.Item -notmatch '#[3-9]$' -and $_.Item -notmatch 'I/O #[2-9]$' -and $_.Item -ne 'Koszt monitora' } | Select-Object -First 8)
+        $why.FindName('nowTitle').Text = 'Co się dzieje teraz – {0}' -f $st.Target
+        Set-LoadLines -Panel $why.FindName('now') -Lines @(@(if ($st.Error) { @{ Tone = 'crit'; Text = $st.Error } } else { Get-LoadFindings -State $st }) | Select-Object -First $script:LoadWhyLines)
+        # W panelu najważniejsze pozycje (okno pomiaru pokazuje kafelek czasu); pełna lista w widoku «Podsumowanie» i w kopii
+        Set-LoadLines -Panel $why.FindName('total') -Lines @(Get-LoadSummary -State $st | Where-Object { $_.Item -notmatch '#[3-9]$' -and $_.Item -notmatch 'I/O #[2-9]$' -and $_.Item -ne 'Koszt monitora' } | Select-Object -First $script:LoadWhyLines)
     }
     if ($m.View_['busyText'] -and $st.Running) { $m.View_['busyText'].Text = 'Monitor: {0} • {1} / {2} min • próbek: {3}' -f $st.Target, (Format-LoadDuration $st.Seconds), $minutes, $st.Ticks.Count }
     $view = [int]$m.Data['LoadView']
@@ -19169,20 +19471,61 @@ function Update-LoadUi {
     }
 }
 
-function Start-LoadMonitor {
+function Set-LoadHostItems {
+    # Pole «Komputer»: komputery zaznaczone po lewej (i obserwowany, jeśli już nie jest zaznaczony); zmiana listy
+    # nie uruchamia przełączenia pomiaru
+    param([hashtable]$Module, [string]$Selected = '')
+    $m = $Module
+    $cb = $m.LoadHost
+    if (-not $Selected) { $Selected = [string]$cb.SelectedItem }
+    $names = New-Object System.Collections.ArrayList
+    foreach ($n in @(Get-TargetComputers -Quiet)) { if (-not $names.Contains($n)) { [void]$names.Add($n) } }
+    $st = $m.Data['Load']
+    if ($st -and $st.Target -and -not $names.Contains($st.Target)) { [void]$names.Insert(0, $st.Target) }
+    if ($Selected -and -not $names.Contains($Selected)) { [void]$names.Insert(0, $Selected) }
+    $m.Data.LoadHostFilling = $true
+    try {
+        $cb.Items.Clear()
+        foreach ($n in $names) { [void]$cb.Items.Add($n) }
+        if ($Selected) { $cb.SelectedItem = $Selected } elseif ($cb.Items.Count) { $cb.SelectedIndex = 0 }
+    }
+    finally { $m.Data.LoadHostFilling = $false }
+}
+
+function Switch-LoadTarget {
+    # Inny komputer w polu «Komputer» w trakcie pomiaru: bieżący pomiar jest przerywany, nowy rusza po jego zakończeniu
+    # (Complete-LoadMonitor); bez trwającego pomiaru wybór czeka na «Start»
     param([hashtable]$Module)
     $m = $Module
-    $targets = @(Get-TargetComputers)
-    if (-not $targets) { return }
-    $target = $targets[0]
-    if ($targets.Count -gt 1) { Show-Toast ('Monitor obserwuje jeden komputer naraz – wybrano {0} (pierwszy zaznaczony).' -f $target) 'info' }
+    if ($m.Data['LoadHostFilling']) { return }
+    $name = [string]$m.LoadHost.SelectedItem
+    $st = $m.Data['Load']
+    if (-not $name -or -not $st -or -not $st.Running -or $st.Target -eq $name) { return }
+    $m.Data.LoadNext = $name
+    Write-Log ('Monitor obciążenia: przełączenie z {0} na {1}.' -f $st.Target, $name) -Module $m.Title
+    Stop-ModuleOperations -Module $m
+}
+
+function Start-LoadMonitor {
+    param([hashtable]$Module, [string]$Target = '')
+    $m = $Module
+    $computer = $Target
+    if (-not $computer) {
+        $computers = @(Get-TargetComputers -Quiet)
+        $chosen = [string]$m.LoadHost.SelectedItem
+        $computer = if ($chosen -and ($computers -contains $chosen -or -not $computers.Count)) { $chosen } elseif ($computers.Count) { $computers[0] } else { '' }
+        if (-not $computer) { Show-Warning 'Zaznacz komputer na liście po lewej stronie.'; return }
+        if ($computers.Count -gt 1) { Show-Toast ('Monitor obserwuje jeden komputer naraz: {0}. Inny wybierzesz w polu «Komputer» – także w trakcie pomiaru.' -f $computer) 'info' }
+    }
+    $m.Data.LoadNext = ''
+    Set-LoadHostItems -Module $m -Selected $computer
     $params = @{ Interval = (Get-Num $m.LoadInterval); Minutes = (Get-Num $m.LoadMinutes) }
-    $m.Data.Load = New-LoadState -Target $target -Params $params
+    $m.Data.Load = New-LoadState -Target $computer -Params $params
     Reset-StatTiles -Module $m
     Show-LoadView -Module $m
     Update-LoadUi -Module $m
-    Write-Log ('Monitor obciążenia: {0} – start (próbka co {1} s, najdłużej {2} min).' -f $target, $params.Interval, $params.Minutes) -Module $m.Title
-    Start-HostOperation -Module $m -Name 'Monitor obciążenia' -Targets @($target) -Output None -Quiet -Parameters $params -ScriptBlock $script:LoadMonitorScript -OnItem {
+    Write-Log ('Monitor obciążenia: {0} – start (próbka co {1} s, najdłużej {2} min).' -f $computer, $params.Interval, $params.Minutes) -Module $m.Title
+    Start-HostOperation -Module $m -Name 'Monitor obciążenia' -Targets @($computer) -Output None -Quiet -Parameters $params -ScriptBlock $script:LoadMonitorScript -OnItem {
         param($m, $target, $obj)
         Receive-LoadItem -Module $m -Object $obj
     } -OnResult {
@@ -19210,6 +19553,8 @@ function Complete-LoadMonitor {
         if (-not $Result.Ok -and -not $cancelled) { $st.Error = 'Połączenie przerwane: ' + ((@($Result.Errors | Select-Object -Unique)) -join ' | ') }
     }
     Update-LoadUi -Module $m
+    # Przełączenie na inny komputer: start po zakończeniu operacji (moduł jest wtedy już wolny)
+    if ([string]$m.Data['LoadNext']) { Invoke-Deferred -Module $m -Action { param($m) Start-LoadMonitor -Module $m -Target ([string]$m.Data['LoadNext']) } }
 }
 
 function Initialize-LoadModule {
@@ -19218,16 +19563,23 @@ function Initialize-LoadModule {
     $m.Data.Load = $null
     $m.Data.LoadView = 0
     $row = Add-ToolbarRow -Module $m -Title 'Pomiar'
+    Add-Label -Parent $row -Text 'Komputer' | Out-Null
+    $m.LoadHost = Add-ComboBox -Parent $row -Width 170
+    $m.LoadHost.ToolTip = 'Komputer obserwowany przez monitor (jeden naraz) – lista zaznaczonych po lewej. Zmiana w trakcie pomiaru przełącza pomiar na wybrany komputer.'
+    Register-ControlHandler -Control $m.LoadHost -EventName 'DropDownOpened' -Module $m -Action { param($m) Set-LoadHostItems -Module $m }
+    Register-ControlHandler -Control $m.LoadHost -EventName 'SelectionChanged' -Module $m -Action { param($m) Switch-LoadTarget -Module $m }
     Add-Label -Parent $row -Text 'Próbka co (s)' | Out-Null
     $m.LoadInterval = Add-Numeric -Parent $row -Value 5 -Minimum 2 -Maximum 60 -Width 50
     Add-Label -Parent $row -Text 'Najdłużej (min)' | Out-Null
     $m.LoadMinutes = Add-Numeric -Parent $row -Value 15 -Minimum 1 -Maximum 240 -Width 55
     Add-Label -Parent $row -Text 'Procesy w tabeli' | Out-Null
     $m.LoadTop = Add-Numeric -Parent $row -Value 30 -Minimum 5 -Maximum 200 -Width 50
-    Add-Button -Parent $row -Text 'Start' -Icon 'E768' -Module $m -Primary -ToolTip 'Obserwuje pierwszy zaznaczony komputer (jeden naraz); pomiar kończy się po ustawionym czasie albo przyciskiem «Przerwij» nad tabelą' -OnClick { param($m) Start-LoadMonitor -Module $m } | Out-Null
+    Add-Button -Parent $row -Text 'Start' -Icon 'E768' -Module $m -Primary -ToolTip 'Obserwuje komputer z pola «Komputer» (domyślnie pierwszy zaznaczony, jeden naraz); pomiar kończy się po ustawionym czasie albo przyciskiem «Przerwij» nad tabelą' -OnClick { param($m) Start-LoadMonitor -Module $m } | Out-Null
     $why = New-UiElement $script:LoadWhyXaml
     $copy = New-PlainButton -Text 'Kopiuj podsumowanie' -Icon 'E8C8'
     $copy.Margin = '0,0,0,0'
+    $copy.Padding = '8,2'
+    $copy.MinHeight = 26
     Register-ControlHandler -Control $copy -EventName 'Click' -Module $m -Action {
         param($m)
         if (-not $m.Data['Load'] -or -not $m.Data.Load.Ticks.Count) { Show-Toast 'Brak danych – uruchom pomiar.' 'info'; return }
@@ -19262,7 +19614,7 @@ function Initialize-LoadModule {
             }
         }
     }
-    $m.EmptyHint = 'Zaznacz serwer na liście po lewej i kliknij «Start». Co kilka sekund widać obciążenie procesora, pamięci, dysków i sieci oraz procesy, które je powodują – z sumami od startu pomiaru.'
+    $m.EmptyHint = 'Zaznacz serwer na liście po lewej (przy kilku zaznaczonych wybierz go w polu «Komputer») i kliknij «Start». Co kilka sekund widać obciążenie procesora, pamięci, dysków i sieci oraz procesy, które je powodują – z sumami od startu pomiaru.'
 }
 
 Register-Module -Workspace 'Remote' -Category 'Diagnostyka' -Key 'LoadMonitor' -Title 'Monitor obciążenia' -Icon 'E916' -Badge 'nowe' `
@@ -36036,6 +36388,1194 @@ Register-ReportType -Key 'ServerCheck' -Title 'Weryfikacja serwerów' -Icon 'E9F
         Tiles = @(@{ Label = 'Serwery'; Value = $targets.Count; Tone = '' }, @{ Label = 'Błędy'; Value = $crit; Tone = $(if ($crit) { 'crit' } else { 'ok' }) }, @{ Label = 'Ostrzeżenia'; Value = $warn; Tone = $(if ($warn) { 'warn' } else { 'ok' }) }, @{ Label = 'Bez połączenia'; Value = $off; Tone = $(if ($off) { 'crit' } else { '' }) })
         Errors = $x.Errors
     }
+}
+#endregion
+
+#region Pomoc modułów – generowane z docs/*.md przez dev/Update-EmbeddedHelp.ps1 (nie edytuj ręcznie)
+$script:HelpTexts = @{
+'Remote|*' = @'
+**Do czego jest ta przestrzeń.** Operacje na komputerach i serwerach domeny bez logowania się na nie: diagnostyka, użytkownicy i dostęp, uruchamianie poleceń i instalacji, usługi, procesy, dyski, zdarzenia, oprogramowanie, aktualizacje, bezpieczeństwo i udostępnianie.
+
+**Lista po lewej:** komputery — z AD (drzewo OU, filtr nazwy, tylko włączone), wpisane ręcznie albo wczytane z pliku TXT/CSV. Operacje działają na komputerach zaznaczonych na liście, chyba że akcję wywołasz z menu wiersza w tabeli wyników.
+
+**Jak to działa ogólnie.** Program łączy się z komputerami przez PowerShell Remoting (WinRM), równolegle, i uruchamia na nich krótkie skrypty. Wyniki wracają do tabeli na bieżąco. Wymagane są uprawnienia administratora lokalnego na komputerze docelowym. Wyjątki (DCOM, RPC, odczyt lokalny) są opisane przy modułach.
+'@
+'Remote|Łączność' = @'
+**Do czego.** Szybko sprawdzić, które komputery są osiągalne i dlaczego któryś nie odpowiada.
+
+**Co możesz zrobić**
+- sprawdzić DNS, ping, wybrane porty TCP i sesję PowerShell Remoting;
+- pokolorować kropki na liście komputerów według wyniku i jednym przyciskiem zostawić zaznaczone tylko dostępne;
+- z menu wiersza uruchomić *Diagnostykę WinRM* dla komputerów, które nie odpowiadają.
+
+**Jak działa.** Test wykonuje Twój komputer, lokalnie — działa więc także dla komputerów bez WinRM.
+'@
+'Remote|Inwentaryzacja' = @'
+**Do czego.** Podstawowe dane sprzętu i systemu z wielu komputerów w jednej tabeli.
+
+**Co możesz zrobić**
+- odczytać producenta, model, numer seryjny, BIOS, system, wydanie i kompilację, architekturę, procesor i rdzenie, RAM, rozmiar i wolne miejsce dysku systemowego, TPM, Secure Boot, zalogowanego użytkownika, domenę, adresy IP i MAC, datę instalacji systemu i ostatniego startu;
+- wyeksportować wynik do CSV albo HTML (np. spis sprzętu).
+
+**Jak działa.** Przez WinRM odczytuje klasy WMI/CIM komputera (system, BIOS, procesor, dyski, karty sieciowe), rejestr wersji Windows oraz stan TPM i Secure Boot.
+'@
+'Remote|Wydajność' = @'
+**Do czego.** Odpowiedzieć na pytanie „co obciąża ten komputer albo serwer” na podstawie pomiaru w krótkim oknie czasu.
+
+**Co możesz zrobić**
+- zmierzyć obciążenie w oknie czasu (np. 10 s, próbka co 2 s) albo uruchomić tryb *Monitoruj* (pomiar za pomiarem);
+- zobaczyć **procesor** (średnio i szczyt, kolejka na rdzeń, czas jądra, przerwania i DPC, przełączenia kontekstu), **pamięć** (dostępna, zadeklarowana względem limitu, stronicowanie, pule), **dyski** (opóźnienia odczytu i zapisu, kolejka, zajętość, IOPS, MB/s, wolne miejsce), **sieć** (wykorzystanie łącza, kolejka, błędy, retransmisje TCP, połączenia);
+- zobaczyć **procesy** z czołówki CPU, pamięci i dysku (z usługami w `svchost`, użytkownikiem i wierszem polecenia) i **zdarzenia** świadczące o problemach (błędy dysków, brak pamięci, BSOD, nieoczekiwane restarty, awarie aplikacji);
+- przełączać widoki *Podsumowanie / Procesy / Dyski / Sieć / Zdarzenia* z jednego pomiaru;
+- zakończyć proces z menu wiersza.
+
+**Jak działa.** Odczytuje surowe liczniki wydajności (niezależne od języka systemu) i wylicza wartości z różnic między próbkami. Ocena wskazuje wąskie gardło, np. „dysk D: opóźnienie 48 ms, kolejka 6 – sqlservr 35 MB/s”.
+'@
+'Remote|Monitor obciążenia' = @'
+**Do czego.** Obserwować jeden serwer na żywo, jak w Monitorze zasobów, i dowiedzieć się, kto zużył najwięcej od początku pomiaru.
+
+**Co możesz zrobić**
+- wybrać komputer w polu **Komputer** — lista komputerów zaznaczonych po lewej (domyślnie pierwszy); zmiana w trakcie pomiaru **przełącza pomiar** na wybrany komputer;
+- uruchomić pomiar z próbką co kilka sekund (domyślnie 5 s) na zadany czas (najdłużej 15 min);
+- widzieć **kafelki z wykresami** ostatnich próbek: procesor, pamięć, najwolniejszy dysk, sieć;
+- czytać **„Co się dzieje teraz”** — wąskie gardło i jego sprawca, np. „Dysk D: 60 ms na operację – najwięcej I/O: backup 25 MB/s”;
+- czytać **„Od startu pomiaru”** — kto zużył najwięcej czasu procesora, odczytu i zapisu, kiedy było najmniej wolnej pamięci;
+- przełączać widoki *Procesy* (teraz, średnio, szczyt, łącznie), *Dyski*, *Sieć*, *Przebieg* (próbka po próbce) i *Podsumowanie*;
+- skopiować podsumowanie do schowka i zakończyć proces z menu wiersza bez przerywania pomiaru.
+
+**Jak działa.** Jedno połączenie WinRM na cały pomiar: na serwerze działa pętla, która odczytuje liczniki i wysyła tylko różnice od poprzedniego odczytu, a program je sumuje. Monitor obserwuje jeden komputer naraz — jego nazwę widać w polu *Komputer*, w nagłówku „Co się dzieje teraz – …” i na kafelku czasu pomiaru. Przy przełączeniu bieżący pomiar jest kończony, a nowy rusza od zera na wybranym komputerze. Tabela odświeża się w miejscu (sortowanie i zaznaczenie zostają). Koszt po stronie serwera widać w tabeli jako proces monitora — zwykle ułamek procenta CPU.
+
+**Uwagi.** Ruch sieciowy procesów to tylko liczba połączeń TCP — bajty na proces wymagałyby śledzenia jądra (ETW).
+'@
+'Remote|Logi aplikacji' = @'
+**Do czego.** Przeglądać pliki logów aplikacji (np. `%ProgramData%\Firma\Aplikacja\Logs\*.log`) z wielu komputerów naraz i sprawdzić, czy problem dzieje się wszędzie, czy na jednej maszynie.
+
+**Co możesz zrobić**
+- wskazać folder i maskę plików (z przeglądaniem folderów na komputerze docelowym);
+- wybrać zakres: ostatnie N wpisów, ostatnie minuty lub godziny albo przedział dat;
+- filtrować tekstem lub wyrażeniem regularnym, wykluczać, pokazywać tylko błędy i ostrzeżenia;
+- przeglądać **wspólną oś czasu** wszystkich komputerów;
+- **porównać komputery** — te same komunikaty (bez dat, liczb i identyfikatorów) zliczone na każdym komputerze z oznaczeniem „wszystkie / część / tylko PC-03”;
+- włączyć tryb **Śledź** (odświeżanie co 15 s).
+
+**Jak działa.** Skrypt na komputerze rozpoznaje kodowanie (UTF-8, UTF-16, ANSI) i format daty, łączy wpisy wielowierszowe (stos wywołań) i czyta duże pliki od końca, bez blokowania pliku aplikacji.
+'@
+'Remote|Zasilanie i uptime' = @'
+**Do czego.** Sprawdzić, od kiedy komputery działają i czy czekają na restart; zaplanować restart lub wyłączenie.
+
+**Co możesz zrobić**
+- odczytać czas pracy i oczekujący restart (obsługa składników, Windows Update, operacje na plikach, zmiana nazwy, SCCM);
+- zaplanować restart lub wyłączenie z opóźnieniem i komunikatem dla użytkownika;
+- anulować zaplanowany restart (także z menu wiersza).
+
+**Jak działa.** Przez WinRM odczytuje czas startu systemu i znaczniki oczekującego restartu w rejestrze; restart i wyłączenie uruchamia systemowym `shutdown` z opóźnieniem.
+'@
+'Remote|Licencja i wersja Windows' = @'
+**Do czego.** Sprawdzić wersję i stan aktywacji Windows na serwerach i stacjach — także tam, gdzie WinRM nie działa.
+
+**Co możesz zrobić**
+- odczytać system i edycję, wydanie, kompilację z numerem poprawki, typ komputera (stacja, serwer, kontroler domeny, Server Core);
+- sprawdzić **stan licencji** (aktywowany, prolongata, tryb powiadomień, bez licencji), **kanał** (Retail, OEM, MAK, KMS, AVMA, ewaluacyjna), końcówkę klucza, serwer KMS, datę ważności i dni do końca, klucz OEM w UEFI i przyczynę problemu po polsku;
+- opcjonalnie odczytać licencje Office 2013 i nowszych;
+- z menu wiersza **aktywować** system (`slmgr /ato`) z odświeżeniem stanu.
+
+**Jak działa.** Odczytuje usługę licencjonowania systemu przez WinRM, a gdy jest niedostępny — przez DCOM (WMI). Kolumna *Połączenie* mówi, którą drogą się udało.
+'@
+'Remote|Diagnostyka WinRM' = @'
+**Do czego.** Ustalić, dlaczego WinRM na komputerze jest niedostępny, i doraźnie go włączyć.
+
+**Co możesz zrobić**
+- z Twojego komputera: sprawdzić DNS, ping, porty 5985/5986/135/445 (z rozróżnieniem *otwarty / odrzucony / filtrowany*), odpowiedź WSMan i sesję PowerShell (brak uprawnień, Kerberos);
+- przez DCOM z komputera docelowego: odczytać usługę WinRM, listener (także z GPO), **profil sieci** karty, przez którą się łączysz, **reguły zapory dla TCP 5985** (lokalne i z GPO, z zakresem adresów porównanym z Twoim adresem) i **filtr IPv4 zasady WinRM**;
+- przeczytać **wniosek** (np. „reguła dopuszcza tylko podsieć lokalną, karta w profilu Publicznym”) i **zalecenie dla GPO**;
+- **włączyć WinRM przez DCOM** (`Enable-PSRemoting`, na PowerShell 2.0 `winrm quickconfig`), opcjonalnie z regułą zapory dopuszczającą TCP 5985 tylko z Twojego adresu, i ponowić diagnozę.
+
+**Jak działa.** Testy sieciowe wykonuje Twój komputer; konfigurację komputera docelowego czyta przez WMI (DCOM), więc działa bez WinRM. Włączenie uruchamia polecenie na komputerze przez WMI; jego dziennik zostaje w `%SystemRoot%\Temp\DomainOps\EnableWinRM.log`.
+'@
+'Remote|Profile użytkowników' = @'
+**Do czego.** Znaleźć profile, które można bezpiecznie usunąć, i usunąć je.
+
+**Co możesz zrobić**
+- zebrać profile z zaznaczonych komputerów (ostatnie użycie, opcjonalnie rozmiar);
+- zobaczyć kandydatów do usunięcia: konta **usunięte z AD**, **wyłączone**, **wygasłe**, usunięte konta lokalne, profile **tymczasowe/uszkodzone** i opcjonalnie nieużywane dłużej niż N dni;
+- *Zaznacz kandydatów* → *Usuń zaznaczone profile* — z potwierdzeniem pokazującym ścieżki i rozmiary.
+
+**Jak działa.** Profile i ostatnie użycie czyta z rejestru `ProfileList` przez WinRM, a każde konto sprawdza w AD przez ADSI (bez RSAT). Usuwa przez `Win32_UserProfile` (folder i wpis w rejestrze).
+
+**Uwagi.** Profile załadowane (użytkownik zalogowany) i systemowe nigdy nie są kandydatami. Potwierdzenie ostrzega, gdy zaznaczysz profil, który nie jest kandydatem.
+'@
+'Remote|Sesje użytkowników' = @'
+**Do czego.** Zobaczyć, kto jest zalogowany na komputerach i serwerach, i obsłużyć te sesje.
+
+**Co możesz zrobić**
+- odczytać sesje konsoli i pulpitu zdalnego: stan, **nazwę i adres IP komputera klienta**, bezczynność, czas logowania, chwilę rozłączenia;
+- dla jednej albo kilku sesji: wysłać wiadomość, rozłączyć, wylogować, **zresetować zawieszoną sesję** (`rwinsta`), podejrzeć sesję (shadow), zaoferować pomoc zdalną;
+- zobaczyć **procesy w sesji** (od największego zużycia pamięci) i zakończyć proces.
+
+**Jak działa.** Czyta sesje przez WTS API (niezależnie od języka systemu). Gdy na serwerze nie da się uruchomić pomocnika WTS (np. tryb ograniczonego języka), lista pochodzi z `quser`, bez danych klienta. Po zmianie odświeżany jest tylko serwer tej sesji.
+'@
+'Remote|Grupy lokalne' = @'
+**Do czego.** Sprawdzić i zmienić członków wbudowanych grup lokalnych na wielu komputerach.
+
+**Co możesz zrobić**
+- odczytać członków grup Administratorzy, Użytkownicy pulpitu zdalnego, Użytkownicy zarządzania zdalnego (WinRM), Czytelnicy dziennika zdarzeń, Operatorzy kopii zapasowych;
+- dodać członków (także wybierając grupy z AD) i usunąć zaznaczonych.
+
+**Jak działa.** Grupy są wyznaczane po SID, więc działa w każdym języku systemu. Wbudowany Administrator i Domain Admins są chronione przed usunięciem.
+'@
+'Remote|Zgodność grup lokalnych' = @'
+**Do czego.** Pilnować, żeby w grupach lokalnych (np. Administratorzy) byli tylko ci, którzy powinni — na wszystkich komputerach według jednego szablonu.
+
+**Co możesz zrobić**
+- przygotować **szablon**: dla grup wbudowanych (Administratorzy, Pulpit zdalny, WinRM, Operatorzy kopii, DCOM, Czytelnicy dziennika i inne) i grup własnych — członkowie **dozwoleni** i **wymagani**; wzorce `DOMENA\nazwa`, sama nazwa, `.\nazwa`, SID albo wzorzec SID (`*-500` — wbudowany Administrator, `*-512` — Administratorzy domeny);
+- porównać komputery z szablonem: **niedozwoleni**, **brakujący**, dodatkowi, brak grupy, **osierocone SID-y**;
+- **usunąć niedozwolonych** (z kopią członkostwa przed zmianą), **dodać brakujących**, **przywrócić z kopii**;
+- z wiersza dopisać członka do dozwolonych w szablonie.
+
+**Jak działa.** Odczyt i zmiany przez WinRM, grupy wbudowane po SID. Kopia przed usunięciem trafia do `%APPDATA%\AD-ManagerDiamond\Backup\GrupyLokalne_*.json`.
+
+**Uwagi.** Wbudowany Administrator i Administratorzy domeny w grupie Administratorzy nigdy nie są usuwani automatycznie. Ten sam przegląd jest dostępny jako [raport cykliczny](06-domena.md#raporty-cykliczne).
+'@
+'Remote|Konta lokalne' = @'
+**Do czego.** Zarządzać lokalnymi kontami użytkowników na komputerach.
+
+**Co możesz zrobić:** odczytać stan, ostatnie logowanie i wiek hasła; włączyć, wyłączyć i ustawić hasło zaznaczonym kontom.
+
+**Jak działa.** Przez WinRM, poleceniami kont lokalnych systemu.
+'@
+'Remote|Pulpit zdalny' = @'
+**Do czego.** Sprawdzić i zmienić dostęp przez Pulpit zdalny (RDP).
+
+**Co możesz zrobić**
+- odczytać stan RDP, uwierzytelnianie na poziomie sieci (NLA), port, reguły zapory i członków grupy Użytkownicy pulpitu zdalnego;
+- włączyć lub wyłączyć RDP razem z regułami zapory i wymagać NLA (także z menu wiersza).
+
+**Jak działa.** Przez WinRM zmienia ustawienia Terminal Services w rejestrze i reguły zapory.
+'@
+'Remote|Gdzie używane jest konto' = @'
+**Do czego.** Przed zmianą hasła konta usługowego dowiedzieć się, gdzie to konto działa — i potem zapisać nowe hasło we wszystkich tych miejscach.
+
+**Co możesz zrobić**
+- znaleźć usługi, zadania Harmonogramu, pule aplikacji i katalogi wirtualne IIS oraz automatyczne logowanie działające na wskazanych kontach (albo na wszystkich poza wbudowanymi);
+- zobaczyć rodzaj konta (wbudowane, lokalne, domenowe), czy hasło jest zapisane, ostrzeżenie o haśle automatycznego logowania zapisanym jawnym tekstem;
+- w kolumnie **Konto w AD** zobaczyć konto wyłączone, zablokowane, z wygasłym hasłem albo nieistniejące (usługa nie wystartuje);
+- **Zapisz nowe hasło…** — zapisać nowe hasło konta we wskazanych miejscach, opcjonalnie z restartem usług i odświeżeniem pul.
+
+**Jak działa.** Przeszukuje konfigurację komputerów przez WinRM. Nowe hasło jest najpierw sprawdzane w AD, żeby złe hasło nie zablokowało konta.
+'@
+'Remote|Polecenia' = @'
+**Do czego.** Uruchomić polecenie PowerShell albo cmd.exe na wielu komputerach naraz i zebrać wynik.
+
+**Co możesz zrobić**
+- wpisać polecenie albo wybrać **szablon** (DNS, Kerberos, gpresult, kanał zaufania, czas, DISM/SFC, ostatnie poprawki);
+- zapisać bieżące polecenie jako **własny szablon** (plik `CommandTemplates.json` — można go przekazać innym administratorom);
+- ustawić **limit czasu** (1 min – 2 h albo bez limitu);
+- przeczytać wynik: stan, kod wyjścia, czas, liczbę błędów; pełny tekst w panelu szczegółów;
+- uruchomić ponownie na wybranych komputerach z menu wiersza.
+
+**Jak działa.** Polecenie działa w osobnym procesie na komputerze, **bez klawiatury** — programy czekające na odpowiedź (`pause`, `choice`, `set /p`, `Read-Host`) kończą się zamiast wisieć. Limit czasu i *Przerwij* zamykają proces razem z procesami potomnymi. Kilka linii w trybie cmd.exe działa jak plik `.cmd`. Polskie znaki są poprawne także w wyniku programów konsolowych.
+
+**Uwagi.** Polecenie działa w sesji WinRM, nie na pulpicie użytkownika — nie pokaże okna zalogowanej osobie.
+'@
+'Remote|Instalacja oprogramowania' = @'
+**Do czego.** Zainstalować program albo poprawkę na wielu komputerach w trybie cichym.
+
+**Co możesz zrobić**
+- wskazać plik MSI, MSP, MSU albo EXE i dodatkowe argumenty;
+- ustawić limit czasu i usuwanie instalatora po instalacji;
+- przeczytać wynik: kod wyjścia z opisem, czas, sposób kopiowania, ścieżka logu instalatora;
+- zainstalować ponownie na wybranych komputerach z menu wiersza.
+
+**Jak działa.** Kopiuje instalator do `%SystemRoot%\Temp\DomainOps` przez udział `ADMIN$` (gdy działasz na bieżącym koncie), a jeśli się nie da — przez sesję WinRM. MSI/MSP instaluje z `/qn /norestart` i logiem, MSU przez DISM (`wusa.exe` nie działa w sesji WinRM), EXE z podanymi przełącznikami. Limit czasu i *Przerwij* zamykają instalator, który czeka na odpowiedź.
+'@
+'Remote|Aktualizacja zasad grupy' = @'
+**Do czego.** Wymusić odświeżenie zasad grupy na wielu komputerach i zobaczyć, czy się udało, a gdy nie — która zasada zawiodła.
+
+**Co możesz zrobić**
+- wybrać zakres: komputer, komputer i użytkownik albo użytkownik, opcjonalnie `/force`;
+- wybrać **metodę**:
+  - **WinRM** — `gpupdate` na komputerze z pełnym wynikiem (domyślna);
+  - **Invoke-GPUpdate** — bez WinRM;
+  - **WinRM, a gdy niedostępny — Invoke-GPUpdate**;
+- dla Invoke-GPUpdate ustawić, jak długo czekać na wynik (nie czekaj, 1, 2 albo 5 min);
+- przy błędzie zobaczyć kolumny **Problem z zasadą** (GUID zasady) i **Nazwa zasady**;
+- uruchomić ponownie na wybranych komputerach z menu wiersza.
+
+**Jak działa**
+- *WinRM:* `gpupdate` działa na komputerze z odpowiedzią „N” na pytania o wylogowanie i restart, z limitem czasu. GUID-y zasad z komunikatów (niezależnie od języka) program tłumaczy na nazwy — z zapisanego stanu zasad grupy na komputerze, a brakujące z AD (nieznany GUID — „brak w AD”).
+- *Invoke-GPUpdate:* moduł GroupPolicy na Twoim komputerze tworzy na komputerze docelowym, przez RPC, zadanie Harmonogramu, które od razu uruchamia `gpupdate`. Wynik program czyta ze zdarzeń *Microsoft-Windows-GroupPolicy* w dzienniku System komputera: zasady komputera i użytkownika zastosowane albo błąd przetwarzania z numerem zdarzenia.
+- Kolumna **Metoda** mówi, którą drogą poszła aktualizacja.
+
+**Wymagania dla Invoke-GPUpdate**
+- moduł GroupPolicy (RSAT) na Twoim komputerze;
+- na komputerach reguły zapory *Zdalne zarządzanie zaplanowanymi zadaniami* (RPC i RPC-EPMAP) i *Instrumentacja zarządzania Windows (WMI)* — gotowe w początkowym GPO *Group Policy Remote Update Firewall Ports*;
+- do odczytu wyniku: reguła *Zdalne zarządzanie dziennikiem zdarzeń*;
+- Invoke-GPUpdate działa na koncie programu — nie przyjmuje poświadczeń alternatywnych.
+'@
+'Remote|Usługi' = @'
+**Do czego.** Sprawdzać i obsługiwać usługi Windows na wielu komputerach, łącznie z zawieszonymi.
+
+**Co możesz zrobić**
+- filtrować usługi po nazwie i stanie;
+- uruchomić, zatrzymać, zrestartować i zmienić typ uruchamiania (z paska albo menu wiersza);
+- **Zakończ proces i uruchom** — dla usługi zawieszonej (np. „Zatrzymywanie”, brak reakcji na restart);
+- **Pokaż proces usługi** — przejście do modułu *Procesy* z procesami zaznaczonych usług.
+
+**Jak działa.** Akcje dotyczą usług zaznaczonych w tabeli, na właściwych komputerach. *Zakończ proces i uruchom* kończy proces usługi, czeka, aż menedżer usług uzna ją za zatrzymaną, uruchamia ją i ponownie te usługi zależne, które działały. Po operacji lista odświeża się na komputerach, których dotyczyła.
+
+**Uwagi.** Pomijane (z powodem w dzienniku): usługa we wspólnym procesie z innymi (svchost — program wypisuje, które jeszcze tam działają), usługi i procesy krytyczne dla systemu oraz WinRM.
+'@
+'Remote|Procesy' = @'
+**Do czego.** Zobaczyć, co działa na komputerach, i zakończyć wybrane procesy.
+
+**Co możesz zrobić:** odczytać pamięć, właściciela, sesję, wiersz poleceń i **usługi działające w procesie**; zakończyć zaznaczone procesy.
+
+**Jak działa.** Przez WinRM. Potwierdzenie ostrzega, gdy proces obsługuje usługi.
+'@
+'Remote|Dyski' = @'
+**Do czego.** Sprawdzić zajętość dysków i zwolnić miejsce, wiedząc najpierw, ile się zwolni.
+
+**Co możesz zrobić**
+- odczytać zajętość dysków lokalnych z oceną;
+- wybrać kategorie czyszczenia: `Windows\Temp`, TEMP profili użytkowników, Kosz, raporty błędów Windows, pamięć optymalizacji dostarczania, zrzuty pamięci (domyślnie wyłączone — bywają potrzebne do diagnozy), pobrane aktualizacje; tylko pliki starsze niż N dni;
+- **Podgląd** — dla każdej kategorii rozmiar i ile miejsca się zwolni, bez usuwania;
+- **Wyczyść** — wiersz na kategorię (usunięte, w użyciu, pominięte) i podsumowanie dysku systemowego z odzyskanym miejscem.
+
+**Jak działa.** Przez WinRM. Rozmiary są w czytelnych jednostkach (KB, MB, GB, TB), a sortowanie idzie według liczby bajtów. Pobrane aktualizacje są czyszczone z chwilowym zatrzymaniem usługi Windows Update. Folder programu `Temp\DomainOps` jest pomijany, puste podfoldery usuwane.
+'@
+'Remote|Dziennik zdarzeń' = @'
+**Do czego.** Przeszukiwać zdarzenia z wielu komputerów naraz, w jednej tabeli, i odpowiadać na pytania typu „kto zrestartował serwer”, „skąd blokada konta”, „czy to dzieje się wszędzie”.
+
+**Co możesz zrobić**
+- wybrać **dzienniki**: System, Application, Security, Setup i dowolne inne (*Wybierz…* pokazuje dzienniki z zapisanymi zdarzeniami);
+- wybrać **poziomy**, w tym *inspekcja – sukces* i *inspekcja – niepowodzenie*;
+- **filtrować**: ostatnie godziny, ID z zakresami i wykluczeniami (`4624, 4720-4767, -4634`), źródło, konto, fragmenty treści (`;` — wystarczy jeden, `!` — wyklucza);
+- użyć **gotowych zestawów**: nieoczekiwane restarty, błędy dysków, awarie aplikacji, logowania, nieudane uwierzytelnienia, blokady kont, zmiany kont i grup, sesje RDP, nowe usługi i zadania, wyczyszczenie dziennika, zasady grupy, Windows Update, podejrzane skrypty PowerShell i inne;
+- czytać dane zdarzenia w kolumnach *Konto*, *Skąd*, *Logowanie*, *Szczegóły*;
+- zobaczyć **Podsumowanie** — zdarzenia pogrupowane według dziennika, ID i źródła: ile, na których komputerach, jakie konta;
+- **Śledzić nowe zdarzenia** (co 30 s, z tymi samymi filtrami);
+- z menu wiersza: te zdarzenia na zaznaczonych komputerach, zdarzenia tego konta, pomijanie identyfikatora.
+
+**Jak działa.** Przez WinRM, z filtrem po stronie komputera. Brak dziennika, wyłączony dziennik albo brak dostępu to wiersz „Uwaga”, a nie błąd całego komputera; uwaga mówi też, gdy limit na komputer uciął starsze zdarzenia.
+'@
+'Remote|Harmonogram zadań' = @'
+**Do czego.** Zarządzać zadaniami Harmonogramu na komputerach.
+
+**Co możesz zrobić:** przeglądać zadania; uruchamiać, zatrzymywać, włączać, wyłączać i usuwać; tworzyć proste zadania na koncie SYSTEM.
+
+**Jak działa.** Przez WinRM, poleceniami Harmonogramu zadań.
+'@
+'Remote|Rejestr – odczyt i eksport' = @'
+**Do czego.** Odczytać wybrane klucze rejestru z wielu komputerów albo je wyeksportować — np. klucze TeamViewera przed reinstalacją.
+
+**Co możesz zrobić**
+- wpisać klucze, jeden w wierszu: `HKLM\…`, `HKU\…`, `HKCR\…`, także skopiowane z paska adresu regedit albo w zapisie PowerShell;
+- użyć **szablonu TeamViewer** (klucz 64- i 32-bitowy z ClientID);
+- **Pokaż wartości** — klucz, nazwa, typ i dane jak w regedit, opcjonalnie z podkluczami, z limitem liczby wartości;
+- **Eksportuj do .reg** — jeden plik `<komputer>.reg` na komputer, w nowym folderze z datą; *Otwórz folder*.
+
+**Jak działa.** Na każdym komputerze program uruchamia `reg export`, a treść wraca do programu i trafia do pliku w formacie regedit (UTF-16). Przywrócenie: uruchomienie pliku albo `reg import`.
+
+**Uwagi.** HKCU jest odrzucany z podpowiedzią — przez WinRM to gałąź konta połączenia, a nie użytkownika; dla użytkownika użyj `HKU\<SID>`.
+'@
+'Remote|Autostart' = @'
+**Do czego.** Sprawdzić, co uruchamia się automatycznie, i usunąć zbędne wpisy.
+
+**Co możesz zrobić:** odczytać klucze Run/RunOnce (komputer i załadowane profile użytkowników) i foldery Autostart; usunąć wybrane wpisy.
+
+**Jak działa.** Przez WinRM, z rejestru i folderów Autostart.
+'@
+'Remote|Drukarki' = @'
+**Do czego.** Obsługiwać drukarki zainstalowane na komputerach.
+
+**Co możesz zrobić:** odczytać drukarki, sterowniki, porty, udostępnianie i zadania w kolejce; wyczyścić kolejki, usunąć drukarki, zrestartować bufor wydruku.
+
+**Jak działa.** Przez WinRM, poleceniami modułu drukowania.
+'@
+'Remote|Sterowniki i urządzenia' = @'
+**Do czego.** Sprawdzić sterowniki i znaleźć urządzenia z problemami.
+
+**Co możesz zrobić:** odczytać zainstalowane sterowniki z filtrem; pokazać urządzenia zgłaszające problem w Menedżerze urządzeń (także z menu wiersza).
+
+**Jak działa.** Przez WinRM, z klas WMI sterowników PnP i urządzeń.
+'@
+'Remote|Zainstalowane programy' = @'
+**Do czego.** Zobaczyć, co jest zainstalowane, i odinstalować programy zdalnie — wiedząc wcześniej, czy to się da zrobić bez użytkownika.
+
+**Co możesz zrobić**
+- odczytać programy z rejestru (64- i 32-bitowe oraz z profili zalogowanych użytkowników);
+- sprawdzić w kolumnie **„Odinstalowanie zdalne”**, czy i jak program da się usunąć: MSI, tryb cichy producenta, Inno Setup (zielone); tylko z przełącznikami albo w sesji użytkownika (żółte); brak deinstalatora, blokada producenta albo profil bez trybu cichego (czerwone);
+- odinstalować zaznaczone programy (z limitem czasu) albo *Odinstaluj z przełącznikami…*;
+- *Pokaż ten program na wszystkich komputerach*.
+
+**Jak działa.** Deinstalacja działa przez WinRM. Po niej program sprawdza, czy aplikacja zniknęła z rejestru, i pisze wynik z przyczyną w kolumnie „Stan” (np. „deinstalator czekał na odpowiedź użytkownika”, „MSI 1618 – trwa inna instalacja”, „nadal zainstalowany – wymaga restartu”). Programy z profilu zalogowanego użytkownika są usuwane jednorazowym zadaniem Harmonogramu w jego sesji, **bez okna konsoli**: krótki skrypt `wscript.exe` uruchamia deinstalator w ukrytym oknie i zapisuje jego kod wyjścia (gdy Windows Script Host jest wyłączony — `cmd`, wtedy okno konsoli widać, a wynik o tym mówi). Gdy użytkownik nie jest zalogowany interaktywnie, zadanie nie rusza i wynik mówi o tym po kilku sekundach, zamiast czekać do limitu czasu. Po przekroczeniu limitu deinstalator jest zamykany razem z procesami, które uruchomił.
+'@
+'Remote|Windows Update' = @'
+**Do czego.** Sprawdzić i zainstalować aktualizacje na wielu komputerach oraz zrozumieć, dlaczego coś się nie instaluje.
+
+**Co możesz zrobić**
+- wyszukać dostępne aktualizacje (ważność, rozmiar, KB, czy wymagają restartu);
+- przejrzeć historię z opisem kodów błędów;
+- **sprawdzić obecność konkretnych poprawek KB**;
+- zainstalować **wszystkie albo zaznaczone** aktualizacje, z opcjonalnym restartem;
+- sprawdzić **stan instalacji**: etap, wynik każdej aktualizacji, czy wymagany jest restart i dlaczego.
+
+**Jak działa.** API Windows Update odmawia dostępu w sesji WinRM, więc wyszukiwanie, historia i instalacja działają jako zadanie Harmonogramu na koncie SYSTEM (zasady wykonywania skryptów z GPO go nie blokują). Wyszukiwanie czeka na wynik do 30 min. Pliki zadania i dzienniki są w `%SystemRoot%\Temp\DomainOps`. Typowe błędy (WSUS niedostępny, proxy, usługa wyłączona) są opisane po polsku.
+'@
+'Remote|Outlook i Microsoft 365' = @'
+**Do czego.** Sprawdzić Office, Outlooka, OneDrive i Teams na komputerach użytkowników oraz rozwiązać typowe problemy bez łączenia z chmurą.
+
+**Co możesz zrobić** — pięć widoków:
+- **Office i Microsoft 365:** produkty Click-to-Run, wersja, kanał aktualizacji, architektura, licencja współdzielona; Office z MSI; dołączenie do **Entra ID** i zapis w **Intune**;
+- **Konta i skrzynki:** konta zalogowane w Office, **OneDrive** (konto, folder, foldery znane w OneDrive), profile Outlooka (konta, pliki OST i PST) oraz **skrzynki współdzielone, delegowane, archiwa i skrzynki grup** z automapowania; opcjonalnie także niezalogowani użytkownicy;
+- **Pliki PST** (opcjonalnie OST): w profilach albo na wszystkich dyskach lokalnych; rozmiar, dni bez użycia, właściciel, czy plik jest otwarty w Outlooku; ostrzeżenia o dużych i osieroconych plikach; z menu wiersza **kopiowanie plików PST na udział** (np. przed migracją);
+- **Dodatki Outlooka:** dodatki COM i VSTO ze stanem (w tym **wyłączone przez Outlooka**); z menu wiersza **włącz na stałe** albo **wyłącz u użytkownika**;
+- **Teams, OneDrive, Outlook:** stan synchronizacji OneDrive, zasady grupy OneDrive, czy aplikacje działają i ile zajmuje ich pamięć podręczna; z menu wiersza **wyczyść pamięć Teams**, **wyczyść pamięć Outlooka**, **zresetuj OneDrive**.
+
+**Jak działa.** Wyłącznie dane z komputera (rejestr, pliki, `dsregcmd`), bez łączenia z Exchange Online ani Graph. Zalogowanych użytkowników czyta z ich gałęzi rejestru, niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`. Skrzynki z automapowania pochodzą z kopii odpowiedzi Autodiscover zapisanej w profilu (skrzynki otwierane ręcznie nie są tam zapisywane). Kopiowanie PST wykonuje Twój komputer przez udział administracyjny; plik otwarty w Outlooku jest pomijany, oryginały zostają. Czyszczenie pamięci najpierw zamyka aplikację tego użytkownika. Reset OneDrive działa w sesji zalogowanego użytkownika przez jednorazowe zadanie Harmonogramu: program czeka na zakończenie `OneDrive.exe /reset` (do 2 min) i podaje jego wynik — także kod błędu — a potem uruchamia OneDrive ponownie (pliki zostają, pełna synchronizacja może potrwać).
+'@
+'Remote|Szybki audyt bezpieczeństwa' = @'
+**Do czego.** W jednym przebiegu sprawdzić podstawowe zabezpieczenia wielu komputerów.
+
+**Co możesz zrobić:** sprawdzić zaporę, antywirusa i sygnatury, BitLockera, SMBv1, NLA, UAC, LAPS, świeżość aktualizacji, oczekujący restart, Secure Boot, TPM, WDigest, ochronę LSA, LLMNR i konto Gość; zobaczyć wynik procentowy i listę problemów.
+
+**Jak działa.** Przez WinRM, z ustawień systemu i rejestru.
+'@
+'Remote|Microsoft Defender' = @'
+**Do czego.** Sprawdzić ochronę antywirusową i uruchomić skan.
+
+**Co możesz zrobić:** odczytać stan ochrony i sygnatur, wykryte zagrożenia; zaktualizować sygnatury; uruchomić szybki albo pełny skan (także z menu wiersza).
+
+**Jak działa.** Przez WinRM, poleceniami modułu Defender. Skan trwa w tle — możesz pracować dalej.
+'@
+'Remote|BitLocker' = @'
+**Do czego.** Sprawdzić szyfrowanie dysków i zabezpieczyć klucze odzyskiwania.
+
+**Co możesz zrobić:** odczytać stan szyfrowania woluminów; zrobić kopię kluczy odzyskiwania do AD (także z menu wiersza).
+
+**Jak działa.** Przez WinRM. Klucze zapisane w AD przeglądasz w przestrzeni [Komputery AD → Klucze BitLocker](04-komputery-ad.md#klucze-bitlocker-ad).
+'@
+'Remote|Zapora Windows' = @'
+**Do czego.** Sprawdzić i zmienić reguły zapory na wielu komputerach.
+
+**Co możesz zrobić:** odczytać stan profili i reguły (z portami, programami i adresami); włączyć, wyłączyć i usunąć zaznaczone reguły; utworzyć nowe.
+
+**Jak działa.** Przez WinRM, poleceniami modułu NetSecurity.
+'@
+'Remote|Certyfikaty komputera' = @'
+**Do czego.** Znaleźć wygasające certyfikaty i je wyeksportować.
+
+**Co możesz zrobić:** przejrzeć magazyny LocalMachine z oceną ważności; znaleźć certyfikaty wygasające w ciągu N dni; wyeksportować zaznaczone do plików `.cer`.
+
+**Jak działa.** Przez WinRM, z magazynów certyfikatów komputera. Wygasające certyfikaty serwerów są też dostępne jako [raport cykliczny](06-domena.md#raporty-cykliczne).
+'@
+'Remote|Udziały sieciowe' = @'
+**Do czego.** Sprawdzać, tworzyć i usuwać udziały SMB.
+
+**Co możesz zrobić**
+- odczytać udziały i ich uprawnienia;
+- utworzyć udział z uprawnieniami: konto lub grupa (wpisane albo wybrane z AD) i **poziom z listy** — *Odczyt*, *Zmiana*, *Pełna kontrola*; opcjonalnie te same uprawnienia w NTFS na folderze;
+- usunąć udział.
+
+**Jak działa.** Przez WinRM. Bez żadnych wpisów Windows nadaje *Wszyscy: Odczyt*. Potwierdzenie pokazuje pełną listę uprawnień.
+'@
+'Remote|Zasoby sieciowe użytkowników' = @'
+**Do czego.** Zobaczyć, co mają podpięte użytkownicy (dyski, drukarki), skąd to pochodzi, oraz podłączać i odłączać dyski sieciowe w imieniu użytkownika.
+
+**Co możesz zrobić** — widoki:
+- **Dyski zmapowane** — litera, ścieżka, serwer, konto połączenia; zalogowani i opcjonalnie niezalogowani użytkownicy oraz historia połączeń Eksploratora. Kolumna **Pochodzenie**: *GPO: nazwa*, *skrypt logowania: plik* albo *ręcznie*;
+- **Dyski z GPO** — Preferencje zasad grupy zastosowane na komputerze (litera, akcja, etykieta, targetowanie, nazwa GPO);
+- **Drukarki sieciowe** — z rejestru i z GPO, z drukarką domyślną;
+- **Podłączeni do komputera** — sesje SMB (klient, konto, otwarte pliki, bezczynność) i opcjonalnie otwarte pliki.
+
+Akcje:
+- **Podłącz dysk…** — ścieżka `\\serwer\udział`, litera (wybrana albo pierwsza wolna od Z:) i opcjonalna etykieta; dla użytkowników zaznaczonych w tabeli, wszystkich zalogowanych albo jednego po loginie;
+- **Odłącz dysk sieciowy…** — tylko dyski zmapowane ręcznie (dyski z GPO i skryptów logowania i tak wróciłyby przy logowaniu);
+- zamknięcie sesji SMB lub pliku, otwarcie ścieżki w Eksploratorze.
+
+**Jak działa**
+- Dyski zalogowanych program czyta z ich gałęzi rejestru (polecenie w sesji WinRM nie widzi cudzych dysków), niezalogowanych — przez chwilowe załadowanie `NTUSER.DAT`.
+- Pochodzenie *skrypt logowania* program ustala, czytając skrypty u siebie, w tle (skrypty z AD i GPO). Ścieżek składanych ze zmiennych nie rozpozna.
+- Podłączanie i odłączanie u zalogowanego działa **w jego sesji, bez okna konsoli** — przez jednorazowe zadanie Harmonogramu i krótki skrypt `wscript.exe`. Gdy Windows Script Host jest wyłączony, program używa `net use` (okno konsoli mignie). Gdy zadanie nie wystartuje (użytkownik bez logowania interaktywnego), wynik mówi o tym wprost.
+- U niezalogowanego program zapisuje albo usuwa wpis trwały w `NTUSER.DAT` — dysk pojawi się albo zniknie przy logowaniu.
+- W trybie diagnostycznym każdy krok podłączania i odłączania trafia do dziennika.
+
+**Uwagi**
+- Połączenie zawsze działa na koncie użytkownika, bez hasła.
+- Programy uruchomione jako administrator nie widzą takiego dysku — to zachowanie UAC.
+- Nie używaj opcji „Także niezalogowani”, gdy użytkownicy właśnie się logują — załadowany plik profilu na chwilę blokuje logowanie.
+- Zamknięcie sesji SMB lub pliku powoduje utratę niezapisanych zmian użytkownika.
+'@
+'AdUsers|*' = @'
+**Do czego jest ta przestrzeń.** Codzienna obsługa kont użytkowników w Active Directory: szczegóły, hasła i blokady, stan konta, atrybuty, grupy, odejście pracownika, hurtowe tworzenie kont i import danych, porządki oraz raporty.
+
+**Lista po lewej:** konta użytkowników — wyszukiwanie w AD (login, nazwisko, e-mail, gwiazdka), filtr stanu (aktywne, wyłączone, zablokowane), OU, loginy wpisane ręcznie albo z pliku. Kropka przy koncie pokazuje stan (np. zablokowane).
+
+**Jak to działa ogólnie.** Moduły korzystają z modułu `ActiveDirectory` (RSAT) na Twoim komputerze i działają z uprawnieniami Twojego konta (albo konta alternatywnego z górnego paska). Kontroler domeny wybierasz w Ustawieniach (puste — automatycznie). Zmiany w AD wymagają potwierdzenia z listą kont; zmiany hurtowe mają podgląd.
+'@
+'AdUsers|Szczegóły konta' = @'
+**Do czego.** Zobaczyć wszystko o koncie w jednym miejscu albo przygotować raport o kilku kontach.
+
+**Co możesz zrobić**
+- odczytać stan, kontakt, przełożonego, logowania, hasło, wygaśnięcie, profil, OU i SID zaznaczonych kont;
+- utworzyć **raport HTML** — kartę każdego konta: tożsamość (login, UPN, e-mail i aliasy, SID), organizacja, stan i blokady, hasło (wiek, wygaśnięcie, flagi), profil i skrypt logowania, **grupy** (bezpośrednie, podstawowa i opcjonalnie zagnieżdżone), **podwładni** oraz ostrzeżenia (np. „hasło nigdy nie wygasa”, konto uprzywilejowane).
+
+**Jak działa.** Odczyt z AD. Raport HTML to samodzielny plik z kafelkami, spisem kont, wyszukiwarką i stylem do druku.
+'@
+'AdUsers|Hasło i blokada' = @'
+**Do czego.** Obsłużyć zgłoszenia „nie mogę się zalogować”: odblokować konto, zresetować hasło.
+
+**Co możesz zrobić**
+- odczytać stan haseł i blokad;
+- odblokować konta;
+- zresetować hasło — **losowe, inne dla każdego konta**, albo wpisane;
+- wymusić zmianę hasła przy logowaniu i ustawić albo zdjąć „hasło nigdy nie wygasa” (także z menu wiersza).
+
+**Jak działa.** Zmiany przez moduł ActiveDirectory. Wygenerowane hasła są wartościami poufnymi: maskowane w tabeli i eksporcie, kopiowane z automatycznym czyszczeniem schowka po 60 s. Program ich nigdzie nie zapisuje.
+'@
+'AdUsers|Stan konta' = @'
+**Do czego.** Włączać i wyłączać konta, ustawiać datę wygaśnięcia, przenosić konta między OU.
+
+**Co możesz zrobić**
+- wyłączyć konto z dopiskiem w opisie (data, autor, powód) i przeniesieniem do wybranej OU;
+- włączyć konto;
+- ustawić albo usunąć datę wygaśnięcia;
+- przenieść konto do innej OU.
+
+**Jak działa.** Zmiany przez moduł ActiveDirectory, z potwierdzeniem i listą kont. Wszystkie akcje są też w menu wiersza.
+'@
+'AdUsers|Edycja atrybutów' = @'
+**Do czego.** Odczytać albo zmienić hurtowo te same atrybuty wielu kont.
+
+**Co możesz zrobić**
+- odczytać atrybuty zaznaczonych kont (stanowisko, dział, firma, biuro, telefony, e-mail, przełożony, extensionAttribute1–15 i inne);
+- ustawić wartość wielu kontom naraz, z polami `{login}`, `{imie}`, `{nazwisko}`, `{nazwa}` — np. `{login}@firma.pl`.
+
+**Jak działa.** Zmiana przez moduł ActiveDirectory, po potwierdzeniu z listą kont. Pola są podstawiane osobno dla każdego konta.
+'@
+'AdUsers|Offboarding' = @'
+**Do czego.** Obsłużyć odejście pracownika w jednym kroku, z kopią stanu konta i możliwością cofnięcia.
+
+**Co możesz zrobić** — dla kont zaznaczonych po lewej, z wyborem kroków (wybór jest zapamiętywany):
+- **wyłączyć konto**;
+- ustawić **losowe hasło** (24 znaki, nigdzie nie pokazywane ani zapisywane);
+- **usunąć z grup** (bez grupy podstawowej i grup chronionych);
+- **dopisać do opisu** datę, autora i powód (np. numer zgłoszenia);
+- ustawić wygaśnięcie konta z końcem dnia, wyczyścić przełożonego, ukryć w książce adresowej (gdy schemat ma atrybuty Exchange);
+- **przenieść do OU**;
+- **wylogować sesje** na serwerach farmy RDS (lista z modułu *Sesje RDS*);
+- **przywrócić konto z kopii** z wyborem elementów (grupy, OU, opis, przełożony, wygaśnięcie, książka adresowa, włączenie).
+
+**Jak działa**
+- **Podgląd** pokazuje liczbę grup do usunięcia, przełożonego i ostrzega o podwładnych i kontach uprzywilejowanych.
+- Przed zmianami program zapisuje **stan każdego konta** w pliku JSON (z protokołem wyników kroków) i kopię członkostw w CSV. Bez udanego zapisu kopii nic nie jest zmieniane.
+- Każdy krok ma własny wynik — błąd jednego nie przerywa pozostałych.
+
+**Uwagi.** Konta wbudowane (Administrator, krbtgt), konta-wyjątki i konto, na którym działa program, są pomijane. Kopie: `%APPDATA%\AD-ManagerDiamond\Offboarding` i `…\Backup\Czlonkostwa_offboarding_*.csv`.
+'@
+'AdUsers|Członkostwo w grupach' = @'
+**Do czego.** Sprawdzić i zmienić, do jakich grup należą konta.
+
+**Co możesz zrobić**
+- odczytać grupy zaznaczonych kont — bezpośrednie i zagnieżdżone;
+- dodać konta do grup (wyszukiwarka grup) i usunąć z zaznaczonych grup;
+- **skopiować członkostwo z konta wzorcowego** (np. nowy pracownik „jak Kowalski”).
+
+**Jak działa.** Odczyt i zmiany przez moduł ActiveDirectory. Ten sam moduł jest w przestrzeniach Komputery AD (dla kont komputerów) i Grupy i OU (*Przynależność do grup* — zagnieżdżanie grup).
+'@
+'AdUsers|Tworzenie kont' = @'
+**Do czego.** Założyć wiele kont naraz z danych wklejonych z Excela, według ustalonych profili (np. Pracownik, Student, Wykładowca).
+
+**Co możesz zrobić**
+- wkleić dane: imię, nazwisko, numer albumu lub pracownika, dział, stanowisko, miasto, opis;
+- wybrać **profil** i edytować go w **konfiguratorze profilu** (z podglądem przykładowego konta): OU, sufiks UPN, domena e-mail, format loginu (`i.nazwisko`, `inazwisko`, `imie.nazwisko`, `nazwisko.imie`, numer…) i nazwy wyświetlanej, opis, firma, dział, grupy, opcje konta (włączone, zmiana hasła przy logowaniu, wygaśnięcie po N dniach, długość hasła);
+- przejrzeć **podgląd** i poprawić dane w tabeli;
+- utworzyć konta, skopiować dane logowania i uruchomić synchronizację z Microsoft Entra ID.
+
+**Jak działa**
+- Polskie znaki są zamieniane w loginach, imiona i nazwiska poprawiane (wielkość liter, nazwiska dwuczłonowe).
+- Podgląd sprawdza w AD zajęte loginy, UPN i nazwy CN i numeruje je automatycznie; hasło jest losowe dla każdego konta.
+- Synchronizacja to `Start-ADSyncSyncCycle -PolicyType Delta` — lokalnie albo na serwerze Entra Connect.
+
+**Uwagi.** Hasła nowych kont są maskowane w tabeli i eksporcie i nie są zapisywane w ustawieniach ani dzienniku.
+'@
+'AdUsers|Konta MAB (802.1X)' = @'
+**Do czego.** Zakładać konta do uwierzytelniania urządzeń adresem MAC (MAC Authentication Bypass, np. przez NPS) — z hasłem, które przejdzie przez zasady haseł.
+
+**Co możesz zrobić**
+- wkleić adresy MAC w dowolnym zapisie (`00:11:22:AA:BB:CC`, `00-11-…`, `0011.22aa.bbcc`) z opcjonalną nazwą urządzenia i opisem;
+- wybrać format loginu i hasła taki, jaki wysyła przełącznik (bez separatorów, z myślnikami, format Cisco z kropkami; małe albo wielkie litery);
+- wybrać jednostkę z listy OU (stale widocznej po prawej) i **PSO** (szczegółowe zasady haseł) z listy odczytanej z AD;
+- dodać konta do grup, opcjonalnie ustawić pierwszą grupę jako **grupę podstawową** zamiast *Domain Users*;
+- zarządzać istniejącymi kontami w OU: ponowne ustawienie hasła i PSO, włączanie, wyłączanie i usuwanie z menu wiersza.
+
+**Jak działa**
+- Podgląd wykrywa błędne, zerowe i powtórzone adresy, adresy grupowe, istniejące konta i zajęte nazwy CN.
+- Program **sprawdza zgodność hasła ze skutecznymi zasadami konta** tak, jak liczy je AD: PSO przypisane do konta, w przeciwnym razie PSO grup konta, w przeciwnym razie zasady domeny.
+- Konto jest tworzone wyłączone, potem dostaje grupy i PSO, flagi (hasło nie wygasa, użytkownik nie może zmienić hasła, opcjonalnie szyfrowanie odwracalne dla CHAP/EAP-MD5), hasło — i dopiero wtedy jest włączane.
+
+**Uwagi.** Złożoność hasła w AD zawsze odrzuci hasło równe nazwie konta — dlatego zwykle potrzebne jest PSO bez wymogu złożoności dla grupy kont MAB.
+'@
+'AdUsers|Import atrybutów z CSV' = @'
+**Do czego.** Zaktualizować dane wielu kont (stanowisko, dział, telefon, przełożony…) z pliku CSV, np. z kadr.
+
+**Co możesz zrobić**
+- wczytać plik CSV (separator rozpoznawany automatycznie) i przypisać kolumny do atrybutów;
+- zobaczyć podgląd **„było → będzie”** dla każdego konta;
+- zastosować zmiany;
+- **cofnąć** zmiany z zapisanego pliku.
+
+**Jak działa.** Przed zmianą program zapisuje poprzednie wartości w `%APPDATA%\AD-ManagerDiamond\Rollback\Import_*.json` — z niego działa przywracanie.
+'@
+'AdUsers|Ostatnio utworzone' = @'
+**Do czego.** Sprawdzić, co niedawno powstało w AD i kto to utworzył — i szybko posprzątać pomyłki.
+
+**Co możesz zrobić:** znaleźć konta użytkowników, komputery, grupy i jednostki utworzone w ostatnich minutach, godzinach lub dniach, z twórcą (właścicielem obiektu); wyłączyć albo usunąć zaznaczone obiekty.
+
+**Jak działa.** Zapytanie do AD po dacie utworzenia obiektu; usuwanie i wyłączanie z potwierdzeniem.
+'@
+'AdUsers|Wyłączone konta' = @'
+**Do czego.** Uporządkować wyłączone konta: przenieść je do jednej OU i usunąć z grup, zachowując możliwość cofnięcia.
+
+**Co możesz zrobić**
+- znaleźć wyłączone konta poza jednostką dla nieaktywnych;
+- przenieść je do tej OU i usunąć z grup;
+- przywrócić członkostwa z kopii.
+
+**Jak działa.** Przed usunięciem z grup program zapisuje kopię członkostw w CSV (`%APPDATA%\AD-ManagerDiamond\Backup\Czlonkostwa_wylaczonych_*.csv`). Grupy chronione i konta-wyjątki (do ustawienia) są pomijane.
+'@
+'AdUsers|Raporty kont' = @'
+**Do czego.** Zestawienia kont z całej domeny lub OU — i od razu operacje na wynikach.
+
+**Co możesz zrobić**
+- wybrać raport: zablokowane, wyłączone, nieaktywne, nigdy nie logowane, hasło wygasa / wygasło / nigdy nie wygasa, konta wygasające, nowe, uprzywilejowane;
+- przenieść wyniki na listę kont po lewej i wykonać na nich operacje w innych modułach.
+
+**Jak działa.** Zapytania do AD (konta uprzywilejowane według `adminCount`). Te same raporty są dostępne jako [raporty cykliczne](06-domena.md#raporty-cykliczne).
+'@
+'AdUsers|Źródło blokady konta' = @'
+**Do czego.** Znaleźć komputer, z którego przychodzą błędne hasła blokujące konto (np. stary telefon, zapisane poświadczenia, usługa).
+
+**Co możesz zrobić**
+- odczytać zdarzenia blokady 4740 z emulatora PDC albo ze wszystkich kontrolerów — z nazwą komputera źródłowego;
+- opcjonalnie dołączyć nieudane uwierzytelnienia Kerberos 4771 i NTLM 4776 z adresem IP lub stacją;
+- bez zaznaczonych kont — zobaczyć wszystkie blokady.
+
+**Jak działa.** Odczyt dziennika Security kontrolerów domeny. Wymaga prawa odczytu tego dziennika.
+'@
+'AdUsers|Gdzie zalogowany' = @'
+**Do czego.** Ustalić, na których komputerach są zalogowani wskazani użytkownicy — i obsłużyć te sesje.
+
+**Co możesz zrobić**
+- podać loginy (albo zaznaczyć konta po lewej);
+- wybrać komputery z AD: stacje robocze, serwery albo wszystkie, włączone, aktywne w ostatnich N dniach, opcjonalnie z OU, najwyżej M najświeżej logowanych;
+- zobaczyć sesje konsoli i pulpitu zdalnego szukanych kont (stan, klient, bezczynność, czas logowania);
+- z menu wiersza: wiadomość, podgląd, pomoc zdalna, procesy, rozłączenie, wylogowanie, reset.
+
+**Jak działa.** Sprawdza sesje na komputerach przez WinRM (jak moduł *Sesje użytkowników*). Kafelki pokazują sprawdzone komputery, komputery bez połączenia (lista w dzienniku) i znalezione sesje.
+'@
+'AdGroups|*' = @'
+**Do czego jest ta przestrzeń.** Grupy i jednostki organizacyjne w Active Directory: szczegóły i członkowie grup, zmiany hurtowe, tworzenie i duplikowanie grup, budowanie i klonowanie struktur OU, raporty.
+
+**Lista po lewej:** grupy — wyszukiwanie w AD (nazwa, sAMAccountName, opis, e-mail), OU, rodzaj (zabezpieczeń, dystrybucyjne, bez członków, uprzywilejowane), nazwy wpisane ręcznie. Przy grupie widać zakres i typ.
+
+**Jak to działa ogólnie.** Moduł `ActiveDirectory` na Twoim komputerze, uprawnienia Twojego konta (albo alternatywnego). Moduły tworzące wiele obiektów najpierw budują **podgląd** sprawdzony w AD (kolumna „Stan”), który można poprawić w tabeli; dopiero potem wykonują zmiany i raportują wynik dla każdego wiersza.
+'@
+'AdGroups|Szczegóły grup' = @'
+**Do czego.** Zobaczyć i zmienić właściwości grup.
+
+**Co możesz zrobić**
+- odczytać zakres, typ, opis, zarządcę, e-mail i liczbę członków zaznaczonych grup;
+- zmienić opis, zarządcę, adres e-mail, zakres i typ, nazwę;
+- przenieść grupę do innej OU, włączyć ochronę przed usunięciem, usunąć grupę;
+- utworzyć **raport HTML** — kartę każdej grupy: właściwości, zarządca, liczniki, lista **członków** z typem i stanem kont (opcjonalnie także zagnieżdżonych) i grupy nadrzędne.
+
+**Jak działa.** Odczyt i zmiany przez moduł ActiveDirectory, z potwierdzeniem.
+'@
+'AdGroups|Członkowie grup' = @'
+**Do czego.** Sprawdzić i zmienić, kto jest w grupie.
+
+**Co możesz zrobić**
+- odczytać członków bezpośrednich i zagnieżdżonych, z typem i stanem kont;
+- dodać członków, skopiować członków z innej grupy, usunąć zaznaczonych;
+- przenieść konta z wyników na listę użytkowników (do dalszych operacji).
+
+**Jak działa.** Odczyt przez moduł ActiveDirectory **bez limitu 5000 obiektów** (którego `Get-ADGroupMember` nie przeskoczy w dużych grupach).
+'@
+'AdGroups|Przynależność do grup' = @'
+**Do czego.** Sprawdzić zagnieżdżanie: do jakich grup należą zaznaczone grupy.
+
+**Co możesz zrobić:** odczytać grupy nadrzędne — bezpośrednio i przez inne grupy; dodać zaznaczone grupy do innych grup i usunąć je z nich.
+
+**Jak działa.** Ten sam mechanizm co *Członkostwo w grupach* w przestrzeni Użytkownicy AD, dla obiektów grup.
+'@
+'AdGroups|Członkostwo hurtowe' = @'
+**Do czego.** Dodać albo usunąć wiele obiektów w wielu grupach naraz — np. według tabeli z Excela.
+
+**Co możesz zrobić**
+- podać obiekty (konta, grupy, komputery) i grupy;
+- wybrać tryb: **każdy do każdej** (A×B) albo **wiersz do wiersza**;
+- dodać albo usunąć członkostwa.
+
+**Jak działa.** Obiekty są rozpoznawane po loginie, UPN, e-mailu, DN, SID i nazwie. Najpierw powstaje **plan** — co już jest, co zostanie zmienione, czego nie znaleziono — potem wykonanie z wynikiem dla każdego wiersza.
+'@
+'AdGroups|Tworzenie grup' = @'
+**Do czego.** Utworzyć wiele grup naraz z tabeli.
+
+**Co możesz zrobić**
+- wkleić tabelę z Excela: nazwa, opis, zakres, typ, e-mail, sAMAccountName, grupy nadrzędne, zarządca, OU;
+- przejrzeć podgląd z edycją komórek;
+- utworzyć grupy.
+
+**Jak działa.** sAMAccountName jest normalizowany, podgląd sprawdza w AD konflikty nazw, istnienie OU, grup nadrzędnych i zarządców.
+'@
+'AdGroups|Duplikowanie grup' = @'
+**Do czego.** Zrobić kopie istniejących grup z nową nazwą — np. zestaw grup oddziału WAW dla nowego oddziału KRK.
+
+**Co możesz zrobić**
+- ustalić nową nazwę: zamiana tekstu, przedrostek, przyrostek — także wiele kopii naraz (np. `WAW → KRK; GDA`);
+- opcjonalnie skopiować członków, przynależność do grup, zarządcę i ochronę;
+- umieścić kopie w tej samej albo innej OU.
+
+**Jak działa.** Podgląd nazw i konfliktów w AD, potem tworzenie z wynikiem dla każdej kopii.
+'@
+'AdGroups|Lokalizacje i role' = @'
+**Do czego.** Zbudować powtarzalną strukturę: jednostki dla lokalizacji (np. miast) i w każdej te same grupy ról.
+
+**Co możesz zrobić**
+- podać lokalizacje i role z kodami;
+- ustalić szablony nazwy i opisu grup z polami `{PREFIKS}`, `{LOKALIZACJA}`, `{KOD_LOK}`, `{ROLA}`, `{KOD_ROLI}`;
+- dodać grupy zbiorcze **ALL**: dla lokalizacji, dla roli i globalną;
+- wymusić unikalne sAMAccountName (opcjonalnie najwyżej 20 znaków).
+
+**Jak działa.** Podgląd całej struktury sprawdzony w AD, potem utworzenie jednostek, grup i zagnieżdżeń.
+'@
+'AdGroups|Drzewo OU' = @'
+**Do czego.** Utworzyć całe drzewo jednostek organizacyjnych z tekstu — albo przenieść istniejącą strukturę w inne miejsce.
+
+**Co możesz zrobić**
+- opisać drzewo wcięciami albo ścieżkami (np. `Firma/Warszawa/Komputery`), z opisami po znaku `|`;
+- włączyć ochronę przed usunięciem;
+- wczytać istniejącą strukturę jako tekst, zmienić ją i utworzyć w innym miejscu.
+
+**Jak działa.** Podgląd pokazuje, które jednostki już są, a które powstaną; tworzenie idzie od góry drzewa.
+'@
+'AdGroups|Klonowanie OU' = @'
+**Do czego.** Skopiować całą jednostkę w nowe miejsce — np. struktura istniejącego oddziału dla nowego.
+
+**Co możesz zrobić**
+- skopiować podjednostki i grupy (z zamianą tekstu w nazwach, np. `WAW=KRK`) oraz zagnieżdżenia między nimi;
+- opcjonalnie skopiować członków i grupy nadrzędne, linki GPO, opisy i ochronę.
+
+**Jak działa.** Podgląd sprawdzony w AD, potem tworzenie. **Konta użytkowników i komputerów nie są kopiowane.**
+'@
+'AdGroups|Drzewo zagnieżdżeń' = @'
+**Do czego.** Zrozumieć, jak grupy są w siebie zagnieżdżone, i znaleźć zapętlenia.
+
+**Co możesz zrobić**
+- pokazać drzewo grup zawartych w zaznaczonych grupach (w dół) albo grup nadrzędnych (w górę), opcjonalnie z członkami;
+- bez zaznaczenia — wszystkie grupy;
+- utworzyć raport HTML z rozwijanymi gałęziami i wyszukiwarką.
+
+**Jak działa.** Odczyt z AD z wykrywaniem zapętleń (grupa pośrednio zawiera samą siebie).
+'@
+'AdGroups|Raporty grup' = @'
+**Do czego.** Znaleźć grupy do sprzątania albo do przeglądu.
+
+**Co możesz zrobić**
+- wybrać raport: puste, z jednym członkiem, duże, bez opisu lub zarządcy, z wyłączonymi kontami, uprzywilejowane, dystrybucyjne, nowe i zmienione, zapętlone zagnieżdżenia;
+- zaznaczyć wyniki na liście grup i wykonać na nich operacje w innych modułach.
+
+**Jak działa.** Zapytania do AD na całej domenie albo w wybranej OU.
+'@
+'AdComputers|*' = @'
+**Do czego jest ta przestrzeń.** Konta komputerów w Active Directory: informacje i kanał zaufania, hasła LAPS, klucze odzyskiwania BitLocker, zmiana nazw, członkostwo w grupach i raporty.
+
+**Lista po lewej:** komputery z AD (drzewo OU, filtr nazwy, tylko włączone) albo wpisane ręcznie.
+
+**Jak to działa ogólnie.** Moduł `ActiveDirectory` na Twoim komputerze i uprawnienia Twojego konta (albo alternatywnego). Część operacji (kanał zaufania, zmiana nazwy) łączy się też z samym komputerem przez WinRM. Hasła LAPS i klucze BitLocker są **wartościami poufnymi** — maskowane w tabeli, eksporcie i kopiowaniu, dopóki nie zaznaczysz „Pokaż poufne”.
+'@
+'AdComputers|Konto komputera' = @'
+**Do czego.** Obsługa obiektu komputera w AD, w tym naprawa „relacji zaufania” bez wyjmowania komputera z domeny.
+
+**Co możesz zrobić**
+- odczytać informacje o koncie komputera;
+- **przetestować i naprawić kanał zaufania** z domeną;
+- włączyć, wyłączyć, zmienić opis, przenieść do OU, zresetować i usunąć konto (także z menu wiersza);
+- utworzyć nowe konta komputerów przed dołączeniem do domeny (pre-staging);
+- utworzyć **raport HTML** — kartę każdego komputera: system, konto, ostatnie logowanie, LAPS i klucze BitLocker w AD (**tylko informacja o obecności i dacie, bez haseł i kluczy**), delegowanie Kerberos, liczba SPN, grupy.
+
+**Jak działa.** Zmiany konta przez moduł ActiveDirectory. Test i naprawa kanału zaufania (`Test-ComputerSecureChannel`) działają na samym komputerze przez WinRM; naprawa wymaga poświadczeń domenowych — program poprosi o nie, jeśli nie ustawiono konta alternatywnego.
+'@
+'AdComputers|Zmiana nazwy komputerów' = @'
+**Do czego.** Zmienić nazwy wielu komputerów naraz — np. według nowego standardu nazewnictwa.
+
+**Co możesz zrobić**
+- ustalić nowe nazwy autonumeracją albo mapowaniem z listy (np. z Excela);
+- poprawić nazwy w tabeli (kolumna *Nowa nazwa*);
+- zmienić nazwy z opcjonalnym restartem.
+
+**Jak działa.** Walidacja przed zmianą: zasady NetBIOS (najwyżej 15 znaków) i duplikaty. Zmiana nazwy działa na komputerze i wymaga poświadczeń domenowych.
+'@
+'AdComputers|Członkostwo w grupach' = @'
+**Do czego.** Sprawdzić i zmienić grupy kont komputerów (np. grupy, którym przypisano GPO albo dostęp do sieci).
+
+**Co możesz zrobić:** odczytać grupy bezpośrednie i zagnieżdżone; dodać komputery do grup i usunąć z zaznaczonych grup.
+
+**Jak działa.** Ten sam mechanizm co [Członkostwo w grupach](02-uzytkownicy-ad.md#członkostwo-w-grupach) dla kont użytkowników.
+'@
+'AdComputers|LAPS' = @'
+**Do czego.** Odczytać hasło lokalnego administratora komputera zarządzane przez LAPS i wymusić jego zmianę.
+
+**Co możesz zrobić**
+- odczytać hasła Windows LAPS (także szyfrowane) i LAPS legacy;
+- bezpiecznie skopiować hasło (dwuklik) — znika ze schowka po 60 s;
+- wymusić zmianę hasła z przetworzeniem zasad na komputerze (także z menu wiersza).
+
+**Jak działa.** Odczyt atrybutów LAPS z AD (wymaga uprawnień do odczytu hasła; dla szyfrowanych haseł Windows LAPS — prawa odszyfrowania). Hasło jest maskowane w tabeli i eksporcie.
+'@
+'AdComputers|Klucze BitLocker (AD)' = @'
+**Do czego.** Znaleźć klucz odzyskiwania BitLocker — także wtedy, gdy znasz tylko identyfikator klucza z ekranu odzyskiwania.
+
+**Co możesz zrobić**
+- odczytać klucze odzyskiwania zapisane w AD dla zaznaczonych komputerów;
+- **wyszukać komputer po identyfikatorze klucza** (fragment z niebieskiego ekranu odzyskiwania) w całej domenie.
+
+**Jak działa.** Odczyt obiektów kluczy odzyskiwania z AD (wymaga odpowiednich uprawnień). Klucze są wartościami poufnymi. Kopię kluczy do AD robi się w przestrzeni Zarządzanie zdalne → [BitLocker](01-zarzadzanie-zdalne.md#bitlocker).
+'@
+'AdComputers|Raporty komputerów' = @'
+**Do czego.** Zestawienia komputerów do sprzątania i przeglądu bezpieczeństwa.
+
+**Co możesz zrobić**
+- wybrać raport: nieaktywne, wyłączone, nowe, podsumowanie systemów, nieobsługiwane systemy, bez LAPS, bez klucza BitLocker w AD, serwery;
+- zaznaczyć wyniki na liście komputerów, wyłączyć, przenieść albo usunąć konta.
+
+**Jak działa.** Zapytania do AD na całej domenie albo w OU. Te same raporty są dostępne jako [raporty cykliczne](06-domena.md#raporty-cykliczne).
+'@
+'Files|*' = @'
+**Do czego jest ta przestrzeń.** Uprawnienia NTFS na folderach i udziałach: nadawanie, raportowanie, sprawdzanie, kto ma jaki dostęp, odbieranie, naprawa, porównania i kopie z przywracaniem. Do tego sumy kontrolne plików.
+
+**Lista po lewej:** brak — moduły działają na ścieżkach folderów wpisanych w panelu parametrów.
+
+**Jak to działa ogólnie**
+- **Gdzie działa:** ścieżka lokalna, ścieżka sieciowa (`\\serwer\udział\…`) albo — po wpisaniu nazwy serwera plików — na samym serwerze przez PowerShell Remoting. Na serwerze skan idzie po ścieżkach lokalnych, bez ruchu sieciowego dla każdego folderu; przycisk wyboru folderu przegląda wtedy dyski i udziały tego serwera.
+- **Tożsamości** są rozpoznawane w AD i zapisywane po SID (także `BUILTIN\Users`), więc działa w każdym języku systemu. Grupy są rozwijane z AD, także zagnieżdżone.
+- **Kopia przed zmianą:** każda zmiana uprawnień najpierw zapisuje kopię uprawnień zmienianych folderów (`%APPDATA%\AD-ManagerDiamond\AclBackup`). Jeśli kopii nie da się zapisać, zmiana nie jest wykonywana. Folder, którego uprawnienia zmieniły się od podglądu, jest pomijany.
+- **Tryb kopii zapasowej** (w modułach NTFS) włącza przywileje kopii zapasowej, przywracania i przejmowania własności — program czyta i zmienia uprawnienia także tam, gdzie Administratorzy nie mają dostępu, bez przejmowania własności. Używaj go świadomie.
+'@
+'Files|Nadawanie uprawnień' = @'
+**Do czego.** Nadać uprawnienia do folderu wielu grupom albo kontom naraz, każdej z innym poziomem.
+
+**Co możesz zrobić**
+- dodać tożsamości (wpisane albo wybrane z AD), każdą z własnym **poziomem** (od odczytu do pełnej kontroli) i **zakresem** (ten folder, podfoldery, pliki);
+- zastąpić dotychczasowe wpisy tych tożsamości;
+- wyłączyć dziedziczenie z kopią odziedziczonych wpisów;
+- podejrzeć bieżące uprawnienia folderu.
+
+**Jak działa.** Lokalnie, przez UNC albo na serwerze plików (WinRM). Wpisy są nadawane po SID, z kopią uprawnień przed zmianą.
+'@
+'Files|Raport uprawnień' = @'
+**Do czego.** Zobaczyć, kto ma jakie uprawnienia w drzewie folderów, gdzie przerwano dziedziczenie i gdzie nie ma dostępu.
+
+**Co możesz zrobić**
+- przeskanować foldery (opcjonalnie pliki) do zadanej głębokości;
+- zobaczyć tożsamość, uprawnienia, typ, dziedziczenie, zakres, właściciela; foldery z wyłączonym dziedziczeniem i bez dostępu;
+- filtrować: tylko jawne wpisy, bez kont systemowych (lista do edycji), bez nierozwiązanych SID;
+- włączyć **tryb kopii zapasowej** i **pomijanie miejsc bez dostępu** (każde trafia do dziennika i raportu);
+- utworzyć **raport HTML w postaci drzewa** — z odznakami (jawne wpisy, wyłączone dziedziczenie, brak dostępu, nierozwiązane SID, właściciel); poddrzewa, w których wszystko dziedziczy, są zwinięte do jednej linii;
+- z wiersza: pokazać członków grupy.
+
+**Jak działa.** Podfoldery są skanowane równolegle. Łącza (junction) nie są przechodzone.
+'@
+'Files|Uprawnienia efektywne' = @'
+**Do czego.** Odpowiedzieć na pytanie „jaki dostęp do tego folderu ma naprawdę ta osoba” — tak, jak policzy go Windows.
+
+**Co możesz zrobić**
+- podać osobę albo grupę i ścieżkę folderu lub pliku;
+- zobaczyć tabelę 13 praw szczegółowych z kolumnami *NTFS*, *Udział*, *Efektywnie* i *Skąd* — który wpis i przez którą grupę daje albo odbiera prawo.
+
+**Jak działa.** Program liczy dostęp przez wszystkie grupy osoby (także zagnieżdżone, z grupą podstawową), konta ogólne (Wszyscy, Użytkownicy uwierzytelnieni, `BUILTIN\Users`), kolejność wpisów (odmowa przed zezwoleniem), uprawnienia ogólne (GENERIC), wpisy „tylko podfoldery” i prawa właściciela. Dla ścieżki `\\serwer\udział` liczy też **uprawnienia udziału** — wynik to mniejsze z dwóch.
+'@
+'Files|Gdzie ma dostęp' = @'
+**Do czego.** Znaleźć wszystkie miejsca w drzewie folderów, do których dana osoba albo grupa ma dostęp.
+
+**Co możesz zrobić**
+- podać osobę albo grupę i folder początkowy;
+- zobaczyć każde miejsce z wpisem: poziom, efektywny dostęp, przez którą grupę, typ, dziedziczenie, zakres;
+- z wiersza: przejść do uprawnień efektywnych albo odebrać dostęp.
+
+**Jak działa.** Skan drzewa z rozwinięciem grup osoby z AD (także zagnieżdżonych) i kont ogólnych.
+'@
+'Files|Odbieranie uprawnień' = @'
+**Do czego.** Usunąć dostęp osoby albo grupy w całym drzewie folderów — np. po odejściu pracownika albo zmianie działu.
+
+**Co możesz zrobić**
+- podać tożsamości i folder;
+- przejrzeć podgląd każdego jawnego wpisu (wpisy dziedziczone są pokazane, ale usuwa się je w folderze wyżej);
+- wybrać miejsca w potwierdzeniu i usunąć wpisy.
+
+**Jak działa.** Kopia uprawnień przed zmianą; folder zmieniony od podglądu jest pomijany.
+'@
+'Files|Grupy dostępu do folderu' = @'
+**Do czego.** Wdrożyć model „grupa na folder”: dla folderu (albo każdego podfolderu) grupy odczytu i modyfikacji z nadanymi od razu uprawnieniami.
+
+**Co możesz zrobić**
+- wybrać folder albo jego podfoldery;
+- ustalić szablon nazwy (np. `DL_{Folder}_{Poziom}`, pola `{Nadrzędny}`, `{Udział}`, `{Serwer}`) i opisu, OU i zakres grup;
+- wybrać poziomy: odczyt, modyfikacja, opcjonalnie pełna kontrola;
+- dodać członków (np. `RO: grupa`);
+- poprawić nazwy i opisy w podglądzie.
+
+**Jak działa.** Podgląd sprawdzony w AD (istniejąca grupa jest używana zamiast tworzenia nowej). Po utworzeniu grup program nadaje im uprawnienia NTFS (ten folder, podfoldery i pliki), z kopią uprawnień.
+'@
+'Files|Naprawa uprawnień' = @'
+**Do czego.** Uporządkować drzewo folderów: przywrócić dziedziczenie, usunąć wpisy po usuniętych kontach, odzyskać dostęp do miejsc bez dostępu.
+
+**Co możesz zrobić**
+- **włączyć dziedziczenie** w podfolderach (jawne wpisy zostają) albo **przywrócić dziedziczenie** (bez jawnych wpisów);
+- **usunąć wpisy kont usuniętych z AD** (nierozwiązane SID);
+- **przejąć własność** miejsc bez dostępu (grupa Administratorzy, opcjonalnie z pełną kontrolą);
+- wybrać miejsca z podglądu.
+
+**Jak działa**
+- Nierozwiązane SID-y są dodatkowo sprawdzane w AD — konta z domen zaufanych zostają.
+- W trybie kopii zapasowej przejęcie własności idzie jednym przejściem drzewa, a wpis Administratorów trafia tylko tam, gdzie go brakowało.
+- Bez tego trybu program używa `icacls` po SID (niezależnie od języka systemu); po pierwszym przebiegu mogą zostać głębsze miejsca bez dostępu — wtedy powtórz podgląd i naprawę.
+- Zawsze podgląd, wybór miejsc i kopia uprawnień przed zmianą.
+'@
+'Files|Kopie uprawnień' = @'
+**Do czego.** Przeglądać kopie uprawnień i przywracać stan sprzed zmiany.
+
+**Co możesz zrobić**
+- zobaczyć kopie zapisane automatycznie przed zmianami i ręczne;
+- **zrobić kopię uprawnień** całego drzewa (przycisk *Zrób kopię uprawnień*);
+- podejrzeć zawartość kopii;
+- **przywrócić** całość albo wybrane foldery (wpisy i dziedziczenie, właściciel);
+- porównać kopię z obecnym stanem (moduł *Zmiany uprawnień*).
+
+**Jak działa.** Kopia zapisuje właściciela, wpisy i dziedziczenie każdego folderu (SDDL). Stan sprzed przywrócenia trafia do nowej kopii. Właściciel jest przywracany w trybie kopii zapasowej albo gdy system pozwala go ustawić — inaczej wynik ma ostrzeżenie.
+'@
+'Files|Raport ryzyk' = @'
+**Do czego.** Znaleźć ryzykowne uprawnienia w drzewie folderów.
+
+**Co możesz zrobić**
+- przeskanować drzewo i zobaczyć ryzyka z oceną (*wysokie / średnie / niskie*) i zaleceniem: zapis dla Wszystkich, Użytkowników uwierzytelnionych i domeny; odczyt dla Wszystkich i gości; pełna kontrola lub zmiana uprawnień dla zwykłych kont; zbyt wiele kont z pełną kontrolą (próg do ustawienia); wpisy dla użytkowników zamiast grup; wpisy usuniętych kont; odmowy; użytkownik jako właściciel;
+- z wiersza: sprawdzić, gdzie jeszcze dana tożsamość ma dostęp, albo odebrać uprawnienia.
+
+**Jak działa.** Skan jak w raporcie uprawnień, z regułami oceny. Ten sam raport jest dostępny jako [raport cykliczny](06-domena.md#raporty-cykliczne).
+'@
+'Files|Porównanie ze wzorcem' = @'
+**Do czego.** Ujednolicić uprawnienia podobnych folderów (np. folderów działów) według jednego wzorca.
+
+**Co możesz zrobić**
+- wskazać folder wzorcowy i foldery do porównania (*Wstaw podfoldery…*);
+- zobaczyć brakujące, nadmiarowe i inne wpisy, różnice w dziedziczeniu i właścicielu;
+- **Zastosuj wzorzec…** — dokładna kopia jawnych wpisów z ustawieniem dziedziczenia albo tylko brakujące wpisy.
+
+**Jak działa.** Porównanie wpisów po SID; zmiana z kopią uprawnień przed zmianą.
+'@
+'Files|Udziały i NTFS' = @'
+**Do czego.** Zobaczyć, jaki dostęp przez sieć wynika z połączenia uprawnień udziału i NTFS.
+
+**Co możesz zrobić**
+- odczytać udziały serwera plików (opcjonalnie administracyjne) z uprawnieniami udziału i NTFS folderu udziału obok siebie;
+- dla każdego konta zobaczyć poziom z udziału, z NTFS i **wynikowy dostęp przez sieć**, z informacją, które uprawnienia go ograniczają;
+- zobaczyć ostrzeżenia o zapisie dla szerokich grup.
+
+**Jak działa.** Odczyt na serwerze przez PowerShell Remoting (uprawnienia udziałów także przez DCOM).
+'@
+'Files|Zmiany uprawnień' = @'
+**Do czego.** Sprawdzić, co się zmieniło w uprawnieniach od czasu kopii — gdzie i komu nadano dostęp.
+
+**Co możesz zrobić**
+- porównać kopię uprawnień z **obecnym stanem** albo z **inną kopią**;
+- zobaczyć nowe, usunięte i zmienione wpisy, zmiany dziedziczenia i właściciela, foldery, których już nie ma, a przy pełnej kopii drzewa także **nowe foldery**;
+- z wiersza: przywrócić wybrane foldery ze stanu z kopii.
+
+**Jak działa.** Porównanie po SID. Nowy zapis dla szerokich grup (Wszyscy, Użytkownicy domeny…) jest wyróżniony. Regularna ręczna kopia drzewa (moduł *Kopie uprawnień*) pozwala śledzić zmiany w czasie.
+'@
+'Files|Sumy kontrolne' = @'
+**Do czego.** Policzyć skróty plików i sprawdzić, czy plik jest taki, jak powinien (np. pobrany obraz ISO, kopia na serwerze).
+
+**Co możesz zrobić**
+- dodać pliki i całe foldery (także przeciągnięte z Eksploratora);
+- wybrać algorytm: MD5, SHA1, SHA256, SHA384, SHA512;
+- porównać z oczekiwanym skrótem;
+- skopiować wyniki w formacie `skrót  plik`.
+
+**Jak działa.** Liczenie w tle, partiami — okno nie zamarza przy dużych plikach. Historia zostaje w tabeli.
+'@
+'Domain|*' = @'
+**Do czego jest ta przestrzeń.** Spojrzenie na całą domenę naraz: audyt bezpieczeństwa Active Directory, delegacje uprawnień, stan kontrolerów i replikacji, zasady grupy, serwery (farma RDS, weryfikacja według ról) oraz raporty cykliczne działające bez otwierania programu.
+
+**Lista po lewej:** brak — moduły działają na całej domenie albo na serwerach wpisanych w panelu parametrów.
+
+**Jak to działa ogólnie.** Odczyty z AD przez moduł `ActiveDirectory` (zasady grupy także z folderu SYSVOL), a z kontrolerów i serwerów — przez WinRM. Moduły bezpieczeństwa i zasad grupy są **tylko do odczytu** (poza kopią GPO).
+'@
+'Domain|Audyt bezpieczeństwa AD' = @'
+**Do czego.** Ocenić bezpieczeństwo domeny jedną liczbą i listą konkretnych problemów z zaleceniami.
+
+**Co możesz zrobić**
+- uruchomić 34 kontrole w pięciu grupach, każdą z oceną *wysokie / średnie / niskie / bez uwag*, listą obiektów i zaleceniem:
+  - **konta uprzywilejowane** — SPN na kontach administratorów, hasła bez wygasania i stare hasła, nieużywane i wyłączone konta w grupach, brak ochrony przed delegowaniem, członkowie Schema i Enterprise Admins, używanie wbudowanego Administratora, pozostałości `adminCount = 1`;
+  - **Kerberos i delegowanie** — konta z SPN (kerberoasting), bez wstępnego uwierzytelnienia (AS-REP roasting), nieograniczone delegowanie poza kontrolerami, delegowanie z dowolnym protokołem, RBCD, wiek hasła `krbtgt`, DES;
+  - **hasła** — brak wymaganego hasła, szyfrowanie odwracalne, hasła bez wygasania, zasady haseł domeny i zasady szczegółowe;
+  - **konta i komputery** — nieaktywne, konto Gość, nieobsługiwane systemy, komputery bez LAPS, SID History;
+  - **domena** — limit dołączania komputerów, kosz AD, poziom funkcjonalny, grupa Protected Users, dostęp anonimowy przez „Pre-Windows 2000 Compatible Access”, zaufania bez filtrowania SID;
+- ustawić progi (nieaktywność, wiek hasła administratora i `krbtgt`, liczba kont uprzywilejowanych);
+- z wiersza: zobaczyć listę obiektów i **zaznaczyć konta lub komputery na listach** do dalszych operacji;
+- utworzyć **raport HTML** z oceną, zestawieniem i kartą każdej kontroli.
+
+**Jak działa.** Kontrole działają równolegle, tylko odczyt z AD. Ocena to 100 minus wagi niespełnionych kontroli; gdy któraś kontrola się nie wykonała, ocena jest oznaczona jako niepełna.
+'@
+'Domain|Delegacje uprawnień w AD' = @'
+**Do czego.** Sprawdzić, kto ma jakie uprawnienia do jednostek organizacyjnych i katalogu głównego domeny — i znaleźć niebezpieczne delegacje (np. DCSync).
+
+**Co możesz zrobić**
+- odczytać uprawnienia do **OU**, **katalogu głównego domeny** i **AdminSDHolder** (opcjonalnie kontenerów Users i Computers);
+- czytać wpisy opisane po polsku: reset hasła, tworzenie i usuwanie obiektów danej klasy, zapis atrybutów (np. `member`), pełna kontrola, zmiana uprawnień i właściciela — z zakresem;
+- zobaczyć ocenę ryzyka:
+  - **wysokie** — zapis dla szerokich grup, prawa replikacji poza kontrolerami (**DCSync**), kontrola nad katalogiem głównym, dodatkowe wpisy AdminSDHolder;
+  - **średnie** — pełna kontrola, wszystkie prawa rozszerzone albo zapis wszystkich atrybutów w jednostce;
+  - **niskie** — delegacja dla konta zamiast grupy, nierozwiązany SID, nietypowy właściciel;
+- z wiersza: zobaczyć wszystkie delegacje danej tożsamości.
+
+**Jak działa.** Odczyt list ACL z AD; nazwy klas, atrybutów i praw rozszerzonych program czyta ze schematu. Wpisy domyślne (SYSTEM, administratorzy, kontrolery, SELF, odczyt dla wszystkich) są ukryte. Tylko odczyt.
+'@
+'Domain|Stan domeny' = @'
+**Do czego.** Sprawdzić zdrowie domeny w jednym przeglądzie — kontrolery, replikację, role, DNS, kopie zapasowe — z oceną i wskazówką przy każdym punkcie.
+
+**Co możesz zrobić**
+- z Twojego komputera sprawdzić:
+  - **kontrolery** (system, lokacja, wykaz globalny, RODC; ostrzeżenie przy jednym kontrolerze albo starym systemie);
+  - **metadane kontrolerów** — pozostałości po usuniętych kontrolerach;
+  - opcjonalny **test portów** (DNS, Kerberos, LDAP, SMB, ADWS, GC);
+  - **replikację** każdego kontrolera od każdego partnera i dla każdej partycji;
+  - **role FSMO**, **rekordy SRV** w DNS, **ostatnią kopię zapasową AD** każdej partycji, poziomy funkcjonalne;
+- na kontrolerach (WinRM) sprawdzić: **usługi** (AD DS, Netlogon, KDC, czas, ADWS, DNS, DFSR), **SYSVOL i NETLOGON** z replikacją DFSR, **odchylenie zegara od emulatora PDC** i źródło czasu, wolne miejsce, **błędy w dziennikach**, czas działania;
+- ustawić progi; z wiersza kontrolera uruchomić **dcdiag /q**.
+
+**Jak działa**
+- Każdy obszar przeglądu jest sprawdzany osobno — błąd jednego nie przerywa reszty, a komunikat podaje polecenie, które zawiodło.
+- Gdy polecenia AD zgłaszają błąd „Specified argument was out of the range of valid values. Parameter name: index” (typowy przy pozostałościach po usuniętym kontrolerze), dane domeny, lasu i role FSMO program czyta wprost z katalogu, z ostrzeżeniem w wynikach.
+- Gdy mimo to przegląd się przerwie, wyniki zebrane do tej chwili zostają, a wiersz *przegląd przerwany* pokazuje polecenie, które zawiodło (w trybie diagnostycznym także stos wywołań).
+
+Ten sam przegląd jest dostępny jako [raport cykliczny](#raporty-cykliczne).
+'@
+'Domain|Obiekty zasad grupy' = @'
+**Do czego.** Znaleźć problemy w zasadach grupy: niepodlinkowane, puste, niespójne, źle filtrowane, z niebezpiecznymi uprawnieniami do edycji.
+
+**Co możesz zrobić**
+- przeglądać trzy widoki:
+  - **obiekty GPO** — stan, linki, ustawienia komputera i użytkownika, wersje, zgodność z SYSVOL, filtr WMI, „stosowany do”, edycja poza administratorami, data zmiany, ocena;
+  - **problemy** z zaleceniami;
+  - **linki** — kolejność, wymuszenie, link wyłączony, blokada dziedziczenia;
+- zobaczyć **dziedziczenie dla jednostki** — kolejność GPO jak w karcie GPMC;
+- zrobić **kopię zapasową** zaznaczonych albo wszystkich GPO (format GPMC, z raportem ustawień HTML);
+- wygenerować **raport ustawień** wybranego GPO.
+
+**Co wykrywa:** GPO niepodlinkowane, z samymi wyłączonymi linkami, puste, wyłączone a podlinkowane, z wyłączoną częścią zawierającą ustawienia, niezgodną wersję AD i SYSVOL, brak folderu albo `GPT.INI` w SYSVOL, brak prawa „Zastosuj”, filtrowanie bez prawa odczytu dla komputerów (**MS16-072** — ustawienia użytkownika nie zadziałają), edycję dla szerokich grup, nieistniejący filtr WMI, linki do nieistniejących GPO i osierocone foldery w SYSVOL.
+
+**Jak działa.** Odczyt z samego modułu ActiveDirectory (obiekty GPO, linki domeny, jednostek i lokacji, filtry WMI) i folderu Policies w SYSVOL. Kopia i raport ustawień wymagają modułu `GroupPolicy`. Tylko odczyt poza kopią. Problemy z zasadami grupy są też dostępne jako [raport cykliczny](#raporty-cykliczne).
+'@
+'Domain|Wynikowe zasady (RSoP)' = @'
+**Do czego.** Sprawdzić, które GPO zadziałały na komputerze (i dla użytkownika), a które zostały odrzucone i dlaczego.
+
+**Co możesz zrobić**
+- wpisać komputery i opcjonalnie użytkownika;
+- zobaczyć informacje (konto, jednostka, lokacja, wolne łącze), GPO **zastosowane** w kolejności z lokalizacją linku i rozszerzeniami, GPO **odrzucone z przyczyną** (filtrowanie zabezpieczeń, filtr WMI, wyłączone, puste) i **błędy rozszerzeń** z kodem HRESULT;
+- z wiersza: otworzyć raport HTML z gpresult.
+
+**Jak działa.** `gpresult /x` (opcjonalnie `/h`) uruchamiany na komputerach przez WinRM.
+'@
+'Domain|Sesje RDS' = @'
+**Do czego.** Obsługa sesji na serwerach farmy pulpitu zdalnego: znaleźć użytkownika na całej farmie, rozłączyć, wylogować, zresetować zawieszoną sesję.
+
+**Co możesz zrobić**
+- wybrać serwery: wpisane ręcznie (zapamiętywane), **z brokera połączeń RD** (kolekcje i serwery sesji) albo z AD według wzorca nazwy;
+- zobaczyć sesje jak w module *Sesje użytkowników* plus kolumnę *Kolekcja*;
+- **szukać użytkownika na całej farmie** i filtrować *tylko rozłączone*;
+- dla jednej albo kilku sesji: wylogowanie, rozłączenie, **reset** (`rwinsta`), wiadomość, procesy w sesji, podgląd;
+- **Wyloguj rozłączone…** — sesje rozłączone dłużej niż podana liczba minut, z listą do potwierdzenia.
+
+**Jak działa.** Sesje przez WTS API na serwerach (WinRM); lista z brokera — modułem RemoteDesktop na brokerze. Dziennik wskazuje serwery, które nie przyjmują nowych połączeń. Moduł *Offboarding* korzysta z tej listy serwerów przy wylogowaniu odchodzącego pracownika.
+'@
+'Domain|Weryfikacja serwerów' = @'
+**Do czego.** Przegląd serwerów dopasowany do tego, co na nich działa — z listą błędów i ostrzeżeń na górze.
+
+**Co możesz zrobić**
+- sprawdzić kontrole **ogólne**: system i koniec wsparcia, czas od restartu, oczekujący restart, ostatnią poprawkę, wolne miejsce, zatrzymane usługi automatyczne, źródło czasu, błędy w dzienniku System z 24 godzin, zaporę;
+- sprawdzić kontrole **ról**: kontroler domeny, DNS, DHCP, IIS, serwer plików, serwer wydruku, Hyper-V, host sesji RD, licencjonowanie RD, WSUS, urząd certyfikacji, klaster, kopia zapasowa Windows Server;
+- ustawić progi dysków, aktualizacji i kopii; *Ukryj wyniki OK*;
+- z wiersza: *Uruchom zatrzymane usługi…* (potem ponowna kontrola tego serwera), *Sesje użytkowników na tych serwerach*, *odśwież tylko te komputery*.
+
+**Jak działa.** Role są rozpoznawane przez `Get-WindowsFeature`, a bez modułu ServerManager — po usługach. Każda kontrola ma ocenę (*błąd / ostrzeżenie / info / OK*), wynik, szczegóły i zalecenie. Brak modułu roli albo uprawnień daje wiersz „Info”, a nie błąd całego serwera. Ten sam przegląd jest dostępny jako [raport cykliczny](#raporty-cykliczne).
+'@
+'Domain|Raporty cykliczne' = @'
+**Do czego.** Uruchamiać wybrane przeglądy według harmonogramu — bez otwierania programu — i dostawać raport pocztą, najlepiej tylko wtedy, gdy coś się zmieniło.
+
+**Rodzaje raportów**
+- audyt bezpieczeństwa AD, stan domeny, delegacje uprawnień w AD;
+- **członkowie grup uprzywilejowanych** (także przez grupy zagnieżdżone) — z wysyłką „gdy są zmiany” działa jak alarm o dodaniu kogoś do Domain Admins;
+- raporty kont (np. hasło wygasa w ciągu N dni, nieaktywne, zablokowane) i komputerów (nieaktywne, nieobsługiwane systemy, bez LAPS…);
+- problemy z zasadami grupy;
+- zgodność grup lokalnych z szablonem;
+- ryzyka uprawnień NTFS;
+- wolne miejsce na dyskach, wygasające certyfikaty serwerów, weryfikacja serwerów.
+
+**Co możesz zrobić**
+- utworzyć definicję raportu w edytorze: opcje rodzaju, wynik, poczta, harmonogram, konto zadania, kontroler domeny;
+- uruchomić raport od razu (*Uruchom teraz*) albo zadanie w Harmonogramie na jego koncie;
+- z wiersza: edytować, otworzyć ostatni raport i folder raportów, przejrzeć **historię uruchomień** i **dziennik przebiegów**, wysłać **wiadomość testową**, duplikować, utworzyć zadanie ponownie, włączyć lub wyłączyć zadanie, usunąć.
+
+**Wynik**
+- raport HTML (ten sam wygląd i filtry co inne raporty programu) w folderze lokalnym albo na udziale, stała kopia `…_najnowszy.html`, opcjonalnie CSV, retencja N ostatnich raportów;
+- każdy przebieg porównuje wyniki z poprzednim: sekcja **„Zmiany od poprzedniego raportu”** (co nowego i co ustąpiło); pierwszy przebieg zapisuje stan odniesienia;
+- dla raportów z oceną ryzyka wybierasz, od jakiego poziomu wyniki się liczą.
+
+**Poczta**
+- tryb: zawsze, gdy są wyniki albo gdy są zmiany; błąd raportu zawsze wysyła powiadomienie;
+- treść z kafelkami i listą nowych i ustąpionych pozycji (czytelna w Outlooku), raport w załączniku, temat z podsumowaniem (np. *ocena 72/100, nowe: 3*);
+- **Serwer SMTP** — przekaźnik bez hasła, konto zadania (Windows) albo login i hasło (zaszyfrowane DPAPI);
+- **Microsoft Graph** (Microsoft 365, bez SMTP):
+  - aplikacja w Entra ID z uprawnieniem aplikacji *Mail.Send* i zgodą administratora; nadawca (*Od*) to skrzynka w Exchange Online;
+  - logowanie aplikacji **certyfikatem** (zalecane — działa też dla zadań na SYSTEM i gMSA, gdy konto zadania może odczytać klucz prywatny) albo **kluczem tajnym** (zaszyfrowanym DPAPI — odczyta go tylko konto, które go wpisało);
+  - opcjonalny serwer proxy;
+  - raport do 3 MB idzie w treści wiadomości; większy — przez sesję przekazywania pliku, co wymaga też *Mail.ReadWrite* (bez tego wiadomość idzie bez załącznika, z informacją, gdzie jest raport);
+  - **ogranicz aplikację do skrzynki nadawcy** (zasady dostępu aplikacji w Exchange Online) — bez tego może wysyłać jako dowolna skrzynka w dzierżawie.
+
+**Harmonogram i konto zadania**
+- codziennie, w wybrane dni tygodnia albo w dzień miesiąca (także ostatni), o podanej godzinie;
+- konto zadania: wskazane konto z hasłem zapisanym w Harmonogramie, bieżący użytkownik (tylko gdy zalogowany), SYSTEM (w domenie działa jako konto komputera) albo gMSA; opcja najwyższych uprawnień.
+
+**Jak działa**
+- Definicje, stan i raporty są w folderze zadań (domyślnie `%APPDATA%\AD-ManagerDiamond\Reports`, do zmiany w module). Zadania trafiają do Harmonogramu, folder `\Domain Ops\`.
+- Zadanie uruchamia **kopię programu** z folderu zadań w trybie bez okna: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<folder zadań>\Program\AD-ManagerDiamond.ps1" -RunReport "<folder zadań>\<id>.json"`. Kopia jest odświeżana przy każdym zapisie definicji, a folder `Program` dostaje uprawnienia tylko dla administratorów, SYSTEM, Ciebie i (odczyt) konta zadania.
+- Kod wyjścia: **0** — raport gotowy, **1** — raport z problemami częściowymi (np. niedostępny serwer) albo niewysłana poczta, **2** — raport nie powstał. Widać go w kolumnie *Wynik ostatniego uruchomienia* Harmonogramu.
+- W tym trybie program nie pyta o PIN.
+
+**Uwagi**
+- Konto zadania musi mieć dostęp do folderu zadań i folderu raportów. Dla gMSA i innych kont wybierz folder zadań poza swoim profilem (np. `C:\ProgramData\DomainOps\Raporty`).
+- Raporty i wiadomości zawierają nazwy kont, grup i ścieżek — wysyłaj je tylko do zaufanych odbiorców.
+- Folder zadań powinien być zapisywalny tylko dla administratorów: kto może zmieniać definicje, może zmienić adresatów raportów.
+'@
+'*' = @'
+### Uruchomienie i wymagania
+
+- **Uruchomienie:** `powershell.exe -ExecutionPolicy Bypass -File .\AD-ManagerDiamond.ps1`. Program działa w Windows PowerShell 5.1 (WPF). Sam uruchomi się ponownie w trybie STA, a uruchomiony z PowerShell 7 przełączy się na `powershell.exe`.
+- **Active Directory:** moduł `ActiveDirectory` (RSAT) — potrzebny w przestrzeniach AD i do wczytywania list z AD. Bez niego działa zarządzanie zdalne z listą komputerów wpisaną ręcznie.
+- **Zasady grupy:** kopie zapasowe GPO, raporty ustawień i metoda Invoke-GPUpdate wymagają modułu `GroupPolicy` (RSAT: Group Policy Management Tools).
+- **Komputery docelowe:** większość operacji zdalnych idzie przez PowerShell Remoting (WinRM, TCP 5985/5986) i wymaga uprawnień administratora lokalnego. Kilka modułów umie działać bez WinRM — patrz [Gdy WinRM jest niedostępny](#gdy-winrm-jest-niedostępny).
+- **Uprawnienia:** program robi to, na co pozwala konto, na którym działa (albo konto alternatywne ustawione na górnym pasku). Do zmian w AD potrzebne są odpowiednie delegacje, do NTFS — prawa do folderów, do dziennika Security — prawo jego odczytu.
+- **Kodowanie pliku:** skrypt musi pozostać zapisany jako UTF-8 z BOM, inaczej Windows PowerShell 5.1 popsuje polskie znaki.
+
+### Układ okna
+
+- **Górny pasek** — przełącznik przestrzeni roboczych (`Ctrl+1…6`), konto używane do operacji (bieżące albo alternatywne, także dla poleceń AD), nazwa operatora i kłódka blokady (`Ctrl+Shift+L`), ustawienia.
+- **Lewy panel — obiekty docelowe.** Zależnie od przestrzeni: komputery, użytkownicy albo grupy.
+  - *Komputery*: z AD (OU z drzewa, filtr nazwy z `*`, tylko włączone), wpisane ręcznie albo z pliku TXT/CSV.
+  - *Użytkownicy*: wyszukiwanie w AD (login, nazwisko, e-mail, gwiazdka), stan konta (aktywne, wyłączone, zablokowane), OU, loginy wpisane ręcznie albo z pliku.
+  - *Grupy*: wyszukiwanie (nazwa, sAMAccountName, opis, e-mail), OU, rodzaj (zabezpieczeń, dystrybucyjne, bez członków, uprzywilejowane), nazwy wpisane ręcznie.
+  - Zaznaczanie polami wyboru (także kilku wierszy naraz i spacją), szybkie wyszukiwanie, kolorowa kropka stanu (np. wynik testu łączności, konto zablokowane).
+  - Menu pod prawym przyciskiem na komputerach: pulpit zdalny, pomoc zdalna (gdy włączona w Ustawieniach), **wiadomość do zalogowanych** na wszystkich zaznaczonych komputerach, Zarządzanie komputerem, Usługi, Podgląd zdarzeń, udział `C$`, kopiowanie nazw.
+- **Nawigacja modułów** — moduły pogrupowane w kategorie; kategorie można zwijać kliknięciem nagłówka (prawy przycisk: zwiń albo rozwiń wszystkie). Kropka przy module oznacza trwającą operację. Każda przestrzeń pamięta ostatnio otwarty moduł.
+- **Moduł** — nagłówek z opisem i przyciskiem **Jak to działa** (albo `F1`), panel parametrów (zwijany), kafelki z podsumowaniem, tabela wyników i panel szczegółów wiersza.
+- **Dziennik operacji** (`Ctrl+L`) — wszystkie operacje z wynikiem; licznik nowych ostrzeżeń na przycisku. Po starcie programu dziennik jest zwinięty.
+- **Pasek stanu** — postęp i przycisk *Przerwij* dla wszystkich operacji.
+
+### Praca z modułem
+
+1. Zaznacz obiekty na liście po lewej (komputery, konta, grupy) — chyba że moduł działa na całej domenie albo na ścieżce folderu.
+2. Ustaw parametry w panelu modułu.
+3. Kliknij główny przycisk (albo `F5`). Operacja działa w tle — możesz pracować dalej, także w innych modułach.
+4. Wyniki pojawiają się w tabeli na bieżąco. Niedostępny komputer albo błąd to wiersz „Błąd” z przyczyną.
+
+**Jak to działa** — przycisk obok nazwy modułu (albo klawisz `F1`) otwiera opis modułu z tej dokumentacji: do czego służy, co można w nim zrobić, jak działa i na co uważać. Zakładki w tym oknie pokazują też wstęp przestrzeni roboczej i podstawy pracy z programem.
+
+**Tabela wyników**
+
+- Sortowanie po kliknięciu nagłówka, przeciąganie kolumn, filtr po wszystkich kolumnach (`Ctrl+F`; słowo z minusem wyklucza wiersze).
+- **Filtry kolumn** jak autofiltr w Excelu — lejek w nagłówku: lista wartości z liczbą wierszy i warunek (*zawiera*, *nie zawiera*, *równa się*, *różne od*, *zaczyna się od*, *kończy się na*, *większe/mniejsze niż*, *puste*, *niepuste*). Przycisk „Filtry kolumn: N” czyści wszystkie.
+- **Kolumny** — wybór widocznych kolumn; kopiowanie i eksport biorą tylko widoczne, w kolejności z tabeli. *Kopiuj wartości kolumny* kopiuje wartości jednej kolumny (także bez powtórzeń i pustych).
+- **Panel szczegółów** — wszystkie pola zaznaczonego wiersza; dwuklik otwiera szczegóły. Wartości wielowierszowe (wynik polecenia, stos wywołań) tabela pokazuje w jednej linii, całość jest w panelu.
+- **Eksport** do CSV albo raportu HTML (samodzielny plik z filtrami pod nagłówkami, sortowaniem, kopiowaniem wierszy, rozwijaniem i zwijaniem).
+
+**Menu pod prawym przyciskiem na wierszach**
+
+- Działa na klikniętym wierszu albo na kilku zaznaczonych (`Ctrl`, `Shift`) — bez zmiany zaznaczenia po lewej.
+- W tabelach z kolumną *Komputer*: *Odśwież tylko te komputery* (ponawia ostatnie zapytanie tylko dla nich), *Zaznacz na liście komputerów*, pulpit zdalny, konsole, `C$`.
+- W modułach kont: zaznaczenie kont na liście użytkowników.
+- Akcje z paska narzędzi modułu są też w menu wiersza i wykonują się dla obiektów z zaznaczonych wierszy. Po takiej akcji odświeżane są tylko ich wiersze.
+
+**Potwierdzenia i zmiany hurtowe**
+
+- Operacje zmieniające stan pytają o potwierdzenie z **listą obiektów z polami wyboru** — można wykonać operację np. dla 4 z 20 zaznaczonych kont. Przy operacjach niszczących domyślnym przyciskiem jest „Anuluj”.
+- Moduły tworzące lub zmieniające wiele obiektów (konta, grupy, OU, członkostwa, uprawnienia NTFS, import atrybutów) najpierw budują **podgląd** sprawdzony w AD: kolumna „Stan” mówi, co zostanie utworzone, co już istnieje, gdzie jest konflikt albo błąd danych. Kolumny z ołówkiem można poprawić w tabeli (dwuklik albo `F2`, także w wielu wierszach naraz). Dane można wkleić prosto z Excela.
+
+### Operacje w tle, przerywanie i powiadomienia
+
+- Wszystkie operacje działają w puli wątków, równolegle dla wielu komputerów i kont. Limity równoległości są w Ustawieniach (osobno dla komputerów i dla zapytań do AD).
+- Polecenia modułu ActiveDirectory idą pojedynczo przez jedną blokadę na cały program — tak usługa ADWS na kontrolerze nie gubi połączeń. Przejściowe błędy odczytu z AD są ponawiane, zmiany nie.
+- **Przerwij** — przycisk przy wskaźniku w nagłówku modułu (ta operacja) albo na pasku stanu (wszystkie). Zadanie, które nie zareaguje (np. zawieszone wywołanie WMI), jest po 10 s porzucane z informacją w tabeli.
+- **Powiadomienie** po każdej operacji w rogu okna: nazwa, liczba udanych i błędnych obiektów, czas i pierwszy błąd. Kliknięcie przenosi do modułu, a przy błędach otwiera dziennik.
+
+### Ustawienia
+
+Okno ustawień (ikona na górnym pasku):
+
+- kontroler domeny (puste — wybór automatyczny), liczba równoległych operacji na komputerach i zapytań do AD, limit czasu połączenia WinRM, domyślny próg nieaktywności kont i komputerów;
+- **blokada po bezczynności** w minutach (0 wyłącza);
+- **nadawca wiadomości** do użytkowników (tytuł okna *Wiadomość od: …*, domyślnie *Administrator*);
+- **pomoc zdalna** w menu (domyślnie wyłączona) — z opisem wymagań;
+- **tryb diagnostyczny** — opis niżej;
+- **MFA – konta i klucze** — opis niżej;
+- **lokalizacje plików programu** (ustawienia, szablony poleceń, dziennik, moduły własne) z przyciskiem *Pokaż* w Eksploratorze.
+
+Ustawienia są zapisywane w `%APPDATA%\AD-ManagerDiamond\settings.json` — bez haseł i poświadczeń.
+
+### Tryb diagnostyczny
+
+Włączony w Ustawieniach dodaje do dziennika (i pliku dziennika) wpisy **DEBUG**:
+
+- przy starcie każdej operacji — tryb, pula wątków, wiersz bloku w pliku programu i **parametry**; hasła, klucze, PIN-y i poświadczenia są ukrywane (`***`), długie teksty i listy skracane;
+- dla każdego obiektu — **czas wykonania**, liczba wyników i błędów, informacja o przerwanym bloku;
+- dla każdego błędu — **typ wyjątku, wiersz bloku z treścią i stos wywołań**; także błędy obsługi wyników, akcji okna i nieobsłużone błędy interfejsu;
+- kolejne kroki wybranych operacji (np. podłączanie i odłączanie dysków sieciowych, przegląd stanu domeny).
+
+Tryb przydaje się, gdy coś „niby działa, ale nic się nie dzieje” — wpisy pokazują, co program wysłał i co wróciło. Plik dziennika: `%LOCALAPPDATA%\AD-ManagerDiamond\Logs\DomainOps_RRRRMMDD.log`.
+
+### Zabezpieczenia programu
+
+**PIN przy starcie.** Zanim pokaże się okno, program prosi o PIN (klawiatura na ekranie albo cyfry z klawiatury). Po 5 błędnych próbach program się zamyka. W skrypcie zapisany jest tylko skrót SHA-256 PIN-u. To ochrona przed przypadkowym uruchomieniem przez osobę postronną, nie przed kimś, kto może edytować skrypt. Raporty cykliczne (tryb bez okna) nie pytają o PIN.
+
+**Blokada w trakcie pracy.** Kłódka albo `Ctrl+Shift+L` ukrywa zawartość okna; odblokowanie tym samym PIN-em. Operacje w tle trwają dalej, a okna, które pojawiłyby się w tym czasie, pokazują się po odblokowaniu. Program blokuje się sam po 10 minutach bez aktywności w jego oknach (do zmiany w Ustawieniach). Przycisk *Zakończ awaryjnie* zamyka program bez PIN-u (drugie kliknięcie w ciągu 10 s).
+
+**MFA — kod z aplikacji w telefonie.** Do PIN-u można dodać kod TOTP (Microsoft Authenticator, Google Authenticator i zgodne): *Ustawienia → MFA – konta i klucze… → Włącz MFA dla konta podstawowego*. Klucz pokazywany jest raz, jako kod QR i tekst; zapisuje się dopiero po poprawnym kodzie z aplikacji.
+
+- **Konta dodatkowe** — własna nazwa, własny PIN i własny klucz w aplikacji. Na ekranie blokady pojawia się lista kont.
+- **Uprawnienia kont dodatkowych** — drzewo przestrzeni i modułów; odznaczone są dla konta zablokowane i znikają z nawigacji.
+- **Reset PIN-u konta dodatkowego** — tylko z konta podstawowego, zatwierdzony jego kodem.
+- Dodawanie, usuwanie, nowe klucze i uprawnienia zatwierdza się kodem konta podstawowego.
+- Dane MFA są w `%APPDATA%\AD-ManagerDiamond\Mfa.json`, zaszyfrowane DPAPI — działają tylko na tym koncie Windows i tym komputerze. Utrata telefonu z kontem podstawowym: usuń ten plik (program wróci do samego PIN-u).
+
+**Wartości poufne.** Hasła LAPS, klucze odzyskiwania BitLocker i nowe hasła są maskowane w tabeli, panelu, eksporcie i kopiowaniu (do zaznaczenia „Pokaż poufne”). Skopiowane hasło znika ze schowka po 60 s.
+
+### Gdy WinRM jest niedostępny
+
+Większość modułów zarządzania zdalnego działa przez WinRM. Bez niego zostają:
+
+- **DCOM / WMI** (TCP 135 i porty dynamiczne) — *Licencja i wersja Windows* i *Diagnostyka WinRM* przechodzą na DCOM same; *Diagnostyka WinRM* potrafi przez DCOM włączyć WinRM;
+- **RPC** — *Aktualizacja zasad grupy* metodą Invoke-GPUpdate;
+- **konsole MMC i udziały** z menu (Zarządzanie komputerem, Usługi, Podgląd zdarzeń, `C$`);
+- **SMB** (kopiowanie instalatorów przez `ADMIN$`), **Pulpit zdalny** (TCP 3389).
+
+Najczęstszą przyczynę „usługa WinRM działa, a z innej podsieci nie” — reguła zapory ograniczona do podsieci lokalnej i karta w profilu Publicznym — wskazuje moduł [Diagnostyka WinRM](01-zarzadzanie-zdalne.md#diagnostyka-winrm), razem z zaleceniem dla GPO.
+
+### Pliki programu i moduły własne
+
+- Lista plików, które program zapisuje (ustawienia, kopie, dzienniki, raporty), jest w [README — Pliki pomocnicze](../README.md#pliki-pomocnicze-i-dane-zapisywane-przez-skrypty).
+- Własne moduły: pliki `*.ps1` w folderze `AD-ManagerDiamond.Modules` obok skryptu są wczytywane przy starcie i mogą dodawać przestrzenie i moduły. Przykład jest w README w sekcji *Rozbudowa — własne moduły*. Uruchamiają się z uprawnieniami użytkownika programu — trzymaj tam tylko zaufane pliki.
+'@
 }
 #endregion
 
