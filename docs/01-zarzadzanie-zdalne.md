@@ -10,7 +10,7 @@
 
 **Spis modułów**
 
-- [Diagnostyka](#diagnostyka): [Łączność](#łączność) · [Inwentaryzacja](#inwentaryzacja) · [Wydajność](#wydajność) · [Monitor obciążenia](#monitor-obciążenia) · [Logi aplikacji](#logi-aplikacji) · [Zasilanie i uptime](#zasilanie-i-uptime) · [Licencja i wersja Windows](#licencja-i-wersja-windows) · [Diagnostyka WinRM](#diagnostyka-winrm)
+- [Diagnostyka](#diagnostyka): [Łączność](#łączność) · [Inwentaryzacja](#inwentaryzacja) · [Wydajność](#wydajność) · [Monitor obciążenia](#monitor-obciążenia) · [Logi aplikacji](#logi-aplikacji) · [Analiza aplikacji](#analiza-aplikacji) · [Zasilanie i uptime](#zasilanie-i-uptime) · [Licencja i wersja Windows](#licencja-i-wersja-windows) · [Diagnostyka WinRM](#diagnostyka-winrm)
 - [Użytkownicy i dostęp](#użytkownicy-i-dostęp): [Profile użytkowników](#profile-użytkowników) · [Sesje użytkowników](#sesje-użytkowników) · [Grupy lokalne](#grupy-lokalne) · [Zgodność grup lokalnych](#zgodność-grup-lokalnych) · [Konta lokalne](#konta-lokalne) · [Pulpit zdalny](#pulpit-zdalny) · [Gdzie używane jest konto](#gdzie-używane-jest-konto)
 - [Zdalne wykonanie](#zdalne-wykonanie): [Polecenia](#polecenia) · [Instalacja oprogramowania](#instalacja-oprogramowania) · [Aktualizacja zasad grupy](#aktualizacja-zasad-grupy)
 - [System](#system): [Usługi](#usługi) · [Procesy](#procesy) · [Dyski](#dyski) · [Dziennik zdarzeń](#dziennik-zdarzeń) · [Harmonogram zadań](#harmonogram-zadań) · [Rejestr – odczyt i eksport](#rejestr--odczyt-i-eksport) · [Autostart](#autostart) · [Drukarki](#drukarki) · [Sterowniki i urządzenia](#sterowniki-i-urządzenia)
@@ -86,6 +86,43 @@
 - włączyć tryb **Śledź** (odświeżanie co 15 s).
 
 **Jak działa.** Skrypt na komputerze rozpoznaje kodowanie (UTF-8, UTF-16, ANSI) i format daty, łączy wpisy wielowierszowe (stos wywołań) i czyta duże pliki od końca, bez blokowania pliku aplikacji.
+
+### Analiza aplikacji
+
+**Do czego.** Ustalić, co się dzieje z programem, który się zamyka, zawiesza, nie startuje albo działa źle — na zaznaczonych komputerach, dla dowolnej aplikacji. Moduł sam rozpoznaje program, zbiera ślady z całego komputera i układa je w **diagnozę**: przyczyny od najbardziej prawdopodobnej, z dowodami i tym, co zrobić. Nie wymaga konfiguracji pod konkretną aplikację.
+
+**Co możesz zrobić**
+- podać fragment nazwy programu (jak w *Zainstalowanych programach*, np. „Optima”, „Teams”) albo nazwę pliku `.exe` i okno czasu (6 godz. – 30 dni albo przedział od – do); opcjonalnie zawęzić profile do jednego użytkownika;
+- przeczytać **diagnozę** na górze tabeli: wiersz z trzema najbardziej prawdopodobnymi przyczynami, a pod nim hipotezy z kolumną **Pewność** (wysoka / średnia / niska), np.:
+  - „Brak biblioteki `mfc120u.dll` – zainstaluj Visual C++ 2013 x64”, „Brak środowiska Microsoft.WindowsDesktop.App 8.0 (x64)”, „Niezgodna architektura biblioteki (32/64-bit)”;
+  - „Serwer niedostępny: `db01:1433`” (z pliku ustawień programu), „Uszkodzony plik ustawień”, „Zmiana ustawień przed pierwszym problemem”;
+  - „Awarie programu: 3 (moduł `plugin.dll`) – moduł zewnętrzny”, z informacją, czy program pada przy starcie, czy w trakcie pracy;
+  - „Problemy zaczęły się po zmianie aplikacji”, „Zmiana środowiska wykonawczego przed problemem” (np. usunięty pakiet Visual C++);
+  - „Nowy błąd w logu `app.log`” (rodzaj błędu, którego wcześniej nie było), „Odmowa dostępu albo plik w użyciu” (z kodów błędów);
+  - „Defender / AppLocker / WDAC zablokował …”, „Przekierowanie uruchamiania”, „Zasada blokuje uruchomienie”, „Pliki programu zablokowane (pobrane z internetu)”;
+  - „Brak pamięci wirtualnej”, „Stan procesu – możliwy wyciek uchwytów”, „Problem jednego użytkownika”, „Komputer czeka na restart”;
+- zaznaczyć kilka komputerów — także taki, na którym program **działa** — i dostać **porównanie**: różnice obecne na wszystkich komputerach z problemem i na żadnym działającym (wersja aplikacji i plików, system, pakiety Visual C++ i .NET, inne programy, poprawki KB). Gdy problem jest wszędzie, porównanie pokazuje wspólne zmiany sprzed jego początku;
+- przełączać **widoki**: wnioski, oś czasu (wszystko z datą, od najnowszego), awarie i zdarzenia, logi, program i zależności, rejestr, system;
+- z menu wiersza: **pełna treść**, **końcówka pliku logu** (ostatnie 400 wierszy), **otwarcie logu w module «Logi aplikacji»** (oś czasu, filtr, śledzenie), pokazanie pliku w Eksploratorze przez udział administracyjny, kopiowanie ścieżki;
+- utworzyć **paczkę diagnostyczną** (ZIP na komputer, np. dla producenta programu): wynik analizy (CSV), pliki logów, raporty WER i zrzuty pamięci, dzienniki Aplikacja i System z okna czasu (`.evtx`), opcjonalnie klucze rejestru aplikacji (`.reg` — mogą zawierać zapisane hasła programu);
+- uruchomić analizę z modułu *Zainstalowane programy* (menu wiersza **Analizuj aplikację**).
+
+**Jak działa**
+- **Rozpoznanie programu** bez listy znanych aplikacji: wpis deinstalacji (wersja, wydawca, folder, plik `.exe` z ikony), pakiet MSIX / Sklepu (stan pakietu, plik z manifestu), rejestracja *App Paths*, pliki `.exe` w folderze instalacji i uruchomione procesy. Z tego program składa słowa wyszukiwania (nazwa, pliki `.exe`, wydawca).
+- **Zależności** z samych plików, bez uruchamiania: tabela importu programu i bibliotek w jego folderze (nagłówek PE) — czy system znajdzie każdą bibliotekę (folder programu, folder systemowy dla tej architektury, PATH, WinSxS) i jaki pakiet ją dostarcza; architektura 32/64-bit; środowisko .NET z pliku `.config` (.NET Framework) albo `runtimeconfig.json` (.NET 5+ — wersja i architektura); pliki z oznaczeniem „pobrany z internetu”; podpis cyfrowy.
+- **Zdarzenia z okna czasu**: awarie (*Application Error*) z modułem, opisanym kodem wyjątku i czasem działania procesu, zawieszenia, wyjątki .NET (typ i kody HRESULT), okna błędu systemu (brak biblioteki DLL), błędy side-by-side, awarie usług aplikacji, brak pamięci wirtualnej, blokady Defendera (wykrycia, ASR, kontrolowany dostęp do folderów), AppLockera i Code Integrity, błędy wdrażania pakietu MSIX, zdarzenia ze źródeł i dzienników aplikacji; instalacje MSI i aktualizacje Windows — także z 7 dni przed oknem, do porównania z początkiem problemu; nieoczekiwane wyłączenia.
+- **Raporty błędów Windows (WER)** z `ProgramData` i profili użytkowników, zrzuty pamięci z `CrashDumps`.
+- **Logi**: pliki z folderu instalacji, `ProgramData`, `AppData\Local`, `Roaming` i `LocalLow` każdego użytkownika (foldery o nazwie aplikacji, w folderach wydawcy — wszystkie podfoldery) oraz z `Temp`. W najnowszych plikach zmienionych w oknie czasu program czyta końcówkę (do 512 KB, UTF-8 / UTF-16), rozpoznaje datę wpisu, grupuje błędy w **rodzaje** (bez dat, liczb, identyfikatorów) i odróżnia **nowe** (nie było ich przed oknem czasu) od powtarzających się. Kody błędów (np. `0x80070005`) tłumaczy na opis systemu tego komputera.
+- **Ustawienia i połączenia**: pliki ustawień programu (`.config`, `.json`, `.ini`, `.xml` …) — czy są poprawne, czy zmieniły się przed problemem; serwery z ustawień (ciągi połączenia z bazą, adresy URL, udziały, `host:port`) — czy nazwa się rozwiązuje i port odpowiada, sprawdzane z komputera docelowego równolegle (kilka sekund). Do wyników trafiają tylko nazwa i port — hasła z ustawień nie.
+- **Rejestr**: klucze aplikacji (komputer i użytkownicy; wartości jak hasło, token, klucz, ciąg połączenia są ukryte), tryb zgodności, *Image File Execution Options*, zrzuty WER, zasada *DisallowRun*. **System**: wolne miejsce, pamięć RAM, oczekujący restart.
+- **Diagnoza**: każda hipoteza dostaje ocenę 0–100 z dowodów i ich zbieżności — np. brak biblioteki zgłoszony też przez system przy starcie, nowy błąd w logu w chwili pierwszej awarii, zmiana aplikacji tuż przed pierwszym problemem, niedostępny serwer przy zawieszeniach. **Porównanie komputerów** korzysta z odcisku każdego komputera (wersje, środowiska, programy, poprawki).
+- Tylko odczyt: program niczego nie zmienia na komputerze. Paczka powstaje w `%SystemRoot%\Temp\DomainOps`, jest kopiowana przez udział administracyjny do wybranego folderu i usuwana z komputera.
+
+**Uwagi**
+- Przeszukiwanie plików ma limit 2 minut i 5000 plików na folder; przy przekroczeniu w wynikach jest wiersz „przeszukiwanie niepełne”.
+- Krótka albo bardzo ogólna nazwa (np. „App”) da więcej fałszywych trafień — podaj pełniejszą nazwę albo plik `.exe`.
+- Ocena to wskazówka, nie wyrok: przy kilku hipotezach o podobnej ocenie sprawdź dowody (pełna treść wiersza) i porównaj z działającym komputerem.
+- Rejestr niezalogowanych użytkowników jest czytany tylko z opcją *Także rejestr niezalogowanych (NTUSER.DAT)*; ich pliki logów i raporty WER — zawsze. Sprawdzanie połączeń wyłączysz opcją *Połączenia z serwerów z ustawień*.
 
 ### Zasilanie i uptime
 
@@ -372,7 +409,8 @@
 - odczytać programy z rejestru (64- i 32-bitowe oraz z profili zalogowanych użytkowników);
 - sprawdzić w kolumnie **„Odinstalowanie zdalne”**, czy i jak program da się usunąć: MSI, tryb cichy producenta, Inno Setup (zielone); tylko z przełącznikami albo w sesji użytkownika (żółte); brak deinstalatora, blokada producenta albo profil bez trybu cichego (czerwone);
 - odinstalować zaznaczone programy (z limitem czasu) albo *Odinstaluj z przełącznikami…*;
-- *Pokaż ten program na wszystkich komputerach*.
+- *Pokaż ten program na wszystkich komputerach*;
+- **Analizuj aplikację** — moduł *Analiza aplikacji* dla programu z wiersza (awarie, logi, rejestr, wnioski).
 
 **Jak działa.** Deinstalacja działa przez WinRM. Po niej program sprawdza, czy aplikacja zniknęła z rejestru, i pisze wynik z przyczyną w kolumnie „Stan” (np. „deinstalator czekał na odpowiedź użytkownika”, „MSI 1618 – trwa inna instalacja”, „nadal zainstalowany – wymaga restartu”). Programy z profilu zalogowanego użytkownika są usuwane jednorazowym zadaniem Harmonogramu w jego sesji, **bez okna konsoli**: krótki skrypt `wscript.exe` uruchamia deinstalator w ukrytym oknie i zapisuje jego kod wyjścia (gdy Windows Script Host jest wyłączony — `cmd`, wtedy okno konsoli widać, a wynik o tym mówi). Gdy użytkownik nie jest zalogowany interaktywnie, zadanie nie rusza i wynik mówi o tym po kilku sekundach, zamiast czekać do limitu czasu. Po przekroczeniu limitu deinstalator jest zamykany razem z procesami, które uruchomił.
 
