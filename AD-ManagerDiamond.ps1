@@ -19390,23 +19390,23 @@ function Switch-LoadTarget {
 function Start-LoadMonitor {
     param([hashtable]$Module, [string]$Target = '')
     $m = $Module
-    $target = $Target
-    if (-not $target) {
-        $targets = @(Get-TargetComputers -Quiet)
+    $computer = $Target
+    if (-not $computer) {
+        $computers = @(Get-TargetComputers -Quiet)
         $chosen = [string]$m.LoadHost.SelectedItem
-        $target = if ($chosen -and ($targets -contains $chosen -or -not $targets.Count)) { $chosen } elseif ($targets.Count) { $targets[0] } else { '' }
-        if (-not $target) { Show-Warning 'Zaznacz komputer na liście po lewej stronie.'; return }
-        if ($targets.Count -gt 1) { Show-Toast ('Monitor obserwuje jeden komputer naraz: {0}. Inny wybierzesz w polu «Komputer» – także w trakcie pomiaru.' -f $target) 'info' }
+        $computer = if ($chosen -and ($computers -contains $chosen -or -not $computers.Count)) { $chosen } elseif ($computers.Count) { $computers[0] } else { '' }
+        if (-not $computer) { Show-Warning 'Zaznacz komputer na liście po lewej stronie.'; return }
+        if ($computers.Count -gt 1) { Show-Toast ('Monitor obserwuje jeden komputer naraz: {0}. Inny wybierzesz w polu «Komputer» – także w trakcie pomiaru.' -f $computer) 'info' }
     }
     $m.Data.LoadNext = ''
-    Set-LoadHostItems -Module $m -Selected $target
+    Set-LoadHostItems -Module $m -Selected $computer
     $params = @{ Interval = (Get-Num $m.LoadInterval); Minutes = (Get-Num $m.LoadMinutes) }
-    $m.Data.Load = New-LoadState -Target $target -Params $params
+    $m.Data.Load = New-LoadState -Target $computer -Params $params
     Reset-StatTiles -Module $m
     Show-LoadView -Module $m
     Update-LoadUi -Module $m
-    Write-Log ('Monitor obciążenia: {0} – start (próbka co {1} s, najdłużej {2} min).' -f $target, $params.Interval, $params.Minutes) -Module $m.Title
-    Start-HostOperation -Module $m -Name 'Monitor obciążenia' -Targets @($target) -Output None -Quiet -Parameters $params -ScriptBlock $script:LoadMonitorScript -OnItem {
+    Write-Log ('Monitor obciążenia: {0} – start (próbka co {1} s, najdłużej {2} min).' -f $computer, $params.Interval, $params.Minutes) -Module $m.Title
+    Start-HostOperation -Module $m -Name 'Monitor obciążenia' -Targets @($computer) -Output None -Quiet -Parameters $params -ScriptBlock $script:LoadMonitorScript -OnItem {
         param($m, $target, $obj)
         Receive-LoadItem -Module $m -Object $obj
     } -OnResult {
