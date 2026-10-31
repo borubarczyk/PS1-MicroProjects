@@ -19204,9 +19204,9 @@ function Set-LoadTile {
 # Stała wysokość i wiersze bez zawijania: zmienna wysokość panelu przy każdej próbce przesuwała kafelki i tabelę.
 # Wspólny wiersz nagłówków: oba nagłówki i obie listy zaczynają się na tej samej wysokości (przycisk kopiowania
 # po prawej nie przesuwa listy w dół); w każdej kolumnie mieści się $script:LoadWhyLines wierszy.
-$script:LoadWhyLines = 6
+$script:LoadWhyLines = 8
 $script:LoadWhyXaml = @'
-<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Margin="0,4,0,6" Height="160" ClipToBounds="True">
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Margin="0,4,0,6" Height="200" ClipToBounds="True">
   <Grid.ColumnDefinitions>
     <ColumnDefinition Width="*"/>
     <ColumnDefinition Width="18"/>
@@ -19454,7 +19454,7 @@ function Update-LoadUi {
         $why.FindName('nowTitle').Text = 'Co się dzieje teraz – {0}' -f $st.Target
         Set-LoadLines -Panel $why.FindName('now') -Lines @(@(if ($st.Error) { @{ Tone = 'crit'; Text = $st.Error } } else { Get-LoadFindings -State $st }) | Select-Object -First $script:LoadWhyLines)
         # W panelu najważniejsze pozycje (okno pomiaru pokazuje kafelek czasu); pełna lista w widoku «Podsumowanie» i w kopii
-        Set-LoadLines -Panel $why.FindName('total') -Lines @(Get-LoadSummary -State $st | Where-Object { $_.Item -notmatch '#[3-9]$' -and $_.Item -notmatch 'I/O #[2-9]$' -and $_.Item -notin 'Koszt monitora', 'Okno pomiaru' } | Select-Object -First $script:LoadWhyLines)
+        Set-LoadLines -Panel $why.FindName('total') -Lines @(Get-LoadSummary -State $st | Where-Object { $_.Item -notmatch '#[3-9]$' -and $_.Item -notmatch 'I/O #[2-9]$' -and $_.Item -ne 'Koszt monitora' } | Select-Object -First $script:LoadWhyLines)
     }
     if ($m.View_['busyText'] -and $st.Running) { $m.View_['busyText'].Text = 'Monitor: {0} • {1} / {2} min • próbek: {3}' -f $st.Target, (Format-LoadDuration $st.Seconds), $minutes, $st.Ticks.Count }
     $view = [int]$m.Data['LoadView']
