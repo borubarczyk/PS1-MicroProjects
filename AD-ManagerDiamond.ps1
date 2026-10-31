@@ -1420,7 +1420,9 @@ $script:ThemeXaml = @'
     <Setter Property="MinRowHeight" Value="28"/>
     <Setter Property="FontSize" Value="12.5"/>
     <Setter Property="EnableRowVirtualization" Value="True"/>
-    <Setter Property="EnableColumnVirtualization" Value="True"/>
+    <!-- Bez wirtualizacji kolumn: nagłówki są elementami okna (nazwa i lejek filtra), a ponownie używany kontener
+         nagłówka przy przewijaniu w poziomie potrafi zgubić taki element - kolumna zostaje bez nazwy -->
+    <Setter Property="EnableColumnVirtualization" Value="False"/>
     <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
     <Setter Property="ColumnHeaderStyle" Value="{StaticResource GridHeader}"/>
     <Setter Property="CellStyle" Value="{StaticResource GridCell}"/>
