@@ -1,26 +1,65 @@
-Copyright (c) 2025-2026 Borys Kaleta (github.com/borubarczyk). Wszelkie prawa zastrzeżone.
+LICENCJA ZASTRZEŻONA - WSZELKIE PRAWA ZASTRZEŻONE
 
-Oprogramowanie w tym repozytorium (skrypty, moduły, testy i dokumentacja) jest
-chronione prawem autorskim. Wolno z niego korzystać wyłącznie na podstawie
-pisemnej zgody albo umowy licencyjnej zawartej z autorem i tylko w zakresie
-w niej określonym. Bez takiej zgody nie wolno go, w całości ani w części,
-kopiować, rozpowszechniać, udostępniać, modyfikować, sprzedawać ani
-sublicencjonować.
+PS1-MicroProjects
+Copyright (c) 2025-2026 Borys Kaleta. Wszelkie prawa zastrzeżone.
 
-Oprogramowanie jest udostępniane w stanie, w jakim jest, bez jakichkolwiek
-gwarancji. W najszerszym zakresie dopuszczalnym przez prawo autor nie ponosi
-odpowiedzialności za szkody wynikłe z korzystania z oprogramowania.
+1. Oprogramowanie PS1-MicroProjects - kod źródłowy, skrypty, moduły, testy, dokumentacja, pliki konfiguracyjne
+   i zasoby autora (dalej: „Oprogramowanie”) - jest wyłączną własnością autora i jest chronione
+   prawem autorskim.
 
---------------------------------------------------------------------------------
+2. Bez uprzedniej zgody autora wyrażonej na piśmie lub w formie elektronicznej zabronione jest w szczególności:
+   a) używanie i uruchamianie Oprogramowania,
+   b) kopiowanie i powielanie Oprogramowania w całości lub w części,
+   c) modyfikowanie, tłumaczenie i przerabianie Oprogramowania oraz tworzenie na jego podstawie
+      utworów zależnych,
+   d) rozpowszechnianie, publikowanie, udostępnianie, sprzedaż, najem, użyczanie i sublicencjonowanie
+      Oprogramowania,
+   e) usuwanie lub zmienianie informacji o autorze i prawach autorskich.
 
-Copyright (c) 2025-2026 Borys Kaleta (github.com/borubarczyk). All rights reserved.
+3. Publiczna dostępność kodu (np. w serwisie GitHub) nie oznacza udzielenia licencji ani zgody na korzystanie
+   z Oprogramowania. Możliwość przeglądania kodu w serwisie, w którym go opublikowano, nie daje żadnych praw
+   do Oprogramowania.
 
-This software, including its scripts, modules, tests and documentation, is
-protected by copyright. It may be used only under the written permission of, or
-a license agreement with, the author and only within the scope set out there.
-Without such permission no part of it may be copied, distributed, made
-available, modified, sold or sublicensed.
+4. Zgoda autora określa zakres, czas i warunki korzystania z Oprogramowania. Wszelkie prawa, które nie zostały
+   wprost przyznane, są zastrzeżone dla autora.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. TO THE FULLEST
-EXTENT PERMITTED BY LAW, THE AUTHOR SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING
-FROM THE USE OF THE SOFTWARE.
+5. Oprogramowanie jest dostarczane w stanie „takim, jaki jest”, bez jakichkolwiek gwarancji. W najszerszym
+   zakresie dopuszczalnym przez prawo autor nie odpowiada za szkody wynikłe z korzystania z Oprogramowania,
+   w tym za zmiany w systemach, usługach, kontach i danych.
+
+6. Składniki osób trzecich, z których Oprogramowanie korzysta, a które nie są jego częścią, podlegają
+   własnym licencjom.
+
+7. Niniejsza licencja obowiązuje od 1 listopada 2026 r. i zastępuje wcześniej dołączone do Oprogramowania
+   pliki licencji.
+
+8. W sprawie zgody na korzystanie z Oprogramowania należy kontaktować się z autorem przez jego profil
+   w serwisie GitHub: https://github.com/borubarczyk
+
+-------------------------------------------------------------------------------------------------------------
+
+PROPRIETARY LICENSE - ALL RIGHTS RESERVED (English translation; in case of discrepancies the Polish version
+prevails)
+
+PS1-MicroProjects
+Copyright (c) 2025-2026 Borys Kaleta. All rights reserved.
+
+This software, including its source code, scripts, modules, tests, documentation, configuration files
+and the author's resources (the "Software"), is the exclusive property of the author and is protected
+by copyright law.
+
+Without the author's prior written or electronic consent, you may not use or run the Software; copy or
+reproduce it in whole or in part; modify, translate or adapt it or create derivative works; distribute,
+publish, share, sell, rent, lend or sublicense it; or remove or alter authorship and copyright notices.
+
+Public availability of the source code (e.g. on GitHub) does not grant any license or permission to use
+the Software. All rights not expressly granted are reserved by the author.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. TO THE MAXIMUM EXTENT PERMITTED BY LAW,
+THE AUTHOR SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE OF THE SOFTWARE, INCLUDING CHANGES TO
+SYSTEMS, SERVICES, ACCOUNTS AND DATA.
+
+Third-party components used by, but not included in, the Software are subject to their own licenses.
+
+This license applies from 1 November 2026 and replaces any license files previously included with the
+Software. To request permission, contact the author via https://github.com/borubarczyk
